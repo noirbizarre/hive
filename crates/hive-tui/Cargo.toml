@@ -1,0 +1,13 @@
+[package]
+name = "hive-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+agent-client-protocol = { workspace = true }
+clap = { workspace = true }
+hive-protocol = { path = "../hive-protocol" }
+tokio = { workspace = true }

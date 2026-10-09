@@ -1,0 +1,10 @@
+{
+  "name": "hive-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node --check app.js",
+    "test": "node --test"
+  }
+}

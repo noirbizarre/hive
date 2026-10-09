@@ -1,0 +1,14 @@
+[package]
+name = "hive-zellij"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde_json = { workspace = true }
+zellij-tile = "=0.45.1"

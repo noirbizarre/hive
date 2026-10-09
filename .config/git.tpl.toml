@@ -1,0 +1,23 @@
+# git-tpl — https://noirbizarre.github.io/git-tpl/configuration/
+#
+# This file is versioned with the project. Edit an answer and run
+# `git tpl update` to re-render the template with it.
+
+[template]
+source = "https://github.com/noirbizarre/rust.tpl"
+
+[answers]
+author = "Axel H. <noirbizarre@gmail.com>"
+categories = "development-tools"
+copyright_holder = "Axel H."
+copyright_year = 2026
+crate = "hive"
+description = "An ACPv2 gateway and session multiplexer for AI coding agents"
+docs = true
+docs_accent = "indigo"
+keywords = ""
+kind = "workspace"
+msrv = true
+msrv_version = "1.88"
+owner = "noirbizarre"
+publish = false

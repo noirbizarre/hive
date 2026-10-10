@@ -17,6 +17,11 @@ struct Options {
     address: String,
     #[arg(long, default_value = "ws", value_parser = ["ws", "http"])]
     transport: String,
+    #[arg(
+        long,
+        help = "Agent profile ID (defaults to the daemon's configured default)"
+    )]
+    agent: Option<String>,
 }
 
 #[tokio::main]
@@ -46,8 +51,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 return Err(Error::invalid_request().data("Hive did not advertise session support"));
             }
             println!("ACPv2 connected; type a prompt, or /quit");
+            let cwd = std::env::current_dir().map_err(Error::into_internal_error)?;
+            let mut request = v2::NewSessionRequest::new(cwd);
+            if let Some(agent) = &options.agent {
+                let mut meta = v2::Meta::new();
+                meta.insert("hive".into(), serde_json::json!({ "agent": agent }));
+                request = request.meta(meta);
+            }
             let session = cx
-                .build_session_cwd()?
+                .build_session_from(request)
                 .start_session()
                 .block_task()
                 .await?

@@ -14,11 +14,22 @@ ID; its completed prompt response generates a v2 idle update. V2-only tool,
 permission, MCP bridge, forks, config options, compaction and other optional
 capabilities are **not** advertised. Non-text v1 prompts return an error.
 
-The v2 downstream provider is stdio; the v1 provider is a separate stdio
-adapter. Selection is explicit via provider configuration, not speculative
-transport probing. Initialization failure is actionable and does not retry
-automatically. Downstream WS and HTTP/SSE agent connections have not been
-implemented even though `HttpClient` supports them as a client-facing transport.
+ACPv2 `session/new` has no standard agent selector. Hive reserves
+`_meta.hive.agent` for a profile ID in **client-to-Hive** requests; Hive removes
+the selector before forwarding to downstream agents. Omit it to use
+`default_agent`; if no default exists, creation returns an error. Example:
+
+```json
+{"cwd":"/workspace","mcpServers":[],"_meta":{"hive":{"agent":"pi"}}}
+```
+
+The same request works over WebSocket and HTTP/SSE. The SDK supports `_meta`
+on `v2::NewSessionRequest`; this selector is a Hive extension, not an ACP
+standard field. Profile-declared versions and transports select one downstream
+connection without speculative retry: v2 first where declared, otherwise the
+explicit v1 compatibility adapter. SDK client transports support stdio,
+WebSocket and HTTP/SSE. No automatic fallback on failed initialization is
+claimed.
 
 The draft [v2 specification](https://github.com/agentclientprotocol/agent-client-protocol/tree/main/docs/protocol/v2)
 and [draft announcement](https://github.com/agentclientprotocol/agent-client-protocol/blob/main/docs/announcements/acp-v2-draft.mdx)

@@ -18,9 +18,10 @@ test('browser initializes with ACPv2 before sending a prompt', async () => {
   };
   const updates = [];
   const client = connect('ws://127.0.0.1:8765/acp', update => updates.push(update), () => {});
-  await client.prompt('hello');
+  await client.prompt('hello', 'pi');
   assert.deepEqual(sent.map(message => message.method), ['initialize', 'session/new', 'session/prompt']);
   assert.equal(sent[2].params.sessionId, 'hive-test');
+  assert.equal(sent[1].params._meta.hive.agent, 'pi');
   socket.onmessage({ data: JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'someone-else', update: { sessionUpdate: 'agent_message_chunk' } } }) });
   socket.onmessage({ data: JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'hive-test', update: { sessionUpdate: 'agent_message_chunk' } } }) });
   assert.equal(updates.length, 1);

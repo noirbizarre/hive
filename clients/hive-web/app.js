@@ -4,6 +4,7 @@ export function connect(url, onUpdate, onStatus) {
   let nextId = 0;
   const pending = new Map();
   let sessionId;
+  let selectedAgent;
   let rejectInitialize;
   const request = (method, params) => new Promise((resolve, reject) => {
     const id = ++nextId;
@@ -16,7 +17,7 @@ export function connect(url, onUpdate, onStatus) {
     if (message.id != null && pending.has(message.id)) {
       const { resolve, reject } = pending.get(message.id);
       pending.delete(message.id);
-      if (message.error) reject(new Error(message.error.message)); else resolve(message.result);
+      if (message.error) reject(new Error(message.error.data || message.error.message)); else resolve(message.result);
     }
   };
   ws.onclose = () => { rejectInitialize?.(new Error('Hive disconnected')); for (const { reject } of pending.values()) reject(new Error('Hive disconnected')); pending.clear(); onStatus('Disconnected'); };
@@ -35,11 +36,13 @@ export function connect(url, onUpdate, onStatus) {
   });
   return {
     initialized,
-    async prompt(text) {
+    async prompt(text, agent) {
       await initialized;
+      if (sessionId && (agent || '') !== selectedAgent) throw new Error('Agent selection applies to a new session; reload to choose another agent');
       if (!sessionId) {
-        const created = await request('session/new', { cwd: '/', mcpServers: [] });
+        const created = await request('session/new', { cwd: '/', mcpServers: [], ...(agent ? { _meta: { hive: { agent } } } : {}) });
         sessionId = created.sessionId;
+        selectedAgent = agent || '';
       }
       return request('session/prompt', { sessionId, prompt: [{ type: 'text', text }] });
     },
@@ -52,12 +55,18 @@ if (typeof document !== 'undefined') {
   const status = document.querySelector('#status');
   const output = document.querySelector('#output');
   fetch('/hive/v1/status').then(r => r.json()).then(s => { status.textContent = `Hive ${s.version} (${s.sessions} sessions)`; }).catch(() => { status.textContent = 'Daemon unavailable'; });
+  const agentSelect = document.querySelector('#agent');
+  fetch('/hive/v1/providers').then(r => r.json()).then(({ agents }) => {
+    for (const agent of agents) agentSelect.add(new Option(agent.name, agent.id));
+    agentSelect.insertBefore(new Option('Default agent', ''), agentSelect.firstChild);
+    agentSelect.value = '';
+  }).catch(() => { status.textContent = 'Agent inventory unavailable'; });
   const client = connect(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/acp`, update => {
     if (update.sessionUpdate === 'agent_message_chunk') output.textContent += update.content?.text || '';
   }, message => { status.textContent = message; });
   document.querySelector('#prompt').onsubmit = async event => {
     event.preventDefault();
-    try { await client.prompt(new FormData(event.target).get('text')); } catch (error) { status.textContent = error.message; }
+    try { await client.prompt(new FormData(event.target).get('text'), agentSelect.value); agentSelect.disabled = true; } catch (error) { status.textContent = error.message; }
   };
   document.querySelector('#cancel').onclick = () => client.cancel();
 }

@@ -19,24 +19,9 @@ pub async fn daemon_status(
         .await?)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum AgentVersion {
     V1,
     V2,
-}
-
-#[derive(Clone, Debug)]
-pub struct StdioProvider {
-    pub command: String,
-    pub version: AgentVersion,
-}
-
-impl StdioProvider {
-    /// A declared version is required: blind probing can launch two processes.
-    pub fn new(command: impl Into<String>, version: AgentVersion) -> Self {
-        Self {
-            command: command.into(),
-            version,
-        }
-    }
 }

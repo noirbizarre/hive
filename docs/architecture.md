@@ -8,15 +8,18 @@ v2 agent handlers against the same broker. `/hive/v1/*` contains operational
 HTTP endpoints and a same-origin browser asset route, not session RPC methods.
 
 `hive-core` defines transport-free Hive session IDs and lifecycle vocabulary.
-`hive-protocol` pins SDK integration, provider declarations and shared native
-status access. The daemon broker maps each Hive session ID to one agent process
-and its downstream session ID. It retains user/agent message snapshots for
+`hive-protocol` pins SDK integration and shared native status access. The daemon
+owns a registry of inert agent profiles loaded from one XDG TOML file, and the
+broker maps each Hive session ID to its selected profile, one downstream
+process/connection, and downstream session ID. It retains message snapshots for
 in-process replay; on resume it attaches a different client connection and
 sends these snapshots before returning. Replay is not durable or complete.
 
-The downstream version is selected **per declared provider configuration**:
-`--agent-version v2` (default) or `v1`. One process is launched for each session;
-there is no speculative probing or fallback after initialization errors. v1
+The downstream version and transport are selected **per session** from its
+profile declaration (v2 preferred over v1). The pinned SDK supports stdio,
+WebSocket and HTTP/SSE. Each session establishes its own connection (and its
+own process for stdio); there is no speculative probing or fallback after
+initialization errors. v1
 text chunks are adapted to v2 agent chunks and the v1 prompt response produces
 a v2 idle state. The transport exposed to clients remains v2 regardless.
 
@@ -29,3 +32,7 @@ The current ownership model is one trusted local OS user. Session routing
 checks the exact Hive session ID and downstream ID. There is no persistent
 storage, per-client authorization, multi-observer event broadcast, reconnect
 cursor, guaranteed stream replay, or remote security policy yet.
+The daemon exclusively locks a private per-user runtime file before binding;
+another `hive serve` invocation cannot own a different port for the same user.
+Both ACP session access and Hive administration are loopback-only, with no
+per-client authentication; an untrusted local process can access both.

@@ -6,7 +6,7 @@
 | Client to Hive | v2 | HTTP POST + SSE GET `/acp` | Integration-tested SDK client through same broker |
 | Hive to agent | v2 | stdio | Integration-tested with deterministic mock |
 | Hive to agent | v1 | stdio | Integration-tested text prompt compatibility adapter |
-| Hive to agent | v2/v1 | WebSocket, HTTP/SSE | Not implemented |
+| Hive to agent | v2/v1 | WebSocket, HTTP/SSE | SDK client transport; v2 HTTP/SSE and WS integration-tested with mock |
 | Client to Hive | v1 | Any | Rejected by v2 gateway |
 
 HTTP/SSE uses connection- and session-scoped GET streams for server events;

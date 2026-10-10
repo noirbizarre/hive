@@ -21,6 +21,13 @@ not replace a live Zellij host integration run.
 
 The daemon refuses non-loopback listener addresses. The default is
 `127.0.0.1:8765`; use `--listen` / `HIVE_LISTEN` for a different loopback
-address and `--agent` / `HIVE_AGENT` for an explicit command. The v1 adapter
-is selected by `--agent-version v1`. Agent stderr is independent of its ACP
-stdio stdout. In-memory state is lost on daemon restart.
+address. `hive serve` needs no agent argument: it loads profiles from
+`$XDG_CONFIG_HOME/hive/config.toml`, falling back to `~/.config/hive/config.toml`,
+or accepts `--config` / `HIVE_CONFIG`. `HIVE_DEFAULT_AGENT` overrides the optional
+`default_agent` setting. Profiles declare `command`, `args`, `env`, or an
+`endpoint` with optional `headers`, and `versions = ["v2", "v1"]` where supported.
+Each session uses `_meta.hive.agent` or the configured default; only declared
+v1 profiles use the compatibility adapter. Never log secrets from profiles.
+Agent stderr is independent of ACP stdio stdout. The per-user lock lives under
+`$XDG_RUNTIME_DIR/hive/daemon.lock` (or `~/.local/state/hive/daemon.lock`),
+and is released on process exit. In-memory state is lost on daemon restart.

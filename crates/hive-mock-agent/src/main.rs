@@ -178,7 +178,10 @@ async fn main() -> agent_client_protocol::Result<()> {
                             v2::RunningStateUpdate::new(),
                         )),
                     )?;
-                    let reply = format!("Echo: {text}");
+                    let reply = format!(
+                        "{}Echo: {text}",
+                        std::env::var("HIVE_MOCK_LABEL").unwrap_or_default()
+                    );
                     notify(
                         &cx,
                         &request.session_id,

@@ -1,7 +1,8 @@
 use std::net::SocketAddr;
 
 use clap::{Parser, Subcommand};
-use hive_protocol::{AgentVersion, StdioProvider};
+use hive_daemon::config::Config;
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "hive", about = "Local ACPv2 gateway for coding agents")]
@@ -15,14 +16,12 @@ enum Command {
     Serve {
         #[arg(long, default_value = "127.0.0.1:8765", env = "HIVE_LISTEN")]
         listen: SocketAddr,
-        #[arg(long, env = "HIVE_AGENT")]
-        agent: String,
-        #[arg(long, default_value = "v2", value_parser = ["v1", "v2"])]
-        agent_version: String,
+        #[arg(long, env = "HIVE_CONFIG")]
+        config: Option<PathBuf>,
     },
     Status {
-        #[arg(long, default_value = "http://127.0.0.1:8765", env = "HIVE_URL")]
-        url: String,
+        #[arg(long, env = "HIVE_URL")]
+        url: Option<String>,
     },
 }
 
@@ -32,21 +31,18 @@ async fn main() -> miette::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     match Cli::parse().command {
-        Command::Serve {
-            listen,
-            agent,
-            agent_version,
-        } => {
-            let version = if agent_version == "v1" {
-                AgentVersion::V1
-            } else {
-                AgentVersion::V2
-            };
-            hive_daemon::serve(listen, StdioProvider::new(agent, version))
+        Command::Serve { listen, config } => {
+            let registry = Config::load(config).map_err(|error| miette::miette!("{error}"))?;
+            hive_daemon::serve(listen, registry)
                 .await
                 .map_err(|e| miette::miette!("cannot serve Hive on {listen}: {e}"))?;
         }
         Command::Status { url } => {
+            let url = url.unwrap_or_else(|| {
+                std::env::var("HIVE_LISTEN")
+                    .map(|listen| format!("http://{listen}"))
+                    .unwrap_or_else(|_| "http://127.0.0.1:8765".into())
+            });
             let url = format!("{}/hive/v1/status", url.trim_end_matches('/'));
             let response = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(3))
@@ -56,9 +52,7 @@ async fn main() -> miette::Result<()> {
                 .send()
                 .await
                 .map_err(|e| {
-                    miette::miette!(
-                        "daemon unavailable at {url}: {e}; start `hive serve --agent <command>`"
-                    )
+                    miette::miette!("daemon unavailable at {url}: {e}; start `hive serve`")
                 })?
                 .error_for_status()
                 .map_err(|e| miette::miette!("daemon status failed: {e}"))?;

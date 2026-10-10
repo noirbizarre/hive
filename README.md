@@ -22,8 +22,8 @@
 
 ---
 
-Hive provides one ACPv2 gateway for multiple clients and translates configured
-ACPv1 or ACPv2 stdio agents behind it. One local daemon exposes the official
+Hive provides one ACPv2 gateway for multiple clients and manages configured
+ACPv1 or ACPv2 agents behind it. One local daemon exposes the official
 ACP HTTP/SSE and WebSocket transports; clients do not launch agents themselves.
 
 The ACPv2 specification and SDK APIs are **draft**. This bootstrap is intended
@@ -34,11 +34,38 @@ for a single trusted local user, not a remotely accessible multi-user service.
 Install Rust (the pinned stable toolchain), then `mise install` for the template
 tools. Build with `mise run build` or `cargo build --workspace`.
 
-Start a deterministic local agent without an API key:
+Create `$XDG_CONFIG_HOME/hive/config.toml` (or `~/.config/hive/config.toml`):
+
+```toml
+default_agent = "pi"
+
+[agents.pi]
+name = "Pi"
+command = "pi"
+args = ["--mode", "acp"]
+versions = ["v2"]
+
+[agents.opencode]
+name = "OpenCode"
+command = "opencode"
+args = ["acp"]
+versions = ["v1"] # Set to the actual ACP version supported by your installation.
+```
+
+The commands and version declarations are examples; check your installed
+agents' ACP entrypoints and supported versions. Profiles may also specify
+`env = { KEY = "value" }`; an endpoint profile uses
+`endpoint = "http://127.0.0.1:9000"` (or `ws://...`) and optional
+`headers = { Authorization = "Bearer ..." }`. Keep the config file private.
+No default is required to start Hive; without one, each session must select a
+profile. `HIVE_DEFAULT_AGENT` overrides `default_agent`, `HIVE_CONFIG` or
+`--config` chooses a different file, and `HIVE_LISTEN` overrides the loopback
+listen address.
+
+Start the daemon once:
 
 ```sh
-cargo build -p hive-mock-agent
-cargo run -p hive-daemon --bin hive -- serve --agent ./target/debug/hive-mock-agent
+cargo run -p hive-daemon --bin hive -- serve
 ```
 
 In another terminal run `cargo run -p hive-daemon --bin hive -- status` and
@@ -47,8 +74,14 @@ In another terminal run `cargo run -p hive-daemon --bin hive -- status` and
 `cargo build -p hive-zellij --target wasm32-wasip1`, then load
 `target/wasm32-wasip1/debug/hive_zellij.wasm` through Zellij's plugin loader;
 grant its WebAccess permission. Configure its `url` setting for a non-default
-loopback daemon. To use a declared v1 stdio provider instead, start `hive serve
---agent 'your-agent-command' --agent-version v1`.
+loopback daemon. The TUI selects a profile with `hive-tui --agent opencode`;
+the web client offers an agent selector before its first session. Other clients
+send `session/new` with `_meta: {"hive":{"agent":"opencode"}}`, or omit it
+to select the configured default. Query `/hive/v1/providers` for agent IDs.
+
+For a key-free local smoke test, build `hive-mock-agent`, set an agent profile
+with `command = "./target/debug/hive-mock-agent"` and `versions = ["v2"]`,
+then run the same `hive serve` command.
 
 Tests: `mise run test`, `mise run cover`, and `mise run ci`. The focused
 end-to-end test is `cargo test -p hive-daemon --test gateway`.

@@ -941,9 +941,14 @@ fn instance_lock() -> std::io::Result<File> {
         }
     }
     lock.try_lock_exclusive().map_err(|error| {
-        if error.kind() == std::io::ErrorKind::WouldBlock {
+        // LockFileEx reports ERROR_LOCK_VIOLATION (33), not WouldBlock, on Windows.
+        #[cfg(windows)]
+        let busy = matches!(error.raw_os_error(), Some(32 | 33));
+        #[cfg(not(windows))]
+        let busy = error.kind() == std::io::ErrorKind::WouldBlock;
+        if busy {
             std::io::Error::new(
-                error.kind(),
+                std::io::ErrorKind::WouldBlock,
                 "Hive is already running for this user; use `hive status` to inspect it",
             )
         } else {

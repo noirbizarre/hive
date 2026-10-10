@@ -635,7 +635,11 @@ async fn a_second_daemon_cannot_start_on_another_port_for_the_same_user() {
     .unwrap()
     .unwrap();
     assert!(!second.status.success());
-    assert!(String::from_utf8_lossy(&second.stderr).contains("already running"));
+    assert!(
+        String::from_utf8_lossy(&second.stderr).contains("already running"),
+        "duplicate startup reported: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
     assert!(
         reqwest::get(&status_url)
             .await

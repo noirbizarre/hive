@@ -78,24 +78,123 @@ struct Entry {
     profile: String,
     abort: tokio::task::AbortHandle,
     commands: mpsc::UnboundedSender<Command>,
-    // Replay is intentionally limited to retained snapshots, not raw chunks.
-    history: Arc<Mutex<History>>,
-    gateway: Arc<Mutex<V2ConnectionTo<Client>>>,
+    control: Arc<Mutex<Control>>,
 }
 
-#[derive(Default)]
-struct History {
-    snapshots: VecDeque<v2::SessionUpdate>,
-    truncated: bool,
+struct Control {
+    generation: u64,
+    token: String,
+    gateway: Option<V2ConnectionTo<Client>>,
+    next_seq: u64,
+    events: VecDeque<(u64, v2::SessionUpdate)>,
+    running: bool,
+    closing: bool,
+    prompts: HashMap<String, PromptRecord>,
+}
+
+struct PromptRecord {
+    content: Vec<v2::ContentBlock>,
+    result: Option<Result<v2::PromptResponse, String>>,
+    waiters: Vec<oneshot::Sender<Result<v2::PromptResponse, String>>>,
 }
 
 enum Command {
-    Prompt(
-        v2::PromptRequest,
-        oneshot::Sender<Result<v2::PromptResponse, String>>,
-    ),
-    Cancel,
-    Close(oneshot::Sender<Result<(), String>>),
+    Prompt(v2::PromptRequest, u64, String),
+    Cancel(u64),
+    Close(u64, oneshot::Sender<Result<(), String>>),
+}
+
+impl Control {
+    fn new(gateway: V2ConnectionTo<Client>) -> Self {
+        Self {
+            generation: 1,
+            token: uuid::Uuid::new_v4().to_string(),
+            gateway: Some(gateway),
+            next_seq: 1,
+            events: VecDeque::new(),
+            running: false,
+            closing: false,
+            prompts: HashMap::new(),
+        }
+    }
+
+    fn metadata(&self) -> v2::Meta {
+        let mut meta = v2::Meta::new();
+        meta.insert(
+            "hive".into(),
+            serde_json::json!({
+                "generation": self.generation, "token": self.token,
+                "nextSeq": self.next_seq, "running": self.running,
+            }),
+        );
+        meta
+    }
+
+    fn owner(&self, meta: Option<&v2::Meta>) -> agent_client_protocol::Result<()> {
+        let hive = meta.and_then(|meta| meta.get("hive"));
+        if hive
+            .and_then(|hive| hive.get("generation"))
+            .and_then(serde_json::Value::as_u64)
+            != Some(self.generation)
+            || hive
+                .and_then(|hive| hive.get("token"))
+                .and_then(serde_json::Value::as_str)
+                != Some(&self.token)
+        {
+            return Err(Error::invalid_request()
+                .data("stale or missing Hive controller; resume the session to take control"));
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self, key: &str, result: Result<v2::PromptResponse, String>) {
+        if let Some(record) = self.prompts.get_mut(key) {
+            for waiter in record.waiters.drain(..) {
+                let _ = waiter.send(result.clone());
+            }
+            record.result = Some(result);
+        }
+    }
+}
+
+fn event_meta(seq: u64) -> v2::Meta {
+    let mut meta = v2::Meta::new();
+    meta.insert("hive".into(), serde_json::json!({ "seq": seq }));
+    meta
+}
+
+fn replay_start(
+    state: &Control,
+    replay: Option<&v2::ReplayFrom>,
+) -> agent_client_protocol::Result<Option<u64>> {
+    let first = state.events.front().map_or(state.next_seq, |(seq, _)| *seq);
+    let from = match replay {
+        None => None,
+        Some(v2::ReplayFrom::Start(_)) => Some(1),
+        Some(v2::ReplayFrom::Other(cursor)) if cursor.type_ == "_hive_seq" => Some(
+            cursor
+                .fields
+                .get("seq")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| {
+                    Error::invalid_params().data("_hive_seq cursor requires an unsigned seq")
+                })?,
+        ),
+        Some(_) => {
+            return Err(
+                Error::invalid_params().data("unsupported replay cursor; use start or _hive_seq")
+            );
+        }
+    };
+    if let Some(from) = from
+        && (from < first || from > state.next_seq)
+    {
+        return Err(Error::invalid_request().data(format!(
+            "replay cursor unavailable; available next-event range is {first}..={}",
+            state.next_seq
+        )));
+    }
+    Ok(from)
 }
 
 #[derive(Clone, Serialize)]
@@ -124,6 +223,111 @@ impl Broker {
             .get(&id.to_string())
             .cloned()
             .ok_or_else(|| Error::invalid_params().data(format!("unknown Hive session {id}")))
+    }
+
+    fn prompt(
+        &self,
+        mut request: v2::PromptRequest,
+    ) -> agent_client_protocol::Result<oneshot::Receiver<Result<v2::PromptResponse, String>>> {
+        let entry = self.entry(&request.session_id)?;
+        let mut state = entry.control.lock().map_err(|_| Error::internal_error())?;
+        state.owner(request.meta.as_ref())?;
+        let key = request
+            .meta
+            .as_ref()
+            .and_then(|m| m.get("hive"))
+            .and_then(|h| h.get("key"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|key| !key.is_empty())
+            .ok_or_else(|| {
+                Error::invalid_params().data("_meta.hive.key is required for idempotent prompts")
+            })?
+            .to_owned();
+        let (tx, rx) = oneshot::channel();
+        if let Some(record) = state.prompts.get_mut(&key) {
+            if record.content != request.prompt {
+                return Err(Error::invalid_params()
+                    .data("prompt key was used with different content; choose a new key"));
+            }
+            if let Some(result) = &record.result {
+                let _ = tx.send(result.clone());
+            } else {
+                record.waiters.push(tx);
+            }
+            return Ok(rx);
+        }
+        if state.running || state.closing {
+            return Err(Error::invalid_request().data(
+                "session has active foreground work; wait for idle or cancel before prompting",
+            ));
+        }
+        // Reserving under the ownership lock prevents two simultaneous prompts from both starting.
+        state.running = true;
+        state.prompts.insert(
+            key.clone(),
+            PromptRecord {
+                content: request.prompt.clone(),
+                result: None,
+                waiters: vec![tx],
+            },
+        );
+        let generation = state.generation;
+        if let Some(meta) = request.meta.as_mut() {
+            meta.remove("hive");
+        }
+        if entry
+            .commands
+            .send(Command::Prompt(request, generation, key.clone()))
+            .is_err()
+        {
+            state.prompts.remove(&key);
+            state.running = false;
+            return Err(Error::internal_error().data("agent disconnected; create another session"));
+        }
+        Ok(rx)
+    }
+
+    fn resume(
+        &self,
+        request: v2::ResumeSessionRequest,
+        cx: V2ConnectionTo<Client>,
+    ) -> agent_client_protocol::Result<v2::ResumeSessionResponse> {
+        let entry = self.entry(&request.session_id)?;
+        if entry.cwd != request.cwd {
+            return Err(Error::invalid_params().data("session cwd does not match"));
+        }
+        let mut state = entry.control.lock().map_err(|_| Error::internal_error())?;
+        if state.closing {
+            return Err(Error::invalid_request().data("session is closing; select another session"));
+        }
+        let from = replay_start(&state, request.replay_from.as_ref())?;
+        // Keep replay and live forwarding in one critical section: no update can cross this boundary twice.
+        if let Some(from) = from {
+            for (seq, update) in state.events.iter().filter(|(seq, _)| *seq >= from) {
+                cx.send_notification(
+                    v2::UpdateSessionNotification::new(request.session_id.clone(), update.clone())
+                        .meta(event_meta(*seq)),
+                )?;
+            }
+        }
+        state.generation = state
+            .generation
+            .checked_add(1)
+            .ok_or_else(Error::internal_error)?;
+        state.token = uuid::Uuid::new_v4().to_string();
+        state.gateway = Some(cx.clone());
+        let response = v2::ResumeSessionResponse::new().meta(state.metadata());
+        let generation = state.generation;
+        let control = entry.control.clone();
+        tokio::spawn(async move {
+            cx.incoming_closed().await;
+            if let Ok(mut state) = control.lock()
+                && state.generation == generation
+            {
+                state.gateway = None;
+            }
+        });
+        Ok(response)
     }
 
     fn status(&self) -> Status {
@@ -155,8 +359,8 @@ impl Broker {
             .unwrap_or_default();
         for entry in entries {
             let (reply, received) = oneshot::channel();
-            let _ = entry.commands.send(Command::Cancel);
-            if entry.commands.send(Command::Close(reply)).is_ok() {
+            let _ = entry.commands.send(Command::Cancel(0));
+            if entry.commands.send(Command::Close(0, reply)).is_ok() {
                 let _ = tokio::time::timeout(std::time::Duration::from_secs(2), received).await;
             }
             // Graceful close is best-effort; dropping the SDK connection terminates its stdio process group.
@@ -204,11 +408,9 @@ impl Broker {
         let (tx, rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = oneshot::channel();
         let (active_tx, active_rx) = oneshot::channel();
-        let history = Arc::new(Mutex::new(History::default()));
-        let current_gateway = Arc::new(Mutex::new(gateway));
+        let control = Arc::new(Mutex::new(Control::new(gateway)));
         let cwd = request.cwd.clone();
-        let entry_history = history.clone();
-        let entry_gateway = current_gateway.clone();
+        let entry_control = control.clone();
         let id = hive_id.clone();
         let sessions = self.sessions.clone();
         // Each session owns its subprocess: no guessed transport support or duplicate probing.
@@ -220,8 +422,7 @@ impl Broker {
                     id.clone(),
                     rx,
                     (ready_tx, active_rx),
-                    history,
-                    current_gateway,
+                    control,
                 )
                 .await;
             } else {
@@ -231,8 +432,7 @@ impl Broker {
                     id.clone(),
                     rx,
                     (ready_tx, active_rx),
-                    history,
-                    current_gateway,
+                    control,
                 )
                 .await;
             }
@@ -246,9 +446,21 @@ impl Broker {
             profile: chosen,
             abort: task.abort_handle(),
             commands: tx,
-            history: entry_history,
-            gateway: entry_gateway,
+            control: entry_control.clone(),
         };
+        if let Ok(state) = entry_control.lock()
+            && let Some(cx) = state.gateway.clone()
+        {
+            let control = entry_control.clone();
+            tokio::spawn(async move {
+                cx.incoming_closed().await;
+                if let Ok(mut state) = control.lock()
+                    && state.generation == 1
+                {
+                    state.gateway = None;
+                }
+            });
+        }
         match tokio::time::timeout(std::time::Duration::from_secs(15), ready_rx).await {
             Ok(Ok(Ok(mut response))) => {
                 self.sessions
@@ -257,6 +469,12 @@ impl Broker {
                     .insert(hive_id.to_string(), entry);
                 let _ = active_tx.send(());
                 response.session_id = hive_id;
+                response.meta = Some(
+                    entry_control
+                        .lock()
+                        .map_err(|_| Error::internal_error())?
+                        .metadata(),
+                );
                 Ok(response)
             }
             Ok(Ok(Err(message))) => {
@@ -278,31 +496,46 @@ impl Broker {
 }
 
 fn forward(
-    history: &Mutex<History>,
-    gateway: &Mutex<V2ConnectionTo<Client>>,
+    control: &Mutex<Control>,
     id: &v2::SessionId,
     update: v2::SessionUpdate,
 ) -> agent_client_protocol::Result<()> {
-    if matches!(
-        update,
-        v2::SessionUpdate::AgentMessage(_) | v2::SessionUpdate::UserMessage(_)
-    ) {
-        let mut history = history.lock().map_err(|_| Error::internal_error())?;
-        if history.snapshots.len() == 256 {
-            history.snapshots.pop_front();
-            history.truncated = true;
+    let mut state = control.lock().map_err(|_| Error::internal_error())?;
+    if let v2::SessionUpdate::StateUpdate(status) = &update {
+        match status {
+            v2::StateUpdate::Running(_) => state.running = true,
+            v2::StateUpdate::Idle(_) => state.running = false,
+            _ => {}
         }
-        history.snapshots.push_back(update.clone());
     }
-    let sent = gateway
-        .lock()
-        .map_err(|_| Error::internal_error())?
-        .send_notification(v2::UpdateSessionNotification::new(id.clone(), update));
-    // A detached client may resume later; its WebSocket/SSE send failure must not kill the agent.
-    if sent.is_err() {
-        tracing::debug!("client detached before session update; retaining the agent session");
+    let seq = state.next_seq;
+    state.next_seq += 1;
+    if state.events.len() == 256 {
+        state.events.pop_front();
+    }
+    state.events.push_back((seq, update.clone()));
+    if let Some(gateway) = &state.gateway {
+        let sent = gateway.send_notification(
+            v2::UpdateSessionNotification::new(id.clone(), update).meta(event_meta(seq)),
+        );
+        // Dropped client streams must never stop the worker or discard retained events.
+        if sent.is_err() {
+            state.gateway = None;
+        }
     }
     Ok(())
+}
+
+fn current(control: &Mutex<Control>, generation: u64) -> bool {
+    control
+        .lock()
+        .is_ok_and(|state| state.generation == generation)
+}
+
+fn complete(control: &Mutex<Control>, key: &str, result: Result<v2::PromptResponse, String>) {
+    if let Ok(mut state) = control.lock() {
+        state.finish(key, result);
+    }
 }
 
 async fn run_agent(
@@ -314,8 +547,7 @@ async fn run_agent(
         oneshot::Sender<Result<v2::NewSessionResponse, String>>,
         oneshot::Receiver<()>,
     ),
-    history: Arc<Mutex<History>>,
-    gateway: Arc<Mutex<V2ConnectionTo<Client>>>,
+    control: Arc<Mutex<Control>>,
 ) {
     let (ready, active) = startup;
     let agent = match transport(&provider) {
@@ -331,8 +563,7 @@ async fn run_agent(
         .v2()
         .on_receive_notification(
             {
-                let gateway = gateway.clone();
-                let history = history.clone();
+                let control = control.clone();
                 let hive_id = hive_id.clone();
                 async move |notification: v2::UpdateSessionNotification,
                             _cx: V2ConnectionTo<Agent>| {
@@ -341,7 +572,7 @@ async fn run_agent(
                     {
                         return Ok(());
                     }
-                    forward(&history, &gateway, &hive_id, notification.update)
+                    forward(&control, &hive_id, notification.update)
                 }
             },
             agent_client_protocol::on_receive_notification!(),
@@ -395,32 +626,46 @@ async fn run_agent(
             if active.await.is_err() { return Ok(()); }
             while let Some(command) = rx.recv().await {
                 match command {
-                    Command::Prompt(mut request, reply) => {
+                    Command::Prompt(mut request, generation, key) => {
                         request.session_id = downstream_id.clone();
-                        let prompt = cx.send_request(request).block_task();
+                        let prompt = {
+                            let state = control.lock().expect("session state is not poisoned");
+                            if state.generation != generation {
+                                drop(state);
+                                complete(&control, &key, Err("controller was superseded before prompt dispatch; resume with a new key".into()));
+                                if let Ok(mut state) = control.lock() { state.running = false; }
+                                continue;
+                            }
+                            // Publication under the lock defines the dispatch-before-handoff order.
+                            cx.send_request(request).block_task()
+                        };
                         tokio::pin!(prompt);
                         let result = loop {
                             tokio::select! {
                                 result = &mut prompt => break result,
                                 incoming = rx.recv() => match incoming {
-                                    Some(Command::Cancel) => { let _ = cx.send_notification(v2::CancelSessionNotification::new(downstream_id.clone())); }
-                                    Some(Command::Prompt(_, reply)) => { let _ = reply.send(Err("session already has foreground work".into())); }
-                                    Some(Command::Close(reply)) => {
-                                        let _ = cx.send_notification(v2::CancelSessionNotification::new(downstream_id.clone()));
+                                    Some(Command::Cancel(epoch)) if epoch == 0 || current(&control, epoch) => { let _ = cx.send_notification(v2::CancelSessionNotification::new(downstream_id.clone())); }
+                                    Some(Command::Cancel(_)) => {}
+                                    Some(Command::Prompt(_, _, key)) => { complete(&control, &key, Err("session already has foreground work".into())); }
+                                    Some(Command::Close(_, reply)) => {
                                         let _ = reply.send(Err("cancel active work before closing".into()));
                                     }
                                     None => return Ok(()),
                                 }
                             }
                         }.map_err(|_| "agent prompt failed; check its availability".to_string());
-                        let _ = reply.send(result);
+                        complete(&control, &key, result);
                     }
-                    Command::Cancel => {
-                        let _ = cx.send_notification(v2::CancelSessionNotification::new(
-                            downstream_id.clone(),
-                        ));
+                    Command::Cancel(epoch) => {
+                        if epoch == 0 || current(&control, epoch) {
+                            let _ = cx.send_notification(v2::CancelSessionNotification::new(downstream_id.clone()));
+                        }
                     }
-                    Command::Close(reply) => {
+                    Command::Close(generation, reply) => {
+                        if generation != 0 && !current(&control, generation) {
+                            let _ = reply.send(Err("controller was superseded; resume before closing".into()));
+                            continue;
+                        }
                         let result = cx
                             .send_request(v2::CloseSessionRequest::new(downstream_id.clone()))
                             .block_task()
@@ -450,8 +695,7 @@ async fn run_v1_agent(
         oneshot::Sender<Result<v2::NewSessionResponse, String>>,
         oneshot::Receiver<()>,
     ),
-    history: Arc<Mutex<History>>,
-    gateway: Arc<Mutex<V2ConnectionTo<Client>>>,
+    control: Arc<Mutex<Control>>,
 ) {
     let (ready, active) = startup;
     let agent = match transport(&provider) {
@@ -469,7 +713,7 @@ async fn run_v1_agent(
         .builder()
         .on_receive_notification(
             {
-                let gateway = gateway.clone();
+                let control = control.clone();
                 let hive_id = hive_id.clone();
                 async move |notification: v1::SessionNotification, _cx: ConnectionTo<Agent>| {
                     if notifications
@@ -489,13 +733,7 @@ async fn run_v1_agent(
                         text.text.into(),
                         id,
                         ));
-                        let _ = gateway
-                            .lock()
-                            .map_err(|_| Error::internal_error())?
-                            .send_notification(v2::UpdateSessionNotification::new(
-                                hive_id.clone(),
-                                update,
-                            ));
+                        forward(&control, &hive_id, update)?;
                     }
                     Ok(())
                 }
@@ -544,7 +782,12 @@ async fn run_v1_agent(
             if active.await.is_err() { return Ok(()); }
             while let Some(command) = rx.recv().await {
                 match command {
-                    Command::Prompt(request, reply) => {
+                    Command::Prompt(request, generation, key) => {
+                        if !current(&control, generation) {
+                            complete(&control, &key, Err("controller was superseded before prompt dispatch; resume with a new key".into()));
+                            if let Ok(mut state) = control.lock() { state.running = false; }
+                            continue;
+                        }
                         let id = v2::MessageId::new(format!("hive-v1-{}", uuid::Uuid::new_v4()));
                         let blocks = request
                             .prompt
@@ -557,20 +800,19 @@ async fn run_v1_agent(
                             })
                             .collect::<Result<Vec<_>, _>>();
                         let Ok(blocks) = blocks else {
-                            let _ = reply
-                                .send(Err("unsupported v2 prompt content for v1 agent".into()));
+                            complete(&control, &key, Err("unsupported v2 prompt content for v1 agent".into()));
+                            if let Ok(mut state) = control.lock() { state.running = false; }
                             continue;
                         };
                         if let Ok(mut current) = message_id.lock() { *current = Some(v2::MessageId::new(format!("v1-agent-{}", uuid::Uuid::new_v4()))); }
                         // Acknowledgement precedes v1 turn completion; the task then emits idle.
-                        let _ = reply.send(Ok(v2::PromptResponse::new(id.clone())));
+                        complete(&control, &key, Ok(v2::PromptResponse::new(id.clone())));
                         let user = v2::SessionUpdate::UserMessage(
                             v2::UserMessage::new(id).content(request.prompt),
                         );
-                        let _ = forward(&history, &gateway, &hive_id, user);
+                        let _ = forward(&control, &hive_id, user);
                         let _ = forward(
-                            &history,
-                            &gateway,
+                            &control,
                             &hive_id,
                             v2::SessionUpdate::StateUpdate(v2::StateUpdate::Running(
                                 v2::RunningStateUpdate::new(),
@@ -583,9 +825,10 @@ async fn run_v1_agent(
                             tokio::select! {
                                 result = &mut response => break result,
                                 command = rx.recv() => match command {
-                                    Some(Command::Cancel) => { let _ = cx.send_notification(v1::CancelNotification::new(downstream_id.clone())); }
-                                    Some(Command::Prompt(_, reply)) => { let _ = reply.send(Err("session already has foreground work".into())); }
-                                    Some(Command::Close(reply)) => { let _ = cx.send_notification(v1::CancelNotification::new(downstream_id.clone())); let _ = reply.send(Err("cancel active work before closing".into())); }
+                                     Some(Command::Cancel(epoch)) if epoch == 0 || current(&control, epoch) => { let _ = cx.send_notification(v1::CancelNotification::new(downstream_id.clone())); }
+                                     Some(Command::Cancel(_)) => {}
+                                     Some(Command::Prompt(_, _, key)) => { complete(&control, &key, Err("session already has foreground work".into())); }
+                                     Some(Command::Close(_, reply)) => { let _ = reply.send(Err("cancel active work before closing".into())); }
                                     None => break Err(Error::internal_error().data("client disconnected")),
                                 }
                             }
@@ -601,19 +844,23 @@ async fn run_v1_agent(
                             }
                         };
                         let _ = forward(
-                            &history,
-                            &gateway,
+                            &control,
                             &hive_id,
                             v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(
                                 v2::IdleStateUpdate::new().stop_reason(stop),
                             )),
                         );
                     }
-                    Command::Cancel => {
-                        let _ = cx
-                            .send_notification(v1::CancelNotification::new(downstream_id.clone()));
+                    Command::Cancel(epoch) => {
+                        if epoch == 0 || current(&control, epoch) {
+                            let _ = cx.send_notification(v1::CancelNotification::new(downstream_id.clone()));
+                        }
                     }
-                    Command::Close(reply) => {
+                    Command::Close(generation, reply) => {
+                        if generation != 0 && !current(&control, generation) {
+                            let _ = reply.send(Err("controller was superseded; resume before closing".into()));
+                            continue;
+                        }
                         let _ = reply.send(Ok(()));
                         break;
                     }
@@ -727,15 +974,7 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
                 async move |request: v2::PromptRequest,
                             responder: Responder<v2::PromptResponse>,
                             _cx: V2ConnectionTo<Client>| {
-                    let entry = broker.entry(&request.session_id)?;
-                    let (reply, received) = oneshot::channel();
-                    entry
-                        .commands
-                        .send(Command::Prompt(request, reply))
-                        .map_err(|_| {
-                            Error::internal_error()
-                                .data("agent disconnected; create another session")
-                        })?;
+                    let received = broker.prompt(request)?;
                     match received.await {
                         Ok(Ok(response)) => responder.respond(response),
                         Ok(Err(error)) => {
@@ -778,30 +1017,10 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
                 async move |request: v2::ResumeSessionRequest,
                             responder: Responder<v2::ResumeSessionResponse>,
                             cx: V2ConnectionTo<Client>| {
-                    let entry = broker.entry(&request.session_id)?;
-                    if entry.cwd != request.cwd {
-                        return responder.respond_with_error(
-                            Error::invalid_params().data("session cwd does not match"),
-                        );
+                    match broker.resume(request, cx) {
+                        Ok(response) => responder.respond(response),
+                        Err(error) => responder.respond_with_error(error),
                     }
-                    if matches!(request.replay_from, Some(v2::ReplayFrom::Other(_))) {
-                        return responder.respond_with_error(Error::invalid_params().data("unsupported replay cursor; use replayFrom: {type: start}"));
-                    }
-                    // Replay notifications must be sent before the resume response.
-                    *entry.gateway.lock().map_err(|_| Error::internal_error())? = cx.clone();
-                    if request.replay_from.is_some() {
-                        let history = entry.history.lock().map_err(|_| Error::internal_error())?;
-                        if history.truncated {
-                            return responder.respond_with_error(Error::invalid_request().data("replay history was truncated; resume without replay or create a new session"));
-                        }
-                        for update in history.snapshots.iter().cloned() {
-                            cx.send_notification(v2::UpdateSessionNotification::new(
-                                request.session_id.clone(),
-                                update,
-                            ))?;
-                        }
-                    }
-                    responder.respond(v2::ResumeSessionResponse::new())
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -814,10 +1033,29 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
                             _cx: V2ConnectionTo<Client>| {
                     let entry = broker.entry(&request.session_id)?;
                     let (reply, received) = oneshot::channel();
-                    entry
-                        .commands
-                        .send(Command::Close(reply))
-                        .map_err(|_| Error::internal_error())?;
+                    {
+                        let mut state =
+                            entry.control.lock().map_err(|_| Error::internal_error())?;
+                        state.owner(request.meta.as_ref())?;
+                        if state.running || state.closing {
+                            return responder.respond_with_error(
+                                Error::invalid_request()
+                                    .data("cancel active work and wait for idle before closing"),
+                            );
+                        }
+                        // Prevent takeover while a close has been admitted but not completed.
+                        state.closing = true;
+                        if entry
+                            .commands
+                            .send(Command::Close(state.generation, reply))
+                            .is_err()
+                        {
+                            state.closing = false;
+                            return Err(
+                                Error::internal_error().data("agent disconnected during close")
+                            );
+                        }
+                    }
                     match received.await {
                         Ok(Ok(())) => {
                             broker
@@ -827,9 +1065,14 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
                                 .remove(&request.session_id.to_string());
                             responder.respond(v2::CloseSessionResponse::new())
                         }
-                        _ => responder.respond_with_error(
-                            Error::internal_error().data("agent could not close session"),
-                        ),
+                        _ => {
+                            if let Ok(mut state) = entry.control.lock() {
+                                state.closing = false;
+                            }
+                            responder.respond_with_error(
+                                Error::internal_error().data("agent could not close session"),
+                            )
+                        }
                     }
                 }
             },
@@ -838,9 +1081,18 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
         .on_receive_notification(
             async move |request: v2::CancelSessionNotification, _cx: V2ConnectionTo<Client>| {
                 let entry = broker.entry(&request.session_id)?;
-                entry.commands.send(Command::Cancel).map_err(|_| {
-                    Error::internal_error().data("agent disconnected during cancellation")
-                })
+                let state = entry.control.lock().map_err(|_| Error::internal_error())?;
+                if state.owner(request.meta.as_ref()).is_err() {
+                    // JSON-RPC notifications have no response channel; never forward a stale cancel.
+                    tracing::debug!("ignored cancel from stale Hive controller");
+                    return Ok(());
+                }
+                entry
+                    .commands
+                    .send(Command::Cancel(state.generation))
+                    .map_err(|_| {
+                        Error::internal_error().data("agent disconnected during cancellation")
+                    })
             },
             agent_client_protocol::on_receive_notification!(),
         )
@@ -969,4 +1221,96 @@ async fn shutdown_signal() {
         }
     }
     let _ = tokio::signal::ctrl_c().await;
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+
+    fn detached() -> Control {
+        Control {
+            generation: 1,
+            token: "first".into(),
+            gateway: None,
+            next_seq: 1,
+            events: VecDeque::new(),
+            running: false,
+            closing: false,
+            prompts: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn concurrent_handoffs_have_one_current_generation() {
+        let state = Arc::new(Mutex::new(detached()));
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let workers: Vec<_> = (0..2)
+            .map(|_| {
+                let (state, barrier) = (state.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let mut state = state.lock().unwrap();
+                    state.generation += 1;
+                    state.token = uuid::Uuid::new_v4().to_string();
+                    (state.generation, state.token.clone())
+                })
+            })
+            .collect();
+        barrier.wait();
+        let outcomes: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        let state = state.lock().unwrap();
+        assert_eq!(state.generation, 3);
+        for (generation, token) in outcomes {
+            let mut meta = v2::Meta::new();
+            meta.insert(
+                "hive".into(),
+                serde_json::json!({ "generation": generation, "token": token }),
+            );
+            assert_eq!(state.owner(Some(&meta)).is_ok(), generation == 3);
+        }
+    }
+
+    #[test]
+    fn a_replay_gap_is_visible_after_the_event_ring_wraps() {
+        let state = Mutex::new(detached());
+        let id = v2::SessionId::new("hive-test");
+        for _ in 0..260 {
+            forward(
+                &state,
+                &id,
+                v2::SessionUpdate::StateUpdate(v2::StateUpdate::Running(
+                    v2::RunningStateUpdate::new(),
+                )),
+            )
+            .unwrap();
+        }
+        let state = state.lock().unwrap();
+        assert_eq!(state.events.len(), 256);
+        assert_eq!(state.events.front().unwrap().0, 5);
+        assert_eq!(state.next_seq, 261);
+        let from = v2::ReplayFrom::Other(v2::OtherReplayFrom::new(
+            "_hive_seq",
+            std::collections::BTreeMap::from([("seq".into(), serde_json::json!(4))]),
+        ));
+        assert!(replay_start(&state, Some(&from)).is_err());
+        assert!(
+            replay_start(
+                &state,
+                Some(&v2::ReplayFrom::Start(v2::ReplayFromStart::new()))
+            )
+            .is_err()
+        );
+        let available = v2::ReplayFrom::Other(v2::OtherReplayFrom::new(
+            "_hive_seq",
+            std::collections::BTreeMap::from([("seq".into(), serde_json::json!(5))]),
+        ));
+        assert_eq!(replay_start(&state, Some(&available)).unwrap(), Some(5));
+        assert_eq!(
+            state.generation, 1,
+            "a failed cursor cannot take over control"
+        );
+    }
 }

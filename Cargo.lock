@@ -1382,6 +1382,7 @@ dependencies = [
  "hive-protocol",
  "serde_json",
  "tokio",
+ "uuid",
 ]
 
 [[package]]

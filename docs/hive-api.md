@@ -15,3 +15,12 @@ ACP session methods live exclusively on `/acp`, not under `/hive/v1`.
 Discovery never returns commands, endpoints, arguments, environment or headers;
 it reports configuration, not live availability. Session creation uses
 `session/new` and the optional Hive-specific `_meta.hive.agent` selector.
+Transfer of control uses ACPv2 `session/resume` over `/acp` on either WebSocket
+or HTTP/SSE, not a separate operational endpoint. A response `_meta.hive`
+contains the current generation, token, next event sequence and running state;
+all mutating ACP calls must include that generation/token. Prompts additionally
+require a stable idempotency key. See [ACP compatibility](acp-compatibility.md)
+for the exact wire contract, replay cursor and retention guarantees. The TUI
+and browser are both clients of this daemon contract. ZJHive's current Zellij
+WebAccess integration reports one-shot status only; its host API does not
+provide the persistent WebSocket/SSE connection needed for an ACP controller.

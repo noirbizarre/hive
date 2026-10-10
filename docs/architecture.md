@@ -1,6 +1,6 @@
 # Architecture
 
-The daemon (`crates/hive-daemon`) owns a shared in-memory session broker. The
+The daemon (`crates/hive-daemon`) owns the only shared in-memory session broker. The
 official `AcpHttpServer` mounts ACP at `/acp`: GET with WebSocket upgrade is a
 persistent bidirectional JSON-RPC channel; POST plus per-connection and
 per-session GET SSE streams form the HTTP alternative. Both create the same
@@ -11,9 +11,13 @@ HTTP endpoints and a same-origin browser asset route, not session RPC methods.
 `hive-protocol` pins SDK integration and shared native status access. The daemon
 owns a registry of inert agent profiles loaded from one XDG TOML file, and the
 broker maps each Hive session ID to its selected profile, one downstream
-process/connection, and downstream session ID. It retains message snapshots for
-in-process replay; on resume it attaches a different client connection and
-sends these snapshots before returning. Replay is not durable or complete.
+process/connection, and downstream session ID. A downstream worker and session
+outlive any attached upstream client. An atomic per-session control state stores
+the current controller generation/token, optional event recipient, active turn,
+prompt-key outcomes, and a bounded log of all emitted updates. `session/resume`
+validates replay, atomically rotates control and replaces the event recipient;
+it never contacts the downstream agent to recreate the conversation. Only an
+explicit session close, downstream failure, or daemon shutdown terminates it.
 
 The downstream version and transport are selected **per session** from its
 profile declaration (v2 preferred over v1). The pinned SDK supports stdio,
@@ -23,15 +27,21 @@ initialization errors. v1
 text chunks are adapted to v2 agent chunks and the v1 prompt response produces
 a v2 idle state. The transport exposed to clients remains v2 regardless.
 
-The TUI uses SDK `Client.v2()` / `HttpClient`; the browser implements the ACPv2
-WebSocket JSON-RPC boundary and queries the operational status endpoint.
+The TUI uses SDK `Client.v2()` / `HttpClient`, can take over by Hive session ID,
+and leaves the session alive on exit. The browser implements the ACPv2
+WebSocket JSON-RPC boundary, can take over by ID, and queries operational status.
 ZJHive uses Zellij's host WebAccess permission for one-shot daemon status;
 Zellij's `web_request` is not a persistent WebSocket or SSE transport.
 
-The current ownership model is one trusted local OS user. Session routing
-checks the exact Hive session ID and downstream ID. There is no persistent
-storage, per-client authorization, multi-observer event broadcast, reconnect
-cursor, guaranteed stream replay, or remote security policy yet.
+The current security boundary is one trusted local OS user. Session routing
+checks the exact Hive session ID and downstream ID. Mutating requests also
+require the current control generation and opaque token. A new controller
+fences the old one, including after a network partition; disconnect leaves the
+downstream running until explicit takeover. The event log retains the latest
+256 updates with contiguous sequence numbers. A replay cursor outside the
+available range fails without changing control. In-memory retries and retained
+events survive client disconnection, **not daemon restart**; no durable storage,
+multi-observer broadcast, or remote security policy is provided.
 The daemon exclusively locks a private per-user runtime file before binding;
 another `hive serve` invocation cannot own a different port for the same user.
 Both ACP session access and Hive administration are loopback-only, with no

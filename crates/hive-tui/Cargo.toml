@@ -12,3 +12,4 @@ agent-client-protocol = { workspace = true }
 clap = { workspace = true }
 hive-protocol = { path = "../hive-protocol" }
 tokio = { workspace = true }
+uuid = { workspace = true }

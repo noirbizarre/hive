@@ -3,8 +3,13 @@ export function connect(url, onUpdate, onStatus) {
   const ws = new WebSocket(url);
   let nextId = 0;
   const pending = new Map();
-  let sessionId;
-  let selectedAgent;
+  const store = typeof localStorage === 'undefined' ? null : localStorage;
+  let sessionId = store?.getItem('hive.session') || undefined;
+  let selectedAgent = store?.getItem('hive.agent') || '';
+  let lastSeq = Number(store?.getItem(`hive.seq.${sessionId}`) || 0);
+  let owner;
+  let active = false;
+  let uncertain = JSON.parse(store?.getItem(`hive.pending.${sessionId}`) || 'null');
   let rejectInitialize;
   const request = (method, params) => new Promise((resolve, reject) => {
     const id = ++nextId;
@@ -13,7 +18,15 @@ export function connect(url, onUpdate, onStatus) {
   });
   ws.onmessage = ({ data }) => {
     const message = JSON.parse(data);
-    if (message.method === 'session/update' && message.params?.sessionId === sessionId) onUpdate(message.params.update);
+    if (message.method === 'session/update' && message.params?.sessionId === sessionId) {
+      const seq = message.params._meta?.hive?.seq;
+      if (typeof seq !== 'number' || seq > lastSeq) {
+        if (typeof seq === 'number') { lastSeq = seq; store?.setItem(`hive.seq.${sessionId}`, String(seq)); }
+        active = message.params.update.sessionUpdate === 'state_update'
+          ? message.params.update.state !== 'idle' : active;
+        onUpdate(message.params.update);
+      }
+    }
     if (message.id != null && pending.has(message.id)) {
       const { resolve, reject } = pending.get(message.id);
       pending.delete(message.id);
@@ -28,7 +41,14 @@ export function connect(url, onUpdate, onStatus) {
       try {
         const result = await request('initialize', { protocolVersion: 2, info: { name: 'hive-web', version: '0.1.0' }, capabilities: {} });
         if (result.protocolVersion !== 2 || !result.capabilities?.session) throw new Error('ACPv2 sessions unavailable');
-        onStatus('Connected to ACPv2');
+        if (sessionId) {
+          const resume = await request('session/resume', { sessionId, cwd: '/', replayFrom: lastSeq
+            ? { type: '_hive_seq', seq: lastSeq + 1 } : { type: 'start' } });
+          owner = resume._meta?.hive;
+          if (!owner) throw new Error('Hive did not return controller metadata');
+          active = owner.running;
+        }
+        onStatus(sessionId ? `Controlling ${sessionId}${active ? ' (running)' : ''}` : 'Connected to ACPv2');
         rejectInitialize = undefined;
         resolve(result);
       } catch (error) { onStatus(error.message); reject(error); }
@@ -39,19 +59,38 @@ export function connect(url, onUpdate, onStatus) {
     async prompt(text, agent) {
       await initialized;
       if (sessionId && (agent || '') !== selectedAgent) throw new Error('Agent selection applies to a new session; reload to choose another agent');
-      if (!sessionId) {
-        const created = await request('session/new', { cwd: '/', mcpServers: [], ...(agent ? { _meta: { hive: { agent } } } : {}) });
-        sessionId = created.sessionId;
-        selectedAgent = agent || '';
-      }
-      return request('session/prompt', { sessionId, prompt: [{ type: 'text', text }] });
-    },
-    cancel() { if (sessionId && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ jsonrpc: '2.0', method: 'session/cancel', params: { sessionId } })); },
+       if (!sessionId) {
+         const created = await request('session/new', { cwd: '/', mcpServers: [], ...(agent ? { _meta: { hive: { agent } } } : {}) });
+         sessionId = created.sessionId;
+         selectedAgent = agent || '';
+         owner = created._meta?.hive;
+         if (!owner) throw new Error('Hive did not return controller metadata');
+         store?.setItem('hive.session', sessionId);
+         store?.setItem('hive.agent', selectedAgent);
+       }
+       if (uncertain && uncertain.text !== text) throw new Error('The previous prompt acknowledgement is uncertain; retry that text after reconnect');
+       if (active && !uncertain) throw new Error('Wait for the active generation to become idle');
+       const key = uncertain?.key || crypto.randomUUID();
+       uncertain = { key, text };
+       store?.setItem(`hive.pending.${sessionId}`, JSON.stringify(uncertain));
+       active = true;
+       const response = await request('session/prompt', { sessionId, prompt: [{ type: 'text', text }], _meta: { hive: { token: owner.token, generation: owner.generation, key } } });
+       uncertain = null;
+       store?.removeItem(`hive.pending.${sessionId}`);
+       return response;
+     },
+    cancel() { if (sessionId && owner && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ jsonrpc: '2.0', method: 'session/cancel', params: { sessionId, _meta: { hive: { token: owner.token, generation: owner.generation } } } })); },
+    sessionId() { return sessionId; },
     close() { ws.close(); }
   };
 }
 
 if (typeof document !== 'undefined') {
+  const requestedSession = new URLSearchParams(location.search).get('session');
+  if (requestedSession && requestedSession !== localStorage.getItem('hive.session')) {
+    localStorage.setItem('hive.session', requestedSession);
+    localStorage.removeItem('hive.agent');
+  }
   const status = document.querySelector('#status');
   const output = document.querySelector('#output');
   fetch('/hive/v1/status').then(r => r.json()).then(s => { status.textContent = `Hive ${s.version} (${s.sessions} sessions)`; }).catch(() => { status.textContent = 'Daemon unavailable'; });
@@ -69,4 +108,9 @@ if (typeof document !== 'undefined') {
     try { await client.prompt(new FormData(event.target).get('text'), agentSelect.value); agentSelect.disabled = true; } catch (error) { status.textContent = error.message; }
   };
   document.querySelector('#cancel').onclick = () => client.cancel();
+  document.querySelector('#takeover').onsubmit = event => {
+    event.preventDefault();
+    const id = new FormData(event.target).get('session').trim();
+    if (id) location.search = new URLSearchParams({ session: id }).toString();
+  };
 }

@@ -35,6 +35,63 @@ The draft [v2 specification](https://github.com/agentclientprotocol/agent-client
 and [draft announcement](https://github.com/agentclientprotocol/agent-client-protocol/blob/main/docs/announcements/acp-v2-draft.mdx)
 may change. See the [SDK v2 guide](https://github.com/agentclientprotocol/rust-sdk/blob/main/md/protocol-v2.md)
 and [HTTP guide](https://github.com/agentclientprotocol/rust-sdk/blob/main/md/http-transport.md).
-Replay is an in-memory message-snapshot subset, not complete history or
-transport-event recovery; a lost prompt acknowledgement must not be blindly
-retried. Updates may arrive before responses and idle is not a turn-ID boundary.
+ACPv2 does not specify transferable control, command idempotency, or a
+standard event sequence cursor. Hive extends `_meta.hive` on its upstream
+requests/responses/notifications; it strips that metadata before forwarding
+downstream. A new session returns `generation`, opaque `token`, `nextSeq`, and
+`running` in response `_meta.hive`. Resuming a Hive session atomically takes
+control, returns fresh ownership metadata and the current running flag, and
+optionally replays retained events before returning. No implicit new prompt is
+sent. TUI `--session hive-…` and WebUI's session-ID form use this same contract.
+For example, after `session/new` returns a session ID and
+`"_meta":{"hive":{"generation":1,"token":"opaque","nextSeq":1,"running":false}}`,
+the controller can send:
+
+```json
+{"sessionId":"hive-…","prompt":[{"type":"text","text":"hello"}],"_meta":{"hive":{"generation":1,"token":"opaque","key":"prompt-123"}}}
+```
+
+On another connection, take over that ID (with the original `cwd`):
+
+```json
+{"sessionId":"hive-…","cwd":"/workspace","replayFrom":{"type":"_hive_seq","seq":8}}
+```
+
+The resume response returns a new generation/token; use those for subsequent
+commands. `session/cancel` and `session/close` carry the same ownership fields
+without a prompt key. Tokens are local control credentials: do not forward
+them to downstream agents or print them in client logs.
+
+Every upstream `session/prompt` and `session/close` request and `session/cancel`
+notification needs `_meta.hive.generation` and `_meta.hive.token` from the
+latest successful new/resume response. Missing or stale owners receive an
+actionable error for requests; cancel is a JSON-RPC notification, so a stale
+cancel is discarded and cannot carry an error response. A subsequent resume
+rotates ownership even when the old connection is still alive. A disconnected
+controller is not automatically timed out: another client may explicitly take
+over. A close is explicit and cannot be issued while work is active; client
+detach does not close the session or cancel the agent. A second distinct prompt
+is rejected until the agent sends `idle` (not merely until its prompt response).
+
+Prompts additionally require `_meta.hive.key`, a nonempty client-generated
+idempotency key scoped to the Hive session. Retrying the *same key and content*
+after an uncertain acknowledgement returns or waits for the original result,
+including after takeover. The same key with changed content fails. A rejected
+prompt that was never dispatched retains its error under that key; use a new
+key for a newly intended prompt. Do not blindly send a new key after losing an
+acknowledgement; reconnect and retry the existing key. Key outcomes are only
+kept for the session lifetime in this daemon process.
+
+Every `session/update` carries `_meta.hive.seq`, an increasing per-session
+integer, unchanged on replay. On `session/resume`, omit `replayFrom` to attach
+without history; `{ "type": "start" }` requests the full history if retained.
+`{ "type": "_hive_seq", "seq": N }` requests updates **at or after** N,
+inclusive. Send `lastProcessedSeq + 1` to avoid duplicates. `nextSeq` in the
+resume response identifies the first event not yet produced at the atomic
+takeover boundary. The most recent 256 updates (including chunks and state
+transitions) are available. An expired or future cursor fails with the current
+available range and leaves the old controller in place. Live updates are
+ordered after replay; a partially delivered replay must be retried using the
+last actually processed sequence. Neither replay nor prompt deduplication
+survives a daemon restart. Updates can arrive before prompt responses; `idle`
+ends foreground work, not a unique turn-ID boundary.

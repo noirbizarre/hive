@@ -7,7 +7,16 @@ use agent_client_protocol::{
 use agent_client_protocol_http::HttpClient;
 use hive_daemon::config::{Config, Profile};
 use hive_protocol::AgentVersion;
-use tokio::{sync::mpsc, time::timeout};
+use tokio::{
+    sync::{mpsc, oneshot},
+    time::timeout,
+};
+
+fn controlled(meta: &Option<v2::Meta>, key: &str) -> v2::Meta {
+    let mut value = meta.clone().unwrap();
+    value.get_mut("hive").unwrap()["key"] = serde_json::json!(key);
+    value
+}
 
 async fn exercise_gateway(transport: &str, version: AgentVersion) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -88,20 +97,33 @@ async fn exercise_gateway(transport: &str, version: AgentVersion) {
                 .await?;
             assert_eq!(init.protocol_version, ProtocolVersion::V2);
             assert!(init.capabilities.session.is_some());
-            let opened = cx.build_session_cwd()?.start_session().block_task().await?;
-            let session = opened.into_session();
-            let id = session.session_id().clone();
-            let second = cx
-                .build_session_cwd()?
-                .start_session()
+            let cwd = std::env::current_dir().map_err(Error::into_internal_error)?;
+            let opened = cx
+                .send_request(v2::NewSessionRequest::new(cwd.clone()))
                 .block_task()
-                .await?
-                .into_session();
-            let other_id = second.session_id().clone();
+                .await?;
+            let id = opened.session_id;
+            let mut opened_meta = opened.meta;
+            let second = cx
+                .send_request(v2::NewSessionRequest::new(cwd))
+                .block_task()
+                .await?;
+            let other_id = second.session_id;
+            let second_meta = second.meta;
             assert_ne!(id, other_id);
             // Publish both requests before waiting for either completion.
-            let first_prompt = session.send_prompt("hello hive").block_task();
-            let second_prompt = second.send_prompt("other session").block_task();
+            let first_prompt = cx
+                .send_request(
+                    v2::PromptRequest::new(id.clone(), vec!["hello hive".into()])
+                        .meta(controlled(&opened_meta, "first")),
+                )
+                .block_task();
+            let second_prompt = cx
+                .send_request(
+                    v2::PromptRequest::new(other_id.clone(), vec!["other session".into()])
+                        .meta(controlled(&second_meta, "second")),
+                )
+                .block_task();
             let (response, other_response) = tokio::try_join!(first_prompt, second_prompt)?;
             assert!(!response.message_id.to_string().is_empty());
             assert!(!other_response.message_id.to_string().is_empty());
@@ -153,7 +175,8 @@ async fn exercise_gateway(transport: &str, version: AgentVersion) {
                 let cwd = std::env::current_dir().map_err(Error::into_internal_error)?;
                 let request = v2::ResumeSessionRequest::new(id.clone(), cwd)
                     .replay_from(v2::ReplayFrom::Start(v2::ReplayFromStart::new()));
-                cx.send_request(request).block_task().await?;
+                let resumed = cx.send_request(request).block_task().await?;
+                opened_meta = resumed.meta;
                 let mut replayed = false;
                 while let Ok(update) = rx.try_recv() {
                     if update.session_id == id
@@ -163,7 +186,10 @@ async fn exercise_gateway(transport: &str, version: AgentVersion) {
                     }
                 }
                 assert!(replayed, "resume must replay retained snapshots");
-                cx.send_notification(v2::CancelSessionNotification::new(id.clone()))?;
+                cx.send_notification(
+                    v2::CancelSessionNotification::new(id.clone())
+                        .meta(controlled(&opened_meta, "cancel")),
+                )?;
                 let cancelled = timeout(Duration::from_secs(10), async {
                     while let Some(update) = rx.recv().await {
                         if update.session_id == id
@@ -181,8 +207,15 @@ async fn exercise_gateway(transport: &str, version: AgentVersion) {
                 .map_err(Error::into_internal_error)?;
                 assert!(cancelled);
             }
-            session.close().block_task().await?;
-            second.send_prompt("still running").block_task().await?;
+            cx.send_request(v2::CloseSessionRequest::new(id.clone()).meta(opened_meta.unwrap()))
+                .block_task()
+                .await?;
+            cx.send_request(
+                v2::PromptRequest::new(other_id.clone(), vec!["still running".into()])
+                    .meta(controlled(&second_meta, "third")),
+            )
+            .block_task()
+            .await?;
             let continued = timeout(Duration::from_secs(10), async {
                 while let Some(update) = rx.recv().await {
                     if update.session_id == other_id
@@ -201,7 +234,9 @@ async fn exercise_gateway(transport: &str, version: AgentVersion) {
                 continued,
                 "closing one session must leave the other running"
             );
-            second.close().block_task().await?;
+            cx.send_request(v2::CloseSessionRequest::new(other_id).meta(second_meta.unwrap()))
+                .block_task()
+                .await?;
             Ok(())
         });
     timeout(Duration::from_secs(30), flow)
@@ -297,7 +332,9 @@ async fn create_and_prompt(
                     id.clone(),
                     vec![v2::ContentBlock::Text(v2::TextContent::new(text))],
                 );
-                cx.send_request(prompt).block_task().await?;
+                cx.send_request(prompt.meta(controlled(&opened.meta, "selection-prompt")))
+                    .block_task()
+                    .await?;
                 let mut saw_reply = false;
                 while let Some(update) = rx.recv().await {
                     if update.session_id != id {
@@ -563,12 +600,16 @@ async fn disconnecting_one_client_does_not_lose_its_resumable_agent_session() {
                 .block_task()
                 .await?;
                 let cwd = std::env::current_dir().map_err(Error::into_internal_error)?;
-                cx.send_request(v2::ResumeSessionRequest::new(id.clone(), cwd))
+                let resumed = cx
+                    .send_request(v2::ResumeSessionRequest::new(id.clone(), cwd))
                     .block_task()
                     .await?;
-                cx.send_request(v2::PromptRequest::new(id.clone(), vec!["after".into()]))
-                    .block_task()
-                    .await?;
+                cx.send_request(
+                    v2::PromptRequest::new(id.clone(), vec!["after".into()])
+                        .meta(controlled(&resumed.meta, "after")),
+                )
+                .block_task()
+                .await?;
                 let saw_reply = timeout(Duration::from_secs(5), async {
                     while let Some(update) = rx.recv().await {
                         if update.session_id == id
@@ -584,7 +625,7 @@ async fn disconnecting_one_client_does_not_lose_its_resumable_agent_session() {
                 .await
                 .map_err(Error::into_internal_error)?;
                 assert!(saw_reply);
-                cx.send_request(v2::CloseSessionRequest::new(id))
+                cx.send_request(v2::CloseSessionRequest::new(id).meta(resumed.meta.unwrap()))
                     .block_task()
                     .await?;
                 Ok(())
@@ -592,6 +633,438 @@ async fn disconnecting_one_client_does_not_lose_its_resumable_agent_session() {
         )
         .await
         .unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_cross_transport_handoff_fences_the_old_controller_and_replays_once() {
+    let config = config_with_agent(
+        "mock",
+        env!("CARGO_BIN_EXE_hive-test-agent"),
+        AgentVersion::V2,
+    );
+    let (address, server) = start_gateway(config).await;
+    let (created_tx, created_rx) = oneshot::channel();
+    let (handoff_tx, handoff_rx) = oneshot::channel();
+    let old = tokio::spawn(async move {
+        let (updates, mut received) = mpsc::unbounded_channel();
+        Client
+            .v2()
+            .on_receive_notification(
+                async move |update: v2::UpdateSessionNotification, _: V2ConnectionTo<Agent>| {
+                    updates.send(update).map_err(Error::into_internal_error)
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(
+                HttpClient::new(format!("ws://{address}")).unwrap(),
+                async move |cx| {
+                    cx.send_request(v2::InitializeRequest::new(
+                        ProtocolVersion::V2,
+                        v2::Implementation::new("handoff-a", "1"),
+                    ))
+                    .block_task()
+                    .await?;
+                    let cwd = std::env::current_dir().unwrap();
+                    let created = cx
+                        .send_request(v2::NewSessionRequest::new(cwd))
+                        .block_task()
+                        .await?;
+                    let id = created.session_id;
+                    let meta = created.meta;
+                    let prompt = v2::PromptRequest::new(id.clone(), vec!["once".into()])
+                        .meta(controlled(&meta, "same-key"));
+                    let response = cx.send_request(prompt).block_task().await?;
+                    let mut running = false;
+                    while let Some(update) = received.recv().await {
+                        if update.session_id != id {
+                            continue;
+                        }
+                        if matches!(
+                            update.update,
+                            v2::SessionUpdate::StateUpdate(v2::StateUpdate::Running(_))
+                        ) {
+                            running = true;
+                        }
+                        if running
+                            && matches!(
+                                update.update,
+                                v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(_))
+                            )
+                        {
+                            break;
+                        }
+                    }
+                    created_tx
+                        .send((id.clone(), meta.clone(), response.message_id))
+                        .unwrap();
+                    handoff_rx.await.unwrap();
+                    let stale = cx
+                        .send_request(
+                            v2::PromptRequest::new(id.clone(), vec!["stale".into()])
+                                .meta(controlled(&meta, "stale-key")),
+                        )
+                        .block_task()
+                        .await
+                        .unwrap_err();
+                    assert!(stale.data.unwrap().to_string().contains("stale"));
+                    let stale_close = cx
+                        .send_request(v2::CloseSessionRequest::new(id).meta(meta.unwrap()))
+                        .block_task()
+                        .await
+                        .unwrap_err();
+                    assert!(stale_close.data.unwrap().to_string().contains("stale"));
+                    Ok(())
+                },
+            )
+            .await
+    });
+    let (id, _meta, original) = match timeout(Duration::from_secs(10), created_rx).await.unwrap() {
+        Ok(value) => value,
+        Err(_) => panic!("creator exited: {:?}", old.await),
+    };
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    timeout(
+        Duration::from_secs(10),
+        Client
+            .v2()
+            .on_receive_notification(
+                async move |update: v2::UpdateSessionNotification, _: V2ConnectionTo<Agent>| {
+                    tx.send(update).map_err(Error::into_internal_error)
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(
+                HttpClient::new(format!("http://{address}")).unwrap(),
+                async move |cx| {
+                    cx.send_request(v2::InitializeRequest::new(
+                        ProtocolVersion::V2,
+                        v2::Implementation::new("handoff-b", "1"),
+                    ))
+                    .block_task()
+                    .await?;
+                    let cwd = std::env::current_dir().unwrap();
+                    let invalid = v2::ReplayFrom::Other(v2::OtherReplayFrom::new(
+                        "_hive_seq",
+                        BTreeMap::from([("seq".into(), serde_json::json!(99999))]),
+                    ));
+                    assert!(
+                        cx.send_request(
+                            v2::ResumeSessionRequest::new(id.clone(), cwd.clone())
+                                .replay_from(invalid)
+                        )
+                        .block_task()
+                        .await
+                        .is_err()
+                    );
+                    let resumed = cx
+                        .send_request(
+                            v2::ResumeSessionRequest::new(id.clone(), cwd)
+                                .replay_from(v2::ReplayFrom::Start(v2::ReplayFromStart::new())),
+                        )
+                        .block_task()
+                        .await?;
+                    assert_eq!(resumed.meta.as_ref().unwrap()["hive"]["generation"], 2);
+                    handoff_tx.send(()).unwrap();
+                    let mut seq = 0;
+                    while seq + 1
+                        < resumed.meta.as_ref().unwrap()["hive"]["nextSeq"]
+                            .as_u64()
+                            .unwrap()
+                    {
+                        let update = timeout(Duration::from_secs(5), rx.recv())
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        let next = update.meta.unwrap()["hive"]["seq"].as_u64().unwrap();
+                        assert_eq!(
+                            next,
+                            seq + 1,
+                            "every retained event is replayed exactly once"
+                        );
+                        seq = next;
+                    }
+                    let retry = cx
+                        .send_request(
+                            v2::PromptRequest::new(id.clone(), vec!["once".into()])
+                                .meta(controlled(&resumed.meta, "same-key")),
+                        )
+                        .block_task()
+                        .await?;
+                    assert_eq!(retry.message_id, original);
+                    assert!(
+                        cx.send_request(
+                            v2::PromptRequest::new(id.clone(), vec!["changed".into()])
+                                .meta(controlled(&resumed.meta, "same-key"))
+                        )
+                        .block_task()
+                        .await
+                        .is_err()
+                    );
+                    let next = cx
+                        .send_request(
+                            v2::PromptRequest::new(id.clone(), vec!["second".into()])
+                                .meta(controlled(&resumed.meta, "next-key")),
+                        )
+                        .block_task()
+                        .await?;
+                    assert_ne!(next.message_id, original);
+                    while let Some(update) = rx.recv().await {
+                        if update.session_id == id
+                            && matches!(
+                                update.update,
+                                v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(_))
+                            )
+                        {
+                            break;
+                        }
+                    }
+                    cx.send_request(v2::CloseSessionRequest::new(id).meta(resumed.meta.unwrap()))
+                        .block_task()
+                        .await?;
+                    Ok(())
+                },
+            ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    old.await.unwrap().unwrap();
+    server.abort();
+}
+
+#[tokio::test]
+async fn a_disconnect_and_handoff_during_generation_do_not_restart_the_prompt() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let downstream = listener.local_addr().unwrap();
+    let (started_tx, started_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let pause = std::sync::Arc::new(tokio::sync::Mutex::new(Some((started_tx, release_rx))));
+    let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let calls = count.clone();
+    let agent = tokio::spawn(async move {
+        let server = move || {
+            let pause = pause.clone();
+            let calls = calls.clone();
+            Agent
+                .v2()
+                .name("paused")
+                .on_receive_request(
+                    async |r: v2::InitializeRequest,
+                           responder: Responder<v2::InitializeResponse>,
+                           _: V2ConnectionTo<Client>| {
+                        responder.respond(
+                            v2::InitializeResponse::new(
+                                r.protocol_version,
+                                v2::Implementation::new("paused", "1"),
+                            )
+                            .capabilities(
+                                v2::AgentCapabilities::new()
+                                    .session(v2::SessionCapabilities::new()),
+                            ),
+                        )
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async |_: v2::NewSessionRequest,
+                           responder: Responder<v2::NewSessionResponse>,
+                           _: V2ConnectionTo<Client>| {
+                        responder.respond(v2::NewSessionResponse::new(v2::SessionId::new(
+                            "downstream-id",
+                        )))
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async move |r: v2::PromptRequest,
+                                responder: Responder<v2::PromptResponse>,
+                                cx: V2ConnectionTo<Client>| {
+                        let index = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        responder.respond(v2::PromptResponse::new(v2::MessageId::new(format!(
+                            "user-{index}"
+                        ))))?;
+                        cx.send_notification(v2::UpdateSessionNotification::new(
+                            r.session_id.clone(),
+                            v2::SessionUpdate::StateUpdate(v2::StateUpdate::Running(
+                                v2::RunningStateUpdate::new(),
+                            )),
+                        ))?;
+                        if let Some((started, release)) = pause.lock().await.take() {
+                            let _ = started.send(());
+                            let _ = release.await;
+                        }
+                        cx.send_notification(v2::UpdateSessionNotification::new(
+                            r.session_id,
+                            v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(
+                                v2::IdleStateUpdate::new(),
+                            )),
+                        ))
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+        };
+        axum::serve(
+            listener,
+            agent_client_protocol_http::AcpHttpServer::new(server).into_router(),
+        )
+        .await
+        .unwrap();
+    });
+    let mut config = Config {
+        default_agent: Some("paused".into()),
+        ..Config::default()
+    };
+    config.agents.insert(
+        "paused".into(),
+        Profile {
+            name: None,
+            command: None,
+            args: vec![],
+            env: BTreeMap::new(),
+            endpoint: Some(format!("http://{downstream}")),
+            headers: BTreeMap::new(),
+            versions: vec![AgentVersion::V2],
+        },
+    );
+    let (address, gateway) = start_gateway(config).await;
+    let id = Client
+        .v2()
+        .connect_with(
+            HttpClient::new(format!("ws://{address}")).unwrap(),
+            async |cx| {
+                cx.send_request(v2::InitializeRequest::new(
+                    ProtocolVersion::V2,
+                    v2::Implementation::new("first", "1"),
+                ))
+                .block_task()
+                .await?;
+                let created = cx
+                    .send_request(v2::NewSessionRequest::new(std::env::current_dir().unwrap()))
+                    .block_task()
+                    .await?;
+                cx.send_request(
+                    v2::PromptRequest::new(created.session_id.clone(), vec!["once".into()])
+                        .meta(controlled(&created.meta, "once")),
+                )
+                .block_task()
+                .await?;
+                Ok(created.session_id)
+            },
+        )
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(5), started_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    let (tx, mut updates) = mpsc::unbounded_channel();
+    timeout(
+        Duration::from_secs(10),
+        Client
+            .v2()
+            .on_receive_notification(
+                async move |update: v2::UpdateSessionNotification, _: V2ConnectionTo<Agent>| {
+                    tx.send(update).map_err(Error::into_internal_error)
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(
+                HttpClient::new(format!("http://{address}")).unwrap(),
+                async move |cx| {
+                    cx.send_request(v2::InitializeRequest::new(
+                        ProtocolVersion::V2,
+                        v2::Implementation::new("second", "1"),
+                    ))
+                    .block_task()
+                    .await?;
+                    let resumed = cx
+                        .send_request(
+                            v2::ResumeSessionRequest::new(
+                                id.clone(),
+                                std::env::current_dir().unwrap(),
+                            )
+                            .replay_from(v2::ReplayFrom::Start(v2::ReplayFromStart::new())),
+                        )
+                        .block_task()
+                        .await?;
+                    assert_eq!(resumed.meta.as_ref().unwrap()["hive"]["running"], true);
+                    assert!(
+                        cx.send_request(
+                            v2::PromptRequest::new(id.clone(), vec!["two".into()])
+                                .meta(controlled(&resumed.meta, "two"))
+                        )
+                        .block_task()
+                        .await
+                        .is_err()
+                    );
+                    release_tx.send(()).unwrap();
+                    while let Some(update) = updates.recv().await {
+                        if matches!(
+                            update.update,
+                            v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(_))
+                        ) {
+                            break;
+                        }
+                    }
+                    cx.send_request(
+                        v2::PromptRequest::new(id.clone(), vec!["two".into()])
+                            .meta(controlled(&resumed.meta, "two")),
+                    )
+                    .block_task()
+                    .await?;
+                    Ok(())
+                },
+            ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+    gateway.abort();
+    agent.abort();
+}
+
+#[tokio::test]
+async fn simultaneous_resume_requests_are_serialized_into_distinct_owners() {
+    let config = config_with_agent(
+        "mock",
+        env!("CARGO_BIN_EXE_hive-test-agent"),
+        AgentVersion::V2,
+    );
+    let (address, server) = start_gateway(config).await;
+    let id = create_and_prompt(&format!("ws://{address}"), None, "initial", "Echo: initial").await;
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+    let takeover = |url: String, id: v2::SessionId, gate: std::sync::Arc<tokio::sync::Barrier>| async move {
+        Client
+            .v2()
+            .connect_with(HttpClient::new(url).unwrap(), async move |cx| {
+                cx.send_request(v2::InitializeRequest::new(
+                    ProtocolVersion::V2,
+                    v2::Implementation::new("racer", "1"),
+                ))
+                .block_task()
+                .await?;
+                gate.wait().await;
+                let resumed = cx
+                    .send_request(v2::ResumeSessionRequest::new(
+                        id,
+                        std::env::current_dir().unwrap(),
+                    ))
+                    .block_task()
+                    .await?;
+                Ok(resumed.meta.unwrap()["hive"]["generation"]
+                    .as_u64()
+                    .unwrap())
+            })
+            .await
+            .unwrap()
+    };
+    let (first, second) = tokio::join!(
+        takeover(format!("ws://{address}"), id.clone(), barrier.clone()),
+        takeover(format!("http://{address}"), id, barrier),
+    );
+    assert_eq!([first.min(second), first.max(second)], [2, 3]);
     server.abort();
 }
 

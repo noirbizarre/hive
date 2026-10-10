@@ -21,4 +21,4 @@ by editing the old one. The history is the value.
 
 ## Index
 
-<!-- - [ADR-001](001-....md) — ... -->
+- [ADR-001](001-session-control-and-replay.md) — In-memory fenced controller and sequenced replay

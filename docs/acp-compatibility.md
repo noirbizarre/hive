@@ -31,6 +31,44 @@ explicit v1 compatibility adapter. SDK client transports support stdio,
 WebSocket and HTTP/SSE. No automatic fallback on failed initialization is
 claimed.
 
+## Installed-agent capability matrix (2026-10-11)
+
+These rows identify **inspected local binaries**, not validated live model runs.
+`Guaranteed` means demonstrated for the specified installation by a completed
+probe; `best-effort` means observed but dependent on timing/model/configuration;
+`unsupported` means a missing entrypoint or Hive operation; `unverified` means
+no successful live probe. The v1/v2 declaration on a profile does **not** prove
+the downstream agent accepts that wire version. Re-run the opt-in probes after
+upgrading either agent and record results with its product version and transport.
+
+| Product/version | ACP entrypoint/transport | ACP wire | Fresh `session/new` | Native-created load/resume over ACP | Hive live-worker resume |
+| --- | --- | --- | --- | --- | --- |
+| Pi 1.1.0 (local CLI inspection) | Default CLI offers text/json/rpc; ACP entrypoint unsupported without verified extension | Unverified | Unverified | Native `--session-id` CLI available; ACP attachment unverified | Unverified with Pi (guaranteed with mock) |
+| OpenCode 1.18.35 (local CLI inspection) | `opencode acp`, stdio documented and command present | v1 documented; v2 unverified | Unverified | Native `session list` and `run --session` available; ACP load unverified | Unverified with OpenCode (guaranteed with mock) |
+
+| Product/version | Text prompt | Streaming events/idle | Tool calls/results | Permissions | User-input requests | Cancellation | Active client disconnect |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Pi 1.1.0 | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified |
+| OpenCode 1.18.35 | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified |
+
+The OpenCode ACP command/documented v1 behavior comes from its
+[ACP CLI reference](https://opencode.ai/docs/acp/); its implementation may
+change between releases. Pi's CLI session flags demonstrate *native* persistence,
+not ACP support. For each successful local run, retain the `PROBE`, `FIRST`,
+`RESUMED` or `NATIVE` summary from `--nocapture`, the run date, and the selected
+wire version before upgrading any cell to guaranteed/best-effort. Failed
+initialization is **not** evidence that session creation, load, or prompts work.
+
+For both agents, Hive's upstream ACPv2 resume is guaranteed by deterministic
+mock tests **only for an existing live Hive session**; native session adoption
+through Hive and daemon-restart recovery are unsupported. Direct native ACP
+`session/load` (v1) or `session/resume` (v2) probes bypass Hive and must be
+recorded independently. Hive currently cancels downstream v2 permission
+requests rather than forwarding them; v1 translates text chunks and cancel but
+not the optional tool, permission, or user-input protocols. A tool-free probe
+does not establish support for those optional features. See
+[the reproducible probes](development.md#real-agent-compatibility-probes).
+
 The draft [v2 specification](https://github.com/agentclientprotocol/agent-client-protocol/tree/main/docs/protocol/v2)
 and [draft announcement](https://github.com/agentclientprotocol/agent-client-protocol/blob/main/docs/announcements/acp-v2-draft.mdx)
 may change. See the [SDK v2 guide](https://github.com/agentclientprotocol/rust-sdk/blob/main/md/protocol-v2.md)

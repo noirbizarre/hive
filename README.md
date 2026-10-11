@@ -37,23 +37,19 @@ tools. Build with `mise run build` or `cargo build --workspace`.
 Create `$XDG_CONFIG_HOME/hive/config.toml` (or `~/.config/hive/config.toml`):
 
 ```toml
-default_agent = "pi"
-
-[agents.pi]
-name = "Pi"
-command = "pi"
-args = ["--mode", "acp"]
-versions = ["v2"]
+default_agent = "opencode"
 
 [agents.opencode]
 name = "OpenCode"
 command = "opencode"
 args = ["acp"]
-versions = ["v1"] # Set to the actual ACP version supported by your installation.
+versions = ["v1"] # Confirm the ACP wire version for your installation.
 ```
 
 The commands and version declarations are examples; check your installed
-agents' ACP entrypoints and supported versions. Profiles may also specify
+agents' ACP entrypoints and supported versions. Pi 1.1.0 does not advertise
+an ACP mode by default; configure Pi only after verifying an ACP-capable
+extension/entrypoint. Profiles may also specify
 `env = { KEY = "value" }`; an endpoint profile uses
 `endpoint = "http://127.0.0.1:9000"` (or `ws://...`) and optional
 `headers = { Authorization = "Bearer ..." }`. Keep the config file private.
@@ -85,6 +81,9 @@ then run the same `hive serve` command.
 
 Tests: `mise run test`, `mise run cover`, and `mise run ci`. The focused
 end-to-end test is `cargo test -p hive-daemon --test gateway`.
+Installed-agent tests and native-session probes are opt-in; see
+[real-agent compatibility probes](docs/development.md#real-agent-compatibility-probes)
+and the [versioned capability matrix](docs/acp-compatibility.md#installed-agent-capability-matrix-2026-10-11).
 
 ## Documentation
 

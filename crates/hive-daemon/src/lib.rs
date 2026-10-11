@@ -351,7 +351,8 @@ impl Broker {
         serde_json::json!({ "defaultAgent": self.registry.default_agent, "agents": self.registry.public_profiles() })
     }
 
-    async fn shutdown(&self) {
+    /// Close every downstream worker when an embedded gateway stops serving requests.
+    pub async fn shutdown(&self) {
         let entries = self
             .sessions
             .lock()

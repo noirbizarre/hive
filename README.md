@@ -69,8 +69,10 @@ In another terminal run `cargo run -p hive-daemon --bin hive -- status` and
 `target/wasm32-wasip1/debug/hive_zellij.wasm` through Zellij's plugin loader;
 grant its WebAccess permission. Configure its `url` setting for a non-default
 loopback daemon. The full-screen TUI lists sessions in the current directory.
-Press `n`/`Ctrl-N` to create one, select a profile with the arrow keys and Enter,
-then type prompts in the conversation pane. `--agent opencode` preselects a
+Press `Ctrl-N` to create one, select a profile with the arrow keys and Enter,
+then type prompts in the bottom composer. The border-light transcript and session
+sidebar follow your terminal's foreground/background and ANSI color palette;
+the sidebar collapses on narrow terminals. `--agent opencode` preselects a
 profile; `--session hive-…` resumes a known session. `Tab` shows the session
 list, `a` toggles all directories, Enter takes pilot control and `o` attaches
 as an observer. `Ctrl-H` relinquishes pilot control while continuing to

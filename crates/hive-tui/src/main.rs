@@ -1,6 +1,7 @@
 //! Full-screen ACPv2 client; the daemon remains the sole session authority.
 
 mod state;
+mod theme;
 mod ui;
 
 use std::{collections::BTreeMap, time::Duration};
@@ -47,7 +48,11 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn enter() -> std::io::Result<Self> {
         enable_raw_mode()?;
-        execute!(std::io::stdout(), EnterAlternateScreen)?;
+        if let Err(error) = execute!(std::io::stdout(), EnterAlternateScreen) {
+            // An alternate-screen failure must not leave the user's shell in raw mode.
+            let _ = disable_raw_mode();
+            return Err(error);
+        }
         Ok(Self)
     }
 }
@@ -116,9 +121,7 @@ async fn resume(
     conversation.pilot_present = hive["pilot"].as_bool().unwrap_or(false);
     app.owner = response.meta;
     if app.skip_replay {
-        conversation
-            .lines
-            .push("[Earlier history unavailable]".into());
+        conversation.push_notice("[Earlier history unavailable]".into());
     }
     app.skip_replay = false;
     app.active = Some(id);
@@ -467,8 +470,7 @@ async fn handle_key(
                     app.conversations
                         .entry(id.clone())
                         .or_default()
-                        .lines
-                        .push(format!("You: {content}"));
+                        .push_user(content.clone());
                     app.pending = Some((key.clone(), content.clone()));
                     send_prompt(cx, app, acks);
                 } else {

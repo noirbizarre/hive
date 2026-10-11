@@ -229,7 +229,7 @@ run = "npm run build --prefix clients/hive-web && npm run test --prefix clients/
 description = "Build ZJHive for the Zellij WASI host"
 run = "cargo build -p hive-zellij --target wasm32-wasip1"
 
-[tasks.tui]
+[tasks."hive:tui"]
 description = "Run the Hive TUI"
 run = "cargo run -p hive-tui"
 

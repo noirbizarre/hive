@@ -87,7 +87,10 @@ resume takes pilot control. `_meta.hive.mode: "observe"` attaches read-only;
 it an observer, leaving no pilot until explicit takeover. Both modes optionally
 replay retained events before returning. Observer responses have no token.
 No implicit new prompt is sent. TUI `--session hive-…` and WebUI's session-ID
-form use this same contract.
+form use this same contract. The WebUI initially requests `mode: "observe"`
+and only attempts pilot resume when the user types a prompt; a pending
+permission or elicitation request then follows the new pilot. Its session
+list supplies the original cwd, including for sessions created in the TUI.
 For example, after `session/new` returns a session ID and
 `"_meta":{"hive":{"generation":1,"token":"opaque","nextSeq":1,"running":false}}`,
 the controller can send:
@@ -154,6 +157,9 @@ takeover boundary. The most recent 256 updates (including chunks and state
 transitions) are available. An expired or future cursor fails with the current
 available range and leaves the old controller in place. Live updates are
 ordered after replay; a partially delivered replay must be retried using the
-last actually processed sequence. Neither replay nor prompt deduplication
-survives a daemon restart. Updates can arrive before prompt responses; `idle`
-ends foreground work, not a unique turn-ID boundary.
+last actually processed sequence. The WebUI rebuilds from `start` on reload
+and retains the cursor alongside rendered history only while the page is
+alive; an expired cursor requires a visible attach-without-history choice.
+Neither replay nor prompt deduplication survives a daemon restart. Updates
+can arrive before prompt responses; `idle` ends foreground work, not a
+unique turn-ID boundary.

@@ -223,7 +223,7 @@ git tpl diff --exit-code --stat
 
 [tasks."hive:web"]
 description = "Check and test the zero-dependency browser client"
-run = "npm run build --prefix clients/hive-web && npm run test --prefix clients/hive-web"
+run = "npm ci --prefix clients/hive-web && npm run build --prefix clients/hive-web && npm run test --prefix clients/hive-web"
 
 [tasks."hive:plugin"]
 description = "Build ZJHive for the Zellij WASI host"

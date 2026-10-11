@@ -2,9 +2,14 @@
 <html lang="en">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Hive</title></head>
 <body>
-<h1>Hive</h1><p id="status">Connecting…</p>
-<form id="takeover"><label>Existing Hive session <input name="session" placeholder="hive-…"></label><button>Take control</button></form>
-<form id="prompt"><label>Agent <select id="agent"><option value="">Default agent</option></select></label><input name="text" aria-label="Prompt" placeholder="Ask the agent"><button>Send</button></form>
-<button id="cancel" type="button">Cancel</button><pre id="output"></pre>
+<h1>Hive</h1><p id="status" role="status">Connecting…</p>
+<h2>Sessions</h2><ul id="sessions"></ul>
+<form id="takeover"><label>Hive session ID <input name="session" placeholder="hive-…"></label><button>Open read-only</button></form>
+<button id="skip-history" type="button" hidden>Attach without earlier history</button>
+<h2>Conversation</h2><div id="output" role="log" aria-live="polite"></div>
+<section id="interaction" aria-label="Agent input request" hidden></section>
+<form id="prompt"><label>Agent <select id="agent"><option value="">Default agent</option></select></label>
+<label>Prompt <input name="text" aria-label="Prompt" placeholder="Type to take control"></label><button id="send">Send</button></form>
+<button id="retry" type="button" hidden>Retry uncertain prompt</button><button id="cancel" type="button" disabled>Cancel</button>
 <script type="module" src="/hive/v1/web/app.js"></script>
 </body></html>

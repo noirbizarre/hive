@@ -71,6 +71,23 @@ person/user identity or a credential. `generation` follows the same fencing
 epoch as ACP `session/resume`. No control token is ever present in a summary.
 `observers` counts attached non-pilot connections.
 
+The WebUI lists these summaries and opens a selected session, including one
+created in the TUI, read-only using its `sessionId` and `cwd`. Typing in its
+prompt explicitly requests control through ACP `session/resume`; Send remains
+unavailable until Hive confirms pilot control and the session is idle. Cancel
+and permission/elicitation responses are available only to the pilot. A
+transferred pilot immediately becomes read-only. Browser reload reconstructs
+history from replay rather than trusting a cursor without rendered messages;
+WebSocket reconnect resumes observing from the last applied event and never
+resends a prompt. If creation itself lost its acknowledgement, the browser
+requires selection of the original session from the catalog before prompting
+again, rather than silently creating a second agent session. An uncertain
+prompt acknowledgement can be retried manually with its original idempotency
+key. If the 256-update in-memory replay window has expired, the WebUI reports
+missing history and offers an explicit
+attach-without-history action. Daemon restart loses both the sessions and
+their replay/command outcomes; the WebUI does not restore them from storage.
+
 To observe the catalog, open `GET /hive/v1/sessions/events` as an EventSource
 (or another SSE client), **then** fetch `/hive/v1/sessions`. Each event is named
 `revision`, with its decimal revision in `data` and `id`; the first event on

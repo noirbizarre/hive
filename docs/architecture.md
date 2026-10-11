@@ -33,7 +33,12 @@ The full-screen TUI uses SDK `Client.v2()` / `HttpClient` for ACP session
 selection, creation and interaction. It can observe without taking control,
 relinquish pilot while observing, or take over by Hive session ID, and leaves
 the session alive on exit. The browser implements the ACPv2
-WebSocket JSON-RPC boundary, can take over by ID, and queries operational status.
+WebSocket JSON-RPC boundary. It lists daemon-owned sessions, attaches as an
+observer using the listed cwd, and takes control when the user starts typing
+a prompt. It renders sequenced replay and live events through the same
+conversation reducer; reconnect observes the original session rather than
+creating another. Pending agent input follows the pilot to whichever client
+currently owns control.
 ZJHive uses Zellij's host WebAccess permission for one-shot daemon status;
 Zellij's `web_request` is not a persistent WebSocket or SSE transport.
 

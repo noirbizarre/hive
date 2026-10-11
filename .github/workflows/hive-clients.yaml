@@ -14,5 +14,6 @@ jobs:
         with:
           node-version: '22'
       - run: cargo build --locked -p hive-zellij --target wasm32-wasip1
+      - run: npm ci --prefix clients/hive-web
       - run: npm run build --prefix clients/hive-web
       - run: npm run test --prefix clients/hive-web

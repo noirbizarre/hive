@@ -125,7 +125,13 @@ pilot relinquishes control; another client must explicitly take over. All
 attached clients receive live updates, including a sequenced `_hive_control`
 event with `generation` and pilot presence but no token. `session/list` includes
 profile, running, generation, pilot presence and observer count in each entry's
-`_meta.hive`. A close is explicit and cannot be issued while work is active;
+`_meta.hive`, along with the shared `title`, `lifecycle`, `activity`,
+`lastActivityAt` and `controlOwner` summary fields. The owner is an ephemeral
+connection ID, **never** the token. An absent title/timestamp/owner is `null`;
+`activity: "unknown"` means no trustworthy foreground status is available.
+The HTTP catalog and its SSE invalidation feed are documented in
+[Hive's operational API](hive-api.md#session-catalog); ACP `session/list` and
+HTTP snapshots derive their fields from the same broker. A close is explicit and cannot be issued while work is active;
 client detach does not close the session or cancel the agent. A second distinct prompt
 is rejected until the agent sends `idle` (not merely until its prompt response).
 

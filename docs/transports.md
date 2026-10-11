@@ -14,3 +14,5 @@ requests and cancellation travel by POST. The SDK handles its connection ID,
 session ID and routing. No transport `Last-Event-ID` resumption is claimed.
 Session resume reattaches to an in-process Hive session with retained snapshots;
 it is not a durable or complete event stream.
+The separate `/hive/v1/sessions/events` SSE feed announces catalog revision
+changes only; clients re-list sessions rather than replaying this feed.

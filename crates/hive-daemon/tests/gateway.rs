@@ -18,6 +18,42 @@ fn controlled(meta: &Option<v2::Meta>, key: &str) -> v2::Meta {
     value
 }
 
+async fn summaries(address: SocketAddr) -> serde_json::Value {
+    reqwest::get(format!("http://{address}/hive/v1/sessions"))
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+async fn next_revision(stream: &mut reqwest::Response, pending: &mut String) -> u64 {
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(end) = pending.find("\n\n") {
+                let event = pending.drain(..end + 2).collect::<String>();
+                if let Some(data) = event.lines().find_map(|line| line.strip_prefix("data: ")) {
+                    return data.parse().unwrap();
+                }
+            }
+            let chunk = stream
+                .chunk()
+                .await
+                .unwrap()
+                .expect("catalog stream closed");
+            pending.push_str(
+                &String::from_utf8(chunk.to_vec())
+                    .unwrap()
+                    .replace("\r\n", "\n"),
+            );
+        }
+    })
+    .await
+    .unwrap()
+}
+
 async fn exercise_gateway(transport: &str, version: AgentVersion) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address: SocketAddr = listener.local_addr().unwrap();
@@ -44,6 +80,20 @@ async fn exercise_gateway(transport: &str, version: AgentVersion) {
         .await
         .unwrap();
     assert_eq!(status["sessions"], 0);
+    assert_eq!(
+        summaries(address).await["sessions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+    let mut events = reqwest::get(format!("http://{address}/hive/v1/sessions/events"))
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let mut pending = String::new();
+    let initial = next_revision(&mut events, &mut pending).await;
     let health: serde_json::Value = reqwest::get(format!("http://{address}/hive/v1/health"))
         .await
         .unwrap()
@@ -111,6 +161,27 @@ async fn exercise_gateway(transport: &str, version: AgentVersion) {
             let other_id = second.session_id;
             let second_meta = second.meta;
             assert_ne!(id, other_id);
+            let created = summaries(address).await;
+            assert_eq!(created["sessions"].as_array().unwrap().len(), 2);
+            assert!(created["revision"].as_u64().unwrap() > initial);
+            for summary in created["sessions"].as_array().unwrap() {
+                assert_eq!(summary["agent"], "mock");
+                assert!(matches!(
+                    summary["activity"].as_str(),
+                    Some("unknown" | "idle")
+                ));
+                assert_eq!(summary["lifecycle"], "active");
+                assert!(summary["title"].is_null());
+                if summary["activity"] == "unknown" {
+                    assert!(summary["lastActivityAt"].is_null());
+                } else {
+                    assert!(summary["lastActivityAt"].as_u64().is_some());
+                }
+                assert!(summary["controlOwner"].as_str().is_some());
+                assert!(summary.get("token").is_none());
+            }
+            let event_revision = next_revision(&mut events, &mut pending).await;
+            assert!(event_revision > initial);
             // Publish both requests before waiting for either completion.
             let first_prompt = cx
                 .send_request(
@@ -171,6 +242,39 @@ async fn exercise_gateway(transport: &str, version: AgentVersion) {
                 .block_task()
                 .await?;
             assert_eq!(listed.sessions.len(), 2);
+            let after = summaries(address).await;
+            assert!(after["revision"].as_u64().unwrap() > created["revision"].as_u64().unwrap());
+            let listed_summaries = after["sessions"].as_array().unwrap();
+            assert_eq!(listed_summaries[0]["activity"], "idle");
+            assert_eq!(listed_summaries[1]["activity"], "idle");
+            assert!(listed_summaries[0]["lastActivityAt"].as_u64().is_some());
+            assert!(listed_summaries[1]["lastActivityAt"].as_u64().is_some());
+            for entry in &listed.sessions {
+                let summary = listed_summaries
+                    .iter()
+                    .find(|summary| summary["sessionId"] == entry.session_id.to_string())
+                    .unwrap();
+                let hive = &entry.meta.as_ref().unwrap()["hive"];
+                assert_eq!(hive["title"], summary["title"]);
+                assert_eq!(hive["activity"], summary["activity"]);
+                assert_eq!(hive["controlOwner"], summary["controlOwner"]);
+                assert_eq!(hive["generation"], summary["generation"]);
+                assert!(hive.get("token").is_none());
+            }
+            let cwd = std::env::current_dir().map_err(Error::into_internal_error)?;
+            let filtered = cx
+                .send_request(v2::ListSessionsRequest::new().cwd(cwd))
+                .block_task()
+                .await?;
+            assert_eq!(filtered.sessions.len(), 2);
+            let elsewhere = std::env::current_dir()
+                .map_err(Error::into_internal_error)?
+                .join("elsewhere");
+            let unmatched = cx
+                .send_request(v2::ListSessionsRequest::new().cwd(elsewhere))
+                .block_task()
+                .await?;
+            assert!(unmatched.sessions.is_empty());
             if version == AgentVersion::V2 {
                 let cwd = std::env::current_dir().map_err(Error::into_internal_error)?;
                 let request = v2::ResumeSessionRequest::new(id.clone(), cwd)
@@ -237,6 +341,22 @@ async fn exercise_gateway(transport: &str, version: AgentVersion) {
             cx.send_request(v2::CloseSessionRequest::new(other_id).meta(second_meta.unwrap()))
                 .block_task()
                 .await?;
+            assert!(
+                summaries(address).await["sessions"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+            let mut reconnected = reqwest::get(format!("http://{address}/hive/v1/sessions/events"))
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+            let latest = next_revision(&mut reconnected, &mut String::new()).await;
+            assert_eq!(
+                latest,
+                summaries(address).await["revision"].as_u64().unwrap()
+            );
             Ok(())
         });
     timeout(Duration::from_secs(30), flow)
@@ -723,6 +843,10 @@ async fn a_cross_transport_handoff_fences_the_old_controller_and_replays_once() 
         Ok(value) => value,
         Err(_) => panic!("creator exited: {:?}", old.await),
     };
+    let old_owner = summaries(address).await["sessions"][0]["controlOwner"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     let (tx, mut rx) = mpsc::unbounded_channel();
     timeout(
         Duration::from_secs(10),
@@ -765,6 +889,11 @@ async fn a_cross_transport_handoff_fences_the_old_controller_and_replays_once() 
                         .block_task()
                         .await?;
                     assert_eq!(resumed.meta.as_ref().unwrap()["hive"]["generation"], 2);
+                    let snapshot = summaries(address).await;
+                    assert_eq!(snapshot["sessions"][0]["generation"], 2);
+                    assert_ne!(snapshot["sessions"][0]["controlOwner"], old_owner);
+                    assert_eq!(snapshot["sessions"][0]["title"], "once");
+                    assert!(snapshot["sessions"][0].get("token").is_none());
                     handoff_tx.send(()).unwrap();
                     let mut seq = 0;
                     while seq + 1
@@ -1227,11 +1356,19 @@ async fn observers_keep_streaming_after_pilot_relinquishes_and_can_take_control(
                             break;
                         }
                     }
+                    let released = summaries(address).await;
+                    assert!(released["sessions"][0]["controlOwner"].is_null());
+                    assert_eq!(released["sessions"][0]["observers"], 2);
                     let resumed = cx
                         .send_request(v2::ResumeSessionRequest::new(id.clone(), cwd))
                         .block_task()
                         .await?;
                     assert_eq!(resumed.meta.as_ref().unwrap()["hive"]["role"], "pilot");
+                    assert!(
+                        summaries(address).await["sessions"][0]["controlOwner"]
+                            .as_str()
+                            .is_some()
+                    );
                     cx.send_request(
                         v2::PromptRequest::new(id, vec!["new pilot".into()])
                             .meta(controlled(&resumed.meta, "new-pilot")),

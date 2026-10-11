@@ -2,11 +2,13 @@
 
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
+    convert::Infallible,
     fs::{File, OpenOptions},
     future::IntoFuture,
     net::SocketAddr,
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use agent_client_protocol::schema::{ProtocolVersion, v1, v2};
@@ -15,12 +17,20 @@ use agent_client_protocol::{
     V2ConnectionTo,
 };
 use agent_client_protocol_http::{CorsOptions, HttpClient, ServerOptions};
-use axum::{Json, Router, response::Html, routing::get};
+use axum::{
+    Json, Router,
+    response::{
+        Html,
+        sse::{Event, Sse},
+    },
+    routing::get,
+};
 use fs2::FileExt;
 use hive_core::SessionId;
 use hive_protocol::{AcpHttpServer, AgentVersion};
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio_stream::{StreamExt, wrappers::WatchStream};
 
 pub mod config;
 use config::{Config, Profile};
@@ -70,6 +80,7 @@ fn transport(profile: &Profile) -> Result<Downstream, String> {
 pub struct Broker {
     registry: Arc<Config>,
     sessions: Arc<Mutex<HashMap<String, Entry>>>,
+    catalog: watch::Sender<u64>,
 }
 
 #[derive(Clone)]
@@ -90,6 +101,10 @@ struct Control {
     next_seq: u64,
     events: VecDeque<(u64, v2::SessionUpdate)>,
     running: bool,
+    activity_known: bool,
+    title: Option<String>,
+    last_activity_at: Option<u64>,
+    catalog: watch::Sender<u64>,
     closing: bool,
     prompts: HashMap<String, PromptRecord>,
 }
@@ -107,7 +122,11 @@ enum Command {
 }
 
 impl Control {
-    fn new(client_id: String, gateway: V2ConnectionTo<Client>) -> Self {
+    fn new(
+        client_id: String,
+        gateway: V2ConnectionTo<Client>,
+        catalog: watch::Sender<u64>,
+    ) -> Self {
         let (changed, _) = watch::channel(1);
         Self {
             generation: 1,
@@ -118,6 +137,10 @@ impl Control {
             next_seq: 1,
             events: VecDeque::new(),
             running: false,
+            activity_known: false,
+            title: None,
+            last_activity_at: None,
+            catalog,
             closing: false,
             prompts: HashMap::new(),
         }
@@ -174,6 +197,82 @@ impl Control {
             record.result = Some(result);
         }
     }
+
+    fn notify(&self) {
+        self.catalog.send_modify(|revision| *revision += 1);
+    }
+}
+
+fn now_millis() -> u64 {
+    // A pre-epoch system clock cannot be represented by the unsigned wire timestamp.
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |time| time.as_millis() as u64)
+}
+
+fn record_activity(state: &mut Control) {
+    // A wall-clock adjustment must not make a later observed update appear older.
+    state.last_activity_at = Some(now_millis().max(state.last_activity_at.unwrap_or(0)));
+}
+
+fn prompt_title(blocks: &[v2::ContentBlock]) -> Option<String> {
+    blocks.iter().find_map(|block| {
+        let v2::ContentBlock::Text(text) = block else {
+            return None;
+        };
+        let title = text.text.split_whitespace().collect::<Vec<_>>().join(" ");
+        (!title.is_empty()).then(|| title.chars().take(120).collect())
+    })
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSummary {
+    session_id: String,
+    cwd: v2::AbsolutePath,
+    agent: String,
+    title: Option<String>,
+    lifecycle: &'static str,
+    activity: &'static str,
+    last_activity_at: Option<u64>,
+    control_owner: Option<String>,
+    generation: u64,
+    observers: usize,
+}
+
+impl SessionSummary {
+    fn from_entry(id: &str, entry: &Entry, state: &Control) -> Self {
+        Self {
+            session_id: id.to_owned(),
+            cwd: entry.cwd.clone(),
+            agent: entry.profile.clone(),
+            title: state.title.clone(),
+            lifecycle: if state.closing { "closing" } else { "active" },
+            activity: if !state.activity_known {
+                "unknown"
+            } else if state.running {
+                "running"
+            } else {
+                "idle"
+            },
+            last_activity_at: state.last_activity_at,
+            control_owner: state.pilot.clone(),
+            generation: state.generation,
+            observers: state.subscribers.len().saturating_sub(usize::from(
+                state
+                    .pilot
+                    .as_ref()
+                    .is_some_and(|id| state.subscribers.contains_key(id)),
+            )),
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSnapshot {
+    revision: u64,
+    sessions: Vec<SessionSummary>,
 }
 
 fn event_meta(seq: u64) -> v2::Meta {
@@ -229,9 +328,39 @@ pub struct Status {
 impl Broker {
     #[must_use]
     pub fn new(registry: Config) -> Self {
+        let (catalog, _) = watch::channel(0);
         Self {
             registry: Arc::new(registry),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            catalog,
+        }
+    }
+
+    fn snapshot(
+        &self,
+        cwd: Option<&v2::AbsolutePath>,
+    ) -> agent_client_protocol::Result<SessionSnapshot> {
+        loop {
+            let before = *self.catalog.borrow();
+            let sessions = self.sessions.lock().map_err(|_| Error::internal_error())?;
+            let mut summaries = sessions
+                .iter()
+                .filter(|(_, entry)| cwd.is_none_or(|cwd| cwd == &entry.cwd))
+                .map(|(id, entry)| {
+                    let state = entry.control.lock().map_err(|_| Error::internal_error())?;
+                    Ok(SessionSummary::from_entry(id, entry, &state))
+                })
+                .collect::<agent_client_protocol::Result<Vec<_>>>()?;
+            // An owner/activity mutation can interleave between individual control locks.
+            // Retrying ensures the snapshot never claims a revision for mixed states.
+            let after = *self.catalog.borrow();
+            if before == after {
+                summaries.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+                return Ok(SessionSnapshot {
+                    revision: after,
+                    sessions: summaries,
+                });
+            }
         }
     }
 
@@ -282,7 +411,15 @@ impl Broker {
             ));
         }
         // Reserving under the ownership lock prevents two simultaneous prompts from both starting.
+        let previous_activity = state.activity_known;
+        let previous_time = state.last_activity_at;
         state.running = true;
+        state.activity_known = true;
+        record_activity(&mut state);
+        let title = state
+            .title
+            .clone()
+            .or_else(|| prompt_title(&request.prompt));
         state.prompts.insert(
             key.clone(),
             PromptRecord {
@@ -302,8 +439,12 @@ impl Broker {
         {
             state.prompts.remove(&key);
             state.running = false;
+            state.activity_known = previous_activity;
+            state.last_activity_at = previous_time;
             return Err(Error::internal_error().data("agent disconnected; create another session"));
         }
+        state.title = title;
+        state.notify();
         Ok(rx)
     }
 
@@ -343,7 +484,10 @@ impl Broker {
                 )?;
             }
         }
-        state.subscribers.insert(client_id.to_owned(), cx.clone());
+        let attached = state
+            .subscribers
+            .insert(client_id.to_owned(), cx.clone())
+            .is_none();
         if mode != Some("observe") {
             state.generation = state
                 .generation
@@ -352,7 +496,10 @@ impl Broker {
             state.token = uuid::Uuid::new_v4().to_string();
             state.pilot = (mode != Some("relinquish")).then(|| client_id.to_owned());
             let _ = state.changed.send(state.generation);
+            state.notify();
             forward_locked(&mut state, &request.session_id, None)?;
+        } else if attached {
+            state.notify();
         }
         let response = v2::ResumeSessionResponse::new().meta(state.metadata(client_id));
         let control = entry.control.clone();
@@ -361,13 +508,16 @@ impl Broker {
         tokio::spawn(async move {
             cx.incoming_closed().await;
             if let Ok(mut state) = control.lock() {
-                state.subscribers.remove(&subscriber);
+                let removed = state.subscribers.remove(&subscriber).is_some();
                 if state.pilot.as_deref() == Some(&subscriber) {
                     state.pilot = None;
                     state.generation += 1;
                     state.token = uuid::Uuid::new_v4().to_string();
                     let _ = state.changed.send(state.generation);
+                    state.notify();
                     let _ = forward_locked(&mut state, &id, None);
+                } else if removed {
+                    state.notify();
                 }
             }
         });
@@ -400,7 +550,13 @@ impl Broker {
         let entries = self
             .sessions
             .lock()
-            .map(|mut sessions| sessions.drain().map(|(_, entry)| entry).collect::<Vec<_>>())
+            .map(|mut sessions| {
+                let entries = sessions.drain().map(|(_, entry)| entry).collect::<Vec<_>>();
+                if !entries.is_empty() {
+                    self.catalog.send_modify(|revision| *revision += 1);
+                }
+                entries
+            })
             .unwrap_or_default();
         for entry in entries {
             let (reply, received) = oneshot::channel();
@@ -454,11 +610,16 @@ impl Broker {
         let (tx, rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = oneshot::channel();
         let (active_tx, active_rx) = oneshot::channel();
-        let control = Arc::new(Mutex::new(Control::new(client_id.clone(), gateway)));
+        let control = Arc::new(Mutex::new(Control::new(
+            client_id.clone(),
+            gateway,
+            self.catalog.clone(),
+        )));
         let cwd = request.cwd.clone();
         let entry_control = control.clone();
         let id = hive_id.clone();
         let sessions = self.sessions.clone();
+        let catalog = self.catalog.clone();
         // Each session owns its subprocess: no guessed transport support or duplicate probing.
         let task = tokio::spawn(async move {
             if provider.preferred_version() == AgentVersion::V1 {
@@ -483,8 +644,10 @@ impl Broker {
                 .await;
             }
             // A crashed or closed subprocess must not remain advertised as active.
-            if let Ok(mut sessions) = sessions.lock() {
-                sessions.remove(&id.to_string());
+            if let Ok(mut sessions) = sessions.lock()
+                && sessions.remove(&id.to_string()).is_some()
+            {
+                catalog.send_modify(|revision| *revision += 1);
             }
         });
         let entry = Entry {
@@ -503,23 +666,27 @@ impl Broker {
             tokio::spawn(async move {
                 cx.incoming_closed().await;
                 if let Ok(mut state) = control.lock() {
-                    state.subscribers.remove(&subscriber);
+                    let removed = state.subscribers.remove(&subscriber).is_some();
                     if state.pilot.as_deref() == Some(&subscriber) {
                         state.pilot = None;
                         state.generation += 1;
                         state.token = uuid::Uuid::new_v4().to_string();
                         let _ = state.changed.send(state.generation);
+                        state.notify();
                         let _ = forward_locked(&mut state, &id, None);
+                    } else if removed {
+                        state.notify();
                     }
                 }
             });
         }
         match tokio::time::timeout(std::time::Duration::from_secs(15), ready_rx).await {
             Ok(Ok(Ok(mut response))) => {
-                self.sessions
-                    .lock()
-                    .map_err(|_| Error::internal_error())?
-                    .insert(hive_id.to_string(), entry);
+                {
+                    let mut sessions = self.sessions.lock().map_err(|_| Error::internal_error())?;
+                    sessions.insert(hive_id.to_string(), entry);
+                    self.catalog.send_modify(|revision| *revision += 1);
+                }
                 let _ = active_tx.send(());
                 response.session_id = hive_id;
                 response.meta = Some(
@@ -562,11 +729,21 @@ fn forward_locked(
     id: &v2::SessionId,
     update: Option<v2::SessionUpdate>,
 ) -> agent_client_protocol::Result<()> {
+    let is_agent_update = update.is_some();
     let update = update.unwrap_or_else(|| state.status_update());
+    if is_agent_update {
+        record_activity(state);
+    }
     if let v2::SessionUpdate::StateUpdate(status) = &update {
         match status {
-            v2::StateUpdate::Running(_) => state.running = true,
-            v2::StateUpdate::Idle(_) => state.running = false,
+            v2::StateUpdate::Running(_) => {
+                state.running = true;
+                state.activity_known = true;
+            }
+            v2::StateUpdate::Idle(_) => {
+                state.running = false;
+                state.activity_known = true;
+            }
             _ => {}
         }
     }
@@ -577,6 +754,7 @@ fn forward_locked(
     }
     state.events.push_back((seq, update.clone()));
     // A broken observer cannot interrupt the downstream worker or other subscribers.
+    let subscribers = state.subscribers.len();
     state.subscribers.retain(|_, gateway| {
         gateway
             .send_notification(
@@ -585,6 +763,9 @@ fn forward_locked(
             )
             .is_ok()
     });
+    if is_agent_update || subscribers != state.subscribers.len() {
+        state.notify();
+    }
     Ok(())
 }
 
@@ -821,7 +1002,7 @@ async fn run_agent(
                             if state.generation != generation {
                                 drop(state);
                                 complete(&control, &key, Err("controller was superseded before prompt dispatch; resume with a new key".into()));
-                                if let Ok(mut state) = control.lock() { state.running = false; }
+                                if let Ok(mut state) = control.lock() { state.running = false; state.notify(); }
                                 continue;
                             }
                             // Publication under the lock defines the dispatch-before-handoff order.
@@ -1038,7 +1219,7 @@ async fn run_v1_agent(
                     Command::Prompt(request, generation, key) => {
                         if !current(&control, generation) {
                             complete(&control, &key, Err("controller was superseded before prompt dispatch; resume with a new key".into()));
-                            if let Ok(mut state) = control.lock() { state.running = false; }
+                            if let Ok(mut state) = control.lock() { state.running = false; state.notify(); }
                             continue;
                         }
                         let id = v2::MessageId::new(format!("hive-v1-{}", uuid::Uuid::new_v4()));
@@ -1054,7 +1235,7 @@ async fn run_v1_agent(
                             .collect::<Result<Vec<_>, _>>();
                         let Ok(blocks) = blocks else {
                             complete(&control, &key, Err("unsupported v2 prompt content for v1 agent".into()));
-                            if let Ok(mut state) = control.lock() { state.running = false; }
+                            if let Ok(mut state) = control.lock() { state.running = false; state.notify(); }
                             continue;
                         };
                         if let Ok(mut current) = message_id.lock() { *current = Some(v2::MessageId::new(format!("v1-agent-{}", uuid::Uuid::new_v4()))); }
@@ -1173,6 +1354,40 @@ pub fn router_with_origin(broker: Broker, origin: Option<&str>) -> Router {
             }),
         )
         .route(
+            "/hive/v1/sessions",
+            get({
+                let broker = broker.clone();
+                move || {
+                    let broker = broker.clone();
+                    async move {
+                        broker
+                            .snapshot(None)
+                            .map(Json)
+                            .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+                    }
+                }
+            }),
+        )
+        .route(
+            "/hive/v1/sessions/events",
+            get({
+                let broker = broker.clone();
+                move || {
+                    let catalog = broker.catalog.subscribe();
+                    async move {
+                        Sse::new(WatchStream::new(catalog).map(|revision| {
+                            Ok::<Event, Infallible>(
+                                Event::default()
+                                    .event("revision")
+                                    .id(revision.to_string())
+                                    .data(revision.to_string()),
+                            )
+                        }))
+                    }
+                }
+            }),
+        )
+        .route(
             "/hive/v1/web",
             get(|| async { Html(include_str!("../../../clients/hive-web/index.html")) }),
         )
@@ -1250,27 +1465,24 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
                 async move |request: v2::ListSessionsRequest,
                             responder: Responder<v2::ListSessionsResponse>,
                             _cx: V2ConnectionTo<Client>| {
-                    let entries = broker
+                    let snapshot = broker.snapshot(request.cwd.as_ref())?;
+                    let entries = snapshot
                         .sessions
-                        .lock()
-                        .map_err(|_| Error::internal_error())?
-                        .iter()
-                        .filter(|(_, entry)| {
-                            request.cwd.as_ref().is_none_or(|cwd| cwd == &entry.cwd)
-                        })
-                        .map(|(id, entry)| {
-                            let state = entry.control.lock().expect("session state is not poisoned");
+                        .into_iter()
+                        .map(|summary| {
                             let mut meta = v2::Meta::new();
-                            meta.insert("hive".into(), serde_json::json!({
-                                "agent": entry.profile, "running": state.running,
-                                "pilot": state.pilot.is_some(), "generation": state.generation,
-                                "observers": state.subscribers.len().saturating_sub(usize::from(state.pilot.as_ref().is_some_and(|id| state.subscribers.contains_key(id)))),
-                            }));
-                            v2::SessionInfo::new(v2::SessionId::new(id.clone()), entry.cwd.clone()).meta(meta)
+                            let mut hive = serde_json::to_value(&summary)
+                                .map_err(Error::into_internal_error)?;
+                            hive["running"] = serde_json::json!(summary.activity == "running");
+                            hive["pilot"] = serde_json::json!(summary.control_owner.is_some());
+                            meta.insert("hive".into(), hive);
+                            Ok(v2::SessionInfo::new(
+                                v2::SessionId::new(summary.session_id),
+                                summary.cwd,
+                            )
+                            .meta(meta))
                         })
-                        .collect::<Vec<_>>();
-                    let mut entries = entries;
-                    entries.sort_by_key(|entry| entry.session_id.to_string());
+                        .collect::<agent_client_protocol::Result<Vec<_>>>()?;
                     responder.respond(v2::ListSessionsResponse::new(entries))
                 }
             },
@@ -1322,19 +1534,24 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
                                 Error::internal_error().data("agent disconnected during close")
                             );
                         }
+                        state.notify();
                     }
                     match received.await {
                         Ok(Ok(())) => {
-                            broker
+                            let mut sessions = broker
                                 .sessions
                                 .lock()
-                                .map_err(|_| Error::internal_error())?
-                                .remove(&request.session_id.to_string());
+                                .map_err(|_| Error::internal_error())?;
+                            if sessions.remove(&request.session_id.to_string()).is_some() {
+                                broker.catalog.send_modify(|revision| *revision += 1);
+                            }
+                            drop(sessions);
                             responder.respond(v2::CloseSessionResponse::new())
                         }
                         _ => {
                             if let Ok(mut state) = entry.control.lock() {
                                 state.closing = false;
+                                state.notify();
                             }
                             responder.respond_with_error(
                                 Error::internal_error().data("agent could not close session"),
@@ -1496,6 +1713,7 @@ mod control_tests {
 
     fn detached() -> Control {
         let (changed, _) = watch::channel(1);
+        let (catalog, _) = watch::channel(0);
         Control {
             generation: 1,
             token: "first".into(),
@@ -1505,9 +1723,67 @@ mod control_tests {
             next_seq: 1,
             events: VecDeque::new(),
             running: false,
+            activity_known: false,
+            title: None,
+            last_activity_at: None,
+            catalog,
             closing: false,
             prompts: HashMap::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn an_unreported_agent_state_remains_unknown_until_a_status_update_arrives() {
+        let (commands, _) = mpsc::unbounded_channel();
+        let worker = tokio::spawn(async {});
+        let entry = Entry {
+            cwd: v2::AbsolutePath::new(std::env::current_dir().unwrap()),
+            profile: "mock".into(),
+            abort: worker.abort_handle(),
+            commands,
+            control: Arc::new(Mutex::new(detached())),
+        };
+        let mut state = entry.control.lock().unwrap();
+        let initial = SessionSummary::from_entry("hive-test", &entry, &state);
+        assert_eq!(initial.activity, "unknown");
+        assert_eq!(initial.last_activity_at, None);
+        assert_eq!(initial.control_owner.as_deref(), Some("test"));
+        forward_locked(
+            &mut state,
+            &v2::SessionId::new("hive-test"),
+            Some(v2::SessionUpdate::StateUpdate(v2::StateUpdate::Running(
+                v2::RunningStateUpdate::new(),
+            ))),
+        )
+        .unwrap();
+        let running = SessionSummary::from_entry("hive-test", &entry, &state);
+        assert_eq!(running.activity, "running");
+        assert!(running.last_activity_at.is_some());
+        forward_locked(
+            &mut state,
+            &v2::SessionId::new("hive-test"),
+            Some(v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(
+                v2::IdleStateUpdate::new(),
+            ))),
+        )
+        .unwrap();
+        let idle = SessionSummary::from_entry("hive-test", &entry, &state);
+        assert_eq!(idle.activity, "idle");
+        assert!(idle.last_activity_at >= running.last_activity_at);
+    }
+
+    #[test]
+    fn the_first_meaningful_prompt_text_becomes_a_bounded_title() {
+        let blocks = vec![
+            v2::ContentBlock::Text(v2::TextContent::new("  \n  ")),
+            v2::ContentBlock::Text(v2::TextContent::new(format!(
+                "  {}   task  ",
+                "a".repeat(130)
+            ))),
+        ];
+        let title = prompt_title(&blocks).unwrap();
+        assert_eq!(title.chars().count(), 120);
+        assert!(!title.contains(' '));
     }
 
     #[test]

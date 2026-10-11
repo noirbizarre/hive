@@ -2,6 +2,18 @@ use std::time::Duration;
 
 use tokio::time::timeout;
 
+#[test]
+fn redirected_help_stays_readable_without_terminal_escape_codes() {
+    for args in [vec!["--help"], vec!["daemon", "--help"]] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_hive"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(!output.stdout.contains(&b'\x1b'));
+    }
+}
+
 #[tokio::test]
 async fn a_second_daemon_cannot_start_on_another_port_for_the_same_user() {
     let runtime = std::env::temp_dir().join(format!("hive-instance-{}", uuid::Uuid::new_v4()));

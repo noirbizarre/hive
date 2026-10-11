@@ -1,15 +1,26 @@
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
+use clap::builder::styling::{AnsiColor, Styles};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
 use hive_daemon::config::Config;
 use hive_tui::Options as TuiOptions;
 
+const HELP_STYLES: Styles = Styles::styled()
+    .header(AnsiColor::Cyan.on_default().bold())
+    .usage(AnsiColor::Cyan.on_default().bold())
+    .literal(AnsiColor::Blue.on_default().bold())
+    .placeholder(AnsiColor::Yellow.on_default())
+    .valid(AnsiColor::Green.on_default())
+    .invalid(AnsiColor::Red.on_default())
+    .error(AnsiColor::Red.on_default().bold());
+
 #[derive(Parser)]
 #[command(
     name = "hive",
     version,
-    about = "Local ACPv2 gateway for coding agents"
+    about = "Local ACPv2 gateway for coding agents",
+    styles = HELP_STYLES
 )]
 struct Cli {
     #[command(flatten)]
@@ -155,6 +166,7 @@ async fn main() -> miette::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::ColorChoice;
     use clap::error::ErrorKind;
 
     #[test]
@@ -228,6 +240,27 @@ mod tests {
                 ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
             ));
         }
+    }
+
+    #[test]
+    fn colored_help_reaches_subcommands_but_can_be_rendered_without_escapes() {
+        let colored = Cli::command()
+            .color(ColorChoice::Always)
+            .try_get_matches_from(["hive", "daemon", "--help"])
+            .unwrap_err()
+            .render()
+            .ansi()
+            .to_string();
+        assert!(colored.contains("\x1b["));
+        assert!(colored.contains("--listen"));
+
+        let plain = Cli::command()
+            .color(ColorChoice::Never)
+            .try_get_matches_from(["hive", "daemon", "--help"])
+            .unwrap_err()
+            .to_string();
+        assert!(!plain.contains("\x1b["));
+        assert!(plain.contains("--listen"));
     }
 
     #[test]

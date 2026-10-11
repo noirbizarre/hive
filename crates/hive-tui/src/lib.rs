@@ -10,7 +10,7 @@ use agent_client_protocol::{
     Agent, Client, Error, V2ConnectionTo,
     schema::{ProtocolVersion, v2},
 };
-use clap::Parser;
+use clap::Args;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
@@ -21,16 +21,16 @@ use tokio::sync::{mpsc, oneshot};
 
 use ui::{App, Page};
 
-#[derive(Parser)]
-struct Options {
+#[derive(Args, Clone, Debug)]
+pub struct Options {
     #[arg(long, default_value = "127.0.0.1:8765")]
-    address: String,
+    pub address: String,
     #[arg(long, default_value = "ws", value_parser = ["ws", "http"])]
-    transport: String,
+    pub transport: String,
     #[arg(long)]
-    agent: Option<String>,
+    pub agent: Option<String>,
     #[arg(long)]
-    session: Option<String>,
+    pub session: Option<String>,
 }
 
 enum Interaction {
@@ -487,9 +487,7 @@ async fn handle_key(
     false
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let options = Options::parse();
+pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut app = App {
         cwd: std::env::current_dir()?,
         ..App::default()

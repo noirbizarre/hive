@@ -68,6 +68,7 @@ fs2 = "0.4"
 toml = "1.1"
 axum = "0.8"
 clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
 miette = { version = "7", features = ["fancy"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 serde = { version = "1", features = ["derive"] }
@@ -77,5 +78,6 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
+webbrowser = "1"
 ratatui = "0.30.2"
 crossterm = "0.29"

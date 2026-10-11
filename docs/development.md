@@ -21,7 +21,7 @@ not replace a live Zellij host integration run.
 
 The daemon refuses non-loopback listener addresses. The default is
 `127.0.0.1:8765`; use `--listen` / `HIVE_LISTEN` for a different loopback
-address. `hive serve` needs no agent argument: it loads profiles from
+address. `hive daemon` needs no agent argument: it loads profiles from
 `$XDG_CONFIG_HOME/hive/config.toml`, falling back to `~/.config/hive/config.toml`,
 or accepts `--config` / `HIVE_CONFIG`. `HIVE_DEFAULT_AGENT` overrides the optional
 `default_agent` setting. Profiles declare `command`, `args`, `env`, or an
@@ -35,7 +35,8 @@ and is released on process exit. In-memory state is lost on daemon restart.
 ## Real-agent compatibility probes
 
 The mock gateway test (`cargo test -p hive-daemon --test gateway`) is the
-deterministic CI baseline. `crates/hive-daemon/tests/real_agents.rs` contains
+deterministic CI baseline. CLI lifecycle and status checks live in
+`cargo test -p hive-cli --test daemon`. `crates/hive-daemon/tests/real_agents.rs` contains
 four **ignored** tests, independently selectable for Pi or OpenCode. They run
 only with an explicit `HIVE_REAL_PI=1` or `HIVE_REAL_OPENCODE=1` opt-in; missing
 binary/version, Pi ACP entrypoint, or native session ID prints `SKIP` with the missing

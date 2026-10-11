@@ -231,8 +231,14 @@ run = "cargo build -p hive-zellij --target wasm32-wasip1"
 
 [tasks."hive:tui"]
 description = "Run the Hive TUI"
-run = "cargo run -p hive-tui"
+run = "cargo run -p hive-cli -- tui"
 
 [tasks."hive:daemon"]
 description = "Run the Hive Daemon"
-run = "cargo run -p hive-daemon --bin hive"
+run = "cargo run -p hive-cli -- daemon"
+
+[tasks.cli]
+description = "Run the Hive CLI"
+run = "cargo run -p hive-cli --"
+alias = "hive"
+raw_args = true

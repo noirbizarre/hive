@@ -7,6 +7,8 @@ per-session GET SSE streams form the HTTP alternative. Both create the same
 v2 agent handlers against the same broker. `/hive/v1/*` contains operational
 HTTP endpoints and a same-origin browser asset route, not session RPC methods.
 
+The `hive` executable lives in `crates/hive-cli` and depends on the daemon and
+TUI crates; neither library depends on the CLI or on the other.
 `hive-core` defines transport-free Hive session IDs and lifecycle vocabulary.
 `hive-protocol` pins SDK integration and shared native status access. The daemon
 owns a registry of inert agent profiles loaded from one XDG TOML file, and the
@@ -48,6 +50,6 @@ or remote security policy is provided. Each attached observer receives live
 updates but never an ownership token. Pending permission/elicitation requests
 follow the pilot across takeovers and expire if nobody answers.
 The daemon exclusively locks a private per-user runtime file before binding;
-another `hive serve` invocation cannot own a different port for the same user.
+another `hive daemon` invocation cannot own a different port for the same user.
 Both ACP session access and Hive administration are loopback-only, with no
 per-client authentication; an untrusted local process can access both.

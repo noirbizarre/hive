@@ -1,0 +1,25 @@
+[package]
+name = "hive-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "hive"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+clap_complete = { workspace = true }
+hive-daemon = { path = "../hive-daemon" }
+hive-tui = { path = "../hive-tui" }
+miette = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+tracing-subscriber = { workspace = true }
+webbrowser = { workspace = true }
+
+[dev-dependencies]
+uuid = { workspace = true }

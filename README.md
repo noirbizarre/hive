@@ -30,7 +30,11 @@ for a single trusted local user, not a remotely accessible multi-user service.
 ## Installation
 
 Install Rust (the pinned stable toolchain), then `mise install` for the template
-tools. Build with `mise run build` or `cargo build --workspace`.
+tools. From a checkout, install the CLI with
+`cargo install --path crates/hive-cli --bin hive`; this installs only `hive`,
+not the development-only test agent. For development, build the workspace with
+`mise run build` or `cargo build --workspace` and use
+`cargo run -p hive-cli -- <arguments>` instead of `hive` below.
 
 Create `$XDG_CONFIG_HOME/hive/config.toml` (or `~/.config/hive/config.toml`):
 
@@ -56,15 +60,28 @@ profile. `HIVE_DEFAULT_AGENT` overrides `default_agent`, `HIVE_CONFIG` or
 `--config` chooses a different file, and `HIVE_LISTEN` overrides the loopback
 listen address.
 
-Start the daemon once:
+Start the daemon once in the foreground:
 
 ```sh
-cargo run -p hive-daemon --bin hive -- serve
+hive daemon
 ```
 
-In another terminal run `cargo run -p hive-daemon --bin hive -- status` and
-`cargo run -p hive-tui`. The web client is served at
-<http://127.0.0.1:8765/hive/v1/web>. Build the Zellij plugin separately with
+In another terminal run `hive daemon status`, then `hive` (or `hive tui`) to
+launch the TUI. `hive web` opens the daemon-served browser client at
+<http://127.0.0.1:8765/hive/v1/web>. Use `hive daemon --listen` to choose a
+different loopback address and `hive daemon --config` for another profile file;
+`hive daemon status --url` and `hive web --url` select a different daemon URL
+(also supported by `HIVE_URL`, falling back to `HIVE_LISTEN`). Set
+`hive --address` or `hive tui --address` to connect the TUI to a non-default
+daemon, and `--transport http` to use HTTP/SSE instead of WebSocket. The legacy
+`hive serve` and `hive status` commands remain available as aliases.
+
+Generate shell completions with `hive completions bash` or
+`hive completions zsh`, redirecting the output to your shell's completion
+directory (for example, `~/.local/share/bash-completion/completions/hive` for
+Bash). Run `hive completions --help` for other supported shells.
+
+Build the Zellij plugin separately with
 `cargo build -p hive-zellij --target wasm32-wasip1`, then load
 `target/wasm32-wasip1/debug/hive_zellij.wasm` through Zellij's plugin loader;
 grant its WebAccess permission. Configure its `url` setting for a non-default
@@ -87,7 +104,7 @@ to select the configured default. Query `/hive/v1/providers` for agent IDs.
 
 For a key-free local smoke test, build `hive-mock-agent`, set an agent profile
 with `command = "./target/debug/hive-mock-agent"` and `versions = ["v2"]`,
-then run the same `hive serve` command.
+then run the same `hive daemon` command.
 
 Tests: `mise run test`, `mise run cover`, and `mise run ci`. The focused
 end-to-end test is `cargo test -p hive-daemon --test gateway`.

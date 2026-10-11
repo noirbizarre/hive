@@ -10,8 +10,12 @@ Implemented v2 operations: initialize, session/new, list, resume, close,
 prompt, cancel and session/update. A prompt response acknowledges acceptance;
 observe `running` then `idle` for work completion. Only text prompts are
 adapted to v1. V1 message chunks are forwarded with a synthetic v2 message
-ID; its completed prompt response generates a v2 idle update. V2-only tool,
-permission, MCP bridge, forks, config options, compaction and other optional
+ID; its completed prompt response generates a v2 idle update. V1 tool calls
+are preserved as `_hive_v1_tool_call`/`_hive_v1_tool_update` events; permissions
+and supported elicitation are forwarded to the pilot. V2 permissions and
+session-scoped form/URL elicitation are forwarded to the pilot with a 120-second
+unanswered-request timeout. Request-scoped/unknown elicitation modes are
+cancelled. MCP bridge, forks, config options, compaction and other optional
 capabilities are **not** advertised. Non-text v1 prompts return an error.
 
 ACPv2 `session/new` has no standard agent selector. Hive reserves
@@ -63,10 +67,10 @@ For both agents, Hive's upstream ACPv2 resume is guaranteed by deterministic
 mock tests **only for an existing live Hive session**; native session adoption
 through Hive and daemon-restart recovery are unsupported. Direct native ACP
 `session/load` (v1) or `session/resume` (v2) probes bypass Hive and must be
-recorded independently. Hive currently cancels downstream v2 permission
-requests rather than forwarding them; v1 translates text chunks and cancel but
-not the optional tool, permission, or user-input protocols. A tool-free probe
-does not establish support for those optional features. See
+recorded independently. Hive forwards downstream permissions and supported
+elicitation modes to the current pilot; this is covered by scripted agents,
+not by either installed product row. A tool-free probe does not establish
+support for those optional features. See
 [the reproducible probes](development.md#real-agent-compatibility-probes).
 
 The draft [v2 specification](https://github.com/agentclientprotocol/agent-client-protocol/tree/main/docs/protocol/v2)
@@ -76,11 +80,14 @@ and [HTTP guide](https://github.com/agentclientprotocol/rust-sdk/blob/main/md/ht
 ACPv2 does not specify transferable control, command idempotency, or a
 standard event sequence cursor. Hive extends `_meta.hive` on its upstream
 requests/responses/notifications; it strips that metadata before forwarding
-downstream. A new session returns `generation`, opaque `token`, `nextSeq`, and
-`running` in response `_meta.hive`. Resuming a Hive session atomically takes
-control, returns fresh ownership metadata and the current running flag, and
-optionally replays retained events before returning. No implicit new prompt is
-sent. TUI `--session hive-…` and WebUI's session-ID form use this same contract.
+downstream. A new session returns `generation`, opaque `token`, `nextSeq`,
+`running`, `pilot: true` and `role: "pilot"` in response `_meta.hive`. Default
+resume takes pilot control. `_meta.hive.mode: "observe"` attaches read-only;
+`_meta.hive.mode: "relinquish"` requires the pilot's generation/token and makes
+it an observer, leaving no pilot until explicit takeover. Both modes optionally
+replay retained events before returning. Observer responses have no token.
+No implicit new prompt is sent. TUI `--session hive-…` and WebUI's session-ID
+form use this same contract.
 For example, after `session/new` returns a session ID and
 `"_meta":{"hive":{"generation":1,"token":"opaque","nextSeq":1,"running":false}}`,
 the controller can send:
@@ -95,10 +102,18 @@ On another connection, take over that ID (with the original `cwd`):
 {"sessionId":"hive-…","cwd":"/workspace","replayFrom":{"type":"_hive_seq","seq":8}}
 ```
 
-The resume response returns a new generation/token; use those for subsequent
+The pilot resume response returns a new generation/token; use those for subsequent
 commands. `session/cancel` and `session/close` carry the same ownership fields
 without a prompt key. Tokens are local control credentials: do not forward
 them to downstream agents or print them in client logs.
+
+To observe without taking control, send the same resume request with
+`"_meta":{"hive":{"mode":"observe"}}`. The pilot can relinquish without
+disconnecting by sending `"_meta":{"hive":{"mode":"relinquish", "generation":N,
+"token":"opaque"}}` in `session/resume`. Both receive live updates; another
+client sends default `session/resume` to become pilot. Agent permission and
+elicitation requests are addressed to the current pilot only, and are
+re-presented after takeover if still pending.
 
 Every upstream `session/prompt` and `session/close` request and `session/cancel`
 notification needs `_meta.hive.generation` and `_meta.hive.token` from the
@@ -106,9 +121,12 @@ latest successful new/resume response. Missing or stale owners receive an
 actionable error for requests; cancel is a JSON-RPC notification, so a stale
 cancel is discarded and cannot carry an error response. A subsequent resume
 rotates ownership even when the old connection is still alive. A disconnected
-controller is not automatically timed out: another client may explicitly take
-over. A close is explicit and cannot be issued while work is active; client
-detach does not close the session or cancel the agent. A second distinct prompt
+pilot relinquishes control; another client must explicitly take over. All
+attached clients receive live updates, including a sequenced `_hive_control`
+event with `generation` and pilot presence but no token. `session/list` includes
+profile, running, generation, pilot presence and observer count in each entry's
+`_meta.hive`. A close is explicit and cannot be issued while work is active;
+client detach does not close the session or cancel the agent. A second distinct prompt
 is rejected until the agent sends `idle` (not merely until its prompt response).
 
 Prompts additionally require `_meta.hive.key`, a nonempty client-generated

@@ -1,7 +1,7 @@
 //! Loopback ACPv2 gateway with a shared, in-memory session broker.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     fs::{File, OpenOptions},
     future::IntoFuture,
     net::SocketAddr,
@@ -20,7 +20,7 @@ use fs2::FileExt;
 use hive_core::SessionId;
 use hive_protocol::{AcpHttpServer, AgentVersion};
 use serde::Serialize;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 pub mod config;
 use config::{Config, Profile};
@@ -84,7 +84,9 @@ struct Entry {
 struct Control {
     generation: u64,
     token: String,
-    gateway: Option<V2ConnectionTo<Client>>,
+    pilot: Option<String>,
+    subscribers: HashMap<String, V2ConnectionTo<Client>>,
+    changed: watch::Sender<u64>,
     next_seq: u64,
     events: VecDeque<(u64, v2::SessionUpdate)>,
     running: bool,
@@ -105,11 +107,14 @@ enum Command {
 }
 
 impl Control {
-    fn new(gateway: V2ConnectionTo<Client>) -> Self {
+    fn new(client_id: String, gateway: V2ConnectionTo<Client>) -> Self {
+        let (changed, _) = watch::channel(1);
         Self {
             generation: 1,
             token: uuid::Uuid::new_v4().to_string(),
-            gateway: Some(gateway),
+            pilot: Some(client_id.clone()),
+            subscribers: HashMap::from([(client_id, gateway)]),
+            changed,
             next_seq: 1,
             events: VecDeque::new(),
             running: false,
@@ -118,24 +123,38 @@ impl Control {
         }
     }
 
-    fn metadata(&self) -> v2::Meta {
+    fn metadata(&self, client_id: &str) -> v2::Meta {
         let mut meta = v2::Meta::new();
-        meta.insert(
-            "hive".into(),
-            serde_json::json!({
-                "generation": self.generation, "token": self.token,
-                "nextSeq": self.next_seq, "running": self.running,
-            }),
-        );
+        let mut hive = serde_json::json!({
+            "generation": self.generation, "nextSeq": self.next_seq,
+            "running": self.running, "pilot": self.pilot.is_some(),
+            "role": if self.pilot.as_deref() == Some(client_id) { "pilot" } else { "observer" },
+        });
+        // Observers must never receive the credential that authorizes mutations.
+        if self.pilot.as_deref() == Some(client_id) {
+            hive["token"] = serde_json::json!(self.token);
+        }
+        meta.insert("hive".into(), hive);
         meta
     }
 
-    fn owner(&self, meta: Option<&v2::Meta>) -> agent_client_protocol::Result<()> {
+    fn status_update(&self) -> v2::SessionUpdate {
+        v2::SessionUpdate::Other(v2::OtherSessionUpdate::new(
+            "_hive_control",
+            BTreeMap::from([
+                ("generation".into(), serde_json::json!(self.generation)),
+                ("pilot".into(), serde_json::json!(self.pilot.is_some())),
+            ]),
+        ))
+    }
+
+    fn owner(&self, client_id: &str, meta: Option<&v2::Meta>) -> agent_client_protocol::Result<()> {
         let hive = meta.and_then(|meta| meta.get("hive"));
-        if hive
-            .and_then(|hive| hive.get("generation"))
-            .and_then(serde_json::Value::as_u64)
-            != Some(self.generation)
+        if self.pilot.as_deref() != Some(client_id)
+            || hive
+                .and_then(|hive| hive.get("generation"))
+                .and_then(serde_json::Value::as_u64)
+                != Some(self.generation)
             || hive
                 .and_then(|hive| hive.get("token"))
                 .and_then(serde_json::Value::as_str)
@@ -227,11 +246,12 @@ impl Broker {
 
     fn prompt(
         &self,
+        client_id: &str,
         mut request: v2::PromptRequest,
     ) -> agent_client_protocol::Result<oneshot::Receiver<Result<v2::PromptResponse, String>>> {
         let entry = self.entry(&request.session_id)?;
         let mut state = entry.control.lock().map_err(|_| Error::internal_error())?;
-        state.owner(request.meta.as_ref())?;
+        state.owner(client_id, request.meta.as_ref())?;
         let key = request
             .meta
             .as_ref()
@@ -290,6 +310,7 @@ impl Broker {
     fn resume(
         &self,
         request: v2::ResumeSessionRequest,
+        client_id: &str,
         cx: V2ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<v2::ResumeSessionResponse> {
         let entry = self.entry(&request.session_id)?;
@@ -301,6 +322,18 @@ impl Broker {
             return Err(Error::invalid_request().data("session is closing; select another session"));
         }
         let from = replay_start(&state, request.replay_from.as_ref())?;
+        let hive = request.meta.as_ref().and_then(|meta| meta.get("hive"));
+        let mode = hive
+            .and_then(|hive| hive.get("mode"))
+            .and_then(serde_json::Value::as_str);
+        if !matches!(mode, None | Some("observe") | Some("relinquish")) {
+            return Err(
+                Error::invalid_params().data("_meta.hive.mode must be observe or relinquish")
+            );
+        }
+        if mode == Some("relinquish") {
+            state.owner(client_id, request.meta.as_ref())?;
+        }
         // Keep replay and live forwarding in one critical section: no update can cross this boundary twice.
         if let Some(from) = from {
             for (seq, update) in state.events.iter().filter(|(seq, _)| *seq >= from) {
@@ -310,21 +343,32 @@ impl Broker {
                 )?;
             }
         }
-        state.generation = state
-            .generation
-            .checked_add(1)
-            .ok_or_else(Error::internal_error)?;
-        state.token = uuid::Uuid::new_v4().to_string();
-        state.gateway = Some(cx.clone());
-        let response = v2::ResumeSessionResponse::new().meta(state.metadata());
-        let generation = state.generation;
+        state.subscribers.insert(client_id.to_owned(), cx.clone());
+        if mode != Some("observe") {
+            state.generation = state
+                .generation
+                .checked_add(1)
+                .ok_or_else(Error::internal_error)?;
+            state.token = uuid::Uuid::new_v4().to_string();
+            state.pilot = (mode != Some("relinquish")).then(|| client_id.to_owned());
+            let _ = state.changed.send(state.generation);
+            forward_locked(&mut state, &request.session_id, None)?;
+        }
+        let response = v2::ResumeSessionResponse::new().meta(state.metadata(client_id));
         let control = entry.control.clone();
+        let id = request.session_id.clone();
+        let subscriber = client_id.to_owned();
         tokio::spawn(async move {
             cx.incoming_closed().await;
-            if let Ok(mut state) = control.lock()
-                && state.generation == generation
-            {
-                state.gateway = None;
+            if let Ok(mut state) = control.lock() {
+                state.subscribers.remove(&subscriber);
+                if state.pilot.as_deref() == Some(&subscriber) {
+                    state.pilot = None;
+                    state.generation += 1;
+                    state.token = uuid::Uuid::new_v4().to_string();
+                    let _ = state.changed.send(state.generation);
+                    let _ = forward_locked(&mut state, &id, None);
+                }
             }
         });
         Ok(response)
@@ -372,6 +416,7 @@ impl Broker {
     async fn create(
         &self,
         mut request: v2::NewSessionRequest,
+        client_id: String,
         gateway: V2ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<v2::NewSessionResponse> {
         let requested = request.meta.as_mut().and_then(|meta| meta.get_mut("hive"));
@@ -409,7 +454,7 @@ impl Broker {
         let (tx, rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = oneshot::channel();
         let (active_tx, active_rx) = oneshot::channel();
-        let control = Arc::new(Mutex::new(Control::new(gateway)));
+        let control = Arc::new(Mutex::new(Control::new(client_id.clone(), gateway)));
         let cwd = request.cwd.clone();
         let entry_control = control.clone();
         let id = hive_id.clone();
@@ -450,15 +495,22 @@ impl Broker {
             control: entry_control.clone(),
         };
         if let Ok(state) = entry_control.lock()
-            && let Some(cx) = state.gateway.clone()
+            && let Some(cx) = state.subscribers.get(&client_id).cloned()
         {
             let control = entry_control.clone();
+            let subscriber = client_id.clone();
+            let id = hive_id.clone();
             tokio::spawn(async move {
                 cx.incoming_closed().await;
-                if let Ok(mut state) = control.lock()
-                    && state.generation == 1
-                {
-                    state.gateway = None;
+                if let Ok(mut state) = control.lock() {
+                    state.subscribers.remove(&subscriber);
+                    if state.pilot.as_deref() == Some(&subscriber) {
+                        state.pilot = None;
+                        state.generation += 1;
+                        state.token = uuid::Uuid::new_v4().to_string();
+                        let _ = state.changed.send(state.generation);
+                        let _ = forward_locked(&mut state, &id, None);
+                    }
                 }
             });
         }
@@ -474,7 +526,7 @@ impl Broker {
                     entry_control
                         .lock()
                         .map_err(|_| Error::internal_error())?
-                        .metadata(),
+                        .metadata(&client_id),
                 );
                 Ok(response)
             }
@@ -502,6 +554,15 @@ fn forward(
     update: v2::SessionUpdate,
 ) -> agent_client_protocol::Result<()> {
     let mut state = control.lock().map_err(|_| Error::internal_error())?;
+    forward_locked(&mut state, id, Some(update))
+}
+
+fn forward_locked(
+    state: &mut Control,
+    id: &v2::SessionId,
+    update: Option<v2::SessionUpdate>,
+) -> agent_client_protocol::Result<()> {
+    let update = update.unwrap_or_else(|| state.status_update());
     if let v2::SessionUpdate::StateUpdate(status) = &update {
         match status {
             v2::StateUpdate::Running(_) => state.running = true,
@@ -515,15 +576,15 @@ fn forward(
         state.events.pop_front();
     }
     state.events.push_back((seq, update.clone()));
-    if let Some(gateway) = &state.gateway {
-        let sent = gateway.send_notification(
-            v2::UpdateSessionNotification::new(id.clone(), update).meta(event_meta(seq)),
-        );
-        // Dropped client streams must never stop the worker or discard retained events.
-        if sent.is_err() {
-            state.gateway = None;
-        }
-    }
+    // A broken observer cannot interrupt the downstream worker or other subscribers.
+    state.subscribers.retain(|_, gateway| {
+        gateway
+            .send_notification(
+                v2::UpdateSessionNotification::new(id.clone(), update.clone())
+                    .meta(event_meta(seq)),
+            )
+            .is_ok()
+    });
     Ok(())
 }
 
@@ -537,6 +598,97 @@ fn complete(control: &Mutex<Control>, key: &str, result: Result<v2::PromptRespon
     if let Ok(mut state) = control.lock() {
         state.finish(key, result);
     }
+}
+
+async fn pilot_permission(
+    control: Arc<Mutex<Control>>,
+    request: v2::RequestPermissionRequest,
+) -> v2::RequestPermissionResponse {
+    let mut changes = control
+        .lock()
+        .expect("session state is not poisoned")
+        .changed
+        .subscribe();
+    let answer = async {
+        loop {
+            let (gateway, generation) = {
+                let state = control.lock().expect("session state is not poisoned");
+                (
+                    state
+                        .pilot
+                        .as_ref()
+                        .and_then(|id| state.subscribers.get(id))
+                        .cloned(),
+                    state.generation,
+                )
+            };
+            if let Some(gateway) = gateway {
+                tokio::select! {
+                    result = gateway.send_request(request.clone()).block_task() => {
+                        if control.lock().expect("session state is not poisoned").generation == generation
+                            && let Ok(response) = result { return response; }
+                    }
+                    _ = changes.changed() => continue,
+                }
+            } else if changes.changed().await.is_err() {
+                break;
+            }
+            // A failed pilot request should not spin against the same connection.
+            if *changes.borrow() == generation && changes.changed().await.is_err() {
+                break;
+            }
+        }
+        v2::RequestPermissionResponse::new(v2::RequestPermissionOutcome::Cancelled)
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(120), answer)
+        .await
+        .unwrap_or_else(|_| {
+            v2::RequestPermissionResponse::new(v2::RequestPermissionOutcome::Cancelled)
+        })
+}
+
+async fn pilot_elicitation(
+    control: Arc<Mutex<Control>>,
+    request: v2::CreateElicitationRequest,
+) -> v2::CreateElicitationResponse {
+    let mut changes = control
+        .lock()
+        .expect("session state is not poisoned")
+        .changed
+        .subscribe();
+    let answer = async {
+        loop {
+            let (gateway, generation) = {
+                let state = control.lock().expect("session state is not poisoned");
+                (
+                    state
+                        .pilot
+                        .as_ref()
+                        .and_then(|id| state.subscribers.get(id))
+                        .cloned(),
+                    state.generation,
+                )
+            };
+            if let Some(gateway) = gateway {
+                tokio::select! {
+                    result = gateway.send_request(request.clone()).block_task() => {
+                        if control.lock().expect("session state is not poisoned").generation == generation
+                            && let Ok(response) = result { return response; }
+                    }
+                    _ = changes.changed() => continue,
+                }
+            } else if changes.changed().await.is_err() {
+                break;
+            }
+            if *changes.borrow() == generation && changes.changed().await.is_err() {
+                break;
+            }
+        }
+        v2::CreateElicitationResponse::new(v2::ElicitationAction::Cancel)
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(120), answer)
+        .await
+        .unwrap_or_else(|_| v2::CreateElicitationResponse::new(v2::ElicitationAction::Cancel))
 }
 
 async fn run_agent(
@@ -579,13 +731,44 @@ async fn run_agent(
             agent_client_protocol::on_receive_notification!(),
         )
         .on_receive_request(
-            async |_request: v2::RequestPermissionRequest,
+            {
+                let control = control.clone();
+                let downstream = downstream.clone();
+                let hive_id = hive_id.clone();
+                async move |mut request: v2::RequestPermissionRequest,
                    responder: Responder<v2::RequestPermissionResponse>,
                    _cx: V2ConnectionTo<Agent>| {
-                // Noninteractive bootstrap cannot safely grant agent permissions.
-                responder.respond(v2::RequestPermissionResponse::new(
-                    v2::RequestPermissionOutcome::Cancelled,
-                ))
+                    if downstream.lock().map_err(|_| Error::internal_error())?.as_ref() != Some(&request.session_id) {
+                        return responder.respond(v2::RequestPermissionResponse::new(v2::RequestPermissionOutcome::Cancelled));
+                    }
+                    request.session_id = hive_id.clone();
+                    responder.respond(pilot_permission(control.clone(), request).await)
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let control = control.clone();
+                let downstream = downstream.clone();
+                let hive_id = hive_id.clone();
+                async move |mut request: v2::CreateElicitationRequest,
+                    responder: Responder<v2::CreateElicitationResponse>,
+                    _cx: V2ConnectionTo<Agent>| {
+                    let scope = match &mut request.mode {
+                        v2::ElicitationMode::Form(mode) => &mut mode.scope,
+                        v2::ElicitationMode::Url(mode) => &mut mode.scope,
+                        _ => return responder.respond(v2::CreateElicitationResponse::new(v2::ElicitationAction::Cancel)),
+                    };
+                    let v2::ElicitationScope::Session(scope) = scope else {
+                        return responder.respond(v2::CreateElicitationResponse::new(v2::ElicitationAction::Cancel));
+                    };
+                    if downstream.lock().map_err(|_| Error::internal_error())?.as_ref() != Some(&scope.session_id) {
+                        return responder.respond(v2::CreateElicitationResponse::new(v2::ElicitationAction::Cancel));
+                    }
+                    scope.session_id = hive_id.clone();
+                    responder.respond(pilot_elicitation(control.clone(), request).await)
+                }
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -594,7 +777,11 @@ async fn run_agent(
                 .send_request(v2::InitializeRequest::new(
                     ProtocolVersion::V2,
                     v2::Implementation::new("hive", env!("CARGO_PKG_VERSION")),
-                ))
+                ).capabilities(v2::ClientCapabilities::new().elicitation(
+                    v2::ElicitationCapabilities::new()
+                        .form(v2::ElicitationFormCapabilities::new())
+                        .url(v2::ElicitationUrlCapabilities::new()),
+                )))
                 .block_task()
                 .await;
             match initialized {
@@ -726,20 +913,85 @@ async fn run_v1_agent(
                         return Ok(());
                     }
                     // V1 chunks have no message ID: assign one per Hive prompt.
-                    if let v1::SessionUpdate::AgentMessageChunk(chunk) = notification.update
-                    && let v1::ContentBlock::Text(text) = chunk.content
-                {
-                    let id = chunk_message_id.lock().map_err(|_| Error::internal_error())?.clone().ok_or_else(Error::internal_error)?;
-                    let update = v2::SessionUpdate::AgentMessageChunk(v2::ContentChunk::new(
-                        text.text.into(),
-                        id,
-                        ));
-                        forward(&control, &hive_id, update)?;
+                    match notification.update {
+                        v1::SessionUpdate::AgentMessageChunk(chunk) => {
+                            if let v1::ContentBlock::Text(text) = chunk.content {
+                                let id = chunk_message_id.lock().map_err(|_| Error::internal_error())?.clone().ok_or_else(Error::internal_error)?;
+                                forward(&control, &hive_id, v2::SessionUpdate::AgentMessageChunk(v2::ContentChunk::new(text.text.into(), id)))?;
+                            }
+                        }
+                        v1::SessionUpdate::ToolCall(call) => {
+                            let mut fields = BTreeMap::new();
+                            fields.insert("tool".into(), serde_json::to_value(call).map_err(Error::into_internal_error)?);
+                            forward(&control, &hive_id, v2::SessionUpdate::Other(v2::OtherSessionUpdate::new("_hive_v1_tool_call", fields)))?;
+                        }
+                        v1::SessionUpdate::ToolCallUpdate(call) => {
+                            let mut fields = BTreeMap::new();
+                            fields.insert("tool".into(), serde_json::to_value(call).map_err(Error::into_internal_error)?);
+                            forward(&control, &hive_id, v2::SessionUpdate::Other(v2::OtherSessionUpdate::new("_hive_v1_tool_update", fields)))?;
+                        }
+                        _ => {}
                     }
                     Ok(())
                 }
             },
             agent_client_protocol::on_receive_notification!(),
+        )
+        .on_receive_request(
+            {
+                let control = control.clone();
+                let route = route.clone();
+                let hive_id = hive_id.clone();
+                async move |request: v1::RequestPermissionRequest,
+                    responder: Responder<v1::RequestPermissionResponse>,
+                    _cx: ConnectionTo<Agent>| {
+                    if route.lock().map_err(|_| Error::internal_error())?.as_ref() != Some(&request.session_id) {
+                        return responder.respond(v1::RequestPermissionResponse::new(v1::RequestPermissionOutcome::Cancelled));
+                    }
+                    let options = request.options.iter().map(|option| {
+                        serde_json::from_value::<v2::PermissionOption>(serde_json::to_value(option).map_err(Error::into_internal_error)?)
+                            .map_err(Error::into_internal_error)
+                    }).collect::<agent_client_protocol::Result<Vec<_>>>()?;
+                    let title = request.tool_call.fields.title.clone().unwrap_or_else(|| "Agent tool permission".into());
+                    let response = pilot_permission(control.clone(), v2::RequestPermissionRequest::new(hive_id.clone(), title, options)).await;
+                    let outcome = serde_json::from_value(serde_json::to_value(response.outcome).map_err(Error::into_internal_error)?)
+                        .unwrap_or(v1::RequestPermissionOutcome::Cancelled);
+                    responder.respond(v1::RequestPermissionResponse::new(outcome))
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let control = control.clone();
+                let route = route.clone();
+                let hive_id = hive_id.clone();
+                async move |request: v1::CreateElicitationRequest,
+                    responder: Responder<v1::CreateElicitationResponse>,
+                    _cx: ConnectionTo<Agent>| {
+                    let mut request: v2::CreateElicitationRequest = serde_json::from_value(
+                        serde_json::to_value(request).map_err(Error::into_internal_error)?,
+                    ).map_err(Error::into_internal_error)?;
+                    let scope = match &mut request.mode {
+                        v2::ElicitationMode::Form(mode) => &mut mode.scope,
+                        v2::ElicitationMode::Url(mode) => &mut mode.scope,
+                        _ => return responder.respond(v1::CreateElicitationResponse::new(v1::ElicitationAction::Cancel)),
+                    };
+                    let v2::ElicitationScope::Session(scope) = scope else {
+                        return responder.respond(v1::CreateElicitationResponse::new(v1::ElicitationAction::Cancel));
+                    };
+                    if route.lock().map_err(|_| Error::internal_error())?.as_ref().map(ToString::to_string) != Some(scope.session_id.to_string()) {
+                        return responder.respond(v1::CreateElicitationResponse::new(v1::ElicitationAction::Cancel));
+                    }
+                    scope.session_id = hive_id.clone();
+                    let response = pilot_elicitation(control.clone(), request).await;
+                    let response: v1::CreateElicitationResponse = serde_json::from_value(
+                        serde_json::to_value(response).map_err(Error::into_internal_error)?,
+                    ).map_err(Error::into_internal_error)?;
+                    responder.respond(response)
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
         )
         .connect_with(agent, async move |cx| {
             let initialized = cx
@@ -936,6 +1188,7 @@ pub fn router_with_origin(broker: Broker, origin: Option<&str>) -> Router {
 }
 
 fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client> {
+    let client_id = uuid::Uuid::new_v4().to_string();
     Agent
         .v2()
         .name("hive")
@@ -958,10 +1211,11 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
         .on_receive_request(
             {
                 let broker = broker.clone();
+                let client_id = client_id.clone();
                 async move |request: v2::NewSessionRequest,
                             responder: Responder<v2::NewSessionResponse>,
                             cx: V2ConnectionTo<Client>| {
-                    match broker.create(request, cx).await {
+                    match broker.create(request, client_id.clone(), cx).await {
                         Ok(response) => responder.respond(response),
                         Err(error) => responder.respond_with_error(error),
                     }
@@ -972,10 +1226,11 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
         .on_receive_request(
             {
                 let broker = broker.clone();
+                let client_id = client_id.clone();
                 async move |request: v2::PromptRequest,
                             responder: Responder<v2::PromptResponse>,
                             _cx: V2ConnectionTo<Client>| {
-                    let received = broker.prompt(request)?;
+                    let received = broker.prompt(&client_id, request)?;
                     match received.await {
                         Ok(Ok(response)) => responder.respond(response),
                         Ok(Err(error)) => {
@@ -1004,9 +1259,18 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
                             request.cwd.as_ref().is_none_or(|cwd| cwd == &entry.cwd)
                         })
                         .map(|(id, entry)| {
-                            v2::SessionInfo::new(v2::SessionId::new(id.clone()), entry.cwd.clone())
+                            let state = entry.control.lock().expect("session state is not poisoned");
+                            let mut meta = v2::Meta::new();
+                            meta.insert("hive".into(), serde_json::json!({
+                                "agent": entry.profile, "running": state.running,
+                                "pilot": state.pilot.is_some(), "generation": state.generation,
+                                "observers": state.subscribers.len().saturating_sub(usize::from(state.pilot.as_ref().is_some_and(|id| state.subscribers.contains_key(id)))),
+                            }));
+                            v2::SessionInfo::new(v2::SessionId::new(id.clone()), entry.cwd.clone()).meta(meta)
                         })
-                        .collect();
+                        .collect::<Vec<_>>();
+                    let mut entries = entries;
+                    entries.sort_by_key(|entry| entry.session_id.to_string());
                     responder.respond(v2::ListSessionsResponse::new(entries))
                 }
             },
@@ -1015,10 +1279,11 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
         .on_receive_request(
             {
                 let broker = broker.clone();
+                let client_id = client_id.clone();
                 async move |request: v2::ResumeSessionRequest,
                             responder: Responder<v2::ResumeSessionResponse>,
                             cx: V2ConnectionTo<Client>| {
-                    match broker.resume(request, cx) {
+                    match broker.resume(request, &client_id, cx) {
                         Ok(response) => responder.respond(response),
                         Err(error) => responder.respond_with_error(error),
                     }
@@ -1029,6 +1294,7 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
         .on_receive_request(
             {
                 let broker = broker.clone();
+                let client_id = client_id.clone();
                 async move |request: v2::CloseSessionRequest,
                             responder: Responder<v2::CloseSessionResponse>,
                             _cx: V2ConnectionTo<Client>| {
@@ -1037,7 +1303,7 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
                     {
                         let mut state =
                             entry.control.lock().map_err(|_| Error::internal_error())?;
-                        state.owner(request.meta.as_ref())?;
+                        state.owner(&client_id, request.meta.as_ref())?;
                         if state.running || state.closing {
                             return responder.respond_with_error(
                                 Error::invalid_request()
@@ -1083,7 +1349,7 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
             async move |request: v2::CancelSessionNotification, _cx: V2ConnectionTo<Client>| {
                 let entry = broker.entry(&request.session_id)?;
                 let state = entry.control.lock().map_err(|_| Error::internal_error())?;
-                if state.owner(request.meta.as_ref()).is_err() {
+                if state.owner(&client_id, request.meta.as_ref()).is_err() {
                     // JSON-RPC notifications have no response channel; never forward a stale cancel.
                     tracing::debug!("ignored cancel from stale Hive controller");
                     return Ok(());
@@ -1229,10 +1495,13 @@ mod control_tests {
     use super::*;
 
     fn detached() -> Control {
+        let (changed, _) = watch::channel(1);
         Control {
             generation: 1,
             token: "first".into(),
-            gateway: None,
+            pilot: Some("test".into()),
+            subscribers: HashMap::new(),
+            changed,
             next_seq: 1,
             events: VecDeque::new(),
             running: false,
@@ -1270,7 +1539,7 @@ mod control_tests {
                 "hive".into(),
                 serde_json::json!({ "generation": generation, "token": token }),
             );
-            assert_eq!(state.owner(Some(&meta)).is_ok(), generation == 3);
+            assert_eq!(state.owner("test", Some(&meta)).is_ok(), generation == 3);
         }
     }
 

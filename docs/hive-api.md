@@ -15,9 +15,10 @@ ACP session methods live exclusively on `/acp`, not under `/hive/v1`.
 Discovery never returns commands, endpoints, arguments, environment or headers;
 it reports configuration, not live availability. Session creation uses
 `session/new` and the optional Hive-specific `_meta.hive.agent` selector.
-Transfer of control uses ACPv2 `session/resume` over `/acp` on either WebSocket
-or HTTP/SSE, not a separate operational endpoint. A response `_meta.hive`
-contains the current generation, token, next event sequence and running state;
+Transfer of control and observe/relinquish attachment use ACPv2 `session/resume`
+over `/acp` on either WebSocket or HTTP/SSE, not a separate operational endpoint.
+A response `_meta.hive` contains the current generation, next event sequence,
+running state and role; only pilot responses include an opaque token;
 all mutating ACP calls must include that generation/token. Prompts additionally
 require a stable idempotency key. See [ACP compatibility](acp-compatibility.md)
 for the exact wire contract, replay cursor and retention guarantees. The TUI

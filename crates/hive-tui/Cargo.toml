@@ -8,8 +8,12 @@ publish = false
 
 [dependencies]
 serde_json = { workspace = true }
+serde = { workspace = true }
 agent-client-protocol = { workspace = true }
 clap = { workspace = true }
 hive-protocol = { path = "../hive-protocol" }
 tokio = { workspace = true }
 uuid = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+reqwest = { workspace = true }

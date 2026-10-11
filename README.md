@@ -70,8 +70,18 @@ In another terminal run `cargo run -p hive-daemon --bin hive -- status` and
 `cargo build -p hive-zellij --target wasm32-wasip1`, then load
 `target/wasm32-wasip1/debug/hive_zellij.wasm` through Zellij's plugin loader;
 grant its WebAccess permission. Configure its `url` setting for a non-default
-loopback daemon. The TUI selects a profile with `hive-tui --agent opencode`;
-the web client offers an agent selector before its first session. Other clients
+loopback daemon. The full-screen TUI lists sessions in the current directory.
+Press `n`/`Ctrl-N` to create one, select a profile with the arrow keys and Enter,
+then type prompts in the conversation pane. `--agent opencode` preselects a
+profile; `--session hive-…` resumes a known session. `Tab` shows the session
+list, `a` toggles all directories, Enter takes pilot control and `o` attaches
+as an observer. `Ctrl-H` relinquishes pilot control while continuing to
+observe; `Ctrl-T` takes control explicitly. `Ctrl-C` cancels work, `Esc` quits
+without closing the session, and `Ctrl-R` accepts a live-only reconnect if
+replay history expires. Permission requests present numbered choices; form
+input accepts comma-separated `key=value` fields and URL requests show a URL
+to open outside the TUI. The web client offers an agent selector before its
+first session. Other clients
 send `session/new` with `_meta: {"hive":{"agent":"opencode"}}`, or omit it
 to select the configured default. Query `/hive/v1/providers` for agent IDs.
 

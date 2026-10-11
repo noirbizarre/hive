@@ -1184,3 +1184,318 @@ async fn an_http_sse_client_reaches_the_same_broker() {
 async fn a_v1_stdio_agent_is_adapted_to_the_v2_websocket_client() {
     exercise_gateway("ws", AgentVersion::V1).await;
 }
+
+#[tokio::test]
+async fn observers_keep_streaming_after_pilot_relinquishes_and_can_take_control() {
+    let config = config_with_agent(
+        "mock",
+        env!("CARGO_BIN_EXE_hive-test-agent"),
+        AgentVersion::V2,
+    );
+    let (address, gateway) = start_gateway(config).await;
+    let (opened_tx, opened_rx) = oneshot::channel();
+    let (command_tx, mut commands) = mpsc::unbounded_channel::<&'static str>();
+    let first = tokio::spawn(async move {
+        Client
+            .v2()
+            .connect_with(
+                HttpClient::new(format!("ws://{address}")).unwrap(),
+                async move |cx| {
+                    cx.send_request(v2::InitializeRequest::new(
+                        ProtocolVersion::V2,
+                        v2::Implementation::new("pilot", "1"),
+                    ))
+                    .block_task()
+                    .await?;
+                    let created = cx
+                        .send_request(v2::NewSessionRequest::new(std::env::current_dir().unwrap()))
+                        .block_task()
+                        .await?;
+                    let id = created.session_id;
+                    let mut owner = created.meta;
+                    opened_tx.send(id.clone()).unwrap();
+                    while let Some(command) = commands.recv().await {
+                        match command {
+                            "prompt" => {
+                                cx.send_request(
+                                    v2::PromptRequest::new(
+                                        id.clone(),
+                                        vec!["observer sees this".into()],
+                                    )
+                                    .meta(controlled(&owner, "observer-prompt")),
+                                )
+                                .block_task()
+                                .await?;
+                            }
+                            "release" => {
+                                let mut meta = owner.clone().unwrap();
+                                meta.get_mut("hive").unwrap()["mode"] =
+                                    serde_json::json!("relinquish");
+                                let response = cx
+                                    .send_request(
+                                        v2::ResumeSessionRequest::new(
+                                            id.clone(),
+                                            std::env::current_dir().unwrap(),
+                                        )
+                                        .meta(meta),
+                                    )
+                                    .block_task()
+                                    .await?;
+                                assert_eq!(
+                                    response.meta.as_ref().unwrap()["hive"]["role"],
+                                    "observer"
+                                );
+                                assert!(
+                                    response.meta.as_ref().unwrap()["hive"]
+                                        .get("token")
+                                        .is_none()
+                                );
+                                assert!(
+                                    cx.send_request(
+                                        v2::PromptRequest::new(id.clone(), vec!["stale".into()])
+                                            .meta(controlled(&owner, "stale"))
+                                    )
+                                    .block_task()
+                                    .await
+                                    .is_err()
+                                );
+                                owner = response.meta;
+                            }
+                            _ => break,
+                        }
+                    }
+                    Ok(())
+                },
+            )
+            .await
+    });
+    let id = opened_rx.await.unwrap();
+    let (updates_tx, mut updates) = mpsc::unbounded_channel();
+    timeout(
+        Duration::from_secs(10),
+        Client
+            .v2()
+            .on_receive_notification(
+                async move |update: v2::UpdateSessionNotification, _: V2ConnectionTo<Agent>| {
+                    updates_tx.send(update).map_err(Error::into_internal_error)
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(
+                HttpClient::new(format!("http://{address}")).unwrap(),
+                async move |cx| {
+                    cx.send_request(v2::InitializeRequest::new(
+                        ProtocolVersion::V2,
+                        v2::Implementation::new("observer", "1"),
+                    ))
+                    .block_task()
+                    .await?;
+                    let cwd = std::env::current_dir().unwrap();
+                    let mut meta = v2::Meta::new();
+                    meta.insert("hive".into(), serde_json::json!({"mode": "observe"}));
+                    let observed = cx
+                        .send_request(
+                            v2::ResumeSessionRequest::new(id.clone(), cwd.clone()).meta(meta),
+                        )
+                        .block_task()
+                        .await?;
+                    assert_eq!(observed.meta.as_ref().unwrap()["hive"]["role"], "observer");
+                    assert!(
+                        observed.meta.as_ref().unwrap()["hive"]
+                            .get("token")
+                            .is_none()
+                    );
+                    command_tx.send("prompt").unwrap();
+                    let mut saw_text = false;
+                    while let Some(update) = updates.recv().await {
+                        if matches!(update.update, v2::SessionUpdate::AgentMessageChunk(_)) {
+                            saw_text = true;
+                        }
+                        if saw_text
+                            && matches!(
+                                update.update,
+                                v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(_))
+                            )
+                        {
+                            break;
+                        }
+                    }
+                    command_tx.send("release").unwrap();
+                    while let Some(update) = updates.recv().await {
+                        if let v2::SessionUpdate::Other(other) = update.update
+                            && other.session_update == "_hive_control"
+                            && other.fields["pilot"] == false
+                        {
+                            break;
+                        }
+                    }
+                    let resumed = cx
+                        .send_request(v2::ResumeSessionRequest::new(id.clone(), cwd))
+                        .block_task()
+                        .await?;
+                    assert_eq!(resumed.meta.as_ref().unwrap()["hive"]["role"], "pilot");
+                    cx.send_request(
+                        v2::PromptRequest::new(id, vec!["new pilot".into()])
+                            .meta(controlled(&resumed.meta, "new-pilot")),
+                    )
+                    .block_task()
+                    .await?;
+                    command_tx.send("done").unwrap();
+                    Ok(())
+                },
+            ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    first.await.unwrap().unwrap();
+    gateway.abort();
+}
+
+#[tokio::test]
+async fn permission_and_form_and_url_elicitation_reach_the_current_pilot() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let downstream = listener.local_addr().unwrap();
+    let agent = tokio::spawn(async move {
+        let make_agent = || {
+            Agent
+                .v2()
+                .name("requests")
+                .on_receive_request(
+                    async |r: v2::InitializeRequest,
+                           responder: Responder<v2::InitializeResponse>,
+                           _: V2ConnectionTo<Client>| {
+                        responder.respond(
+                            v2::InitializeResponse::new(
+                                r.protocol_version,
+                                v2::Implementation::new("requests", "1"),
+                            )
+                            .capabilities(
+                                v2::AgentCapabilities::new()
+                                    .session(v2::SessionCapabilities::new()),
+                            ),
+                        )
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async |_: v2::NewSessionRequest,
+                           responder: Responder<v2::NewSessionResponse>,
+                           _: V2ConnectionTo<Client>| {
+                        responder.respond(v2::NewSessionResponse::new(v2::SessionId::new(
+                            "downstream",
+                        )))
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+                .on_receive_request(
+                    async |r: v2::PromptRequest,
+                           responder: Responder<v2::PromptResponse>,
+                           cx: V2ConnectionTo<Client>| {
+                        responder.respond(v2::PromptResponse::new(v2::MessageId::new("user")))?;
+                        tokio::spawn(async move {
+                            let result: agent_client_protocol::Result<()> = async {
+                                let choice = cx
+                                    .send_request(v2::RequestPermissionRequest::new(
+                                        r.session_id.clone(),
+                                        "Run tool",
+                                        vec![v2::PermissionOption::new(
+                                            "allow",
+                                            "Allow once",
+                                            v2::PermissionOptionKind::AllowOnce,
+                                        )],
+                                    ))
+                                    .block_task()
+                                    .await?;
+                                assert!(matches!(
+                                    choice.outcome,
+                                    v2::RequestPermissionOutcome::Selected(_)
+                                ));
+                                let scope = v2::ElicitationSessionScope::new(r.session_id.clone());
+                                let form = v2::ElicitationFormMode::new(
+                                    scope,
+                                    v2::ElicitationSchema::new(),
+                                );
+                                let answer = cx
+                                    .send_request(v2::CreateElicitationRequest::new(form, "Name?"))
+                                    .block_task()
+                                    .await?;
+                                assert!(matches!(answer.action, v2::ElicitationAction::Accept(_)));
+                                let url = v2::ElicitationUrlMode::new(
+                                    v2::ElicitationSessionScope::new(r.session_id.clone()),
+                                    "url-1",
+                                    "https://example.com/auth",
+                                );
+                                let answer = cx
+                                    .send_request(v2::CreateElicitationRequest::new(
+                                        url,
+                                        "Authenticate",
+                                    ))
+                                    .block_task()
+                                    .await?;
+                                assert!(matches!(answer.action, v2::ElicitationAction::Accept(_)));
+                                cx.send_notification(v2::UpdateSessionNotification::new(
+                                    r.session_id,
+                                    v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(
+                                        v2::IdleStateUpdate::new(),
+                                    )),
+                                ))
+                            }
+                            .await;
+                            result.unwrap();
+                        });
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_request!(),
+                )
+        };
+        axum::serve(
+            listener,
+            agent_client_protocol_http::AcpHttpServer::new(make_agent).into_router(),
+        )
+        .await
+        .unwrap();
+    });
+    let mut config = Config {
+        default_agent: Some("requests".into()),
+        ..Config::default()
+    };
+    config.agents.insert(
+        "requests".into(),
+        Profile {
+            name: None,
+            command: None,
+            args: vec![],
+            env: BTreeMap::new(),
+            endpoint: Some(format!("http://{downstream}")),
+            headers: BTreeMap::new(),
+            versions: vec![AgentVersion::V2],
+        },
+    );
+    let (address, gateway) = start_gateway(config).await;
+    let (tx, mut updates) = mpsc::unbounded_channel();
+    timeout(Duration::from_secs(10), Client.v2()
+        .on_receive_notification(async move |update: v2::UpdateSessionNotification, _: V2ConnectionTo<Agent>| {
+            tx.send(update).map_err(Error::into_internal_error)
+        }, agent_client_protocol::on_receive_notification!())
+        .on_receive_request(async |request: v2::RequestPermissionRequest, responder: Responder<v2::RequestPermissionResponse>, _: V2ConnectionTo<Agent>| {
+            assert!(request.session_id.to_string().starts_with("hive-"));
+            responder.respond(v2::RequestPermissionResponse::new(v2::RequestPermissionOutcome::Selected(
+                v2::SelectedPermissionOutcome::new("allow"))))
+        }, agent_client_protocol::on_receive_request!())
+        .on_receive_request(async |request: v2::CreateElicitationRequest, responder: Responder<v2::CreateElicitationResponse>, _: V2ConnectionTo<Agent>| {
+            assert!(matches!(request.scope(), v2::ElicitationScope::Session(scope) if scope.session_id.to_string().starts_with("hive-")));
+            responder.respond(v2::CreateElicitationResponse::new(v2::ElicitationAction::Accept(v2::ElicitationAcceptAction::new())))
+        }, agent_client_protocol::on_receive_request!())
+        .connect_with(HttpClient::new(format!("ws://{address}")).unwrap(), async move |cx| {
+            cx.send_request(v2::InitializeRequest::new(ProtocolVersion::V2, v2::Implementation::new("pilot", "1"))).block_task().await?;
+            let opened = cx.send_request(v2::NewSessionRequest::new(std::env::current_dir().unwrap())).block_task().await?;
+            cx.send_request(v2::PromptRequest::new(opened.session_id.clone(), vec!["interact".into()]).meta(controlled(&opened.meta, "requests"))).block_task().await?;
+            while let Some(update) = updates.recv().await {
+                if matches!(update.update, v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(_))) { break; }
+            }
+            Ok(())
+        })).await.unwrap().unwrap();
+    gateway.abort();
+    agent.abort();
+}

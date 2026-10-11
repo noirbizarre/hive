@@ -1,8 +1,6 @@
-<p align="center">
-  <img src="docs/images/icon.svg" alt="hive" width="160">
-</p>
-
-<h1 align="center">hive</h1>
+<h1 align="center">
+  <img src="docs/images/logo.svg" alt="hive" width="640">
+</h1>
 
 <p align="center"><strong>An ACPv2 gateway and session multiplexer for AI coding agents</strong></p>
 

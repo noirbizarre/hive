@@ -1,5 +1,9 @@
 # Hive
 
+<p align="center">
+  <img src="images/logo.svg" alt="Hive wordmark" width="220" style="background:#101d35; border-radius:16px">
+</p>
+
 Hive is a local ACPv2 gateway for ACP coding agents. Start with the
 [architecture](architecture.md) and the [roadmap](roadmap.md); consult the
 [compatibility](acp-compatibility.md), [transport](transports.md) and

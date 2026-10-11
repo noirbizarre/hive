@@ -7,11 +7,31 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{Block, Borders, List, ListItem, ListState, Padding, Paragraph, Wrap},
 };
+use serde::Deserialize;
 
 use crate::{
     state::{Conversation, LineKind},
     theme::Theme,
 };
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSummary {
+    pub session_id: String,
+    pub cwd: std::path::PathBuf,
+    pub agent: String,
+    pub title: Option<String>,
+    pub lifecycle: String,
+    pub activity: String,
+    pub last_activity_at: Option<u64>,
+    pub control_owner: Option<String>,
+    pub generation: u64,
+}
+
+#[derive(Deserialize)]
+pub struct SessionSnapshot {
+    pub sessions: Vec<SessionSummary>,
+}
 
 #[derive(Default, PartialEq)]
 pub enum Page {
@@ -24,23 +44,77 @@ pub enum Page {
 #[derive(Default)]
 pub struct App {
     pub page: Page,
-    pub sessions: Vec<v2::SessionInfo>,
+    pub sessions: Vec<SessionSummary>,
     pub profiles: Vec<String>,
     pub selected: usize,
     pub all: bool,
     pub active: Option<String>,
+    pub recent: Vec<String>,
     pub cwd: std::path::PathBuf,
     pub conversations: HashMap<String, Conversation>,
     pub owner: Option<v2::Meta>,
     pub input: String,
     pub status: String,
     pub connected: bool,
-    pub pending: Option<(String, String)>,
+    pub pending: HashMap<String, (String, String)>,
+    pub drafts: HashMap<String, String>,
     pub dialog: Option<String>,
     pub skip_replay: bool,
 }
 
 impl App {
+    pub fn toggle_sessions(&mut self) -> bool {
+        if self.page == Page::Sessions && self.active.is_some() {
+            self.page = Page::Chat;
+            return false;
+        }
+        self.page = Page::Sessions;
+        if let Some(id) = &self.active
+            && let Some(index) = self.sessions.iter().position(|s| &s.session_id == id)
+        {
+            self.selected = index;
+        }
+        true
+    }
+
+    pub fn previous_session(&self) -> Option<SessionSummary> {
+        self.recent
+            .iter()
+            .skip(1)
+            .find_map(|id| {
+                self.sessions
+                    .iter()
+                    .find(|session| &session.session_id == id)
+            })
+            .cloned()
+    }
+
+    pub fn select_session(&mut self, id: String) {
+        if let Some(previous) = self.active.take() {
+            self.drafts
+                .insert(previous, std::mem::take(&mut self.input));
+        }
+        self.input = self.drafts.remove(&id).unwrap_or_default();
+        self.recent.retain(|recent| recent != &id);
+        self.recent.insert(0, id.clone());
+        self.active = Some(id);
+        self.page = Page::Chat;
+    }
+
+    pub fn update_sessions(&mut self, sessions: Vec<SessionSummary>) {
+        let selected_id = self
+            .sessions
+            .get(self.selected)
+            .map(|s| s.session_id.clone());
+        self.sessions = sessions;
+        self.recent.retain(|id| {
+            self.active.as_ref() == Some(id) || self.sessions.iter().any(|s| &s.session_id == id)
+        });
+        self.selected = selected_id
+            .and_then(|id| self.sessions.iter().position(|s| s.session_id == id))
+            .unwrap_or_else(|| self.selected.min(self.sessions.len().saturating_sub(1)));
+    }
+
     pub fn conversation(&self) -> Option<&Conversation> {
         self.active
             .as_ref()
@@ -63,7 +137,7 @@ impl App {
         frame.render_widget(Block::default().style(theme.text()), area);
         let columns = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints(if area.width >= 90 {
+            .constraints(if area.width >= 90 && self.page == Page::Chat {
                 [Constraint::Min(40), Constraint::Length(31)]
             } else {
                 [Constraint::Min(0), Constraint::Length(0)]
@@ -101,7 +175,13 @@ impl App {
 
     fn render_heading(&self, frame: &mut Frame, area: Rect, theme: Theme) {
         let title = match self.page {
-            Page::Chat => self.active.as_deref().unwrap_or("Select a session"),
+            Page::Chat => self
+                .active
+                .as_ref()
+                .and_then(|id| self.sessions.iter().find(|s| &s.session_id == id))
+                .and_then(|s| s.title.as_deref())
+                .or(self.active.as_deref())
+                .unwrap_or("Select a session"),
             Page::Sessions => "Sessions",
             Page::Profiles => "New session · Select an agent",
         };
@@ -116,22 +196,55 @@ impl App {
 
     fn render_sessions(&self, frame: &mut Frame, area: Rect, theme: Theme) {
         let entries = self.sessions.iter().map(|info| {
-            let agent = info
-                .meta
-                .as_ref()
-                .and_then(|m| m.get("hive"))
-                .and_then(|h| h.get("agent"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("?");
-            let running = info
-                .meta
-                .as_ref()
-                .is_some_and(|m| m["hive"]["running"] == true);
+            let owner = if info.control_owner.is_none() {
+                "unclaimed"
+            } else if self.active.as_deref() == Some(&info.session_id)
+                && self.pilot()
+                && self
+                    .conversation()
+                    .is_some_and(|c| c.generation == info.generation)
+            {
+                "pilot here"
+            } else {
+                "another pilot"
+            };
+            let age = info
+                .last_activity_at
+                .map_or("no activity".to_owned(), |at| {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |time| time.as_millis() as u64);
+                    let minutes = now.saturating_sub(at) / 60_000;
+                    if minutes < 1 {
+                        "just now".into()
+                    } else {
+                        format!("{minutes}m ago")
+                    }
+                });
+            let attention =
+                if self.active.as_deref() == Some(&info.session_id) && self.dialog.is_some() {
+                    " · needs attention"
+                } else {
+                    ""
+                };
             ListItem::new(Line::from(vec![
-                Span::styled(format!("{}  ", info.session_id), theme.text()),
-                Span::styled(format!("{agent}  "), theme.muted()),
-                Span::styled(if running { "running  " } else { "idle  " }, theme.accent()),
-                Span::styled(info.cwd.0.display().to_string(), theme.muted()),
+                Span::styled(
+                    format!("{}  ", info.title.as_deref().unwrap_or(&info.session_id)),
+                    theme.text(),
+                ),
+                Span::styled(format!("{}  ", info.agent), theme.muted()),
+                Span::styled(
+                    format!("{} / {}{attention}  ", info.lifecycle, info.activity),
+                    if info.activity == "running" || !attention.is_empty() {
+                        theme.warning()
+                    } else {
+                        theme.accent()
+                    },
+                ),
+                Span::styled(
+                    format!("{owner} · {age} · {}", info.cwd.display()),
+                    theme.muted(),
+                ),
             ]))
         });
         let list = List::new(entries)
@@ -254,11 +367,13 @@ impl App {
 
     fn render_footer(&self, frame: &mut Frame, area: Rect, theme: Theme, compact: bool) {
         let hint = match self.page {
-            Page::Sessions => "↑↓ select  Enter pilot  o observe  a all  Ctrl-N new  Esc quit",
+            Page::Sessions => {
+                "↑↓ select  Enter pilot  o observe  Tab chat  a all  Ctrl-N new  Esc quit"
+            }
             Page::Profiles => "↑↓ select  Enter create  Tab sessions  Esc quit",
             Page::Chat if self.dialog.is_some() => "Enter confirm  Esc decline",
             Page::Chat => {
-                "Enter send  Tab sessions  Ctrl-N new  Ctrl-T pilot  Ctrl-H handoff  Ctrl-R live  Ctrl-C cancel  Esc quit"
+                "Enter send  Tab sessions  Ctrl-B recent  Ctrl-N new  Ctrl-T pilot  Ctrl-H handoff  Ctrl-R live  Ctrl-C cancel  Esc quit"
             }
         };
         let mut lines = vec![Line::from(vec![
@@ -306,17 +421,11 @@ impl App {
         } else {
             "Observer · no pilot"
         };
-        let active = self.active.as_ref().and_then(|id| {
-            self.sessions
-                .iter()
-                .find(|s| s.session_id.to_string() == *id)
-        });
-        let agent = active
-            .and_then(|s| s.meta.as_ref())
-            .and_then(|m| m.get("hive"))
-            .and_then(|h| h.get("agent"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("—");
+        let active = self
+            .active
+            .as_ref()
+            .and_then(|id| self.sessions.iter().find(|s| s.session_id == *id));
+        let agent = active.map_or("—", |s| s.agent.as_str());
         let mut lines = vec![
             Line::styled("Hive", theme.accent()),
             Line::default(),
@@ -352,7 +461,7 @@ impl App {
         lines.push(Line::styled(
             active.map_or_else(
                 || self.cwd.display().to_string(),
-                |s| s.cwd.0.display().to_string(),
+                |s| s.cwd.display().to_string(),
             ),
             theme.text(),
         ));
@@ -374,6 +483,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_client_protocol::schema::v2;
     use ratatui::{
         Terminal,
         backend::TestBackend,
@@ -428,18 +538,17 @@ mod tests {
     #[test]
     fn the_session_picker_shows_profile_and_work_state() {
         let mut app = App::default();
-        let mut meta = v2::Meta::new();
-        meta.insert(
-            "hive".into(),
-            serde_json::json!({"agent": "pi", "running": true}),
-        );
-        app.sessions.push(
-            v2::SessionInfo::new(
-                v2::SessionId::new("hive-one"),
-                std::env::current_dir().unwrap(),
-            )
-            .meta(meta),
-        );
+        app.sessions.push(SessionSummary {
+            session_id: "hive-one".into(),
+            cwd: std::env::current_dir().unwrap(),
+            agent: "pi".into(),
+            title: None,
+            lifecycle: "active".into(),
+            activity: "running".into(),
+            last_activity_at: None,
+            control_owner: None,
+            generation: 1,
+        });
         let mut terminal = Terminal::new(TestBackend::new(120, 14)).unwrap();
         terminal.draw(|frame| app.show(frame)).unwrap();
         let rendered = terminal
@@ -452,6 +561,62 @@ mod tests {
         assert!(rendered.contains("hive-one"));
         assert!(rendered.contains("pi"));
         assert!(rendered.contains("running"));
+    }
+
+    #[test]
+    fn catalog_updates_keep_the_highlighted_identity_and_remove_expired_recents() {
+        let summary = |id: &str| SessionSummary {
+            session_id: id.into(),
+            cwd: std::env::current_dir().unwrap(),
+            agent: "pi".into(),
+            title: Some(format!("Task {id}")),
+            lifecycle: "active".into(),
+            activity: "unknown".into(),
+            last_activity_at: None,
+            control_owner: None,
+            generation: 1,
+        };
+        let mut app = App::default();
+        app.update_sessions(vec![summary("one"), summary("two")]);
+        app.selected = 1;
+        app.select_session("two".into());
+        app.input = "draft for two".into();
+        app.select_session("one".into());
+        app.update_sessions(vec![summary("two"), summary("one")]);
+        assert_eq!(app.sessions[app.selected].session_id, "two");
+        assert_eq!(app.recent, ["one", "two"]);
+        assert_eq!(app.previous_session().unwrap().session_id, "two");
+        assert!(app.toggle_sessions());
+        assert_eq!(app.sessions[app.selected].session_id, "one");
+        assert!(!app.toggle_sessions());
+        assert!(app.page == Page::Chat);
+        app.select_session("two".into());
+        assert_eq!(app.input, "draft for two");
+        app.update_sessions(vec![summary("two")]);
+        assert_eq!(app.recent, ["two"]);
+        assert_eq!(app.active.as_deref(), Some("two"));
+        let mut terminal = Terminal::new(TestBackend::new(100, 14)).unwrap();
+        app.page = Page::Sessions;
+        terminal.draw(|frame| app.show(frame)).unwrap();
+        assert!(screen(&terminal).contains("Task two"));
+        assert!(screen(&terminal).contains("unknown"));
+    }
+
+    #[test]
+    fn hiding_the_overview_keeps_the_active_conversation() {
+        let mut app = App {
+            page: Page::Chat,
+            active: Some("one".into()),
+            ..App::default()
+        };
+        app.conversations
+            .entry("one".into())
+            .or_default()
+            .push_notice("Still here".into());
+        let mut terminal = Terminal::new(TestBackend::new(50, 12)).unwrap();
+        terminal.draw(|frame| app.show(frame)).unwrap();
+        assert!(screen(&terminal).contains("Still here"));
+        assert!(screen(&terminal).contains("Tab sessions"));
     }
 
     #[test]

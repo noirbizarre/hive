@@ -99,3 +99,22 @@ the snapshot, rather than carrying session deltas. An SSE connection is only
 for catalog discovery; ACP `/acp` remains the source of session conversations
 and control operations. Both endpoints use the same loopback-only policy as
 the rest of this API.
+
+## Client navigation
+
+The TUI starts with the overview visible and hides it after opening a session;
+`Tab` toggles the overview from chat, `Ctrl-B` switches back to the previous
+session visited in this TUI run, and `a` toggles all directories/current
+directory in the overview. Enter attaches as pilot, `o` as observer. TUI
+summaries refresh while connected and on selection and reconnect. The browser
+shows a collapsible session rail by default; "Hide sessions" and "Show
+sessions" control its visibility, and selecting a row observes the existing
+conversation before prompting requests control. Recently visited sessions
+appear first during the current client run; other sessions are ordered by
+reported last activity. The rail preserves keyboard focus, selection and
+conversation state across catalog refreshes and visibility changes.
+
+Clients display `unknown` activity as unknown, rather than treating it as
+idle. A currently visible permission/input request may be flagged as needing
+attention; the catalog cannot identify such requests for unrelated sessions.
+Neither recents nor the daemon's sessions survive a daemon restart.

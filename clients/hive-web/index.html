@@ -1,15 +1,48 @@
 <!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Hive</title></head>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Hive</title>
+<style>
+  body { margin: 0; font: 1rem system-ui, sans-serif; color: #e8eaf0; background: #161a22; }
+  button, input, select { font: inherit; }
+  button { cursor: pointer; }
+  button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid #73d9e7; outline-offset: 2px; }
+  header { padding: .8rem 1rem; border-bottom: 1px solid #566174; display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; }
+  header h1 { margin: 0; font-size: 1.3rem; }
+  #status { margin: 0; }
+  #layout { display: grid; grid-template-columns: minmax(16rem, 22rem) minmax(0, 1fr); min-height: calc(100vh - 4rem); }
+  #layout.nav-hidden { grid-template-columns: minmax(0, 1fr); }
+  #navigation { border-right: 1px solid #566174; padding: 1rem; overflow: auto; max-height: calc(100vh - 6rem); }
+  #layout.nav-hidden #navigation { display: none; }
+  #navigation h2 { margin: .2rem 0 1rem; }
+  #sessions { padding: 0; list-style: none; }
+  #sessions li { margin-bottom: .5rem; }
+  #sessions li button { width: 100%; text-align: left; border: 1px solid #566174; border-radius: .4rem; background: #242b37; color: inherit; padding: .65rem; }
+  #sessions li button[aria-current="page"] { border-color: #73d9e7; background: #304455; }
+  #sessions li button:hover { background: #354354; }
+  #sessions small { display: block; color: #bac4d3; margin-top: .3rem; }
+  #sessions .attention { color: #ffd782; }
+  main { padding: 1rem; min-width: 0; display: flex; flex-direction: column; gap: 1rem; }
+  main h2 { margin: 0; }
+  #output { flex: 1; min-height: 12rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+  #output > div { padding: .5rem 0; border-bottom: 1px solid #363f4d; }
+  #prompt { display: flex; gap: .5rem; flex-wrap: wrap; }
+  #prompt label { display: flex; gap: .5rem; align-items: center; }
+  #prompt label:last-of-type { flex: 1; }
+  #prompt input { flex: 1; min-width: 10rem; }
+  @media (max-width: 700px) {
+    #layout { grid-template-columns: minmax(0, 1fr); }
+    #navigation { max-height: 40vh; border-right: 0; border-bottom: 1px solid #566174; }
+  }
+</style></head>
 <body>
-<h1>Hive</h1><p id="status" role="status">Connecting…</p>
-<h2>Sessions</h2><ul id="sessions"></ul>
-<form id="takeover"><label>Hive session ID <input name="session" placeholder="hive-…"></label><button>Open read-only</button></form>
-<button id="skip-history" type="button" hidden>Attach without earlier history</button>
-<h2>Conversation</h2><div id="output" role="log" aria-live="polite"></div>
+<header><h1>Hive</h1><button id="toggle-sessions" type="button" aria-controls="navigation" aria-expanded="true">Hide sessions</button><p id="status" role="status">Connecting…</p></header>
+<div id="layout"><nav id="navigation" aria-label="Session navigation"><h2>Sessions</h2><p id="session-list-status" role="status">Loading sessions…</p><ul id="sessions"></ul>
+<form id="takeover"><label>Hive session ID <input name="session" placeholder="hive-…"></label><button>Open read-only</button></form></nav>
+<main><h2>Conversation</h2><button id="skip-history" type="button" hidden>Attach without earlier history</button>
+<div id="output" role="log" aria-live="polite"></div>
 <section id="interaction" aria-label="Agent input request" hidden></section>
 <form id="prompt"><label>Agent <select id="agent"><option value="">Default agent</option></select></label>
 <label>Prompt <input name="text" aria-label="Prompt" placeholder="Type to take control"></label><button id="send">Send</button></form>
-<button id="retry" type="button" hidden>Retry uncertain prompt</button><button id="cancel" type="button" disabled>Cancel</button>
+<div><button id="retry" type="button" hidden>Retry uncertain prompt</button><button id="cancel" type="button" disabled>Cancel</button></div></main></div>
 <script type="module" src="/hive/v1/web/app.js"></script>
 </body></html>

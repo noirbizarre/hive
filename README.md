@@ -85,20 +85,28 @@ Build the Zellij plugin separately with
 `cargo build -p hive-zellij --target wasm32-wasip1`, then load
 `target/wasm32-wasip1/debug/hive_zellij.wasm` through Zellij's plugin loader;
 grant its WebAccess permission. Configure its `url` setting for a non-default
-loopback daemon. The full-screen TUI lists sessions in the current directory.
+loopback daemon. The full-screen TUI lists sessions across directories.
 Press `Ctrl-N` to create one, select a profile with the arrow keys and Enter,
-then type prompts in the bottom composer. The border-light transcript and session
-sidebar follow your terminal's foreground/background and ANSI color palette;
-the sidebar collapses on narrow terminals. `--agent opencode` preselects a
-profile; `--session hive-…` resumes a known session. `Tab` shows the session
-list, `a` toggles all directories, Enter takes pilot control and `o` attaches
-as an observer. `Ctrl-H` relinquishes pilot control while continuing to
-observe; `Ctrl-T` takes control explicitly. `Ctrl-C` cancels work, `Esc` quits
-without closing the session, and `Ctrl-R` accepts a live-only reconnect if
-replay history expires. Permission requests present numbered choices; form
-input accepts comma-separated `key=value` fields and URL requests show a URL
-to open outside the TUI. The web client offers an agent selector before its
-first session. Other clients
+then type prompts in the bottom composer. The border-light transcript and
+session details follow your terminal's foreground/background and ANSI color
+palette; details collapse on narrow terminals. `--agent opencode` preselects a
+profile; `--session hive-…` resumes a known session. The TUI opens on a session
+overview; while chatting, `Tab` shows or hides it and `Ctrl-B` returns to the
+previously visited session. The overview lists sessions from all directories
+by default; `a` filters to the current directory, Enter takes pilot control
+and `o` attaches as an observer. `Ctrl-H` relinquishes pilot control while
+continuing to observe; `Ctrl-T` takes control explicitly. `Ctrl-C` cancels
+work, `Esc` quits without closing the session, and `Ctrl-R` accepts a live-only
+reconnect if replay history expires. Permission requests present numbered
+choices; form input accepts comma-separated `key=value` fields and URL
+requests show a URL to open outside the TUI. The browser shows a session rail
+by default; use "Hide sessions" / "Show sessions" to collapse or restore it
+without losing the conversation. Select a recent or listed session to view its history
+read-only, then type to request control before sending. Both overviews show
+daemon-reported title, profile, activity, last activity and current control;
+`unknown` means the agent has not reported activity, and only locally visible
+pending requests are marked as needing attention. The web client offers an
+agent selector before its first session. Other clients
 send `session/new` with `_meta: {"hive":{"agent":"opencode"}}`, or omit it
 to select the configured default. Query `/hive/v1/providers` for agent IDs.
 

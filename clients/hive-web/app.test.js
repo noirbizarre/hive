@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, test } from 'node:test';
 import { strict as assert } from 'node:assert';
 import { JSDOM } from 'jsdom';
+import { readFileSync } from 'node:fs';
 import { connect, conversation, mount } from './app.js';
 
 const session = { sessionId: 'hive-tui', cwd: '/workspace', agent: 'pi', title: 'Review parser',
@@ -306,4 +307,89 @@ test('agent input UI collects typed form values and prevents stale interaction r
   assert.equal(client.respond({ outcome: { outcome: 'selected', optionId: 'allow-once' } }, 51), false);
   view.close();
   dom.window.close();
+});
+
+test('the session rail toggles, follows catalog revisions and keeps recent selection', async () => {
+  const dom = new JSDOM(readFileSync(new URL('./index.html', import.meta.url), 'utf8'),
+    { url: 'http://localhost/hive/v1/web' });
+  globalThis.document = dom.window.document;
+  globalThis.location = dom.window.location;
+  globalThis.history = dom.window.history;
+  globalThis.FormData = dom.window.FormData;
+  let revision = 1;
+  let items = [{ ...session, lifecycle: 'active', generation: 3 }, { ...session, sessionId: 'hive-second',
+    title: null, activity: 'unknown', controlOwner: null, lastActivityAt: null }];
+  globalThis.fetch = async url => ({ ok: true, json: async () => url.includes('providers')
+    ? { agents: [] } : { revision, sessions: items } });
+  let source;
+  globalThis.EventSource = class {
+    constructor() { source = this; }
+    addEventListener(_, listener) { this.revision = listener; }
+    close() {}
+  };
+  const sockets = transport();
+  let view;
+  const client = connect('ws://localhost/acp', state => view?.show(state));
+  view = mount(client);
+  await new Promise(resolve => setImmediate(resolve));
+  const toggle = document.querySelector('#toggle-sessions');
+  toggle.click();
+  assert.equal(toggle.getAttribute('aria-expanded'), 'false');
+  assert.equal(document.querySelector('#layout').classList.contains('nav-hidden'), true);
+  toggle.click();
+  assert.equal(toggle.getAttribute('aria-expanded'), 'true');
+  document.querySelector('[data-session-id="hive-second"]').click();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(client.state().session.sessionId, 'hive-second');
+  assert.equal(document.querySelector('#sessions button').dataset.sessionId, 'hive-second');
+  assert.equal(document.querySelector('#sessions [aria-current="page"]').dataset.sessionId, 'hive-second');
+  revision = 2;
+  items = items.map(item => item.sessionId === 'hive-second'
+    ? { ...item, activity: 'running', controlOwner: 'other', lastActivityAt: Date.now() } : item);
+  source.revision({ data: '2' });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.match(document.querySelector('#sessions').textContent, /running · controlled by another client/);
+  assert.equal(document.querySelector('#sessions [aria-current="page"]').dataset.sessionId, 'hive-second');
+  assert.equal(sockets[0].sent.filter(message => message.method === 'session/new').length, 0);
+  view.close();
+  dom.window.close();
+});
+
+test('rapid selections ignore obsolete attachment responses without forking a session', async () => {
+  const sockets = transport((_, message) => message.method === 'session/resume' &&
+    message.params.sessionId === 'hive-tui' ? false : undefined);
+  const client = connect('ws://localhost/acp');
+  const first = client.open(session);
+  await new Promise(resolve => setImmediate(resolve));
+  const second = client.open({ ...session, sessionId: 'hive-second' });
+  const old = sockets[0].sent.find(message => message.method === 'session/resume');
+  sockets[0].receive({ jsonrpc: '2.0', id: old.id, result: { _meta: { hive: {
+    generation: 3, role: 'observer', running: false, nextSeq: 1,
+  } } } });
+  await Promise.all([first, second]);
+  assert.equal(client.state().session.sessionId, 'hive-second');
+  assert.equal(sockets[0].sent.filter(message => message.method === 'session/new').length, 0);
+  assert.equal(sockets[0].sent.filter(message => message.method === 'session/resume').length, 2);
+  client.close();
+});
+
+test('a takeover acknowledged after switching releases the abandoned pilot', async () => {
+  const sockets = transport((_, message) => message.method === 'session/resume' &&
+    message.params.sessionId === 'hive-tui' && !message.params._meta?.hive?.mode ? false : undefined);
+  const client = connect('ws://localhost/acp');
+  await client.open(session);
+  const takeover = client.takeControl();
+  await new Promise(resolve => setImmediate(resolve));
+  const switchToSecond = client.open({ ...session, sessionId: 'hive-second' });
+  await switchToSecond;
+  const pending = sockets[0].sent.find(message => message.method === 'session/resume' &&
+    message.params.sessionId === 'hive-tui' && !message.params._meta?.hive?.mode);
+  sockets[0].receive({ jsonrpc: '2.0', id: pending.id, result: { _meta: { hive: {
+    generation: 3, role: 'pilot', token: 'late-token', nextSeq: 1, running: false,
+  } } } });
+  await takeover;
+  assert.equal(sockets[0].sent.at(-1).params._meta.hive.mode, 'relinquish');
+  assert.equal(sockets[0].sent.at(-1).params._meta.hive.token, 'late-token');
+  assert.equal(client.state().session.sessionId, 'hive-second');
+  client.close();
 });

@@ -76,10 +76,13 @@ export function connect(url, onChange = () => {}) {
   let status = 'Connecting…';
   let uncertain;
   let creationUncertain = store?.getItem('hive.creating') === 'true';
+  let openQueue = Promise.resolve();
+  let openVersion = 0;
   let firstResolve;
   const initialized = new Promise(resolve => { firstResolve = resolve; });
 
   const snapshot = () => ({ connected, status, session: selected && { ...selected }, role: owner?.role || 'observer',
+    generation: owner?.generation,
     running: history.runningNow, lines: history.lines, seq: history.seq, gap, interaction,
     uncertain: uncertain && { ...uncertain }, takingControl: Boolean(takingControl) });
   const publish = () => onChange(snapshot());
@@ -138,12 +141,25 @@ export function connect(url, onChange = () => {}) {
   }
   async function resume(mode = 'observe', replay = true) {
     if (!selected) throw new Error('Select a session first');
+    const target = selected.sessionId;
+    const targetCwd = selected.cwd;
+    const version = openVersion;
     const params = { sessionId: selected.sessionId, cwd: selected.cwd,
       ...(mode === 'observe' ? { _meta: { hive: { mode } } } : {}) };
     if (replay) params.replayFrom = history.seq
       ? { type: '_hive_seq', seq: history.seq + 1 } : { type: 'start' };
     try {
       const response = await request('session/resume', params);
+      // A delayed response from an older attachment must never grant control over the new view.
+      if (selected?.sessionId !== target || version !== openVersion) {
+        const stale = response?._meta?.hive;
+        if (stale?.role === 'pilot' && stale.token) {
+          // An overtaken handoff may succeed at the daemon after the user has left its view.
+          await request('session/resume', { sessionId: target, cwd: targetCwd,
+            _meta: { hive: { mode: 'relinquish', generation: stale.generation, token: stale.token } } });
+        }
+        return response;
+      }
       const hive = ownership(response);
       if (!replay) {
         // With no retained events, move the cursor to the daemon's atomic attachment boundary.
@@ -153,6 +169,7 @@ export function connect(url, onChange = () => {}) {
       }
       return response;
     } catch (error) {
+      if (selected?.sessionId !== target || version !== openVersion) throw error;
       if (error.message.includes('replay cursor unavailable')) {
         gap = true;
         status = 'History expired — attach without earlier events to continue';
@@ -210,25 +227,32 @@ export function connect(url, onChange = () => {}) {
   return {
     initialized,
     state: snapshot,
-    async open(session) {
+    open(session) {
       if (!session?.sessionId || !session.cwd) throw new Error('Select a listed Hive session with a cwd');
-      await initialized;
-      if (selected?.sessionId === session.sessionId && owner) return;
-      if (selected && owner?.role === 'pilot' && selected.sessionId !== session.sessionId) {
-        // Leaving an owned conversation must release its pilot token without ending the agent session.
-        await request('session/resume', { sessionId: selected.sessionId, cwd: selected.cwd,
-          _meta: { hive: { mode: 'relinquish', generation: owner.generation, token: owner.token } } });
-      }
-      selected = { sessionId: session.sessionId, cwd: session.cwd, agent: session.agent };
-      creationUncertain = false;
-      store?.removeItem('hive.creating');
-      history = conversation();
-      owner = undefined;
-      interaction = undefined;
-      earlyInteraction = undefined;
-      uncertain = JSON.parse(store?.getItem(`hive.pending.${selected.sessionId}`) || 'null');
-      publish();
-      return resume('observe');
+      const version = ++openVersion;
+      const operation = openQueue.then(async () => {
+        await initialized;
+        if (version !== openVersion) return;
+        if (selected?.sessionId === session.sessionId && owner) return;
+        if (selected && owner?.role === 'pilot' && selected.sessionId !== session.sessionId) {
+          // Leaving an owned conversation must release its pilot token without ending the agent session.
+          await request('session/resume', { sessionId: selected.sessionId, cwd: selected.cwd,
+            _meta: { hive: { mode: 'relinquish', generation: owner.generation, token: owner.token } } });
+        }
+        if (version !== openVersion) return;
+        selected = { sessionId: session.sessionId, cwd: session.cwd, agent: session.agent };
+        creationUncertain = false;
+        store?.removeItem('hive.creating');
+        history = conversation();
+        owner = undefined;
+        interaction = undefined;
+        earlyInteraction = undefined;
+        uncertain = JSON.parse(store?.getItem(`hive.pending.${selected.sessionId}`) || 'null');
+        publish();
+        return resume('observe');
+      });
+      openQueue = operation.catch(() => {});
+      return operation;
     },
     async attachWithoutHistory() { if (!gap) throw new Error('No history gap to skip'); return resume('observe', false); },
     async takeControl() {
@@ -362,6 +386,9 @@ function formValues(schema, form) {
 export function mount(client, root = document) {
   const status = root.querySelector('#status');
   const list = root.querySelector('#sessions');
+  const listStatus = root.querySelector('#session-list-status');
+  const toggle = root.querySelector('#toggle-sessions');
+  const layout = root.querySelector('#layout');
   const output = root.querySelector('#output');
   const prompt = root.querySelector('#prompt');
   const input = prompt.elements.namedItem('text');
@@ -372,12 +399,23 @@ export function mount(client, root = document) {
   const retry = root.querySelector('#retry');
   const skip = root.querySelector('#skip-history');
   let sessions = [];
+  let recent = [];
+  let navigationVisible = true;
+  let selectedBefore;
   let opening;
   let sending = false;
   let currentInteraction;
 
   function show(state) {
     status.textContent = state.status;
+    if (state.session?.sessionId !== selectedBefore) {
+      selectedBefore = state.session?.sessionId;
+      if (selectedBefore) {
+        recent = [selectedBefore, ...recent.filter(id => id !== selectedBefore)];
+        history.replaceState?.(null, '', `?${new URLSearchParams({ session: selectedBefore })}`);
+      }
+    }
+    renderRows(state);
     const pilot = state.role === 'pilot' && state.connected && !state.gap;
     input.disabled = !state.connected || state.gap;
     send.disabled = !state.connected || state.gap || sending || state.takingControl || state.running ||
@@ -440,29 +478,53 @@ export function mount(client, root = document) {
     if (!session) { status.textContent = `Hive session ${id} not found; choose a listed session`; return; }
     try {
       await client.open(session);
-      history.replaceState?.(null, '', `?${new URLSearchParams({ session: id })}`);
     } catch (error) { status.textContent = error.message; }
   }
   const history = globalThis.history;
   const selectedId = new URLSearchParams(globalThis.location?.search || '').get('session');
-  function renderList(items) {
-    sessions = items;
+  function renderRows(state) {
+    const focused = root.activeElement?.dataset?.sessionId;
     list.replaceChildren();
-    for (const session of items) {
+    const ordered = [...sessions].sort((a, b) => {
+      const first = recent.indexOf(a.sessionId);
+      const second = recent.indexOf(b.sessionId);
+      if (first !== -1 || second !== -1) return (first === -1 ? Infinity : first) - (second === -1 ? Infinity : second);
+      return (b.lastActivityAt || 0) - (a.lastActivityAt || 0) || a.sessionId.localeCompare(b.sessionId);
+    });
+    for (const session of ordered) {
       const row = add(list, 'li', '');
       const button = add(row, 'button', session.title || session.sessionId, { type: 'button' });
+      button.dataset.sessionId = session.sessionId;
+      if (session.sessionId === state.session?.sessionId) button.setAttribute('aria-current', 'page');
       button.onclick = () => open(session.sessionId);
       const control = session.controlOwner
-        ? session.sessionId === client.state().session?.sessionId && client.state().role === 'pilot'
-          ? 'controlled here' : 'controlled by another client'
+        ? session.sessionId === state.session?.sessionId && state.role === 'pilot' && state.connected
+          && state.generation === session.generation ? 'controlled here' : 'controlled by another client'
         : 'unclaimed';
-      add(row, 'span', ` ${session.sessionId} · ${session.agent} · ${session.activity} · ` +
-        `${control} · ` +
+      const activity = session.lifecycle && session.lifecycle !== 'active' ? session.lifecycle : session.activity;
+      const attention = session.sessionId === state.session?.sessionId && state.interaction ? ' · needs attention' : '';
+      const detail = add(button, 'small', `${session.sessionId} · ${session.agent || 'unknown agent'} · ${activity || 'unknown'}${attention} · ${control} · ` +
         `${session.lastActivityAt == null ? 'no activity yet' : new Date(session.lastActivityAt).toLocaleString()}`);
+      if (attention || activity === 'running' || activity === 'closing') detail.className = 'attention';
     }
+    if (focused) list.querySelectorAll('button').forEach(button => { if (button.dataset.sessionId === focused) button.focus(); });
+    if (listStatus) listStatus.textContent = sessions.length ? `${sessions.length} sessions` : 'No sessions yet. Send a prompt to start one.';
+  }
+  function renderList(items) {
+    sessions = items;
+    // Creation may publish before its catalog snapshot arrives; keep the new ID until then.
+    recent = recent.filter(id => id === client.state().session?.sessionId || items.some(item => item.sessionId === id));
+    renderRows(client.state());
     if (selectedId && !opening) { opening = true; open(selectedId); }
   }
-  const feed = catalog(renderList, message => { status.textContent = message; });
+  const feed = catalog(renderList, message => { if (listStatus) listStatus.textContent = message; else status.textContent = message; });
+  if (toggle) toggle.onclick = () => {
+    navigationVisible = !navigationVisible;
+    layout.classList.toggle('nav-hidden', !navigationVisible);
+    toggle.setAttribute('aria-expanded', String(navigationVisible));
+    toggle.textContent = navigationVisible ? 'Hide sessions' : 'Show sessions';
+    if (navigationVisible) list.querySelector('[aria-current="page"]')?.focus();
+  };
   fetch('/hive/v1/providers').then(response => response.json()).then(({ agents }) => {
     for (const agent of agents) add(agentSelect, 'option', agent.name, { value: agent.id });
     if (client.state().session?.agent) agentSelect.value = client.state().session.agent;

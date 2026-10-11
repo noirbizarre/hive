@@ -29,8 +29,10 @@ initialization errors. v1
 text chunks are adapted to v2 agent chunks and the v1 prompt response produces
 a v2 idle state. The transport exposed to clients remains v2 regardless.
 
-The full-screen TUI uses SDK `Client.v2()` / `HttpClient` for ACP session
-selection, creation and interaction. It can observe without taking control,
+The full-screen TUI uses the daemon session catalog for discovery and SDK
+`Client.v2()` / `HttpClient` for ACP session creation and interaction. It
+refreshes summaries periodically and preserves session identity across picker
+updates. It can observe without taking control,
 relinquish pilot while observing, or take over by Hive session ID, and leaves
 the session alive on exit. The browser implements the ACPv2
 WebSocket JSON-RPC boundary. It lists daemon-owned sessions, attaches as an
@@ -39,6 +41,9 @@ a prompt. It renders sequenced replay and live events through the same
 conversation reducer; reconnect observes the original session rather than
 creating another. Pending agent input follows the pilot to whichever client
 currently owns control.
+The browser rail observes catalog revisions via SSE and reconciles full
+snapshots with locally visited sessions; its hide/show state is presentation
+only. Neither client stores a second authoritative session catalog.
 ZJHive uses Zellij's host WebAccess permission for one-shot daemon status;
 Zellij's `web_request` is not a persistent WebSocket or SSE transport.
 

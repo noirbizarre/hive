@@ -62,8 +62,8 @@ strip = true
 # Shared versions for member crates to inherit via `dep = { workspace = true }`.
 # Owned by the project and Dependabot from here, same deal as [dependencies]
 # in the single-crate shapes.
-agent-client-protocol = { version = "=3.2.0", features = ["unstable_protocol_v2", "process", "stdio"] }
-agent-client-protocol-http = { version = "=3.2.0", features = ["client", "server"] }
+agent-client-protocol = { version = "=3.3.0", features = ["unstable_protocol_v2", "process", "stdio"] }
+agent-client-protocol-http = { version = "=3.3.0", features = ["client", "server"] }
 fs2 = "0.4"
 toml = "1.1"
 axum = "0.8"

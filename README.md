@@ -49,9 +49,12 @@ versions = ["v1"] # Confirm the ACP wire version for your installation.
 ```
 
 The commands and version declarations are examples; check your installed
-agents' ACP entrypoints and supported versions. Pi 1.1.0 does not advertise
-an ACP mode by default; configure Pi only after verifying an ACP-capable
-extension/entrypoint. Profiles may also specify
+agents' ACP entrypoints and supported versions. Pi support depends on a
+compatible ACP entrypoint or adapter being available for your installed
+version; do not assume native ACP mode is enabled by default. See the
+[Pi ACP compatibility issue](https://github.com/noirbizarre/hive/issues/19)
+and the versioned [ACP compatibility matrix](docs/acp-compatibility.md) for
+the current investigation and tested support. Profiles may also specify
 `env = { KEY = "value" }`; an endpoint profile uses
 `endpoint = "http://127.0.0.1:9000"` (or `ws://...`) and optional
 `headers = { Authorization = "Bearer ..." }`. Keep the config file private.

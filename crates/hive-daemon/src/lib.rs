@@ -1270,11 +1270,17 @@ async fn run_v1_agent(
                         let stop = match result {
                             Ok(response) => match response.stop_reason {
                                 v1::StopReason::EndTurn => v2::StopReason::EndTurn,
-                                _ => v2::StopReason::Other("_v1_stop".into()),
+                                _ => v2::StopReason::Other(v2::OtherStopReason::new(
+                                    "_v1_stop",
+                                    Default::default(),
+                                )),
                             },
                             Err(error) => {
                                 tracing::warn!(%error, "v1 prompt failed");
-                                v2::StopReason::Other("_v1_error".into())
+                                v2::StopReason::Other(v2::OtherStopReason::new(
+                                    "_v1_error",
+                                    Default::default(),
+                                ))
                             }
                         };
                         let _ = forward(

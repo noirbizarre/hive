@@ -449,6 +449,14 @@ async fn a_restart_reattaches_the_original_downstream_session_without_creating_a
         .unwrap()
         .env
         .insert("HIVE_MOCK_STATE".into(), agent_state.display().to_string());
+    if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
+        // Abruptly stopped test agents cannot safely flush coverage profiles;
+        // only the parent test's profile should be collected by llvm-cov.
+        config.agents.get_mut("mock").unwrap().env.insert(
+            "LLVM_PROFILE_FILE".into(),
+            if cfg!(windows) { "NUL" } else { "/dev/null" }.into(),
+        );
+    }
     let broker = hive_daemon::Broker::persistent(config.clone(), database.clone()).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -481,6 +489,8 @@ async fn a_restart_reattaches_the_original_downstream_session_without_creating_a
     );
     broker.shutdown().await;
     server.abort();
+    let _ = server.await;
+    drop(broker);
     let recovered = hive_daemon::Broker::persistent(config.clone(), database.clone()).unwrap();
     recovered.reconcile().await;
     recovered.reconcile().await;
@@ -518,6 +528,8 @@ async fn a_restart_reattaches_the_original_downstream_session_without_creating_a
     assert_eq!(saved["sessions"].as_object().unwrap().len(), 1);
     recovered.shutdown().await;
     server.abort();
+    let _ = server.await;
+    drop(recovered);
     let db = rusqlite::Connection::open(&database).unwrap();
     let mut record: serde_json::Value = serde_json::from_str(
         &db.query_row(
@@ -610,12 +622,28 @@ async fn a_restart_reattaches_the_original_downstream_session_without_creating_a
     );
     recovered.shutdown().await;
     server.abort();
+    let _ = server.await;
+    drop(recovered);
     std::fs::remove_file(&agent_state).unwrap();
     let orphaned = hive_daemon::Broker::persistent(config, database).unwrap();
     orphaned.reconcile().await;
     assert_eq!(orphaned_snapshot(&orphaned).await, "lost");
     orphaned.shutdown().await;
-    std::fs::remove_dir_all(base).unwrap();
+    drop(orphaned);
+    for attempt in 0..20 {
+        match std::fs::remove_dir_all(&base) {
+            Ok(()) => break,
+            Err(error) if cfg!(windows) && attempt < 19 => {
+                // Windows keeps SQLite and child-process files locked until their handles close.
+                tracing::debug!(%error, "waiting for test files to close");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(error) => panic!(
+                "cannot clean up recovery fixture {}: {error}",
+                base.display()
+            ),
+        }
+    }
 }
 
 async fn orphaned_snapshot(broker: &hive_daemon::Broker) -> String {
@@ -628,6 +656,7 @@ async fn orphaned_snapshot(broker: &hive_daemon::Broker) -> String {
         .unwrap()
         .to_owned();
     server.abort();
+    let _ = server.await;
     outcome
 }
 

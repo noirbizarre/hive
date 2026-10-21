@@ -183,9 +183,14 @@ async fn exercise_gateway(transport: &str, version: AgentVersion) {
             let event_revision = next_revision(&mut events, &mut pending).await;
             assert!(event_revision > initial);
             // Publish both requests before waiting for either completion.
+            let first_text = if version == AgentVersion::V1 {
+                "activity-sequence hello hive"
+            } else {
+                "hello hive"
+            };
             let first_prompt = cx
                 .send_request(
-                    v2::PromptRequest::new(id.clone(), vec!["hello hive".into()])
+                    v2::PromptRequest::new(id.clone(), vec![first_text.into()])
                         .meta(controlled(&opened_meta, "first")),
                 )
                 .block_task();
@@ -201,6 +206,8 @@ async fn exercise_gateway(transport: &str, version: AgentVersion) {
             let mut texts = [false; 2];
             let mut running = [false; 2];
             let mut idle = [false; 2];
+            let mut saw_v1_tool = false;
+            let mut saw_v1_plan = false;
             while !idle.iter().all(|done| *done) {
                 let update = timeout(Duration::from_secs(10), rx.recv())
                     .await
@@ -219,7 +226,7 @@ async fn exercise_gateway(transport: &str, version: AgentVersion) {
                             assert_eq!(
                                 text.text,
                                 if index == 0 {
-                                    "Echo: hello hive"
+                                    if version == AgentVersion::V1 { "Echo: activity-sequence hello hive" } else { "Echo: hello hive" }
                                 } else {
                                     "Echo: other session"
                                 }
@@ -233,10 +240,17 @@ async fn exercise_gateway(transport: &str, version: AgentVersion) {
                     v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(_)) if running[index] => {
                         idle[index] = true;
                     }
+                    v2::SessionUpdate::Other(other) if index == 0 && other.session_update == "_hive_activity" => {
+                        if other.fields["kind"] == "tool" && other.fields["tool"]["status"] == "failed" { saw_v1_tool = true; }
+                        if other.fields["kind"] == "plan" && other.fields["plan"]["entries"][0]["status"] == "in_progress" { saw_v1_plan = true; }
+                    }
                     _ => {}
                 }
             }
             assert!(texts.iter().all(|seen| *seen));
+            if version == AgentVersion::V1 {
+                assert!(saw_v1_tool && saw_v1_plan, "v1 tool and plan activity must stream before idle");
+            }
             let listed = cx
                 .send_request(v2::ListSessionsRequest::new())
                 .block_task()
@@ -321,13 +335,21 @@ async fn exercise_gateway(transport: &str, version: AgentVersion) {
             .block_task()
             .await?;
             let continued = timeout(Duration::from_secs(10), async {
+                let mut saw_reply = false;
                 while let Some(update) = rx.recv().await {
-                    if update.session_id == other_id
-                        && let v2::SessionUpdate::AgentMessageChunk(chunk) = update.update
-                        && let v2::ContentBlock::Text(text) = chunk.content
-                        && text.text == "Echo: still running"
-                    {
-                        return true;
+                    if update.session_id == other_id {
+                        match update.update {
+                            v2::SessionUpdate::AgentMessageChunk(chunk)
+                                if matches!(&chunk.content, v2::ContentBlock::Text(text) if text.text == "Echo: still running") =>
+                            {
+                                saw_reply = true;
+                            }
+                            v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(_)) if saw_reply => {
+                                // A chunk precedes the agent's idle transition; closing before idle races the worker.
+                                return true;
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 false
@@ -482,6 +504,74 @@ async fn create_and_prompt(
     .await
     .unwrap()
     .unwrap()
+}
+
+#[tokio::test]
+async fn live_tools_and_late_tasks_reach_every_observer_and_survive_live_only_resume() {
+    let config = config_with_agent(
+        "mock",
+        env!("CARGO_BIN_EXE_hive-test-agent"),
+        AgentVersion::V2,
+    );
+    let (address, server) = start_gateway(config).await;
+    let (observed_tx, mut observed_rx) = mpsc::unbounded_channel();
+    timeout(Duration::from_secs(15), Client.v2()
+        .on_receive_notification(async move |event: v2::UpdateSessionNotification, _: V2ConnectionTo<Agent>| {
+            observed_tx.send(event).map_err(Error::into_internal_error)
+        }, agent_client_protocol::on_receive_notification!())
+        .connect_with(HttpClient::new(format!("ws://{address}")).unwrap(), async move |cx| {
+            cx.send_request(v2::InitializeRequest::new(ProtocolVersion::V2, v2::Implementation::new("activity-test", "1"))).block_task().await?;
+            let cwd = std::env::current_dir().map_err(Error::into_internal_error)?;
+            let opened = cx.send_request(v2::NewSessionRequest::new(cwd.clone())).block_task().await?;
+            let id = opened.session_id.clone();
+            let (ready, attached) = oneshot::channel();
+            let observer = tokio::spawn(async move {
+                let (tx, mut rx) = mpsc::unbounded_channel();
+                Client.v2().on_receive_notification(async move |event: v2::UpdateSessionNotification, _: V2ConnectionTo<Agent>| {
+                    tx.send(event).map_err(Error::into_internal_error)
+                }, agent_client_protocol::on_receive_notification!())
+                .connect_with(HttpClient::new(format!("http://{address}")).unwrap(), async move |cx| {
+                    cx.send_request(v2::InitializeRequest::new(ProtocolVersion::V2, v2::Implementation::new("observer", "1"))).block_task().await?;
+                    let mut meta = v2::Meta::new();
+                    meta.insert("hive".into(), serde_json::json!({"mode":"observe"}));
+                    let response = cx.send_request(v2::ResumeSessionRequest::new(id.clone(), cwd.clone()).meta(meta)).block_task().await?;
+                    assert_eq!(response.meta.unwrap()["hive"]["activitySnapshot"]["support"]["tools"], "unknown");
+                    let _ = ready.send(());
+                    let mut kinds = Vec::new();
+                    let mut last = 0;
+                    while let Some(event) = rx.recv().await {
+                        let seq = event.meta.as_ref().unwrap()["hive"]["seq"].as_u64().unwrap();
+                        assert!(seq > last);
+                        last = seq;
+                        if let v2::SessionUpdate::Other(other) = event.update
+                            && other.session_update == "_hive_activity" {
+                                kinds.push(other.fields["kind"].as_str().unwrap().to_owned());
+                                if other.fields["kind"] == "task" { break; }
+                            }
+                    }
+                    assert!(kinds.windows(2).any(|window| window == ["tool", "plan"]));
+                    assert_eq!(kinds.last().unwrap(), "task");
+                    Ok(())
+                }).await.unwrap();
+            });
+            attached.await.map_err(Error::into_internal_error)?;
+            cx.send_request(v2::PromptRequest::new(opened.session_id.clone(), vec!["activity-sequence".into()])
+                .meta(controlled(&opened.meta, "activity-prompt"))).block_task().await?;
+            while let Some(event) = observed_rx.recv().await {
+                if let v2::SessionUpdate::Other(other) = &event.update
+                    && other.session_update == "_hive_activity" && other.fields["kind"] == "task" { break; }
+            }
+            observer.await.map_err(Error::into_internal_error)?;
+            let mut meta = v2::Meta::new();
+            meta.insert("hive".into(), serde_json::json!({"mode":"observe"}));
+            let response = cx.send_request(v2::ResumeSessionRequest::new(opened.session_id, std::env::current_dir().unwrap()).meta(meta)).block_task().await?;
+            let snapshot = &response.meta.unwrap()["hive"]["activitySnapshot"];
+            assert_eq!(snapshot["foreground"], "idle");
+            assert_eq!(snapshot["tools"]["mock-tool"]["status"], "completed");
+            assert_eq!(snapshot["tasks"]["background"]["status"], "completed");
+            Ok(())
+        })).await.unwrap().unwrap();
+    server.abort();
 }
 
 #[tokio::test]

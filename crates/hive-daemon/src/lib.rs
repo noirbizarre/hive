@@ -32,7 +32,9 @@ use serde::Serialize;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_stream::{StreamExt, wrappers::WatchStream};
 
+mod activity;
 pub mod config;
+use activity::Activity;
 use config::{Config, Profile};
 
 enum Downstream {
@@ -107,6 +109,7 @@ struct Control {
     catalog: watch::Sender<u64>,
     closing: bool,
     prompts: HashMap<String, PromptRecord>,
+    activity: Activity,
 }
 
 struct PromptRecord {
@@ -126,8 +129,14 @@ impl Control {
         client_id: String,
         gateway: V2ConnectionTo<Client>,
         catalog: watch::Sender<u64>,
+        version: AgentVersion,
     ) -> Self {
         let (changed, _) = watch::channel(1);
+        let mut activity = Activity::new();
+        if version == AgentVersion::V1 {
+            // The stable v1 adapter cannot emit task identities.
+            activity.support.insert("tasks".into(), "unsupported");
+        }
         Self {
             generation: 1,
             token: uuid::Uuid::new_v4().to_string(),
@@ -143,6 +152,7 @@ impl Control {
             catalog,
             closing: false,
             prompts: HashMap::new(),
+            activity,
         }
     }
 
@@ -151,6 +161,7 @@ impl Control {
         let mut hive = serde_json::json!({
             "generation": self.generation, "nextSeq": self.next_seq,
             "running": self.running, "pilot": self.pilot.is_some(),
+            "activitySnapshot": self.activity,
             "role": if self.pilot.as_deref() == Some(client_id) { "pilot" } else { "observer" },
         });
         // Observers must never receive the credential that authorizes mutations.
@@ -614,9 +625,11 @@ impl Broker {
             client_id.clone(),
             gateway,
             self.catalog.clone(),
+            provider.preferred_version(),
         )));
         let cwd = request.cwd.clone();
         let entry_control = control.clone();
+        let worker_control = control.clone();
         let id = hive_id.clone();
         let sessions = self.sessions.clone();
         let catalog = self.catalog.clone();
@@ -642,6 +655,16 @@ impl Broker {
                     control,
                 )
                 .await;
+            }
+            if let Ok(mut state) = worker_control.lock() {
+                state.activity.session = "ended".into();
+                let _ = publish_activity(
+                    &mut state,
+                    &id,
+                    serde_json::json!({
+                        "kind": "session", "status": "ended", "source": "hive",
+                    }),
+                );
             }
             // A crashed or closed subprocess must not remain advertised as active.
             if let Ok(mut sessions) = sessions.lock()
@@ -724,6 +747,40 @@ fn forward(
     forward_locked(&mut state, id, Some(update))
 }
 
+fn forward_v1(
+    control: &Mutex<Control>,
+    id: &v2::SessionId,
+    source: &v1::SessionUpdate,
+    raw: v2::SessionUpdate,
+) -> agent_client_protocol::Result<()> {
+    let mut state = control.lock().map_err(|_| Error::internal_error())?;
+    forward_locked(&mut state, id, Some(raw))?;
+    if let Some(event) = state.activity.v1(source) {
+        publish_activity(&mut state, id, event)?;
+    }
+    Ok(())
+}
+
+fn publish_activity(
+    state: &mut Control,
+    id: &v2::SessionId,
+    event: serde_json::Value,
+) -> agent_client_protocol::Result<()> {
+    let serde_json::Value::Object(mut fields) = event else {
+        return Ok(());
+    };
+    fields.insert("version".into(), serde_json::json!(1));
+    state.activity.seq = state.next_seq;
+    forward_locked(
+        state,
+        id,
+        Some(v2::SessionUpdate::Other(v2::OtherSessionUpdate::new(
+            "_hive_activity",
+            fields.into_iter().collect(),
+        ))),
+    )
+}
+
 fn forward_locked(
     state: &mut Control,
     id: &v2::SessionId,
@@ -765,6 +822,9 @@ fn forward_locked(
     });
     if is_agent_update || subscribers != state.subscribers.len() {
         state.notify();
+    }
+    if let Some(event) = state.activity.v2(&update) {
+        publish_activity(state, id, event)?;
     }
     Ok(())
 }
@@ -1094,6 +1154,7 @@ async fn run_v1_agent(
                         return Ok(());
                     }
                     // V1 chunks have no message ID: assign one per Hive prompt.
+                    let source = notification.update.clone();
                     match notification.update {
                         v1::SessionUpdate::AgentMessageChunk(chunk) => {
                             if let v1::ContentBlock::Text(text) = chunk.content {
@@ -1104,12 +1165,17 @@ async fn run_v1_agent(
                         v1::SessionUpdate::ToolCall(call) => {
                             let mut fields = BTreeMap::new();
                             fields.insert("tool".into(), serde_json::to_value(call).map_err(Error::into_internal_error)?);
-                            forward(&control, &hive_id, v2::SessionUpdate::Other(v2::OtherSessionUpdate::new("_hive_v1_tool_call", fields)))?;
+                            forward_v1(&control, &hive_id, &source, v2::SessionUpdate::Other(v2::OtherSessionUpdate::new("_hive_v1_tool_call", fields)))?;
                         }
                         v1::SessionUpdate::ToolCallUpdate(call) => {
                             let mut fields = BTreeMap::new();
                             fields.insert("tool".into(), serde_json::to_value(call).map_err(Error::into_internal_error)?);
-                            forward(&control, &hive_id, v2::SessionUpdate::Other(v2::OtherSessionUpdate::new("_hive_v1_tool_update", fields)))?;
+                            forward_v1(&control, &hive_id, &source, v2::SessionUpdate::Other(v2::OtherSessionUpdate::new("_hive_v1_tool_update", fields)))?;
+                        }
+                        v1::SessionUpdate::Plan(plan) => {
+                            let mut fields = BTreeMap::new();
+                            fields.insert("plan".into(), serde_json::to_value(plan).map_err(Error::into_internal_error)?);
+                            forward_v1(&control, &hive_id, &source, v2::SessionUpdate::Other(v2::OtherSessionUpdate::new("_hive_v1_plan", fields)))?;
                         }
                         _ => {}
                     }
@@ -1735,6 +1801,7 @@ mod control_tests {
             catalog,
             closing: false,
             prompts: HashMap::new(),
+            activity: Activity::new(),
         }
     }
 
@@ -1841,8 +1908,8 @@ mod control_tests {
         }
         let state = state.lock().unwrap();
         assert_eq!(state.events.len(), 256);
-        assert_eq!(state.events.front().unwrap().0, 5);
-        assert_eq!(state.next_seq, 261);
+        assert_eq!(state.events.front().unwrap().0, 265);
+        assert_eq!(state.next_seq, 521);
         let from = v2::ReplayFrom::Other(v2::OtherReplayFrom::new(
             "_hive_seq",
             std::collections::BTreeMap::from([("seq".into(), serde_json::json!(4))]),
@@ -1857,12 +1924,55 @@ mod control_tests {
         );
         let available = v2::ReplayFrom::Other(v2::OtherReplayFrom::new(
             "_hive_seq",
-            std::collections::BTreeMap::from([("seq".into(), serde_json::json!(5))]),
+            std::collections::BTreeMap::from([("seq".into(), serde_json::json!(265))]),
         ));
-        assert_eq!(replay_start(&state, Some(&available)).unwrap(), Some(5));
+        assert_eq!(replay_start(&state, Some(&available)).unwrap(), Some(265));
         assert_eq!(
             state.generation, 1,
             "a failed cursor cannot take over control"
         );
+    }
+
+    #[test]
+    fn expired_history_retains_current_activity_for_a_live_only_attachment() {
+        let state = Mutex::new(detached());
+        let id = v2::SessionId::new("hive-test");
+        forward(
+            &state,
+            &id,
+            v2::SessionUpdate::ToolCallUpdate(
+                v2::ToolCallUpdate::new("finished")
+                    .status(v2::ToolCallStatus::Failed)
+                    .raw_output(serde_json::json!({"error": "failure"})),
+            ),
+        )
+        .unwrap();
+        for _ in 0..260 {
+            forward(
+                &state,
+                &id,
+                v2::SessionUpdate::AgentMessageChunk(v2::ContentChunk::new(
+                    "text".into(),
+                    v2::MessageId::new("message"),
+                )),
+            )
+            .unwrap();
+        }
+        let state = state.lock().unwrap();
+        assert!(
+            replay_start(
+                &state,
+                Some(&v2::ReplayFrom::Start(v2::ReplayFromStart::new()))
+            )
+            .is_err()
+        );
+        assert!(replay_start(&state, None).unwrap().is_none());
+        let snapshot = serde_json::to_value(&state.activity).unwrap();
+        assert_eq!(snapshot["tools"]["finished"]["status"], "failed");
+        assert_eq!(
+            snapshot["tools"]["finished"]["rawOutput"]["error"],
+            "failure"
+        );
+        assert_eq!(snapshot["seq"], 2);
     }
 }

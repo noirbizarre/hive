@@ -178,6 +178,40 @@ async fn main() -> agent_client_protocol::Result<()> {
                             v2::RunningStateUpdate::new(),
                         )),
                     )?;
+                    if text.contains("activity-sequence") {
+                        notify(
+                            &cx,
+                            &request.session_id,
+                            v2::SessionUpdate::ToolCallUpdate(
+                                v2::ToolCallUpdate::new("mock-tool")
+                                    .title("Check files")
+                                    .status(v2::ToolCallStatus::InProgress),
+                            ),
+                        )?;
+                        notify(
+                            &cx,
+                            &request.session_id,
+                            v2::SessionUpdate::PlanUpdate(v2::PlanUpdate::new(
+                                v2::PlanUpdateContent::items(
+                                    "mock-plan",
+                                    vec![v2::PlanEntry::new(
+                                        "Check files",
+                                        v2::PlanEntryPriority::High,
+                                        v2::PlanEntryStatus::InProgress,
+                                    )],
+                                ),
+                            )),
+                        )?;
+                        notify(
+                            &cx,
+                            &request.session_id,
+                            v2::SessionUpdate::ToolCallUpdate(
+                                v2::ToolCallUpdate::new("mock-tool")
+                                    .status(v2::ToolCallStatus::Completed)
+                                    .raw_output(serde_json::json!({"result": "ok"})),
+                            ),
+                        )?;
+                    }
                     let reply = format!(
                         "{}Echo: {text}",
                         std::env::var("HIVE_MOCK_LABEL").unwrap_or_default()
@@ -201,6 +235,24 @@ async fn main() -> agent_client_protocol::Result<()> {
                             v2::IdleStateUpdate::new().stop_reason(v2::StopReason::EndTurn),
                         )),
                     )?;
+                    if text.contains("activity-sequence") {
+                        let cx = cx.clone();
+                        let session = request.session_id.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                            let _ = notify(
+                                &cx,
+                                &session,
+                                v2::SessionUpdate::Other(v2::OtherSessionUpdate::new(
+                                    "_hive_task",
+                                    std::collections::BTreeMap::from([
+                                        ("taskId".into(), serde_json::json!("background")),
+                                        ("status".into(), serde_json::json!("completed")),
+                                    ]),
+                                )),
+                            );
+                        });
+                    }
                     if let Some((_, history)) = state
                         .lock()
                         .map_err(|_| Error::internal_error())?
@@ -271,6 +323,27 @@ async fn serve_v1() -> agent_client_protocol::Result<()> {
                     })
                     .collect::<Vec<_>>()
                     .join(" ");
+                if text.contains("activity-sequence") {
+                    cx.send_notification(v1::SessionNotification::new(
+                        request.session_id.clone(),
+                        v1::SessionUpdate::ToolCall(v1::ToolCall::new("v1-tool", "Check files")),
+                    ))?;
+                    cx.send_notification(v1::SessionNotification::new(
+                        request.session_id.clone(),
+                        v1::SessionUpdate::Plan(v1::Plan::new(vec![v1::PlanEntry::new(
+                            "Check files",
+                            v1::PlanEntryPriority::High,
+                            v1::PlanEntryStatus::InProgress,
+                        )])),
+                    ))?;
+                    cx.send_notification(v1::SessionNotification::new(
+                        request.session_id.clone(),
+                        v1::SessionUpdate::ToolCallUpdate(v1::ToolCallUpdate::new(
+                            "v1-tool",
+                            v1::ToolCallUpdateFields::new().status(v1::ToolCallStatus::Failed),
+                        )),
+                    ))?;
+                }
                 cx.send_notification(v1::SessionNotification::new(
                     request.session_id,
                     v1::SessionUpdate::AgentMessageChunk(v1::ContentChunk::new(

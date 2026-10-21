@@ -121,6 +121,45 @@ test('replay folds chunks into full messages without duplicating them', () => {
   assert.equal(history.runningNow, false);
 });
 
+test('activity snapshots reconcile missed tools and later task updates without reopening idle', () => {
+  const view = conversation();
+  view.reconcile({ version: 1, seq: 14, foreground: 'idle', tools: {
+    call: { toolCallId: 'call', title: 'Compile', status: 'completed' } },
+  plans: { list: { entries: [{ content: 'Compile', status: 'completed' }] } }, tasks: {},
+  support: { tools: 'observed', plans: 'observed', tasks: 'unknown' } });
+  view.skip(15);
+  assert.equal(view.apply(update(15, { sessionUpdate: '_hive_activity', kind: 'task', taskId: 'job',
+    task: { taskId: 'job', status: 'completed' } }).params), true);
+  assert.equal(view.apply(update(15, { sessionUpdate: '_hive_activity', kind: 'task', taskId: 'job' }).params), false);
+  assert.equal(view.activity.foreground, 'idle');
+  assert.equal(view.activity.tasks.job.status, 'completed');
+  assert.equal(view.activity.tools.call.title, 'Compile');
+  assert.equal(view.activity.support.tasks, 'observed');
+  assert.equal(view.apply(update(17, { sessionUpdate: '_hive_activity', kind: 'tool' }).params), false);
+  assert.equal(view.gap, true);
+  assert.equal(view.seq, 15);
+});
+
+test('a resume snapshot is applied before activity that arrives before its acknowledgement', async () => {
+  const sockets = transport((socket, message, result) => {
+    if (message.method === 'session/resume') {
+      result._meta.hive.nextSeq = 12;
+      result._meta.hive.activitySnapshot = { version: 1, seq: 10, session: 'active',
+        foreground: 'idle', tools: { call: { title: 'Compile', status: 'completed' } },
+        plans: {}, tasks: {}, support: { tools: 'observed', plans: 'unknown', tasks: 'unknown' } };
+      queueMicrotask(() => socket.receive(update(11, { sessionUpdate: '_hive_activity', kind: 'task',
+        taskId: 'background', task: { status: 'completed' } })));
+    }
+  });
+  const client = connect('ws://localhost/acp');
+  await client.open(session);
+  assert.equal(client.state().activity.tools.call.status, 'completed');
+  assert.equal(client.state().activity.tasks.background.status, 'completed');
+  assert.equal(client.state().activity.foreground, 'idle');
+  client.close();
+  assert.equal(sockets.length, 1);
+});
+
 test('takeover replay precedes live events and fences an earlier pilot', async () => {
   const sockets = transport((socket, message) => {
     if (message.method === 'session/resume' && message.params.replayFrom?.type === 'start') {

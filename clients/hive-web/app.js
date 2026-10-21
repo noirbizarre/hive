@@ -7,6 +7,14 @@ export function conversation() {
   let running = false;
   let generation = 0;
   let pilot = false;
+  let activity = { version: 1, seq: 0, session: 'active', foreground: 'unknown', tools: {}, plans: {}, tasks: {},
+    support: { tools: 'unknown', plans: 'unknown', tasks: 'unknown' } };
+  let gap = false;
+
+  function reconcile(snapshot) {
+    if (snapshot?.version === 1 && snapshot.seq >= activity.seq) activity = structuredClone(snapshot);
+    gap = false;
+  }
 
   function upsert(map, key, kind, text, replace = false) {
     if (!map.has(key)) {
@@ -20,6 +28,7 @@ export function conversation() {
   function apply(event) {
     const number = event._meta?.hive?.seq;
     if (!Number.isSafeInteger(number) || number <= seq) return false;
+    if (seq && number !== seq + 1) { gap = true; return false; }
     const update = event.update;
     const kind = update.sessionUpdate;
     if (kind === 'agent_message_chunk' || kind === 'user_message_chunk') {
@@ -40,6 +49,14 @@ export function conversation() {
     } else if (kind === '_hive_control') {
       generation = update.generation;
       pilot = update.pilot;
+    } else if (kind === '_hive_activity' && number > activity.seq) {
+      if (update.kind === 'foreground') activity.foreground = update.state?.state || 'unknown';
+      if (update.kind === 'session') activity.session = update.status;
+      for (const [type, id, value] of [['tools', update.toolCallId, update.tool],
+        ['plans', update.planId, update.plan], ['tasks', update.taskId, update.task]]) {
+        if (id && value) { activity[type][id] = value; activity.support[type] = 'observed'; }
+      }
+      activity.seq = number;
     }
     seq = number;
     return true;
@@ -48,13 +65,16 @@ export function conversation() {
   return {
     apply,
     notice(text) { lines.push({ kind: 'notice', text }); },
-    skip(nextSeq) { seq = nextSeq - 1; },
+    skip(nextSeq) { seq = Math.max(seq, nextSeq - 1); gap = false; },
+    reconcile,
     running(value) { running = value; },
     get seq() { return seq; },
     get runningNow() { return running; },
     get generation() { return generation; },
     get pilot() { return pilot; },
     get lines() { return lines.map(line => ({ ...line })); },
+    get activity() { return structuredClone(activity); },
+    get gap() { return gap; },
   };
 }
 
@@ -73,6 +93,8 @@ export function connect(url, onChange = () => {}) {
   let earlyInteraction;
   let takingControl;
   let gap = false;
+  let attaching = false;
+  let queuedUpdates = [];
   let status = 'Connecting…';
   let uncertain;
   let creationUncertain = store?.getItem('hive.creating') === 'true';
@@ -83,7 +105,7 @@ export function connect(url, onChange = () => {}) {
 
   const snapshot = () => ({ connected, status, session: selected && { ...selected }, role: owner?.role || 'observer',
     generation: owner?.generation,
-    running: history.runningNow, lines: history.lines, seq: history.seq, gap, interaction,
+    running: history.runningNow, lines: history.lines, activity: history.activity, seq: history.seq, gap, interaction,
     uncertain: uncertain && { ...uncertain }, takingControl: Boolean(takingControl) });
   const publish = () => onChange(snapshot());
   const errorText = error => error?.data || error?.message || String(error);
@@ -105,7 +127,15 @@ export function connect(url, onChange = () => {}) {
   }
   function update(message) {
     if (message.params?.sessionId !== selected?.sessionId) return;
-    if (!history.apply({ ...message.params, _meta: message.params._meta })) return;
+    if (attaching) { queuedUpdates.push(message); return; }
+    const applied = history.apply({ ...message.params, _meta: message.params._meta });
+    if (history.gap && !gap) {
+      status = 'Activity gap detected — reconciling…';
+      publish();
+      queueMicrotask(() => resume(owner?.role === 'pilot' ? 'pilot' : 'observe').catch(() => {}));
+      return;
+    }
+    if (!applied) return;
     if (owner?.role === 'pilot' && history.generation > owner.generation) relinquished();
     else publish();
   }
@@ -148,10 +178,13 @@ export function connect(url, onChange = () => {}) {
       ...(mode === 'observe' ? { _meta: { hive: { mode } } } : {}) };
     if (replay) params.replayFrom = history.seq
       ? { type: '_hive_seq', seq: history.seq + 1 } : { type: 'start' };
+    attaching = true;
     try {
       const response = await request('session/resume', params);
       // A delayed response from an older attachment must never grant control over the new view.
       if (selected?.sessionId !== target || version !== openVersion) {
+        attaching = false;
+        queuedUpdates = [];
         const stale = response?._meta?.hive;
         if (stale?.role === 'pilot' && stale.token) {
           // An overtaken handoff may succeed at the daemon after the user has left its view.
@@ -161,14 +194,20 @@ export function connect(url, onChange = () => {}) {
         return response;
       }
       const hive = ownership(response);
+      history.reconcile(hive.activitySnapshot);
       if (!replay) {
         // With no retained events, move the cursor to the daemon's atomic attachment boundary.
         history.skip(hive.nextSeq);
         history.notice('[Earlier history unavailable]');
         publish();
       }
+      attaching = false;
+      for (const queued of queuedUpdates.splice(0)) update(queued);
+      publish();
       return response;
     } catch (error) {
+      attaching = false;
+      queuedUpdates = [];
       if (selected?.sessionId !== target || version !== openVersion) throw error;
       if (error.message.includes('replay cursor unavailable')) {
         gap = true;
@@ -209,6 +248,8 @@ export function connect(url, onChange = () => {}) {
     ws.onclose = () => {
       if (socket !== ws) return;
       connected = false;
+      attaching = false;
+      queuedUpdates = [];
       owner = undefined;
       interaction = undefined;
       earlyInteraction = undefined;
@@ -430,6 +471,19 @@ export function mount(client, root = document) {
     }
     output.replaceChildren();
     for (const line of state.lines) add(output, 'div', `${line.kind === 'notice' ? '' : `${line.kind}: `}${line.text}`);
+    const activity = state.activity;
+    if (activity) {
+      const panel = add(output, 'section', '');
+      add(panel, 'h3', `Activity · ${activity.session || 'active'} / ${activity.foreground}`);
+      for (const [label, key] of [['Tools', 'tools'], ['Tasks', 'tasks'], ['Todos', 'plans']]) {
+        add(panel, 'h4', `${label} · ${activity.support?.[key] || 'unknown'}`);
+        for (const [id, item] of Object.entries(activity[key] || {})) {
+          if (key === 'plans') {
+            for (const entry of item.entries || []) add(panel, 'div', `${entry.status}: ${entry.content}`);
+          } else add(panel, 'div', `${item.title || id} · ${item.status || 'unknown'}`);
+        }
+      }
+    }
     if (currentInteraction?.id === state.interaction?.id) return;
     currentInteraction = state.interaction;
     dialog.replaceChildren();

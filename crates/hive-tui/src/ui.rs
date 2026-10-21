@@ -465,6 +465,39 @@ impl App {
             ),
             theme.text(),
         ));
+        if let Some(activity) = self.conversation().map(|c| &c.activity) {
+            lines.push(Line::default());
+            lines.push(Line::styled("Activity", theme.muted()));
+            for (label, field) in [("Tools", "tools"), ("Tasks", "tasks"), ("Todos", "plans")] {
+                let status = activity["support"][field].as_str().unwrap_or("unknown");
+                lines.push(Line::styled(format!("{label} · {status}"), theme.text()));
+                if let Some(items) = activity[field].as_object() {
+                    for (id, item) in items {
+                        if field == "plans" {
+                            for entry in item["entries"].as_array().into_iter().flatten() {
+                                lines.push(Line::styled(
+                                    format!(
+                                        "  {} · {}",
+                                        entry["status"].as_str().unwrap_or("?"),
+                                        entry["content"].as_str().unwrap_or("?")
+                                    ),
+                                    theme.text(),
+                                ));
+                            }
+                        } else {
+                            lines.push(Line::styled(
+                                format!(
+                                    "  {} · {}",
+                                    item["status"].as_str().unwrap_or("unknown"),
+                                    item["title"].as_str().unwrap_or(id)
+                                ),
+                                theme.text(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
         frame.render_widget(
             Paragraph::new(lines)
                 .style(theme.text())
@@ -642,6 +675,32 @@ mod tests {
         // No fixed background should override terminal transparency or a light theme.
         assert!(buffer.content().iter().all(|cell| cell.bg == Color::Reset));
         assert!(buffer.content().iter().any(|cell| cell.fg == Color::Cyan));
+    }
+
+    #[test]
+    fn the_sidebar_shows_tool_task_and_todo_status_from_the_shared_snapshot() {
+        let mut app = App {
+            page: Page::Chat,
+            active: Some("hive-one".into()),
+            cwd: "/tmp".into(),
+            ..App::default()
+        };
+        app.conversations
+            .entry("hive-one".into())
+            .or_default()
+            .snapshot(&serde_json::json!({
+                "version": 1, "seq": 4, "foreground": "idle", "session": "active",
+                "support": {"tools": "observed", "plans": "observed", "tasks": "observed"},
+                "tools": {"tool": {"title": "Compile", "status": "failed"}},
+                "tasks": {"job": {"title": "Index", "status": "completed"}},
+                "plans": {"plan": {"entries": [{"content": "Review", "status": "in_progress"}]}},
+            }));
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| app.show(frame)).unwrap();
+        let rendered = screen(&terminal);
+        assert!(rendered.contains("failed · Compile"));
+        assert!(rendered.contains("completed · Index"));
+        assert!(rendered.contains("in_progress · Review"));
     }
 
     #[test]

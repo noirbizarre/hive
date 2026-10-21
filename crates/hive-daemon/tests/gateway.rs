@@ -321,13 +321,21 @@ async fn exercise_gateway(transport: &str, version: AgentVersion) {
             .block_task()
             .await?;
             let continued = timeout(Duration::from_secs(10), async {
+                let mut saw_reply = false;
                 while let Some(update) = rx.recv().await {
-                    if update.session_id == other_id
-                        && let v2::SessionUpdate::AgentMessageChunk(chunk) = update.update
-                        && let v2::ContentBlock::Text(text) = chunk.content
-                        && text.text == "Echo: still running"
-                    {
-                        return true;
+                    if update.session_id == other_id {
+                        match update.update {
+                            v2::SessionUpdate::AgentMessageChunk(chunk)
+                                if matches!(&chunk.content, v2::ContentBlock::Text(text) if text.text == "Echo: still running") =>
+                            {
+                                saw_reply = true;
+                            }
+                            v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(_)) if saw_reply => {
+                                // A chunk precedes the agent's idle transition; closing before idle races the worker.
+                                return true;
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 false

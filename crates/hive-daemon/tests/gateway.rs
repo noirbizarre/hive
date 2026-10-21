@@ -630,19 +630,13 @@ async fn a_restart_reattaches_the_original_downstream_session_without_creating_a
     assert_eq!(orphaned_snapshot(&orphaned).await, "lost");
     orphaned.shutdown().await;
     drop(orphaned);
-    for attempt in 0..20 {
-        match std::fs::remove_dir_all(&base) {
-            Ok(()) => break,
-            Err(error) if cfg!(windows) && attempt < 19 => {
-                // Windows keeps SQLite and child-process files locked until their handles close.
-                tracing::debug!(%error, "waiting for test files to close");
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            Err(error) => panic!(
-                "cannot clean up recovery fixture {}: {error}",
-                base.display()
-            ),
-        }
+    #[cfg(not(windows))]
+    std::fs::remove_dir_all(base).unwrap();
+    #[cfg(windows)]
+    {
+        // Windows holds child-process and SQLite handles until after the test returns;
+        // the runner cleans its unique temporary directory when the job ends.
+        let _ = std::fs::remove_dir_all(base);
     }
 }
 

@@ -1,6 +1,6 @@
 # Architecture
 
-The daemon (`crates/hive-daemon`) owns the only shared in-memory session broker. The
+The daemon (`crates/hive-daemon`) owns the shared session broker and durable catalog. The
 official `AcpHttpServer` mounts ACP at `/acp`: GET with WebSocket upgrade is a
 persistent bidirectional JSON-RPC channel; POST plus per-connection and
 per-session GET SSE streams form the HTTP alternative. Both create the same
@@ -13,13 +13,16 @@ TUI crates; neither library depends on the CLI or on the other.
 `hive-protocol` pins SDK integration and shared native status access. The daemon
 owns a registry of inert agent profiles loaded from one XDG TOML file, and the
 broker maps each Hive session ID to its selected profile, one downstream
-process/connection, and downstream session ID. A downstream worker and session
+process/connection, and persisted downstream session ID. A downstream worker and session
 outlive any attached upstream client. An atomic per-session control state stores
 the current pilot generation/token, attached observer recipients, active turn,
-prompt-key outcomes, and a bounded log of all emitted updates. `session/resume`
+prompt-key outcomes, and a bounded log of all emitted updates. Upstream `session/resume`
 validates replay, atomically rotates pilot control and adds an event recipient;
-it never contacts the downstream agent to recreate the conversation. Only an
-explicit session close, downstream failure, or daemon shutdown terminates it.
+does not contact the downstream agent for a live session. At daemon startup,
+Hive instead reattaches through the original downstream ID using the agent's
+ACP recovery method; no new downstream session or prompt is sent. Unexpected
+worker exits leave an offline catalog record. Explicit close deletes that
+record, while daemon shutdown preserves it for reattachment.
 
 The downstream version and transport are selected **per session** from its
 profile declaration (v2 preferred over v1). The pinned SDK supports stdio,
@@ -55,8 +58,19 @@ downstream running until explicit takeover. The event log retains the latest
 256 updates (including token-free control changes) with contiguous sequence
 numbers. A replay cursor outside the
 available range fails without changing control. In-memory retries and retained
-events survive client disconnection, **not daemon restart**; no durable storage
-or remote security policy is provided. Each attached observer receives live
+events survive client disconnection; restart retains session IDs and prompt
+reservations but loses replay history and activity snapshots. A SQLite WAL
+database at `$XDG_STATE_HOME/hive/sessions.sqlite3` (or
+`$HOME/.local/state/hive/sessions.sqlite3`) keeps the catalog in per-record
+transactions. Migrations use SQLite `user_version`; a newer schema refuses to
+start rather than overwriting data. Back up the database together with its WAL
+file only while Hive is stopped (or through SQLite's backup API). Crash-safe
+cursor block reservations expose gaps rather than reusing sequence numbers;
+an interrupted prompt requires explicit user acknowledgement before new work.
+Explicit closes remove the record immediately; orphaned/lost records without
+uncertain work are pruned after 90 days without activity. Unavailable sessions
+and records with interrupted work remain until explicitly resolved.
+Storage errors fail the affected operation or fence its session. Each attached observer receives live
 updates but never an ownership token. Pending permission/elicitation requests
 follow the pilot across takeovers and expire if nobody answers.
 The daemon exclusively locks a private per-user runtime file before binding;

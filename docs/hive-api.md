@@ -7,7 +7,7 @@ administration and session access MUST NOT be exposed on an external listener.
 | --- | --- |
 | `GET /hive/v1/health` | `{ "status": "ok" }` when HTTP responds |
 | `GET /hive/v1/ready` | `{ "ready": true }` when listener is active (does not probe the provider) |
-| `GET /hive/v1/status` | name, build version, in-memory session count, default agent ID and active sessions by agent |
+| `GET /hive/v1/status` | name, build version, live and persisted session count, default agent ID and active sessions by agent |
 | `GET /hive/v1/providers` | configured agent IDs, display names, declared transports and versions, default indication |
 | `GET /hive/v1/sessions` | current broker-owned session summaries and catalog revision |
 | `GET /hive/v1/sessions/events` | SSE catalog revision notifications; re-list on change |
@@ -31,7 +31,7 @@ provide the persistent WebSocket/SSE connection needed for an ACP controller.
 
 ## Session catalog
 
-`GET /hive/v1/sessions` returns a sorted snapshot of the daemon's in-memory
+`GET /hive/v1/sessions` returns a sorted snapshot of live and persisted
 sessions, independent of the connection that created them:
 
 ```json
@@ -44,6 +44,8 @@ sessions, independent of the connection that created them:
       "agent": "my-profile",
       "title": "Review the parser",
       "lifecycle": "active",
+      "recovery": "active",
+      "recoveryReason": null,
       "activity": "idle",
       "lastActivityAt": 1791754566280,
       "controlOwner": "opaque-connection-id",
@@ -67,8 +69,15 @@ summary does not represent tool, plan, or late background task state: use
 `_hive_activity` updates on `/acp` and `activitySnapshot` from new/resume for
 those; see [the activity contract](acp-compatibility.md#live-execution-activity).
 `lifecycle` is
-`active` or temporarily `closing`; closed and failed sessions are removed.
-These sessions do not persist across a daemon restart.
+`active` or temporarily `closing` for a live worker. Offline records are
+`recovering`, `unavailable`, `orphaned` (agent cannot attach), or `lost`
+(agent rejects the saved ID) and retain their original Hive ID.
+`recovery` reports `active` for a newly created live worker, `reattached`
+after successful downstream recovery, `recovery_required` when
+interrupted work needs an explicit acknowledgement, or the offline lifecycle.
+`recoveryReason` explains why action is needed. Offline records cannot accept
+ACP commands; an uncertain reattached session can be observed but not
+controlled until acknowledged.
 
 `controlOwner` is the current pilot's opaque **connection-scoped** ID, or
 `null` when control is unclaimed. It can change across reconnects and is not a
@@ -92,8 +101,10 @@ key. If the 256-update in-memory replay window has expired, the WebUI reports
 missing history and offers an explicit
 attach-without-history action. That action restores current activity from the
 atomic resume snapshot but cannot restore missed conversation messages.
-Daemon restart loses both the sessions and
-their replay/command outcomes; the WebUI does not restore them from storage.
+Daemon restart retains session records and prompt keys, but loses replay
+events and activity snapshots. The browser reports the history gap and offers
+live-only attachment; interrupted work requires a separate explicit
+acknowledgement before new prompts.
 
 To observe the catalog, open `GET /hive/v1/sessions/events` as an EventSource
 (or another SSE client), **then** fetch `/hive/v1/sessions`. Each event is named
@@ -124,4 +135,7 @@ conversation state across catalog refreshes and visibility changes.
 Clients display `unknown` activity as unknown, rather than treating it as
 idle. A currently visible permission/input request may be flagged as needing
 attention; the catalog cannot identify such requests for unrelated sessions.
-Neither recents nor the daemon's sessions survive a daemon restart.
+Client recents do not survive restart; the daemon's session catalog does.
+In the TUI, inspect a recovered session as an observer, then press `Ctrl-Y`
+only after verifying agent state to acknowledge interrupted work and take
+control. In the browser, use the explicit recovery acknowledgement button.

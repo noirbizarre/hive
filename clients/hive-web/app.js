@@ -97,6 +97,7 @@ export function connect(url, onChange = () => {}) {
   let queuedUpdates = [];
   let status = 'Connecting…';
   let uncertain;
+  let recoveryRequired = false;
   let creationUncertain = store?.getItem('hive.creating') === 'true';
   let openQueue = Promise.resolve();
   let openVersion = 0;
@@ -106,7 +107,7 @@ export function connect(url, onChange = () => {}) {
   const snapshot = () => ({ connected, status, session: selected && { ...selected }, role: owner?.role || 'observer',
     generation: owner?.generation,
     running: history.runningNow, lines: history.lines, activity: history.activity, seq: history.seq, gap, interaction,
-    uncertain: uncertain && { ...uncertain }, takingControl: Boolean(takingControl) });
+    uncertain: uncertain && { ...uncertain }, recoveryRequired, takingControl: Boolean(takingControl) });
   const publish = () => onChange(snapshot());
   const errorText = error => error?.data || error?.message || String(error);
   function request(method, params) {
@@ -161,6 +162,7 @@ export function connect(url, onChange = () => {}) {
     const hive = meta?._meta?.hive;
     if (!hive || !Number.isSafeInteger(hive.generation) || !hive.role) throw new Error('Hive did not return control metadata');
     owner = hive.role === 'pilot' ? hive : { generation: hive.generation, role: 'observer' };
+    recoveryRequired = Boolean(hive.recoveryRequired);
     history.running(hive.running);
     gap = false;
     status = `${owner.role === 'pilot' ? 'Controlling' : 'Read-only'} ${selected.sessionId}${hive.running ? ' (running)' : ''}`;
@@ -169,13 +171,14 @@ export function connect(url, onChange = () => {}) {
     earlyInteraction = undefined;
     return hive;
   }
-  async function resume(mode = 'observe', replay = true) {
+  async function resume(mode = 'observe', replay = true, acknowledge = false) {
     if (!selected) throw new Error('Select a session first');
     const target = selected.sessionId;
     const targetCwd = selected.cwd;
     const version = openVersion;
     const params = { sessionId: selected.sessionId, cwd: selected.cwd,
-      ...(mode === 'observe' ? { _meta: { hive: { mode } } } : {}) };
+      ...((mode === 'observe' || acknowledge) ? { _meta: { hive: { ...(mode === 'observe' ? { mode } : {}),
+        ...(acknowledge ? { recoveryAction: 'acknowledge' } : {}) } } } : {}) };
     if (replay) params.replayFrom = history.seq
       ? { type: '_hive_seq', seq: history.seq + 1 } : { type: 'start' };
     attaching = true;
@@ -282,6 +285,7 @@ export function connect(url, onChange = () => {}) {
         }
         if (version !== openVersion) return;
         selected = { sessionId: session.sessionId, cwd: session.cwd, agent: session.agent };
+        recoveryRequired = session.recovery === 'recovery_required';
         creationUncertain = false;
         store?.removeItem('hive.creating');
         history = conversation();
@@ -296,6 +300,15 @@ export function connect(url, onChange = () => {}) {
       return operation;
     },
     async attachWithoutHistory() { if (!gap) throw new Error('No history gap to skip'); return resume('observe', false); },
+    async acknowledgeRecovery() {
+      if (!selected || !connected || gap || !recoveryRequired) throw new Error('Observe the recovered session before acknowledging interrupted work');
+      const response = await resume('pilot', true, true);
+      uncertain = undefined;
+      store?.removeItem(`hive.pending.${selected.sessionId}`);
+      history.running(false);
+      publish();
+      return response;
+    },
     async takeControl() {
       if (!selected || !connected || gap) throw new Error('Attach to a session before taking control');
       if (owner?.role === 'pilot') return;
@@ -342,7 +355,10 @@ export function connect(url, onChange = () => {}) {
         publish();
         return result;
       } catch (error) {
-        status = `Prompt acknowledgement uncertain: ${error.message}; retry with the same key`;
+        if (error.message.includes('outcome is uncertain after restart')) {
+          recoveryRequired = true;
+          status = `${error.message}; inspect agent state and acknowledge recovery`;
+        } else status = `Prompt acknowledgement uncertain: ${error.message}; retry with the same key`;
         if (error.message.includes('stale')) relinquished();
         publish();
         throw error;
@@ -438,6 +454,7 @@ export function mount(client, root = document) {
   const cancel = root.querySelector('#cancel');
   const dialog = root.querySelector('#interaction');
   const retry = root.querySelector('#retry');
+  const recover = root.querySelector('#recover');
   const skip = root.querySelector('#skip-history');
   let sessions = [];
   let recent = [];
@@ -459,11 +476,15 @@ export function mount(client, root = document) {
     renderRows(state);
     const pilot = state.role === 'pilot' && state.connected && !state.gap;
     input.disabled = !state.connected || state.gap;
-    send.disabled = !state.connected || state.gap || sending || state.takingControl || state.running ||
+    send.disabled = !state.connected || state.gap || sending || state.takingControl || state.running || state.recoveryRequired ||
       (Boolean(state.session) && !pilot) || Boolean(state.uncertain);
     cancel.disabled = !pilot || !state.running;
-    retry.hidden = !state.uncertain;
+    retry.hidden = !state.uncertain || state.recoveryRequired;
     retry.disabled = !pilot || !state.connected || sending;
+    if (recover) {
+      recover.hidden = !state.recoveryRequired;
+      recover.disabled = !state.connected || state.gap || sending;
+    }
     skip.hidden = !state.gap;
     agentSelect.disabled = Boolean(state.session);
     if (state.session?.agent && Array.from(agentSelect.options).some(option => option.value === state.session.agent)) {
@@ -557,7 +578,7 @@ export function mount(client, root = document) {
         : 'unclaimed';
       const activity = session.lifecycle && session.lifecycle !== 'active' ? session.lifecycle : session.activity;
       const attention = session.sessionId === state.session?.sessionId && state.interaction ? ' · needs attention' : '';
-      const detail = add(button, 'small', `${session.sessionId} · ${session.agent || 'unknown agent'} · ${activity || 'unknown'}${attention} · ${control} · ` +
+      const detail = add(button, 'small', `${session.sessionId} · ${session.agent || 'unknown agent'} · ${activity || 'unknown'}${session.recoveryReason ? ` · ${session.recoveryReason}` : ''}${attention} · ${control} · ` +
         `${session.lastActivityAt == null ? 'no activity yet' : new Date(session.lastActivityAt).toLocaleString()}`);
       if (attention || activity === 'running' || activity === 'closing') detail.className = 'attention';
     }
@@ -611,6 +632,7 @@ export function mount(client, root = document) {
     catch (error) { status.textContent = error.message; }
     finally { sending = false; show(client.state()); }
   };
+  if (recover) recover.onclick = () => client.acknowledgeRecovery().catch(error => { status.textContent = error.message; });
   skip.onclick = () => client.attachWithoutHistory().catch(error => { status.textContent = error.message; });
   cancel.onclick = () => client.cancel();
   show(client.state());

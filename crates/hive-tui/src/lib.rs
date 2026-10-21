@@ -445,6 +445,39 @@ async fn handle_key(
                 }
             }
         }
+        (KeyCode::Char('y'), true) => {
+            if let Some(id) = app.active.clone() {
+                let cwd = app
+                    .sessions
+                    .iter()
+                    .find(|session| session.session_id == id)
+                    .map_or_else(|| app.cwd.clone(), |session| session.cwd.clone());
+                let mut meta = v2::Meta::new();
+                meta.insert(
+                    "hive".into(),
+                    serde_json::json!({ "recoveryAction": "acknowledge" }),
+                );
+                match cx
+                    .send_request(
+                        v2::ResumeSessionRequest::new(v2::SessionId::new(id.clone()), cwd.clone())
+                            .meta(meta),
+                    )
+                    .block_task()
+                    .await
+                {
+                    Ok(response) => {
+                        app.owner = response.meta;
+                        app.skip_replay = true;
+                        if let Err(error) = resume(cx, app, id, cwd, "pilot").await {
+                            app.status = resume_failure(&error);
+                        } else {
+                            app.status = "Interrupted work acknowledged; verify agent state before sending a new prompt".into();
+                        }
+                    }
+                    Err(error) => app.status = resume_failure(&error),
+                }
+            }
+        }
         (KeyCode::Char('c'), true) => {
             if let (Some(id), Some(owner)) = (&app.active, &app.owner)
                 && app.pilot()

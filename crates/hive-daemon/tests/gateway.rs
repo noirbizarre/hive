@@ -183,9 +183,14 @@ async fn exercise_gateway(transport: &str, version: AgentVersion) {
             let event_revision = next_revision(&mut events, &mut pending).await;
             assert!(event_revision > initial);
             // Publish both requests before waiting for either completion.
+            let first_text = if version == AgentVersion::V1 {
+                "activity-sequence hello hive"
+            } else {
+                "hello hive"
+            };
             let first_prompt = cx
                 .send_request(
-                    v2::PromptRequest::new(id.clone(), vec!["hello hive".into()])
+                    v2::PromptRequest::new(id.clone(), vec![first_text.into()])
                         .meta(controlled(&opened_meta, "first")),
                 )
                 .block_task();
@@ -201,6 +206,8 @@ async fn exercise_gateway(transport: &str, version: AgentVersion) {
             let mut texts = [false; 2];
             let mut running = [false; 2];
             let mut idle = [false; 2];
+            let mut saw_v1_tool = false;
+            let mut saw_v1_plan = false;
             while !idle.iter().all(|done| *done) {
                 let update = timeout(Duration::from_secs(10), rx.recv())
                     .await
@@ -219,7 +226,7 @@ async fn exercise_gateway(transport: &str, version: AgentVersion) {
                             assert_eq!(
                                 text.text,
                                 if index == 0 {
-                                    "Echo: hello hive"
+                                    if version == AgentVersion::V1 { "Echo: activity-sequence hello hive" } else { "Echo: hello hive" }
                                 } else {
                                     "Echo: other session"
                                 }
@@ -233,10 +240,17 @@ async fn exercise_gateway(transport: &str, version: AgentVersion) {
                     v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(_)) if running[index] => {
                         idle[index] = true;
                     }
+                    v2::SessionUpdate::Other(other) if index == 0 && other.session_update == "_hive_activity" => {
+                        if other.fields["kind"] == "tool" && other.fields["tool"]["status"] == "failed" { saw_v1_tool = true; }
+                        if other.fields["kind"] == "plan" && other.fields["plan"]["entries"][0]["status"] == "in_progress" { saw_v1_plan = true; }
+                    }
                     _ => {}
                 }
             }
             assert!(texts.iter().all(|seen| *seen));
+            if version == AgentVersion::V1 {
+                assert!(saw_v1_tool && saw_v1_plan, "v1 tool and plan activity must stream before idle");
+            }
             let listed = cx
                 .send_request(v2::ListSessionsRequest::new())
                 .block_task()

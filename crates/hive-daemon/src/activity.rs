@@ -228,4 +228,55 @@ mod tests {
             "in_progress"
         );
     }
+
+    #[test]
+    fn v2_plan_replacements_and_tool_chunks_remain_current_after_idle() {
+        let mut activity = Activity::new();
+        let plan = |status| {
+            v2::SessionUpdate::PlanUpdate(v2::PlanUpdate::new(v2::PlanUpdateContent::items(
+                "steps",
+                vec![v2::PlanEntry::new(
+                    "Compile",
+                    v2::PlanEntryPriority::High,
+                    status,
+                )],
+            )))
+        };
+        activity.v2(&plan(v2::PlanEntryStatus::Pending));
+        activity.v2(&plan(v2::PlanEntryStatus::Completed));
+        assert_eq!(activity.plans["steps"]["entries"][0]["status"], "completed");
+        activity.v2(&v2::SessionUpdate::ToolCallContentChunk(
+            v2::ToolCallContentChunk::new("call", "output"),
+        ));
+        assert_eq!(activity.tools["call"]["status"], "pending");
+        assert_eq!(
+            activity.tools["call"]["chunks"].as_array().unwrap().len(),
+            1
+        );
+        activity.v2(&v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(
+            v2::IdleStateUpdate::new(),
+        )));
+        activity.tool(json!({"toolCallId":"call", "status":"cancelled"}), false);
+        assert_eq!(activity.foreground, "idle");
+        assert_eq!(activity.tools["call"]["status"], "cancelled");
+    }
+
+    #[test]
+    fn a_finished_call_snapshot_is_bounded_without_eviction_of_running_work() {
+        let mut activity = Activity::new();
+        activity.tool(
+            json!({"toolCallId":"active", "status":"in_progress"}),
+            false,
+        );
+        for index in 0..130 {
+            activity.tool(
+                json!({"toolCallId": format!("finished-{index}"), "status":"completed"}),
+                false,
+            );
+        }
+        assert_eq!(activity.tools.len(), 129);
+        assert!(activity.tools.contains_key("active"));
+        assert!(!activity.tools.contains_key("finished-0"));
+        assert!(activity.tools.contains_key("finished-129"));
+    }
 }

@@ -678,6 +678,32 @@ mod tests {
     }
 
     #[test]
+    fn the_sidebar_shows_tool_task_and_todo_status_from_the_shared_snapshot() {
+        let mut app = App {
+            page: Page::Chat,
+            active: Some("hive-one".into()),
+            cwd: "/tmp".into(),
+            ..App::default()
+        };
+        app.conversations
+            .entry("hive-one".into())
+            .or_default()
+            .snapshot(&serde_json::json!({
+                "version": 1, "seq": 4, "foreground": "idle", "session": "active",
+                "support": {"tools": "observed", "plans": "observed", "tasks": "observed"},
+                "tools": {"tool": {"title": "Compile", "status": "failed"}},
+                "tasks": {"job": {"title": "Index", "status": "completed"}},
+                "plans": {"plan": {"entries": [{"content": "Review", "status": "in_progress"}]}},
+            }));
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| app.show(frame)).unwrap();
+        let rendered = screen(&terminal);
+        assert!(rendered.contains("failed · Compile"));
+        assert!(rendered.contains("completed · Index"));
+        assert!(rendered.contains("in_progress · Review"));
+    }
+
+    #[test]
     fn selected_profiles_are_visible_on_the_terminal_background() {
         let app = App {
             page: Page::Profiles,

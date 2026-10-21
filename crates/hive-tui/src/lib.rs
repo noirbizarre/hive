@@ -151,6 +151,8 @@ async fn resume(
     conversation.generation = hive["generation"].as_u64().unwrap_or(0);
     conversation.running = hive["running"].as_bool().unwrap_or(false);
     conversation.pilot_present = hive["pilot"].as_bool().unwrap_or(false);
+    conversation.snapshot(&hive["activitySnapshot"]);
+    conversation.gap = false;
     let next_seq = hive["nextSeq"].as_u64().unwrap_or(1);
     app.owner = response.meta;
     if app.skip_replay {
@@ -653,11 +655,18 @@ pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error + Sen
                          _ = catalog_tick.tick() => {
                              if let Err(error) = refresh(&options.address, &mut app).await { app.status = format!("Session list unavailable: {error}"); }
                          }
-                        Some(update) = updates.recv() => {
+                         Some(update) = updates.recv() => {
                             let id = update.session_id.to_string();
                             let current = app.active.as_ref() == Some(&id);
                             let state = app.conversations.entry(id).or_default();
-                            if state.apply(update) && current && !app.pilot() {
+                             let applied = state.apply(update);
+                             let missing = state.gap;
+                             if missing && current {
+                                 app.status = "Activity gap detected; reconnect to reconcile history".into();
+                                 // The next connection replays from the last committed sequence.
+                                 break;
+                             }
+                             if applied && current && !app.pilot() {
                                 app.status = "Observer — take control to interact".into();
                                 interaction = None;
                                 app.dialog = None;

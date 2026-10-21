@@ -25,9 +25,20 @@ pub struct Conversation {
     pub running: bool,
     pub generation: u64,
     pub pilot_present: bool,
+    pub activity: serde_json::Value,
+    pub activity_seq: u64,
+    pub gap: bool,
 }
 
 impl Conversation {
+    pub fn snapshot(&mut self, value: &serde_json::Value) {
+        let seq = value["seq"].as_u64().unwrap_or(0);
+        if seq >= self.activity_seq && value["version"] == 1 {
+            self.activity = value.clone();
+            self.activity_seq = seq;
+        }
+    }
+
     pub fn push_user(&mut self, text: String) {
         self.lines.push(ConversationLine {
             kind: LineKind::User,
@@ -79,6 +90,10 @@ impl Conversation {
             return false;
         };
         if seq <= self.seq {
+            return false;
+        }
+        if self.seq != 0 && seq != self.seq + 1 {
+            self.gap = true;
             return false;
         }
         // Replay and live events share sequence numbers; only advance after reducing the event.
@@ -146,6 +161,39 @@ impl Conversation {
                     .as_u64()
                     .unwrap_or(self.generation);
                 self.pilot_present = other.fields["pilot"].as_bool().unwrap_or(false);
+            }
+            v2::SessionUpdate::Other(other) if other.session_update == "_hive_activity" => {
+                let value = serde_json::to_value(other.fields).unwrap_or_default();
+                if seq > self.activity_seq {
+                    let kind = value["kind"].as_str().unwrap_or_default();
+                    if kind == "foreground" {
+                        self.activity["foreground"] = value["state"]["state"].clone();
+                    }
+                    if kind == "session" {
+                        self.activity["session"] = value["status"].clone();
+                    }
+                    let (key, id) = match kind {
+                        "tool" => ("tools", value["toolCallId"].as_str()),
+                        "plan" => ("plans", value["planId"].as_str()),
+                        "task" => ("tasks", value["taskId"].as_str()),
+                        _ => ("", None),
+                    };
+                    if let Some(id) = id {
+                        if !self.activity[key].is_object() {
+                            self.activity[key] = serde_json::json!({});
+                        }
+                        self.activity[key][id] = value[kind].clone();
+                        let support = if key == "plans" {
+                            "plans"
+                        } else if key == "tasks" {
+                            "tasks"
+                        } else {
+                            "tools"
+                        };
+                        self.activity["support"][support] = serde_json::json!("observed");
+                    }
+                    self.activity_seq = seq;
+                }
             }
             v2::SessionUpdate::Other(other)
                 if other.session_update.starts_with("_hive_v1_tool") =>
@@ -247,5 +295,42 @@ mod tests {
         ));
         assert_eq!(conversation.generation, 2);
         assert!(!conversation.pilot_present);
+    }
+
+    #[test]
+    fn a_snapshot_and_late_task_reconcile_without_changing_idle_or_duplicating_calls() {
+        let mut conversation = Conversation::default();
+        conversation.snapshot(
+            &serde_json::json!({"version":1,"seq":10,"foreground":"idle",
+            "tools":{"call":{"title":"Compile","status":"completed"}},"plans":{},"tasks":{},
+            "support":{"tools":"observed","plans":"unknown","tasks":"unknown"}}),
+        );
+        conversation.seq = 10;
+        assert!(conversation.apply(event(
+            11,
+            v2::SessionUpdate::Other(v2::OtherSessionUpdate::new(
+                "_hive_activity",
+                BTreeMap::from([
+                    ("kind".into(), serde_json::json!("task")),
+                    ("taskId".into(), serde_json::json!("background")),
+                    ("task".into(), serde_json::json!({"status":"completed"})),
+                ]),
+            ))
+        )));
+        assert_eq!(conversation.activity["foreground"], "idle");
+        assert_eq!(
+            conversation.activity["tasks"]["background"]["status"],
+            "completed"
+        );
+        assert_eq!(
+            conversation.activity["tools"]["call"]["status"],
+            "completed"
+        );
+        assert!(!conversation.apply(event(
+            13,
+            v2::SessionUpdate::StateUpdate(v2::StateUpdate::Running(v2::RunningStateUpdate::new()))
+        )));
+        assert!(conversation.gap);
+        assert!(!conversation.running);
     }
 }

@@ -1,10 +1,10 @@
 # ACP compatibility and draft maturity
 
 Hive clients always initialize with ACP protocol version 2. The current SDK
-`agent-client-protocol =3.2.0` needs its `unstable_protocol_v2` feature;
-`agent-client-protocol-http =3.2.0` provides both server transport shapes.
+`agent-client-protocol =3.3.0` needs its `unstable_protocol_v2` feature;
+`agent-client-protocol-http =3.3.0` provides both server transport shapes.
 Their crate versions do not denote the ACP wire version. The SDK pins schema
-`=1.10.2`; the Cargo lockfile records the tested dependency set.
+`=1.11.0`; the Cargo lockfile records the tested dependency set.
 
 Implemented v2 operations: initialize, session/new, list, resume, close,
 prompt, cancel and session/update. A prompt response acknowledges acceptance;
@@ -163,3 +163,55 @@ alive; an expired cursor requires a visible attach-without-history choice.
 Neither replay nor prompt deduplication survives a daemon restart. Updates
 can arrive before prompt responses; `idle` ends foreground work, not a
 unique turn-ID boundary.
+
+## Live execution activity
+
+Native ACPv2 tool, plan, and state updates remain on the shared session stream.
+Immediately after each supported native update Hive publishes a sequenced
+`session/update` with `sessionUpdate: "_hive_activity"`, `version: 1`, and fields
+selected by `kind`:
+
+| Kind | Fields | Meaning |
+| --- | --- | --- |
+| `tool` | `toolCallId`, `tool`, `source` | Current full tool-call state after applying an ACP patch or content chunk. `status` uses ACP's `pending`, `in_progress`, `completed`, `failed`, `cancelled` values. Raw input/output and result/error content are retained when sent. |
+| `plan` | `planId`, `plan`, `source` | Full replacement of structured entries, including each status. A v1 plan uses the session-scoped ID `v1-plan`. |
+| `foreground` | `state`, `source` | ACP foreground running, idle (with stop reason), or requires-action state. Idle ends foreground work only. |
+| `session` | `status`, `source` | Hive worker ended (`ended`), distinct from turn idle or background task completion. |
+| `task` | `taskId`, `task`, `source` | Explicitly identified background task update from a `_hive_task` downstream extension; unrecognized extensions are forwarded unchanged. |
+
+`source` is `acp-v1`, `acp-v2`, `acp` (v1/v2 tool patches), or `extension`.
+`_meta.hive.seq` is the ordinary per-session event cursor, including normalized
+updates. Tool patch fields absent from an update retain their previous value;
+explicit null clears a field; arrays replace previous arrays. Content chunks
+append until a full content update replaces them. Top-level provider `_meta` is
+excluded from tool/plan/task projections. IDs are scoped to the Hive session;
+turn IDs, parent task IDs, and other relationships are present only when the
+downstream event provides them. A tool or task update after idle never reopens
+the foreground turn or closes the session.
+
+`_meta.hive.activitySnapshot` in new/resume responses contains `{version:1,
+seq,session,foreground,tools,plans,tasks,support}` at the atomic replay/live attachment
+boundary. `seq` is the last normalized activity event; `nextSeq` remains the
+first not-yet-produced *session update*. The support values for tools, plans,
+and tasks are `observed`, `unknown`, or `unsupported`. V1 task identities are
+unsupported by Hive's stable v1 adapter; otherwise an absent todo update cannot
+justify an invented plan or an unsupported claim.
+Unrecognized provider statuses are preserved. Finished tools are retained up
+to 128 per session; streaming chunk snapshots retain the latest 64 chunks and
+flag `chunksTruncated` when earlier chunks have been evicted. Raw event history
+remains bounded at 256 updates (now including normalized activity), so a full
+replay can expire sooner than before.
+
+Apply replay in sequence order; ignore repeated sequence numbers. Identical
+downstream content chunks without provider event IDs cannot be distinguished
+from legitimate repeated chunks; entity upserts still replace the same call or
+plan. On a gap,
+replay from the last applied sequence plus one. If that cursor has expired,
+attach live-only after an explicit history-gap decision, restore
+`activitySnapshot`, and continue from `nextSeq`. A snapshot restores *current
+activity*, not missed conversation text. Buffer updates that arrive before the
+resume response and reduce them after the snapshot so later activity cannot be
+overwritten. A daemon restart loses both history and this in-memory snapshot.
+V1 tool calls and plans are adapted; ACPv2 provides tool, plan, and foreground
+updates natively. Background tasks require explicit provider extension events;
+neither wire version guarantees them.

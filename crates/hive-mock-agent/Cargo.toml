@@ -8,4 +8,5 @@ publish = false
 
 [dependencies]
 agent-client-protocol = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }

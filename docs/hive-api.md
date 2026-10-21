@@ -20,7 +20,8 @@ it reports configuration, not live availability. Session creation uses
 Transfer of control and observe/relinquish attachment use ACPv2 `session/resume`
 over `/acp` on either WebSocket or HTTP/SSE, not a separate operational endpoint.
 A response `_meta.hive` contains the current generation, next event sequence,
-running state and role; only pilot responses include an opaque token;
+running state, current `activitySnapshot` and role; only pilot responses include
+an opaque token;
 all mutating ACP calls must include that generation/token. Prompts additionally
 require a stable idempotency key. See [ACP compatibility](acp-compatibility.md)
 for the exact wire contract, replay cursor and retention guarantees. The TUI
@@ -61,7 +62,11 @@ accepted prompt or agent update, or `null` before either. It is not proof of
 ongoing agent work. `activity` is `unknown` until Hive receives an agent
 running/idle update or admits a prompt, then `running` or `idle` according to
 the last known foreground state. Agents may perform other work without a
-corresponding status update; Hive does not guess its state. `lifecycle` is
+corresponding status update; Hive does not guess its state. This foreground
+summary does not represent tool, plan, or late background task state: use
+`_hive_activity` updates on `/acp` and `activitySnapshot` from new/resume for
+those; see [the activity contract](acp-compatibility.md#live-execution-activity).
+`lifecycle` is
 `active` or temporarily `closing`; closed and failed sessions are removed.
 These sessions do not persist across a daemon restart.
 
@@ -85,7 +90,9 @@ again, rather than silently creating a second agent session. An uncertain
 prompt acknowledgement can be retried manually with its original idempotency
 key. If the 256-update in-memory replay window has expired, the WebUI reports
 missing history and offers an explicit
-attach-without-history action. Daemon restart loses both the sessions and
+attach-without-history action. That action restores current activity from the
+atomic resume snapshot but cannot restore missed conversation messages.
+Daemon restart loses both the sessions and
 their replay/command outcomes; the WebUI does not restore them from storage.
 
 To observe the catalog, open `GET /hive/v1/sessions/events` as an EventSource

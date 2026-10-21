@@ -1532,6 +1532,7 @@ name = "hive-mock-agent"
 version = "0.1.0"
 dependencies = [
  "agent-client-protocol",
+ "serde_json",
  "tokio",
 ]
 

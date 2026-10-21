@@ -465,6 +465,39 @@ impl App {
             ),
             theme.text(),
         ));
+        if let Some(activity) = self.conversation().map(|c| &c.activity) {
+            lines.push(Line::default());
+            lines.push(Line::styled("Activity", theme.muted()));
+            for (label, field) in [("Tools", "tools"), ("Tasks", "tasks"), ("Todos", "plans")] {
+                let status = activity["support"][field].as_str().unwrap_or("unknown");
+                lines.push(Line::styled(format!("{label} · {status}"), theme.text()));
+                if let Some(items) = activity[field].as_object() {
+                    for (id, item) in items {
+                        if field == "plans" {
+                            for entry in item["entries"].as_array().into_iter().flatten() {
+                                lines.push(Line::styled(
+                                    format!(
+                                        "  {} · {}",
+                                        entry["status"].as_str().unwrap_or("?"),
+                                        entry["content"].as_str().unwrap_or("?")
+                                    ),
+                                    theme.text(),
+                                ));
+                            }
+                        } else {
+                            lines.push(Line::styled(
+                                format!(
+                                    "  {} · {}",
+                                    item["status"].as_str().unwrap_or("unknown"),
+                                    item["title"].as_str().unwrap_or(id)
+                                ),
+                                theme.text(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
         frame.render_widget(
             Paragraph::new(lines)
                 .style(theme.text())

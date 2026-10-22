@@ -7,11 +7,23 @@ use std::{
 
 use agent_client_protocol::schema::{v1, v2};
 use agent_client_protocol::{Agent, Client, Error, Responder, Stdio, V2ConnectionTo};
+use serde::{Deserialize, Serialize};
 
-#[derive(Default)]
+#[derive(Default, Deserialize, Serialize)]
 struct State {
     next: u64,
     sessions: HashMap<v2::SessionId, (v2::AbsolutePath, Vec<v2::SessionUpdate>)>,
+}
+
+fn save(state: &State) -> agent_client_protocol::Result<()> {
+    let Some(path) = std::env::var_os("HIVE_MOCK_STATE") else {
+        return Ok(());
+    };
+    std::fs::write(
+        path,
+        serde_json::to_vec(state).map_err(Error::into_internal_error)?,
+    )
+    .map_err(Error::into_internal_error)
 }
 
 fn notify(
@@ -31,7 +43,12 @@ async fn main() -> agent_client_protocol::Result<()> {
     if std::env::args().nth(1).as_deref() == Some("v1") {
         return serve_v1().await;
     }
-    let state = Arc::new(Mutex::new(State::default()));
+    let state = Arc::new(Mutex::new(
+        std::env::var_os("HIVE_MOCK_STATE")
+            .and_then(|path| std::fs::read(path).ok())
+            .and_then(|data| serde_json::from_slice::<State>(&data).ok())
+            .unwrap_or_default(),
+    ));
     Agent
         .v2()
         .name("hive-mock-agent")
@@ -62,6 +79,7 @@ async fn main() -> agent_client_protocol::Result<()> {
                         state.next += 1;
                         let id = v2::SessionId::new(format!("mock-{}", state.next));
                         state.sessions.insert(id.clone(), (request.cwd, Vec::new()));
+                        save(&state)?;
                         id
                     };
                     responder.respond(v2::NewSessionResponse::new(id.clone()))?;
@@ -128,12 +146,12 @@ async fn main() -> agent_client_protocol::Result<()> {
                 async move |request: v2::CloseSessionRequest,
                             responder: Responder<v2::CloseSessionResponse>,
                             _cx: V2ConnectionTo<Client>| {
+                    let mut state = state.lock().map_err(|_| Error::internal_error())?;
                     state
-                        .lock()
-                        .map_err(|_| Error::internal_error())?
                         .sessions
                         .remove(&request.session_id)
                         .ok_or_else(|| invalid("unknown session"))?;
+                    save(&state)?;
                     responder.respond(v2::CloseSessionResponse::new())
                 }
             },

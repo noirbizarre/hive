@@ -432,6 +432,228 @@ async fn start_gateway(config: Config) -> (SocketAddr, tokio::task::JoinHandle<(
     (address, server)
 }
 
+#[tokio::test]
+async fn a_restart_reattaches_the_original_downstream_session_without_creating_another() {
+    let base = std::env::temp_dir().join(format!("hive-recovery-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&base).unwrap();
+    let database = base.join("hive/sessions.sqlite3");
+    let agent_state = base.join("agent.json");
+    let mut config = config_with_agent(
+        "mock",
+        env!("CARGO_BIN_EXE_hive-test-agent"),
+        AgentVersion::V2,
+    );
+    config
+        .agents
+        .get_mut("mock")
+        .unwrap()
+        .env
+        .insert("HIVE_MOCK_STATE".into(), agent_state.display().to_string());
+    if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
+        // Abruptly stopped test agents cannot safely flush coverage profiles;
+        // only the parent test's profile should be collected by llvm-cov.
+        config.agents.get_mut("mock").unwrap().env.insert(
+            "LLVM_PROFILE_FILE".into(),
+            if cfg!(windows) { "NUL" } else { "/dev/null" }.into(),
+        );
+    }
+    let broker = hive_daemon::Broker::persistent(config.clone(), database.clone()).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = hive_daemon::router(broker.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let id = Client
+        .v2()
+        .connect_with(
+            HttpClient::new(format!("ws://{address}")).unwrap(),
+            async |cx| {
+                cx.send_request(v2::InitializeRequest::new(
+                    ProtocolVersion::V2,
+                    v2::Implementation::new("recovery-test", "1"),
+                ))
+                .block_task()
+                .await?;
+                let cwd = std::env::current_dir().unwrap();
+                let opened = cx
+                    .send_request(v2::NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?;
+                Ok(opened.session_id)
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        summaries(address).await["sessions"][0]["sessionId"],
+        id.to_string()
+    );
+    broker.shutdown().await;
+    server.abort();
+    let _ = server.await;
+    drop(broker);
+    let recovered = hive_daemon::Broker::persistent(config.clone(), database.clone()).unwrap();
+    recovered.reconcile().await;
+    recovered.reconcile().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = hive_daemon::router(recovered.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let catalog = summaries(address).await;
+    assert_eq!(catalog["sessions"][0]["sessionId"], id.to_string());
+    assert_eq!(catalog["sessions"][0]["recovery"], "reattached");
+    Client
+        .v2()
+        .connect_with(
+            HttpClient::new(format!("ws://{address}")).unwrap(),
+            async |cx| {
+                cx.send_request(v2::InitializeRequest::new(
+                    ProtocolVersion::V2,
+                    v2::Implementation::new("recovery-test", "1"),
+                ))
+                .block_task()
+                .await?;
+                let cwd = std::env::current_dir().unwrap();
+                let attached = cx
+                    .send_request(v2::ResumeSessionRequest::new(id.clone(), cwd))
+                    .block_task()
+                    .await?;
+                assert_eq!(attached.meta.unwrap()["hive"]["role"], "pilot");
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&agent_state).unwrap()).unwrap();
+    assert_eq!(saved["sessions"].as_object().unwrap().len(), 1);
+    recovered.shutdown().await;
+    server.abort();
+    let _ = server.await;
+    drop(recovered);
+    let db = rusqlite::Connection::open(&database).unwrap();
+    let mut record: serde_json::Value = serde_json::from_str(
+        &db.query_row(
+            "SELECT record FROM sessions WHERE id=?1",
+            [id.to_string()],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    record["uncertain"] = true.into();
+    db.execute(
+        "UPDATE sessions SET record=?2 WHERE id=?1",
+        rusqlite::params![id.to_string(), record.to_string()],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO prompts (session_id,key,content) VALUES (?1,'interrupted','[]')",
+        [id.to_string()],
+    )
+    .unwrap();
+    drop(db);
+    let recovered = hive_daemon::Broker::persistent(config.clone(), database.clone()).unwrap();
+    recovered.reconcile().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = hive_daemon::router(recovered.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    assert_eq!(
+        summaries(address).await["sessions"][0]["recovery"],
+        "recovery_required"
+    );
+    Client
+        .v2()
+        .connect_with(
+            HttpClient::new(format!("ws://{address}")).unwrap(),
+            async |cx| {
+                cx.send_request(v2::InitializeRequest::new(
+                    ProtocolVersion::V2,
+                    v2::Implementation::new("recovery-test", "1"),
+                ))
+                .block_task()
+                .await?;
+                let cwd = std::env::current_dir().unwrap();
+                let mut observe = v2::Meta::new();
+                observe.insert("hive".into(), serde_json::json!({"mode":"observe"}));
+                let attached = cx
+                    .send_request(
+                        v2::ResumeSessionRequest::new(id.clone(), cwd.clone()).meta(observe),
+                    )
+                    .block_task()
+                    .await?;
+                assert_eq!(attached.meta.unwrap()["hive"]["recoveryRequired"], true);
+                assert!(
+                    cx.send_request(v2::ResumeSessionRequest::new(id.clone(), cwd.clone()))
+                        .block_task()
+                        .await
+                        .is_err()
+                );
+                let mut acknowledge = v2::Meta::new();
+                acknowledge.insert(
+                    "hive".into(),
+                    serde_json::json!({"recoveryAction":"acknowledge"}),
+                );
+                let owner = cx
+                    .send_request(v2::ResumeSessionRequest::new(id.clone(), cwd).meta(acknowledge))
+                    .block_task()
+                    .await?;
+                let mut meta = owner.meta.unwrap();
+                meta.get_mut("hive").unwrap()["key"] = "interrupted".into();
+                let result = cx
+                    .send_request(
+                        v2::PromptRequest::new(id.clone(), vec!["hello".into()]).meta(meta),
+                    )
+                    .block_task()
+                    .await;
+                assert!(result.is_err(), "an interrupted key must never be resent");
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&std::fs::read(&agent_state).unwrap()).unwrap()
+            ["sessions"]
+            .as_object()
+            .unwrap()
+            .len(),
+        1
+    );
+    recovered.shutdown().await;
+    server.abort();
+    let _ = server.await;
+    drop(recovered);
+    std::fs::remove_file(&agent_state).unwrap();
+    let orphaned = hive_daemon::Broker::persistent(config, database).unwrap();
+    orphaned.reconcile().await;
+    assert_eq!(orphaned_snapshot(&orphaned).await, "lost");
+    orphaned.shutdown().await;
+    drop(orphaned);
+    #[cfg(not(windows))]
+    std::fs::remove_dir_all(base).unwrap();
+    #[cfg(windows)]
+    {
+        // Windows holds child-process and SQLite handles until after the test returns;
+        // the runner cleans its unique temporary directory when the job ends.
+        let _ = std::fs::remove_dir_all(base);
+    }
+}
+
+async fn orphaned_snapshot(broker: &hive_daemon::Broker) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = hive_daemon::router(broker.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let outcome = summaries(address).await["sessions"][0]["recovery"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    server.abort();
+    let _ = server.await;
+    outcome
+}
+
 async fn create_and_prompt(
     url: &str,
     agent: Option<&str>,

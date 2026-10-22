@@ -84,6 +84,21 @@ test('opening a TUI session observes its original cwd until the user types', asy
   client.close();
 });
 
+test('an interrupted session only acknowledges recovery after an explicit user action', async () => {
+  const sockets = transport((_, message, result) => message.method === 'session/resume'
+    ? { _meta: { hive: { ...result._meta.hive, recoveryRequired: !message.params._meta?.hive?.recoveryAction } } }
+    : undefined);
+  const client = connect('ws://localhost/acp');
+  await client.open({ ...session, recovery: 'recovery_required' });
+  assert.equal(client.state().recoveryRequired, true);
+  assert.equal(sockets[0].sent.filter(message => message.params?._meta?.hive?.recoveryAction).length, 0);
+  await client.acknowledgeRecovery();
+  assert.equal(sockets[0].sent.filter(message => message.params?._meta?.hive?.recoveryAction).length, 1);
+  assert.equal(client.state().role, 'pilot');
+  assert.equal(client.state().recoveryRequired, false);
+  client.close();
+});
+
 test('a new browser session is created only on its first prompt', async () => {
   const sockets = transport();
   const client = connect('ws://localhost/acp');

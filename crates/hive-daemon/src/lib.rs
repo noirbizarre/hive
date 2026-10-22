@@ -1,4 +1,4 @@
-//! Loopback ACPv2 gateway with a shared, in-memory session broker.
+//! Loopback ACPv2 gateway with a durable session catalog and live control broker.
 
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
@@ -34,8 +34,14 @@ use tokio_stream::{StreamExt, wrappers::WatchStream};
 
 mod activity;
 pub mod config;
+mod persistence;
 use activity::Activity;
 use config::{Config, Profile};
+use persistence::{Outcome, Record, Store};
+
+fn storage_error(error: persistence::StoreError) -> Error {
+    Error::internal_error().data(error.to_string())
+}
 
 enum Downstream {
     Stdio(AcpAgent),
@@ -47,6 +53,16 @@ impl ConnectTo<Client> for Downstream {
         match self {
             Self::Stdio(agent) => ConnectTo::<Client>::connect_to(agent, client).await,
             Self::Network(agent) => ConnectTo::<Client>::connect_to(agent, client).await,
+        }
+    }
+}
+
+struct AbortOnDrop(Option<tokio::task::AbortHandle>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
         }
     }
 }
@@ -83,6 +99,8 @@ pub struct Broker {
     registry: Arc<Config>,
     sessions: Arc<Mutex<HashMap<String, Entry>>>,
     catalog: watch::Sender<u64>,
+    store: Option<Arc<Store>>,
+    offline: Arc<Mutex<HashMap<String, Record>>>,
 }
 
 #[derive(Clone)]
@@ -110,6 +128,10 @@ struct Control {
     closing: bool,
     prompts: HashMap<String, PromptRecord>,
     activity: Activity,
+    recovery_required: bool,
+    reattached: bool,
+    store: Option<Arc<Store>>,
+    record: Option<Arc<Mutex<Record>>>,
 }
 
 struct PromptRecord {
@@ -124,7 +146,46 @@ enum Command {
     Close(u64, oneshot::Sender<Result<(), String>>),
 }
 
+type WorkerStartup = (
+    oneshot::Sender<Result<(v2::NewSessionResponse, String), String>>,
+    oneshot::Receiver<()>,
+);
+
 impl Control {
+    fn recovered(
+        catalog: watch::Sender<u64>,
+        version: AgentVersion,
+        record: &Record,
+        store: Arc<Store>,
+        saved: Arc<Mutex<Record>>,
+    ) -> Self {
+        let (changed, _) = watch::channel(record.generation);
+        let mut activity = Activity::new();
+        if version == AgentVersion::V1 {
+            activity.support.insert("tasks".into(), "unsupported");
+        }
+        Self {
+            generation: record.generation,
+            token: uuid::Uuid::new_v4().to_string(),
+            pilot: None,
+            subscribers: HashMap::new(),
+            changed,
+            next_seq: record.next_seq,
+            events: VecDeque::new(),
+            running: false,
+            activity_known: false,
+            title: record.title.clone(),
+            last_activity_at: record.last_activity_at,
+            catalog,
+            closing: false,
+            prompts: HashMap::new(),
+            activity,
+            recovery_required: record.uncertain,
+            reattached: true,
+            store: Some(store),
+            record: Some(saved),
+        }
+    }
     fn new(
         client_id: String,
         gateway: V2ConnectionTo<Client>,
@@ -153,6 +214,10 @@ impl Control {
             closing: false,
             prompts: HashMap::new(),
             activity,
+            recovery_required: false,
+            reattached: false,
+            store: None,
+            record: None,
         }
     }
 
@@ -162,6 +227,7 @@ impl Control {
             "generation": self.generation, "nextSeq": self.next_seq,
             "running": self.running, "pilot": self.pilot.is_some(),
             "activitySnapshot": self.activity,
+            "recoveryRequired": self.recovery_required,
             "role": if self.pilot.as_deref() == Some(client_id) { "pilot" } else { "observer" },
         });
         // Observers must never receive the credential that authorizes mutations.
@@ -244,6 +310,8 @@ pub struct SessionSummary {
     agent: String,
     title: Option<String>,
     lifecycle: &'static str,
+    recovery: &'static str,
+    recovery_reason: Option<String>,
     activity: &'static str,
     last_activity_at: Option<u64>,
     control_owner: Option<String>,
@@ -259,6 +327,8 @@ impl SessionSummary {
             agent: entry.profile.clone(),
             title: state.title.clone(),
             lifecycle: if state.closing { "closing" } else { "active" },
+            recovery: if state.recovery_required { "recovery_required" } else if state.reattached { "reattached" } else { "active" },
+            recovery_reason: state.recovery_required.then(|| "A prompt may have been interrupted; inspect agent state and explicitly acknowledge recovery before sending new work".into()),
             activity: if !state.activity_known {
                 "unknown"
             } else if state.running {
@@ -275,6 +345,23 @@ impl SessionSummary {
                     .as_ref()
                     .is_some_and(|id| state.subscribers.contains_key(id)),
             )),
+        }
+    }
+
+    fn from_record(record: &Record) -> Self {
+        Self {
+            session_id: record.id.clone(),
+            cwd: v2::AbsolutePath::from(PathBuf::from(&record.cwd)),
+            agent: record.profile.clone(),
+            title: record.title.clone(),
+            lifecycle: record.outcome.as_str(),
+            recovery: record.outcome.as_str(),
+            recovery_reason: record.reason.clone(),
+            activity: "unknown",
+            last_activity_at: record.last_activity_at,
+            control_owner: None,
+            generation: record.generation,
+            observers: 0,
         }
     }
 }
@@ -337,6 +424,211 @@ pub struct Status {
 }
 
 impl Broker {
+    pub async fn reconcile(&self) {
+        let ids = self
+            .offline
+            .lock()
+            .map(|records| records.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let permits = Arc::new(tokio::sync::Semaphore::new(4));
+        let mut jobs = tokio::task::JoinSet::new();
+        for id in ids {
+            let broker = self.clone();
+            let permits = permits.clone();
+            jobs.spawn(async move {
+                let _permit = permits.acquire().await;
+                for attempt in 0..3 {
+                    broker.recover(&id).await;
+                    let retry = broker.offline.lock().ok().and_then(|records| records.get(&id).cloned())
+                        .is_some_and(|record| matches!(record.outcome, Outcome::Unavailable)
+                            && record.reason.as_deref().is_some_and(|reason| reason.contains("timed out") || reason.contains("reattachment failed") || reason.contains("session/resume failed")));
+                    if !retry { break; }
+                    if attempt == 2 {
+                        if let Ok(mut offline) = broker.offline.lock() && let Some(record) = offline.get_mut(&id) {
+                            record.reason = Some("agent recovery failed after three attempts; check agent state and restart Hive to retry".into());
+                            if let Some(store) = &broker.store { let _ = store.save(record); }
+                        }
+                    } else {
+                        tokio::time::sleep(std::time::Duration::from_millis(200 * (1 << attempt))).await;
+                    }
+                }
+            });
+        }
+        while jobs.join_next().await.is_some() {}
+    }
+
+    async fn recover(&self, id: &str) {
+        let Some(mut record) = self
+            .offline
+            .lock()
+            .ok()
+            .and_then(|records| records.get(id).cloned())
+        else {
+            return;
+        };
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        let Some(provider) = self.registry.agents.get(&record.profile).cloned() else {
+            record.outcome = Outcome::Unavailable;
+            record.reason =
+                Some("agent profile is missing; restore its configuration and restart Hive".into());
+            self.update_offline(record);
+            return;
+        };
+        let version = if record.version == "v1" {
+            AgentVersion::V1
+        } else {
+            AgentVersion::V2
+        };
+        if !provider.versions.contains(&version) {
+            record.outcome = Outcome::Unavailable;
+            record.reason = Some("agent profile no longer enables the original ACP version; restore it and restart Hive".into());
+            self.update_offline(record);
+            return;
+        }
+        let saved = Arc::new(Mutex::new(record.clone()));
+        let control = Arc::new(Mutex::new(Control::recovered(
+            self.catalog.clone(),
+            version,
+            &record,
+            store.clone(),
+            saved.clone(),
+        )));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (active_tx, active_rx) = oneshot::channel();
+        let hive_id = v2::SessionId::new(record.id.clone());
+        let cwd = v2::AbsolutePath::from(PathBuf::from(&record.cwd));
+        let request = v2::NewSessionRequest::new(cwd.clone());
+        let downstream_id = record.downstream_id.clone();
+        let worker_control = control.clone();
+        let broker = self.clone();
+        let worker_id = id.to_owned();
+        let worker_saved = saved.clone();
+        let worker = tokio::spawn(async move {
+            if version == AgentVersion::V1 {
+                run_v1_agent(
+                    provider,
+                    request,
+                    hive_id,
+                    rx,
+                    (ready_tx, active_rx),
+                    worker_control.clone(),
+                    Some(downstream_id),
+                )
+                .await;
+            } else {
+                run_agent(
+                    provider,
+                    request,
+                    hive_id,
+                    rx,
+                    (ready_tx, active_rx),
+                    worker_control.clone(),
+                    Some(downstream_id),
+                )
+                .await;
+            }
+            let closing = worker_control.lock().is_ok_and(|state| state.closing);
+            if !closing && let Ok(mut state) = worker_control.lock() {
+                if let Some(record) = &state.record
+                    && let Ok(mut record) = record.lock()
+                {
+                    record.outcome = Outcome::Unavailable;
+                    record.reason =
+                        Some("agent worker exited; restart Hive to retry recovery".into());
+                    if let Some(store) = &state.store {
+                        let _ = store.save(&record);
+                    }
+                }
+                state.activity.session = "ended".into();
+            }
+            if !closing
+                && let Ok(mut sessions) = broker.sessions.lock()
+                && sessions.remove(&worker_id).is_some()
+                && let Ok(record) = worker_saved.lock()
+            {
+                broker.update_offline(record.clone());
+            }
+        });
+        let mut guard = AbortOnDrop(Some(worker.abort_handle()));
+        let result = tokio::time::timeout(std::time::Duration::from_secs(12), ready_rx).await;
+        match result {
+            Ok(Ok(Ok((_, returned_id)))) if returned_id == record.downstream_id => {
+                record.outcome = Outcome::Active;
+                record.reason = None;
+                if let Err(error) = store.save(&record) {
+                    tracing::error!(%error, "cannot save reattached session");
+                    worker.abort();
+                    return;
+                }
+                if let Ok(mut stored) = saved.lock() {
+                    *stored = record.clone();
+                }
+                let entry = Entry {
+                    cwd,
+                    profile: record.profile.clone(),
+                    abort: worker.abort_handle(),
+                    commands: tx,
+                    control,
+                };
+                if let Ok(mut sessions) = self.sessions.lock() {
+                    sessions.insert(id.to_owned(), entry);
+                    self.offline
+                        .lock()
+                        .expect("offline lock poisoned")
+                        .remove(id);
+                    self.catalog.send_modify(|revision| *revision += 1);
+                }
+                if active_tx.send(()).is_err() {
+                    worker.abort();
+                    if let Ok(mut sessions) = self.sessions.lock() {
+                        sessions.remove(id);
+                    }
+                    record.outcome = Outcome::Unavailable;
+                    record.reason = Some(
+                        "agent exited before reattachment completed; restart Hive to retry".into(),
+                    );
+                    self.update_offline(record);
+                    return;
+                }
+                guard.0 = None;
+                return;
+            }
+            Ok(Ok(Err(error))) => {
+                record.outcome = if error.contains("saved session not found") {
+                    Outcome::Lost
+                } else if error.contains("does not advertise")
+                    || error.contains("-32601")
+                    || error.contains("-32602")
+                {
+                    Outcome::Orphaned
+                } else {
+                    Outcome::Unavailable
+                };
+                record.reason = Some(error);
+            }
+            _ => {
+                record.outcome = Outcome::Unavailable;
+                record.reason = Some("agent reattachment timed out or disconnected; check agent availability and restart Hive".into());
+            }
+        }
+        worker.abort();
+        self.update_offline(record);
+    }
+
+    fn update_offline(&self, record: Record) {
+        if let Some(store) = &self.store
+            && let Err(error) = store.save(&record)
+        {
+            tracing::error!(%error, "cannot record recovery failure");
+        }
+        if let Ok(mut offline) = self.offline.lock() {
+            offline.insert(record.id.clone(), record);
+            self.catalog.send_modify(|revision| *revision += 1);
+        }
+    }
     #[must_use]
     pub fn new(registry: Config) -> Self {
         let (catalog, _) = watch::channel(0);
@@ -344,7 +636,30 @@ impl Broker {
             registry: Arc::new(registry),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             catalog,
+            store: None,
+            offline: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn persistent(registry: Config, path: PathBuf) -> Result<Self, persistence::StoreError> {
+        let store = Arc::new(Store::open(path)?);
+        // Retain interrupted keys indefinitely; only definitely non-resumable old records age out.
+        store.prune(now_millis().saturating_sub(90 * 24 * 60 * 60 * 1000))?;
+        let mut broker = Self::new(registry);
+        broker.offline = Arc::new(Mutex::new(
+            store
+                .records()?
+                .into_iter()
+                .map(|mut r| {
+                    r.generation = r.generation.saturating_add(1);
+                    r.next_seq = r.reserved_seq.saturating_add(1).max(r.next_seq);
+                    r.outcome = Outcome::Recovering;
+                    (r.id.clone(), r)
+                })
+                .collect(),
+        ));
+        broker.store = Some(store);
+        Ok(broker)
     }
 
     fn snapshot(
@@ -362,6 +677,15 @@ impl Broker {
                     Ok(SessionSummary::from_entry(id, entry, &state))
                 })
                 .collect::<agent_client_protocol::Result<Vec<_>>>()?;
+            let offline = self.offline.lock().map_err(|_| Error::internal_error())?;
+            summaries.extend(
+                offline
+                    .values()
+                    .filter(|record| {
+                        cwd.is_none_or(|cwd| cwd.0 == std::path::Path::new(&record.cwd))
+                    })
+                    .map(SessionSummary::from_record),
+            );
             // An owner/activity mutation can interleave between individual control locks.
             // Retrying ensures the snapshot never claims a revision for mixed states.
             let after = *self.catalog.borrow();
@@ -381,7 +705,12 @@ impl Broker {
             .map_err(|_| Error::internal_error())?
             .get(&id.to_string())
             .cloned()
-            .ok_or_else(|| Error::invalid_params().data(format!("unknown Hive session {id}")))
+            .ok_or_else(|| {
+                if let Ok(offline) = self.offline.lock() && let Some(record) = offline.get(&id.to_string()) {
+                    return Error::invalid_request().data(format!("Hive session {id} is {}: {}; inspect the catalog and retry recovery or choose another session", record.outcome.as_str(), record.reason.as_deref().unwrap_or("agent reattachment pending")));
+                }
+                Error::invalid_params().data(format!("unknown Hive session {id}"))
+            })
     }
 
     fn prompt(
@@ -416,6 +745,28 @@ impl Broker {
             }
             return Ok(rx);
         }
+        if let Some(store) = &state.store
+            && let Some((content, result)) = store
+                .prompt(&request.session_id.to_string(), &key)
+                .map_err(storage_error)?
+        {
+            if content
+                != serde_json::to_string(&request.prompt).map_err(Error::into_internal_error)?
+            {
+                return Err(Error::invalid_params()
+                    .data("prompt key was used with different content; choose a new key"));
+            }
+            if let Some(result) = result {
+                let outcome: Result<v2::PromptResponse, String> =
+                    serde_json::from_str(&result).map_err(Error::into_internal_error)?;
+                let _ = tx.send(outcome);
+                return Ok(rx);
+            }
+            return Err(Error::invalid_request().data("prompt outcome is uncertain after restart; never retry this key; inspect agent state and explicitly acknowledge recovery"));
+        }
+        if state.recovery_required {
+            return Err(Error::invalid_request().data("session recovery requires explicit acknowledgement on session/resume before new prompts"));
+        }
         if state.running || state.closing {
             return Err(Error::invalid_request().data(
                 "session has active foreground work; wait for idle or cancel before prompting",
@@ -439,6 +790,20 @@ impl Broker {
                 waiters: vec![tx],
             },
         );
+        if let (Some(store), Some(record)) = (state.store.clone(), state.record.clone()) {
+            let mut record = record.lock().map_err(|_| Error::internal_error())?;
+            record.uncertain = true;
+            record.last_activity_at = state.last_activity_at;
+            record.title = title.clone();
+            let content =
+                serde_json::to_string(&request.prompt).map_err(Error::into_internal_error)?;
+            if let Err(error) = store.reserve_prompt(&record, &key, &content) {
+                state.prompts.remove(&key);
+                state.running = false;
+                state.recovery_required = true;
+                return Err(storage_error(error));
+            }
+        }
         let generation = state.generation;
         if let Some(meta) = request.meta.as_mut() {
             meta.remove("hive");
@@ -450,6 +815,7 @@ impl Broker {
         {
             state.prompts.remove(&key);
             state.running = false;
+            state.recovery_required = state.store.is_some();
             state.activity_known = previous_activity;
             state.last_activity_at = previous_time;
             return Err(Error::internal_error().data("agent disconnected; create another session"));
@@ -470,6 +836,22 @@ impl Broker {
             return Err(Error::invalid_params().data("session cwd does not match"));
         }
         let mut state = entry.control.lock().map_err(|_| Error::internal_error())?;
+        let action = request
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("hive"))
+            .and_then(|hive| hive.get("recoveryAction"))
+            .and_then(serde_json::Value::as_str);
+        if !matches!(action, None | Some("acknowledge")) {
+            return Err(
+                Error::invalid_params().data("_meta.hive.recoveryAction must be acknowledge")
+            );
+        }
+        if action.is_some() && !state.recovery_required {
+            return Err(
+                Error::invalid_request().data("session does not require recovery acknowledgement")
+            );
+        }
         if state.closing {
             return Err(Error::invalid_request().data("session is closing; select another session"));
         }
@@ -483,8 +865,15 @@ impl Broker {
                 Error::invalid_params().data("_meta.hive.mode must be observe or relinquish")
             );
         }
+        if action.is_some() && mode.is_some() {
+            return Err(Error::invalid_params()
+                .data("recovery acknowledgement requires pilot takeover; omit _meta.hive.mode"));
+        }
         if mode == Some("relinquish") {
             state.owner(client_id, request.meta.as_ref())?;
+        }
+        if state.recovery_required && mode != Some("observe") && action != Some("acknowledge") {
+            return Err(Error::invalid_request().data("interrupted generation may have produced external effects; inspect agent state and explicitly acknowledge with _meta.hive.recoveryAction = acknowledge on session/resume"));
         }
         // Keep replay and live forwarding in one critical section: no update can cross this boundary twice.
         if let Some(from) = from {
@@ -495,15 +884,31 @@ impl Broker {
                 )?;
             }
         }
+        if mode != Some("observe") {
+            let next_generation = state
+                .generation
+                .checked_add(1)
+                .ok_or_else(Error::internal_error)?;
+            if let (Some(store), Some(record)) = (&state.store, &state.record) {
+                let mut record = record.lock().map_err(|_| Error::internal_error())?;
+                let mut next = record.clone();
+                next.generation = next_generation;
+                if action.is_some() {
+                    next.uncertain = false;
+                }
+                store.save(&next).map_err(storage_error)?;
+                *record = next;
+            }
+            state.generation = next_generation;
+            if action.is_some() {
+                state.recovery_required = false;
+            }
+        }
         let attached = state
             .subscribers
             .insert(client_id.to_owned(), cx.clone())
             .is_none();
         if mode != Some("observe") {
-            state.generation = state
-                .generation
-                .checked_add(1)
-                .ok_or_else(Error::internal_error)?;
             state.token = uuid::Uuid::new_v4().to_string();
             state.pilot = (mode != Some("relinquish")).then(|| client_id.to_owned());
             let _ = state.changed.send(state.generation);
@@ -543,10 +948,15 @@ impl Broker {
                 *active_by_agent.entry(entry.profile.clone()).or_insert(0) += 1;
             }
         }
+        let offline = self
+            .offline
+            .lock()
+            .map(|offline| offline.len())
+            .unwrap_or_default();
         Status {
             name: "hive",
             version: env!("CARGO_PKG_VERSION"),
-            sessions: sessions.map_or(0, |sessions| sessions.len()),
+            sessions: sessions.map_or(0, |sessions| sessions.len()) + offline,
             default_agent: self.registry.default_agent.clone(),
             active_by_agent,
         }
@@ -570,12 +980,7 @@ impl Broker {
             })
             .unwrap_or_default();
         for entry in entries {
-            let (reply, received) = oneshot::channel();
-            let _ = entry.commands.send(Command::Cancel(0));
-            if entry.commands.send(Command::Close(0, reply)).is_ok() {
-                let _ = tokio::time::timeout(std::time::Duration::from_secs(2), received).await;
-            }
-            // Graceful close is best-effort; dropping the SDK connection terminates its stdio process group.
+            // Shutdown is not an explicit user close: preserve downstream state for reattachment.
             entry.abort.abort();
         }
     }
@@ -632,7 +1037,34 @@ impl Broker {
         let worker_control = control.clone();
         let id = hive_id.clone();
         let sessions = self.sessions.clone();
+        let offline = self.offline.clone();
         let catalog = self.catalog.clone();
+        let store = self.store.clone();
+        let stored_record = self.store.as_ref().map(|_| {
+            Arc::new(Mutex::new(Record {
+                id: hive_id.to_string(),
+                downstream_id: String::new(),
+                cwd: cwd.0.display().to_string(),
+                profile: chosen.clone(),
+                version: if provider.preferred_version() == AgentVersion::V1 {
+                    "v1"
+                } else {
+                    "v2"
+                }
+                .into(),
+                created_at: now_millis(),
+                updated_at: now_millis(),
+                last_activity_at: None,
+                title: None,
+                next_seq: 1,
+                reserved_seq: 0,
+                generation: 1,
+                outcome: Outcome::Active,
+                reason: None,
+                uncertain: false,
+            }))
+        });
+        let worker_record = stored_record.clone();
         // Each session owns its subprocess: no guessed transport support or duplicate probing.
         let task = tokio::spawn(async move {
             if provider.preferred_version() == AgentVersion::V1 {
@@ -643,6 +1075,7 @@ impl Broker {
                     rx,
                     (ready_tx, active_rx),
                     control,
+                    None,
                 )
                 .await;
             } else {
@@ -653,6 +1086,7 @@ impl Broker {
                     rx,
                     (ready_tx, active_rx),
                     control,
+                    None,
                 )
                 .await;
             }
@@ -665,6 +1099,24 @@ impl Broker {
                         "kind": "session", "status": "ended", "source": "hive",
                     }),
                 );
+            }
+            let closing = worker_control.lock().is_ok_and(|state| state.closing);
+            if !closing
+                && let (Some(store), Some(record)) = (&store, &worker_record)
+                && let Ok(mut record) = record.lock()
+            {
+                if record.downstream_id.is_empty() {
+                    return;
+                }
+                record.outcome = Outcome::Unavailable;
+                record.reason =
+                    Some("downstream worker exited; restart Hive to attempt reattachment".into());
+                if let Err(error) = store.save(&record) {
+                    tracing::error!(%error, "cannot persist worker exit");
+                }
+                if let Ok(mut offline) = offline.lock() {
+                    offline.insert(id.to_string(), record.clone());
+                }
             }
             // A crashed or closed subprocess must not remain advertised as active.
             if let Ok(mut sessions) = sessions.lock()
@@ -704,7 +1156,23 @@ impl Broker {
             });
         }
         match tokio::time::timeout(std::time::Duration::from_secs(15), ready_rx).await {
-            Ok(Ok(Ok(mut response))) => {
+            Ok(Ok(Ok((mut response, downstream_id)))) => {
+                if let (Some(store), Some(record)) = (&self.store, &stored_record) {
+                    let mut record = record.lock().map_err(|_| Error::internal_error())?;
+                    record.downstream_id = downstream_id;
+                    record.next_seq = entry_control
+                        .lock()
+                        .map_err(|_| Error::internal_error())?
+                        .next_seq;
+                    record.reserved_seq = record.next_seq.saturating_sub(1);
+                    if let Err(error) = store.save(&record) {
+                        task.abort();
+                        return Err(storage_error(error));
+                    }
+                    let mut state = entry_control.lock().map_err(|_| Error::internal_error())?;
+                    state.store = Some(store.clone());
+                    state.record = stored_record.clone();
+                }
                 {
                     let mut sessions = self.sessions.lock().map_err(|_| Error::internal_error())?;
                     sessions.insert(hive_id.to_string(), entry);
@@ -800,11 +1268,28 @@ fn forward_locked(
             v2::StateUpdate::Idle(_) => {
                 state.running = false;
                 state.activity_known = true;
+                if let (Some(store), Some(record)) = (&state.store, &state.record)
+                    && !state.recovery_required
+                    && state.prompts.values().all(|prompt| prompt.result.is_some())
+                {
+                    let mut record = record.lock().map_err(|_| Error::internal_error())?;
+                    record.uncertain = false;
+                    store.save(&record).map_err(storage_error)?;
+                }
             }
             _ => {}
         }
     }
     let seq = state.next_seq;
+    if let (Some(store), Some(record)) = (&state.store, &state.record) {
+        let mut record = record.lock().map_err(|_| Error::internal_error())?;
+        if seq > record.reserved_seq {
+            // Reserve a whole block durably before publishing any cursor in it; after a crash
+            // skipped numbers make the loss visible rather than reusing old client cursors.
+            record.reserved_seq = seq.saturating_add(1023);
+            store.save(&record).map_err(storage_error)?;
+        }
+    }
     state.next_seq += 1;
     if state.events.len() == 256 {
         state.events.pop_front();
@@ -837,6 +1322,24 @@ fn current(control: &Mutex<Control>, generation: u64) -> bool {
 
 fn complete(control: &Mutex<Control>, key: &str, result: Result<v2::PromptResponse, String>) {
     if let Ok(mut state) = control.lock() {
+        if let (Some(store), Some(record)) = (state.store.clone(), state.record.clone())
+            && let Ok(record) = record.lock()
+        {
+            let persisted = serde_json::to_string(&result)
+                .map_err(|error| error.to_string())
+                .and_then(|encoded| {
+                    store
+                        .finish_prompt(&record.id, key, &encoded)
+                        .map_err(|error| error.to_string())
+                });
+            if let Err(error) = persisted {
+                tracing::error!(%error, "cannot persist prompt result");
+                state.recovery_required = true;
+                state.finish(key, Err("cannot persist prompt outcome; inspect agent state and acknowledge recovery before new work".into()));
+                state.notify();
+                return;
+            }
+        }
         state.finish(key, result);
     }
 }
@@ -937,11 +1440,9 @@ async fn run_agent(
     request: v2::NewSessionRequest,
     hive_id: v2::SessionId,
     mut rx: mpsc::UnboundedReceiver<Command>,
-    startup: (
-        oneshot::Sender<Result<v2::NewSessionResponse, String>>,
-        oneshot::Receiver<()>,
-    ),
+    startup: WorkerStartup,
     control: Arc<Mutex<Control>>,
+    recovering: Option<String>,
 ) {
     let (ready, active) = startup;
     let agent = match transport(&provider) {
@@ -1038,20 +1539,35 @@ async fn run_agent(
                     return Ok(());
                 }
             }
-            let opened = cx.send_request(request).block_task().await;
-            let opened = match opened {
-                Ok(response) => response,
-                Err(error) => {
-                    tracing::warn!(code = ?error.code, "agent session/new failed");
-                    let _ = ready.send(Err("agent session/new failed; check its capabilities and configuration".into()));
-                    return Ok(());
+            let (opened, downstream_id) = if let Some(id) = recovering {
+                let id = v2::SessionId::new(id);
+                // Route updates sent during session/resume, before its response is available.
+                if let Ok(mut route) = downstream.lock() { *route = Some(id.clone()); }
+                match cx.send_request(v2::ResumeSessionRequest::new(id.clone(), request.cwd)).block_task().await {
+                    Ok(_) => (v2::NewSessionResponse::new(hive_id.clone()), id),
+                    Err(error) => {
+                        tracing::warn!(code = ?error.code, "agent session/resume failed");
+                        let missing = error.data.as_ref().and_then(serde_json::Value::as_str)
+                            .is_some_and(|data| data.contains("unknown session") || data.contains("not found"));
+                        let detail = if missing { "saved session not found" } else { "session/resume failed" };
+                        let _ = ready.send(Err(format!("agent {detail} ({:?}); verify its saved session and restart Hive", error.code)));
+                        return Ok(());
+                    }
+                }
+            } else {
+                match cx.send_request(request).block_task().await {
+                    Ok(response) => { let id = response.session_id.clone(); (response, id) }
+                    Err(error) => {
+                        tracing::warn!(code = ?error.code, "agent session/new failed");
+                        let _ = ready.send(Err("agent session/new failed; check its capabilities and configuration".into()));
+                        return Ok(());
+                    }
                 }
             };
-            let downstream_id = opened.session_id.clone();
             if let Ok(mut route) = downstream.lock() {
                 *route = Some(downstream_id.clone());
             }
-            let _ = ready.send(Ok(opened));
+            let _ = ready.send(Ok((opened, downstream_id.to_string())));
             if active.await.is_err() { return Ok(()); }
             while let Some(command) = rx.recv().await {
                 match command {
@@ -1120,11 +1636,9 @@ async fn run_v1_agent(
     request: v2::NewSessionRequest,
     hive_id: v2::SessionId,
     mut rx: mpsc::UnboundedReceiver<Command>,
-    startup: (
-        oneshot::Sender<Result<v2::NewSessionResponse, String>>,
-        oneshot::Receiver<()>,
-    ),
+    startup: WorkerStartup,
     control: Arc<Mutex<Control>>,
+    recovering: Option<String>,
 ) {
     let (ready, active) = startup;
     let agent = match transport(&provider) {
@@ -1245,8 +1759,8 @@ async fn run_v1_agent(
                 .send_request(v1::InitializeRequest::new(ProtocolVersion::V1))
                 .block_task()
                 .await;
-            match initialized {
-                Ok(response) if response.protocol_version == ProtocolVersion::V1 => {}
+            let capabilities = match initialized {
+                Ok(response) if response.protocol_version == ProtocolVersion::V1 => response.agent_capabilities,
                 Ok(_) => {
                     let _ = ready.send(Err("agent negotiated a different protocol version; correct the profile's versions setting".into()));
                     return Ok(());
@@ -1256,29 +1770,47 @@ async fn run_v1_agent(
                     let _ = ready.send(Err("v1 initialize failed; check the declared protocol version and agent availability".into()));
                     return Ok(());
                 }
-            }
+            };
             if !request.mcp_servers.is_empty() {
                 let _ = ready.send(Err(
                     "v1 adapter cannot translate v2 MCP server declarations".into(),
                 ));
                 return Ok(());
             }
-            let opened = cx
-                .send_request(v1::NewSessionRequest::new(request.cwd.0))
-                .block_task()
-                .await;
-            let downstream_id = match opened {
-                Ok(response) => response.session_id,
-                Err(error) => {
-                    tracing::warn!(code = ?error.code, "v1 session/new failed");
-                    let _ = ready.send(Err("v1 session/new failed; check agent availability".into()));
+            let downstream_id = if let Some(id) = recovering {
+                let id = v1::SessionId::new(id);
+                if let Ok(mut route) = route.lock() { *route = Some(id.clone()); }
+                let result = if capabilities.session_capabilities.resume.is_some() {
+                    cx.send_request(v1::ResumeSessionRequest::new(id.clone(), request.cwd.0)).block_task().await.map(|_| ())
+                } else if capabilities.load_session {
+                    cx.send_request(v1::LoadSessionRequest::new(id.clone(), request.cwd.0)).block_task().await.map(|_| ())
+                } else {
+                    let _ = ready.send(Err("agent does not advertise ACPv1 session/resume or session/load; saved session is orphaned".into()));
                     return Ok(());
+                };
+                if let Err(error) = result {
+                    tracing::warn!(code = ?error.code, "v1 agent reattachment failed");
+                    let missing = error.data.as_ref().and_then(serde_json::Value::as_str)
+                        .is_some_and(|data| data.contains("unknown session") || data.contains("not found"));
+                    let detail = if missing { "saved session not found" } else { "reattachment failed" };
+                    let _ = ready.send(Err(format!("v1 agent {detail} ({:?}); verify its saved session and restart Hive", error.code)));
+                    return Ok(());
+                }
+                id
+            } else {
+                match cx.send_request(v1::NewSessionRequest::new(request.cwd.0)).block_task().await {
+                    Ok(response) => response.session_id,
+                    Err(error) => {
+                        tracing::warn!(code = ?error.code, "v1 session/new failed");
+                        let _ = ready.send(Err("v1 session/new failed; check agent availability".into()));
+                        return Ok(());
+                    }
                 }
             };
             if let Ok(mut route) = route.lock() {
                 *route = Some(downstream_id.clone());
             }
-            let _ = ready.send(Ok(v2::NewSessionResponse::new(hive_id.clone())));
+            let _ = ready.send(Ok((v2::NewSessionResponse::new(hive_id.clone()), downstream_id.to_string())));
             if active.await.is_err() { return Ok(()); }
             while let Some(command) = rx.recv().await {
                 match command {
@@ -1610,6 +2142,11 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
                     }
                     match received.await {
                         Ok(Ok(())) => {
+                            if let Some(store) = &broker.store {
+                                store
+                                    .remove(&request.session_id.to_string())
+                                    .map_err(storage_error)?;
+                            }
                             let mut sessions = broker
                                 .sessions
                                 .lock()
@@ -1666,11 +2203,22 @@ pub async fn serve(addr: SocketAddr, registry: Config) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(address = %listener.local_addr()?, "Hive listening");
     let origin = format!("http://{}", listener.local_addr()?);
-    let broker = Broker::new(registry);
+    let broker = Broker::persistent(
+        registry,
+        persistence::default_path().map_err(std::io::Error::other)?,
+    )
+    .map_err(std::io::Error::other)?;
+    // Discovery stays responsive while slow or unavailable agents are reconciled.
+    let recovery = tokio::spawn({
+        let broker = broker.clone();
+        async move { broker.reconcile().await }
+    });
     let (shutdown_done, shut_down) = oneshot::channel();
     let server = axum::serve(listener, router_with_origin(broker.clone(), Some(&origin)))
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
+            recovery.abort();
+            let _ = recovery.await;
             broker.shutdown().await;
             let _ = shutdown_done.send(());
         })
@@ -1802,7 +2350,26 @@ mod control_tests {
             closing: false,
             prompts: HashMap::new(),
             activity: Activity::new(),
+            recovery_required: false,
+            reattached: false,
+            store: None,
+            record: None,
         }
+    }
+
+    #[test]
+    fn an_idle_update_after_restart_does_not_acknowledge_an_interrupted_prompt() {
+        let mut state = detached();
+        state.recovery_required = true;
+        forward_locked(
+            &mut state,
+            &v2::SessionId::new("hive-recovered"),
+            Some(v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(
+                v2::IdleStateUpdate::new(),
+            ))),
+        )
+        .unwrap();
+        assert!(state.recovery_required);
     }
 
     #[tokio::test]

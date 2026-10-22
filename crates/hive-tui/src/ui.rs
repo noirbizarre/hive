@@ -22,6 +22,8 @@ pub struct SessionSummary {
     pub agent: String,
     pub title: Option<String>,
     pub lifecycle: String,
+    pub recovery: Option<String>,
+    pub recovery_reason: Option<String>,
     pub activity: String,
     pub last_activity_at: Option<u64>,
     pub control_owner: Option<String>,
@@ -234,8 +236,19 @@ impl App {
                 ),
                 Span::styled(format!("{}  ", info.agent), theme.muted()),
                 Span::styled(
-                    format!("{} / {}{attention}  ", info.lifecycle, info.activity),
-                    if info.activity == "running" || !attention.is_empty() {
+                    format!(
+                        "{} / {}{}{}  ",
+                        info.lifecycle,
+                        info.activity,
+                        info.recovery_reason
+                            .as_ref()
+                            .map_or(String::new(), |reason| format!(" · {reason}")),
+                        attention
+                    ),
+                    if info.activity == "running"
+                        || !attention.is_empty()
+                        || info.recovery.as_deref() == Some("recovery_required")
+                    {
                         theme.warning()
                     } else {
                         theme.accent()
@@ -373,7 +386,7 @@ impl App {
             Page::Profiles => "↑↓ select  Enter create  Tab sessions  Esc quit",
             Page::Chat if self.dialog.is_some() => "Enter confirm  Esc decline",
             Page::Chat => {
-                "Enter send  Tab sessions  Ctrl-B recent  Ctrl-N new  Ctrl-T pilot  Ctrl-H handoff  Ctrl-R live  Ctrl-C cancel  Esc quit"
+                "Enter send  Tab sessions  Ctrl-B recent  Ctrl-N new  Ctrl-T pilot  Ctrl-H handoff  Ctrl-R live  Ctrl-Y acknowledge recovery  Ctrl-C cancel  Esc quit"
             }
         };
         let mut lines = vec![Line::from(vec![
@@ -577,6 +590,8 @@ mod tests {
             agent: "pi".into(),
             title: None,
             lifecycle: "active".into(),
+            recovery: None,
+            recovery_reason: None,
             activity: "running".into(),
             last_activity_at: None,
             control_owner: None,
@@ -604,6 +619,8 @@ mod tests {
             agent: "pi".into(),
             title: Some(format!("Task {id}")),
             lifecycle: "active".into(),
+            recovery: None,
+            recovery_reason: None,
             activity: "unknown".into(),
             last_activity_at: None,
             control_owner: None,

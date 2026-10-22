@@ -65,7 +65,10 @@ initialization is **not** evidence that session creation, load, or prompts work.
 
 For both agents, Hive's upstream ACPv2 resume is guaranteed by deterministic
 mock tests **only for an existing live Hive session**; native session adoption
-through Hive and daemon-restart recovery are unsupported. Direct native ACP
+through Hive remains unsupported. Daemon-restart recovery attempts the saved
+downstream ID through v2 `session/resume` or advertised v1 `session/resume` or
+`session/load`. Capability negotiation does not guarantee downstream persistence:
+failure retains a visible offline record, never a replacement session. Direct native ACP
 `session/load` (v1) or `session/resume` (v2) probes bypass Hive and must be
 recorded independently. Hive forwards downstream permissions and supported
 elicitation modes to the current pilot; this is covered by scripted agents,
@@ -144,8 +147,13 @@ after an uncertain acknowledgement returns or waits for the original result,
 including after takeover. The same key with changed content fails. A rejected
 prompt that was never dispatched retains its error under that key; use a new
 key for a newly intended prompt. Do not blindly send a new key after losing an
-acknowledgement; reconnect and retry the existing key. Key outcomes are only
-kept for the session lifetime in this daemon process.
+acknowledgement; reconnect and retry the existing key while this daemon is
+alive. Reservations and confirmed responses survive restart. An interrupted
+key remains reserved and is never redispatched. After inspecting the agent's
+state, explicitly take control with `_meta.hive.recoveryAction: "acknowledge"`
+on `session/resume`; this permits *new* keys, but does not establish that
+previous work completed or allow the interrupted key to be reused. Observe
+mode remains available without acknowledgement.
 
 Every `session/update` carries `_meta.hive.seq`, an increasing per-session
 integer, unchanged on replay. On `session/resume`, omit `replayFrom` to attach
@@ -160,7 +168,10 @@ ordered after replay; a partially delivered replay must be retried using the
 last actually processed sequence. The WebUI rebuilds from `start` on reload
 and retains the cursor alongside rendered history only while the page is
 alive; an expired cursor requires a visible attach-without-history choice.
-Neither replay nor prompt deduplication survives a daemon restart. Updates
+Replay does not survive a daemon restart; prompt deduplication records do.
+Cursor blocks are reserved on disk before publishing updates: a restart can
+skip numbers, and an expired cursor fails rather than silently replaying an
+incomplete history. Updates
 can arrive before prompt responses; `idle` ends foreground work, not a
 unique turn-ID boundary.
 
@@ -211,7 +222,8 @@ attach live-only after an explicit history-gap decision, restore
 `activitySnapshot`, and continue from `nextSeq`. A snapshot restores *current
 activity*, not missed conversation text. Buffer updates that arrive before the
 resume response and reduce them after the snapshot so later activity cannot be
-overwritten. A daemon restart loses both history and this in-memory snapshot.
+overwritten. A daemon restart loses both history and this in-memory snapshot;
+activity resumes as unknown rather than assuming the interrupted turn was idle.
 V1 tool calls and plans are adapted; ACPv2 provides tool, plan, and foreground
 updates natively. Background tasks require explicit provider extension events;
 neither wire version guarantees them.

@@ -30,7 +30,9 @@ Each session uses `_meta.hive.agent` or the configured default; only declared
 v1 profiles use the compatibility adapter. Never log secrets from profiles.
 Agent stderr is independent of ACP stdio stdout. The per-user lock lives under
 `$XDG_RUNTIME_DIR/hive/daemon.lock` (or `~/.local/state/hive/daemon.lock`),
-and is released on process exit. In-memory state is lost on daemon restart.
+and is released on process exit. Session metadata is persisted separately under
+`$XDG_STATE_HOME/hive/sessions.sqlite3` (or `~/.local/state/hive/sessions.sqlite3`);
+replay events and activity snapshots remain in-memory and are lost on restart.
 
 ## Real-agent compatibility probes
 

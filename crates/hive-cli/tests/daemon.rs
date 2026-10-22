@@ -24,6 +24,7 @@ async fn a_second_daemon_cannot_start_on_another_port_for_the_same_user() {
     let first = tokio::process::Command::new(env!("CARGO_BIN_EXE_hive"))
         .args(["daemon", "--listen", &address.to_string()])
         .env("XDG_RUNTIME_DIR", &runtime)
+        .env("XDG_STATE_HOME", &runtime)
         .kill_on_drop(true)
         .spawn()
         .unwrap();
@@ -48,6 +49,7 @@ async fn a_second_daemon_cannot_start_on_another_port_for_the_same_user() {
         tokio::process::Command::new(env!("CARGO_BIN_EXE_hive"))
             .args(["daemon", "--listen", "127.0.0.1:0"])
             .env("XDG_RUNTIME_DIR", &runtime)
+            .env("XDG_STATE_HOME", &runtime)
             .output(),
     )
     .await
@@ -109,6 +111,7 @@ async fn a_second_daemon_cannot_start_on_another_port_for_the_same_user() {
     let third = tokio::process::Command::new(env!("CARGO_BIN_EXE_hive"))
         .args(["serve", "--listen", &address.to_string()])
         .env("XDG_RUNTIME_DIR", &runtime)
+        .env("XDG_STATE_HOME", &runtime)
         .kill_on_drop(true)
         .spawn()
         .unwrap();

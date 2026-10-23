@@ -52,3 +52,21 @@ pub(crate) async fn discover(
             .collect(),
     })
 }
+
+/// What an OpenCode server answered to the health probes. Never holds the endpoint.
+pub(crate) struct Health {
+    pub version: String,
+    pub v1: bool,
+    pub v2: bool,
+}
+
+/// Checks credentials, reachability and version without listing or touching any session.
+pub(crate) async fn check(profile: &Profile) -> Result<Health, OpencodeError> {
+    let client = http::Client::new(profile)?;
+    let capabilities = version::probe(&client).await?;
+    Ok(Health {
+        version: capabilities.version,
+        v1: capabilities.v1,
+        v2: capabilities.v2,
+    })
+}

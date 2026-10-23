@@ -84,3 +84,35 @@ async fn a_network_profile_is_not_probeable() {
         CompatError::NotProbeable
     );
 }
+
+#[tokio::test]
+async fn an_endpoint_with_nothing_listening_is_unreachable_without_naming_it() {
+    // Reserve a port, then free it so nothing answers there.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut network = profile(MOCK, &[], AgentVersion::V2);
+    network.command = None;
+    network.endpoint = Some(format!("http://127.0.0.1:{port}/secret-path"));
+    let error = hive_daemon::compat::probe_endpoint(&network)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, CompatError::EndpointUnreachable { .. }));
+    let text = format!(
+        "{error} {error:?} {:?}",
+        error.help().map(|h| h.to_string())
+    );
+    assert!(!text.contains("secret-path") && !text.contains(&port.to_string()));
+}
+
+#[tokio::test]
+async fn a_stdio_profile_is_not_an_endpoint_probe_target() {
+    assert_eq!(
+        hive_daemon::compat::probe_endpoint(&profile(MOCK, &[], AgentVersion::V2))
+            .await
+            .unwrap_err(),
+        CompatError::NotProbeable
+    );
+}

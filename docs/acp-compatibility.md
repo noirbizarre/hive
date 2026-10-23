@@ -275,9 +275,56 @@ diagnostic. Codes are public identifiers and never renamed.
 | `hive::compat::missing_capability` | The agent omits a capability Hive needs, such as v2 `session`. |
 | `hive::compat::startup_timeout` | No `initialize` answer within 30 seconds. Run the command by hand. |
 | `hive::compat::initialize_failed` | The handshake failed (wrong protocol, crash, not ACP). Check the agent's stderr. |
-| `hive::compat::not_probeable` | Endpoint profiles are not launched; the probe covers stdio only. |
+| `hive::compat::not_probeable` | The stdio probe needs `command`; endpoint profiles use the endpoint probe. |
+| `hive::compat::endpoint_unreachable` | Nothing accepted a TCP connection at the profile's `endpoint`. The URL and headers are never printed. |
 
-Run the free, opt-in probe (it sends no prompt) with:
+### `hive doctor`
+
+`hive doctor [AGENT]...` runs these checks for every profile (or only the ones
+named) and prints the diagnostics above with their help text:
+
+- **Configuration**: every problem at once, not only the first.
+- **stdio profiles**: the launch checks and the initialize-only probe, with the
+  resulting capability report. For `pi-acp` (or `npx -y pi-acp`) it also warns
+  when Node.js 22+ or `pi` is missing from `PATH`.
+- **Endpoint profiles**: a TCP connect, then the initialize-only probe at the
+  declared protocol version.
+- **`opencode-server` profiles**: the health and version probes, with
+  `hive::opencode::*` codes.
+- **Daemon**: the listen address (loopback only), whether another daemon holds
+  the lock (and answers there), and the permissions of the state directory.
+  Doctor never creates the lock or state files.
+
+It exits with status 1 when any check fails; warnings alone exit 0. `--json`
+prints the same report as one JSON object (`ok`, `config`, `profiles`,
+`daemon`), each finding having `status`, `code`, `message` and `help`. Nothing
+sends a prompt. Reports never contain endpoint URLs, headers, environment
+values, arguments or agent output; agent names and versions are reduced to
+printable characters. A missing-binary message does name the configured
+`command`, so review a pasted report before sharing it.
+
+| Code | Meaning and fix |
+| --- | --- |
+| `hive::config::unreadable` | The config file cannot be read. Check the path and permissions. |
+| `hive::config::syntax` | The TOML is invalid or has an unknown field; only the line is reported. |
+| `hive::config::default_agent` | `default_agent` is not one of the `[agents]` ids. |
+| `hive::config::agent_id` | The profile id uses characters other than letters, digits, `-` and `_`. |
+| `hive::config::pricing` | The `pricing` table is incomplete. |
+| `hive::config::versions` | The profile declares no protocol version. |
+| `hive::config::profile` | The profile needs a stdio `command` or an `endpoint`, not both or neither. |
+| `hive::config::endpoint` | The endpoint is missing, malformed, embeds credentials or uses plain HTTP off loopback. |
+| `hive::config::header` | A header name or value is invalid (neither is printed). |
+| `hive::config::credentials` | `password_env` is not a variable name, or credentials fields are set on an ACP profile. |
+| `hive::doctor::unknown_agent` | A named profile is not configured. |
+| `hive::doctor::no_agents` | No profile is configured (warning). |
+| `hive::doctor::missing_prerequisite` | Node.js 22+ or `pi` needed by `pi-acp` was not found (warning). |
+| `hive::doctor::listen_not_loopback` | The daemon refuses non-loopback listen addresses. |
+| `hive::doctor::port_in_use` | Another program holds the listen address. |
+| `hive::doctor::daemon_locked` | Another daemon holds the lock but does not answer on the listen address (warning). |
+| `hive::doctor::unsafe_runtime_dir` | The runtime directory or lock is not private; the daemon would refuse to start. |
+| `hive::doctor::unsafe_state_dir` | The state directory or database is not private; the daemon would refuse to start. |
+
+Run the free, opt-in probe against a real Pi (it sends no prompt) with:
 
 ```sh
 HIVE_REAL_PI=1 cargo test -p hive-daemon --test real_agents \

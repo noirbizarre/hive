@@ -111,9 +111,9 @@ the capability matrix. Pi has no native ACP mode; the supported path is the
 external `pi-acp` adapter, documented in the
 [Pi section](acp-compatibility.md#pi) together with an opt-in initialize probe and
 typed `hive::compat::*` diagnostics. This does not itself implement
-native-session adoption. A broader
-[`hive doctor` command](https://github.com/noirbizarre/hive/issues/26) will
-reuse those checks for configuration and every profile.
+native-session adoption. The
+[`hive doctor` command](https://github.com/noirbizarre/hive/issues/26) reuses
+those checks for the configuration, every profile and the daemon state.
 
 ### Phase 7 — Adopt sessions created in native agent interfaces
 

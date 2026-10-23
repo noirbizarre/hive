@@ -47,12 +47,12 @@ upgrading either agent and record results with its product version and transport
 
 | Product/version | ACP entrypoint/transport | ACP wire | Fresh `session/new` | Native-created load/resume over ACP | Hive live-worker resume |
 | --- | --- | --- | --- | --- | --- |
-| Pi 1.1.0 (local CLI inspection) | Default CLI offers text/json/rpc; ACP entrypoint unsupported without verified extension | Unverified | Unverified | Native `--session-id` CLI available; ACP attachment unverified | Unverified with Pi (guaranteed with mock) |
+| Pi 1.3.0 via external `pi-acp` 0.0.34 (see [Pi](#pi)) | `pi-acp` or `npx -y pi-acp`, stdio. Pi itself has no ACP entrypoint | v1 negotiated (2026-10-23); a v2 `initialize` is answered with v1 | Unverified (only `initialize` is verified) | Adapter advertises `loadSession` via its own session map; ACP attachment unverified; Hive adoption is [#6](https://github.com/noirbizarre/hive/issues/6) | Unverified with Pi (guaranteed with mock) |
 | OpenCode 1.18.35 (local CLI inspection) | `opencode acp`, stdio documented and command present | v1 documented; v2 unverified | Unverified | Native `session list` and `run --session` available; ACP load unverified | Unverified with OpenCode (guaranteed with mock) |
 
 | Product/version | Text prompt | Streaming events/idle | Tool calls/results | Permissions | User-input requests | Cancellation | Active client disconnect |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| Pi 1.1.0 | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified |
+| Pi 1.3.0 via `pi-acp` 0.0.34 | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified |
 | OpenCode 1.18.35 | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified |
 
 The OpenCode ACP command/documented v1 behavior comes from its
@@ -210,6 +210,74 @@ An aggregate cost is null if any contributing price is missing or currencies
 disagree. Accounting survives
 daemon restarts, but the bounded event replay remains in-memory. A prompt
 interrupted before idle has no recorded turn; do not infer usage from it.
+
+## Pi
+
+**Pi has no native ACP mode.** Pi 1.3.0 offers `--mode text|json|rpc`; `rpc` is
+Pi's own JSON protocol, not ACP, and neither its documentation nor its changelog
+mentions ACP. Do not assume any Pi version exposes ACP by default.
+
+Hive's supported path is the external adapter
+[`pi-acp`](https://github.com/svkozak/pi-acp), which speaks ACP over stdio and
+launches `pi --mode rpc` itself. It is a **prerequisite you install**; Hive does
+not ship or maintain it. Pin the version you tested:
+
+```toml
+[agents.pi]
+name = "Pi"
+command = "npx"
+args = ["-y", "pi-acp@0.0.34"] # or: command = "pi-acp" after `npm install -g pi-acp`
+versions = ["v1"]
+```
+
+| Item | Value |
+| --- | --- |
+| Tested | Pi 1.3.0, `pi-acp` 0.0.34, Node 26 (2026-10-23) |
+| Minimum | Node 22+ and Pi 0.81.0+, as stated by `pi-acp`; Hive has not tested below the versions above |
+| Wire | ACPv1 over stdio. A v2 `initialize` is answered with `protocolVersion: 1`, so `versions = ["v2"]` fails |
+| Permissions | Pi runs tools itself, so it never asks Hive for permission; none are required of Hive |
+| Authentication | `pi-acp --terminal-login`, or configure credentials in Pi directly |
+
+`initialize` reports (probe output, 2026-10-23): `load_session=true list=true
+resume=false image=true audio=false embedded_context=false auth_methods=1`.
+Embedded context needs `PI_ACP_ENABLE_EMBEDDED_CONTEXT=true` in the profile's
+`env`.
+
+Limitations documented by `pi-acp` (not independently tested by Hive): no
+`fs/*` or `terminal/*` delegation, MCP servers are accepted but not passed to
+Pi (and Hive's v1 adapter rejects non-empty MCP declarations), and Pi extension
+slash commands are unavailable. The adapter calls itself an MVP, so re-run the
+probe after upgrading either Pi or the adapter.
+
+Only `initialize` is verified. Prompt turns, streaming, cancellation, tool calls
+and reconnect stay **Unverified** in the matrix until someone records a completed
+`pi_creates_prompts_and_reattaches_to_a_live_hive_session` run with its versions.
+`pi-acp` stores a map of ACP to Pi session IDs, so it can load a session created in
+Pi; whether Hive can adopt such a session is tracked separately in
+[#6](https://github.com/noirbizarre/hive/issues/6) and is **not** part of basic
+ACP operation.
+
+### Diagnostics
+
+`hive_daemon::compat` rejects broken launch settings and reports an actionable
+diagnostic. Codes are public identifiers and never renamed.
+
+| Code | Meaning and fix |
+| --- | --- |
+| `hive::compat::binary_missing` | The command is not on `PATH`. Install it (for Pi: `npm install -g pi-acp`) or fix `command`. |
+| `hive::compat::pi_without_adapter` | The command is `pi` with no ACP argument, which starts Pi's own interface. Use `pi-acp`. |
+| `hive::compat::protocol_mismatch` | The agent negotiated another ACP version than the profile declares. Fix `versions`. |
+| `hive::compat::missing_capability` | The agent omits a capability Hive needs, such as v2 `session`. |
+| `hive::compat::startup_timeout` | No `initialize` answer within 30 seconds. Run the command by hand. |
+| `hive::compat::initialize_failed` | The handshake failed (wrong protocol, crash, not ACP). Check the agent's stderr. |
+| `hive::compat::not_probeable` | Endpoint profiles are not launched; the probe covers stdio only. |
+
+Run the free, opt-in probe (it sends no prompt) with:
+
+```sh
+HIVE_REAL_PI=1 cargo test -p hive-daemon --test real_agents \
+  pi_initialize_probe_reports_a_capability_report -- --ignored --exact --nocapture
+```
 
 ## Live execution activity
 

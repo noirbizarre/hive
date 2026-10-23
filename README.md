@@ -58,12 +58,14 @@ reported input count includes cached reads and writes. Unmapped turns have
 unknown estimated cost; catalog outages do not prevent token tracking.
 
 The commands and version declarations are examples; check your installed
-agents' ACP entrypoints and supported versions. Pi support depends on a
-compatible ACP entrypoint or adapter being available for your installed
-version; do not assume native ACP mode is enabled by default. See the
-[Pi ACP compatibility issue](https://github.com/noirbizarre/hive/issues/19)
-and the versioned [ACP compatibility matrix](docs/acp-compatibility.md) for
-the current investigation and tested support. Profiles may also specify
+agents' ACP entrypoints and supported versions. Pi has **no native ACP mode**:
+Hive reaches it through the external [`pi-acp`](https://github.com/svkozak/pi-acp)
+adapter (ACPv1, tested with Pi 1.3.0 and `pi-acp` 0.0.34), which you install
+yourself, for example `command = "npx"`, `args = ["-y", "pi-acp@0.0.34"]`,
+`versions = ["v1"]`. See the [Pi section](docs/acp-compatibility.md#pi) and the
+versioned [ACP compatibility matrix](docs/acp-compatibility.md) for launch
+details, limitations and diagnostics. Adopting sessions created in Pi's own UI
+is separate work ([#6](https://github.com/noirbizarre/hive/issues/6)). Profiles may also specify
 `env = { KEY = "value" }`; an endpoint profile uses
 `endpoint = "http://127.0.0.1:9000"` (or `ws://...`) and optional
 `headers = { Authorization = "Bearer ..." }`. Keep the config file private.

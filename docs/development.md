@@ -55,7 +55,7 @@ deterministic CI baseline. CLI lifecycle and status checks live in
 `cargo test -p hive-cli --test daemon`. `crates/hive-daemon/tests/real_agents.rs` contains
 four **ignored** tests, independently selectable for Pi or OpenCode. They run
 only with an explicit `HIVE_REAL_PI=1` or `HIVE_REAL_OPENCODE=1` opt-in; missing
-binary/version, Pi ACP entrypoint, or native session ID prints `SKIP` with the missing
+binary/version or native session ID prints `SKIP` with the missing
 prerequisite. Once a configured binary is available, a failing protocol/model
 probe is an actionable test failure. Runs can consume paid model tokens. Use an
 existing empty directory as `HIVE_REAL_<AGENT>_CWD` to keep conversations
@@ -73,9 +73,8 @@ opencode --version
 opencode acp --help
 ```
 
-The inspected Pi 1.1.0 CLI does not advertise ACP; obtain and verify an
-ACP-capable extension/entrypoint before setting Pi's argument array. The
-inspected OpenCode 1.18.35 CLI advertises `opencode acp`; its documented stdio
+Pi has no ACP mode of its own; install the external `pi-acp` adapter (see
+[Pi](acp-compatibility.md#pi)). The inspected OpenCode 1.18.35 CLI advertises `opencode acp`; its documented stdio
 wire is v1. These observations do not prove the agent can initialize or prompt.
 For a configured OpenCode model, run:
 
@@ -84,19 +83,28 @@ HIVE_REAL_OPENCODE=1 HIVE_REAL_OPENCODE_WIRE=v1 HIVE_REAL_OPENCODE_CWD=/absolute
   cargo test -p hive-daemon --test real_agents opencode_creates_prompts_and_reattaches_to_a_live_hive_session -- --ignored --exact --nocapture
 ```
 
-For a verified Pi ACP entrypoint, substitute the actual arguments and wire
-version, for example (replace the placeholder before running):
+Pi defaults to an installed `pi-acp` (otherwise `npx -y pi-acp`) on wire v1.
+The initialize-only probe sends no prompt and costs nothing; it prints a
+`CAPABILITIES` line and fails with a `hive::compat::*` diagnostic naming the fix
+for a missing adapter or a bare `pi` command:
 
 ```sh
-HIVE_REAL_PI=1 HIVE_REAL_PI_COMMAND=pi HIVE_REAL_PI_ARGS_JSON='["<verified-acp-argument>"]' \
-  HIVE_REAL_PI_WIRE=v1 HIVE_REAL_PI_CWD=/absolute/empty/workspace \
+HIVE_REAL_PI=1 cargo test -p hive-daemon --test real_agents \
+  pi_initialize_probe_reports_a_capability_report -- --ignored --exact --nocapture
+```
+
+The full Pi turn (this may use model tokens) is:
+
+```sh
+HIVE_REAL_PI=1 HIVE_REAL_PI_CWD=/absolute/empty/workspace \
   cargo test -p hive-daemon --test real_agents pi_creates_prompts_and_reattaches_to_a_live_hive_session -- --ignored --exact --nocapture
 ```
 
 `HIVE_REAL_<AGENT>_COMMAND` overrides the executable (including a path with
 spaces); `HIVE_REAL_<AGENT>_ARGS_JSON` is a JSON array of **separate** argument
 strings; `HIVE_REAL_<AGENT>_WIRE` is `v1` or `v2`. OpenCode defaults to `acp`
-and v1, Pi requires explicit ACP arguments and wire selection. Each test prints
+and v1; Pi defaults to `pi-acp` and v1, and its version is read from `pi --version`
+because the adapter has no `--version`. Each test prints
 the agent/version, declared wire, downstream stdio and upstream WS/HTTP+SSE;
 `FIRST` and `RESUMED` summarize observed text chunks/snapshots, running, tool
 updates and idle. Hive has a 15-second agent startup limit; a slow model turn
@@ -122,8 +130,7 @@ HIVE_REAL_OPENCODE=1 HIVE_REAL_OPENCODE_WIRE=v1 HIVE_REAL_OPENCODE_CWD=/same/abs
   cargo test -p hive-daemon --test real_agents opencode_reports_whether_a_native_session_can_be_attached_over_acp -- --ignored --exact --nocapture
 ```
 
-Replace `OPENCODE`/`opencode` with `PI`/`pi` and provide Pi's verified ACP
-entrypoint/args to test Pi. The v1 direct probe calls `session/load`; v2 calls
+Replace `OPENCODE`/`opencode` with `PI`/`pi` to test Pi through `pi-acp`. The v1 direct probe calls `session/load`; v2 calls
 `session/resume`. A failed load does not establish that native sessions cannot
 be reopened via their own CLI or server. Hive itself cannot adopt a native ID:
 record native-CLI reopen, direct ACP attachment and Hive's live-worker resume

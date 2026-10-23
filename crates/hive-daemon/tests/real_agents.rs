@@ -21,33 +21,59 @@ struct Installation {
     wire: AgentVersion,
 }
 
+/// The launch command: an explicit override, otherwise the documented entrypoint for `id`.
+fn launch(id: &str, prefix: &str) -> (String, Vec<String>) {
+    let command = std::env::var(format!("{prefix}_COMMAND")).ok();
+    let args = std::env::var(format!("{prefix}_ARGS_JSON"))
+        .ok()
+        .map(|value| {
+            serde_json::from_str::<Vec<String>>(&value)
+                .expect("ARGS_JSON must be a JSON array of separate argument strings")
+        });
+    let (default_command, default_args): (&str, &[&str]) = match id {
+        "opencode" => ("opencode", &["acp"]),
+        // Prefer an installed adapter; otherwise let npx fetch it, as the adapter's README does.
+        _ if hive_daemon::compat::check_launch("pi-acp", &[]).is_ok() => ("pi-acp", &[]),
+        _ => ("npx", &["-y", "pi-acp"]),
+    };
+    match (command, args) {
+        (Some(command), Some(args)) => (command, args),
+        // Default arguments only belong to the default command.
+        (Some(command), None) if id == "opencode" => (
+            command,
+            default_args.iter().map(ToString::to_string).collect(),
+        ),
+        (Some(command), None) => (command, Vec::new()),
+        (None, args) => (
+            default_command.into(),
+            args.unwrap_or_else(|| default_args.iter().map(ToString::to_string).collect()),
+        ),
+    }
+}
+
 async fn installation(id: &'static str) -> Option<Installation> {
     let prefix = format!("HIVE_REAL_{}", id.to_ascii_uppercase());
     if std::env::var(&prefix).as_deref() != Ok("1") {
         eprintln!("SKIP {id}: set {prefix}=1 and run this ignored test explicitly");
         return None;
     }
-    let command = std::env::var(format!("{prefix}_COMMAND")).unwrap_or_else(|_| id.into());
-    let args = match std::env::var(format!("{prefix}_ARGS_JSON")) {
-        Ok(value) => serde_json::from_str::<Vec<String>>(&value)
-            .expect("ARGS_JSON must be a JSON array of separate argument strings"),
-        Err(_) if id == "opencode" => vec!["acp".into()],
-        Err(_) => {
-            eprintln!(
-                "SKIP {id}: set {prefix}_ARGS_JSON to a verified ACP entrypoint (Pi's installed CLI does not advertise one)"
-            );
-            return None;
-        }
-    };
+    let (command, args) = launch(id, &prefix);
     let wire = match std::env::var(format!("{prefix}_WIRE")) {
         Ok(value) if value == "v2" => AgentVersion::V2,
         Ok(value) if value == "v1" => AgentVersion::V1,
-        Err(_) if id == "opencode" => AgentVersion::V1,
+        // Both known adapters (OpenCode, pi-acp) negotiate ACPv1 today.
+        Err(_) => AgentVersion::V1,
         _ => panic!("{prefix}_WIRE must be v1 or v2; verify the agent's actual ACP protocol"),
+    };
+    // pi-acp is a stdio adapter with no `--version`; the product version is Pi's own.
+    let version_command = if id == "pi" {
+        "pi".to_string()
+    } else {
+        command.clone()
     };
     let result = timeout(
         Duration::from_secs(5),
-        tokio::process::Command::new(&command)
+        tokio::process::Command::new(&version_command)
             .arg("--version")
             .stderr(Stdio::null())
             .output(),
@@ -57,13 +83,13 @@ async fn installation(id: &'static str) -> Option<Installation> {
         Ok(Ok(output)) if output.status.success() => output,
         Ok(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
             eprintln!(
-                "SKIP {id}: executable unavailable; set {prefix}_COMMAND to an installed binary"
+                "SKIP {id}: `{version_command}` unavailable; install it or set {prefix}_COMMAND to an installed binary"
             );
             return None;
         }
         _ => {
             eprintln!(
-                "SKIP {id}: product version unavailable; verify {prefix}_COMMAND and its --version support"
+                "SKIP {id}: product version unavailable; verify `{version_command} --version` works"
             );
             return None;
         }
@@ -428,6 +454,40 @@ async fn native_session(installation: Installation) -> Result<(), String> {
         installation.id, installation.version, installation.wire
     );
     Ok(())
+}
+
+#[tokio::test]
+#[ignore = "explicit opt-in: starts a locally installed agent; sends no prompt, so incurs no model costs"]
+async fn pi_initialize_probe_reports_a_capability_report() {
+    let Some(installation) = installation("pi").await else {
+        return;
+    };
+    let profile = Profile {
+        name: None,
+        command: Some(installation.command),
+        args: installation.args,
+        env: BTreeMap::new(),
+        endpoint: None,
+        headers: BTreeMap::new(),
+        versions: vec![installation.wire],
+        pricing: Default::default(),
+    };
+    match hive_daemon::compat::probe_initialize(&profile).await {
+        Ok(report) => eprintln!(
+            "CAPABILITIES pi_version={} {}",
+            installation.version,
+            report.summary()
+        ),
+        // Print the diagnostic code and help only: both are Hive-authored, never agent output.
+        Err(error) => {
+            let code = miette::Diagnostic::code(&error).map(|code| code.to_string());
+            let help = miette::Diagnostic::help(&error).map(|help| help.to_string());
+            panic!(
+                "Pi {} probe failed: {error} [{code:?}] {help:?}",
+                installation.version
+            );
+        }
+    }
 }
 
 #[tokio::test]

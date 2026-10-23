@@ -107,8 +107,13 @@ Keep actual provider-reported costs distinct from estimates.
 - [#19 — Establish and document Pi ACP entrypoint compatibility](https://github.com/noirbizarre/hive/issues/19)
 
 Determine the supported Pi entrypoint/adapter and tested versions, and document
-the capability matrix. This is an investigation that can run in parallel with
-Phases 3–5; it does not itself implement native-session adoption.
+the capability matrix. Pi has no native ACP mode; the supported path is the
+external `pi-acp` adapter, documented in the
+[Pi section](acp-compatibility.md#pi) together with an opt-in initialize probe and
+typed `hive::compat::*` diagnostics. This does not itself implement
+native-session adoption. A broader
+[`hive doctor` command](https://github.com/noirbizarre/hive/issues/26) will
+reuse those checks for configuration and every profile.
 
 ### Phase 7 — Adopt sessions created in native agent interfaces
 
@@ -122,7 +127,7 @@ These are separate, longer-term integrations and are not first-release blockers:
   Hive-created sessions in Pi where its supported persistence APIs allow it.
 
 Both depend on the shared session contract and real-agent capability testing.
-For Pi, use the findings from #19. ACP compatibility alone does not guarantee
+For Pi, use the findings from #19 (the `pi-acp` adapter and its session map). ACP compatibility alone does not guarantee
 that an existing native session can be adopted. Do not silently create a
 duplicate conversation when adoption is unsupported.
 

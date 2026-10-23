@@ -33,6 +33,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio_stream::{StreamExt, wrappers::WatchStream};
 
 mod activity;
+pub mod compat;
 pub mod config;
 mod persistence;
 mod pricing;

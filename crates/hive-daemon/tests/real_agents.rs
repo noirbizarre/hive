@@ -216,6 +216,7 @@ async fn run(installation: Installation) -> Result<(), String> {
         endpoint: None,
         headers: BTreeMap::new(),
         versions: vec![installation.wire],
+        pricing: Default::default(),
     };
     let mut agents = BTreeMap::new();
     agents.insert(installation.id.into(), profile);

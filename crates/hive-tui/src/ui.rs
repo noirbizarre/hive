@@ -478,6 +478,28 @@ impl App {
             ),
             theme.text(),
         ));
+        if let Some(usage) = self.conversation().map(|c| &c.usage) {
+            let tokens = usage["tokens"]["totalTokens"]
+                .as_u64()
+                .map_or("unknown".into(), |count| count.to_string());
+            let actual = &usage["actualSessionCost"];
+            let estimated = &usage["estimatedCost"];
+            let price = if let (Some(amount), Some(currency)) =
+                (actual["amount"].as_f64(), actual["currency"].as_str())
+            {
+                format!("actual {amount:.4} {currency}")
+            } else if let (Some(amount), Some(currency)) =
+                (estimated["amount"].as_f64(), estimated["currency"].as_str())
+            {
+                format!("estimated {amount:.4} {currency}")
+            } else {
+                "unknown".into()
+            };
+            lines.push(Line::default());
+            lines.push(Line::styled("Usage", theme.muted()));
+            lines.push(Line::styled(format!("Tokens  {tokens}"), theme.text()));
+            lines.push(Line::styled(format!("Cost  {price}"), theme.text()));
+        }
         if let Some(activity) = self.conversation().map(|c| &c.activity) {
             lines.push(Line::default());
             lines.push(Line::styled("Activity", theme.muted()));
@@ -712,12 +734,22 @@ mod tests {
                 "tasks": {"job": {"title": "Index", "status": "completed"}},
                 "plans": {"plan": {"entries": [{"content": "Review", "status": "in_progress"}]}},
             }));
+        app.conversations
+            .get_mut("hive-one")
+            .unwrap()
+            .usage_snapshot(
+                &serde_json::json!({"turns": 1, "tokens": {"totalTokens": 120},
+                "estimatedCost": {"amount": 0.0005, "currency": "USD"}}),
+                5,
+            );
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         terminal.draw(|frame| app.show(frame)).unwrap();
         let rendered = screen(&terminal);
         assert!(rendered.contains("failed · Compile"));
         assert!(rendered.contains("completed · Index"));
         assert!(rendered.contains("in_progress · Review"));
+        assert!(rendered.contains("Tokens  120"));
+        assert!(rendered.contains("estimated 0.0005 USD"));
     }
 
     #[test]

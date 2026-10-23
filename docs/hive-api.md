@@ -38,6 +38,16 @@ sessions, independent of the connection that created them:
 ```json
 {
   "revision": 7,
+  "usageByAgent": {
+    "my-profile": {
+      "turns": 0, "reportedTurns": 0,
+      "tokens": {"totalTokens": null, "inputTokens": null,
+        "outputTokens": null, "thoughtTokens": null,
+        "cachedReadTokens": null, "cachedWriteTokens": null},
+      "estimatedCost": null, "actualSessionCost": null,
+      "contextUsed": null, "contextSize": null
+    }
+  },
   "sessions": [
     {
       "sessionId": "hive-…",
@@ -51,7 +61,12 @@ sessions, independent of the connection that created them:
       "lastActivityAt": 1791754566280,
       "controlOwner": "opaque-connection-id",
       "generation": 2,
-      "observers": 1
+      "observers": 1,
+      "usage": {"turns": 0, "reportedTurns": 0, "tokens": {"totalTokens": null,
+        "inputTokens": null, "outputTokens": null, "thoughtTokens": null,
+        "cachedReadTokens": null, "cachedWriteTokens": null},
+        "estimatedCost": null, "actualSessionCost": null,
+        "contextUsed": null, "contextSize": null}
     }
   ]
 }

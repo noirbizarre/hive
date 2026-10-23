@@ -830,6 +830,7 @@ mod tests {
                 endpoint: Some(endpoint),
                 headers: BTreeMap::new(),
                 versions: vec![AgentVersion::V2],
+                pricing: Default::default(),
             },
         );
         let gateway = tokio::spawn(async move {

@@ -48,6 +48,15 @@ args = ["acp"]
 versions = ["v1"] # Confirm the ACP wire version for your installation.
 ```
 
+Optional price mapping requires an exact models.dev provider and model ID. For
+an agent pinned to one model, add `[agents.opencode.pricing]` with
+`provider = "anthropic"` and `model = "claude-sonnet-4-5"` (only if those
+are the **actual billed** provider and model). For an agent exposing an ACP
+model selector, use `models = { "agent-model-id" = "catalog-model-id" }`
+instead of `model`. Set `cached_input_included = true` only if that agent's
+reported input count includes cached reads and writes. Unmapped turns have
+unknown estimated cost; catalog outages do not prevent token tracking.
+
 The commands and version declarations are examples; check your installed
 agents' ACP entrypoints and supported versions. Pi support depends on a
 compatible ACP entrypoint or adapter being available for your installed

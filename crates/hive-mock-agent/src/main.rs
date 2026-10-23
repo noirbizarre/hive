@@ -246,12 +246,22 @@ async fn main() -> agent_client_protocol::Result<()> {
                         v2::AgentMessage::new(agent_id).content(vec![reply.into()]),
                     );
                     notify(&cx, &request.session_id, snapshot.clone())?;
+                    let mut idle = v2::IdleStateUpdate::new().stop_reason(v2::StopReason::EndTurn);
+                    if text.contains("usage-fixture") {
+                        idle = idle.usage(v2::Usage::new(120, 80, 40).cached_read_tokens(Some(20)));
+                        notify(
+                            &cx,
+                            &request.session_id,
+                            v2::SessionUpdate::UsageUpdate(
+                                v2::UsageUpdate::new(120, 200_000)
+                                    .cost(v2::Cost::new(0.004, "USD")),
+                            ),
+                        )?;
+                    }
                     notify(
                         &cx,
                         &request.session_id,
-                        v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(
-                            v2::IdleStateUpdate::new().stop_reason(v2::StopReason::EndTurn),
-                        )),
+                        v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(idle)),
                     )?;
                     if text.contains("activity-sequence") {
                         let cx = cx.clone();
@@ -368,7 +378,12 @@ async fn serve_v1() -> agent_client_protocol::Result<()> {
                         format!("Echo: {text}").into(),
                     )),
                 ))?;
-                responder.respond(v1::PromptResponse::new(v1::StopReason::EndTurn))
+                let mut response = v1::PromptResponse::new(v1::StopReason::EndTurn);
+                if text.contains("usage-fixture") {
+                    response =
+                        response.usage(v1::Usage::new(120, 80, 40).cached_read_tokens(Some(20)));
+                }
+                responder.respond(response)
             },
             agent_client_protocol::on_receive_request!(),
         )

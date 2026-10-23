@@ -175,6 +175,42 @@ incomplete history. Updates
 can arrive before prompt responses; `idle` ends foreground work, not a
 unique turn-ID boundary.
 
+## Token usage and costs
+
+Hive reads the optional ACP end-turn token usage from v2 `state_update` / `idle`
+or from the v1 `session/prompt` result, and reads ACP `usage_update.cost` as
+**authoritative cumulative session cost**. These ACP token fields are turn
+aggregates, not individual model-call records: individual retries, sub-agent
+calls, billable provider IDs and provider-specific token categories cannot be
+inferred. The context-window `used` field is a gauge, not billable tokens.
+
+Each accepted turn ends with one sequenced `session/update` extension
+`sessionUpdate: "_hive_usage"` containing `version: 1`, `scope: "turn"`,
+`source: "acp"`, `turn: { id, agent, timestamp, tokens, estimate }` and
+`session: { turns, reportedTurns, tokens, estimatedCost, actualSessionCost,
+contextUsed, contextSize }`. For an ACP `usage_update` or cost change, `turn`
+is null; the session snapshot replaces the previous one. `turn.id` is Hive's
+idempotency key, not a provider request ID. A later price lookup can publish
+a replacement event for the same turn ID; clients replace rather than sum it.
+Unreported/partially reported fields are null, including aggregate categories
+when any contributing turn lacks that field. `totalTokens` is the agent's
+reported total, not a sum inferred from other categories. Cost numbers are
+USD unless the agent supplies a different currency in `actualSessionCost`;
+actual cumulative cost takes precedence over estimates. An estimate includes
+`input`, `output`, `cacheRead`, `cacheWrite`, `total`, `currency`, `provider`,
+`model`, `retrievedAt` (Unix milliseconds) and `source` (models.dev URL).
+Partial estimates have a null total. No price identity or pricing lookup means
+null estimated cost, while tokens remain available.
+
+`_meta.hive.usageSnapshot` contains the latest session aggregate atomically on
+new/resume; `_meta.hive.usageSeq` marks its event cursor. Summaries from
+`session/list` and the HTTP catalog also include `usage`; the HTTP catalog
+includes `usageByAgent`, grouped by configured Hive profile across sessions.
+An aggregate cost is null if any contributing price is missing or currencies
+disagree. Accounting survives
+daemon restarts, but the bounded event replay remains in-memory. A prompt
+interrupted before idle has no recorded turn; do not infer usage from it.
+
 ## Live execution activity
 
 Native ACPv2 tool, plan, and state updates remain on the shared session stream.

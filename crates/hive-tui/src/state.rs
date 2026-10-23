@@ -27,6 +27,8 @@ pub struct Conversation {
     pub pilot_present: bool,
     pub activity: serde_json::Value,
     pub activity_seq: u64,
+    pub usage: serde_json::Value,
+    pub usage_seq: u64,
     pub gap: bool,
 }
 
@@ -36,6 +38,13 @@ impl Conversation {
         if seq >= self.activity_seq && value["version"] == 1 {
             self.activity = value.clone();
             self.activity_seq = seq;
+        }
+    }
+
+    pub fn usage_snapshot(&mut self, value: &serde_json::Value, seq: u64) {
+        if seq >= self.usage_seq && value.is_object() {
+            self.usage = value.clone();
+            self.usage_seq = seq;
         }
     }
 
@@ -162,6 +171,14 @@ impl Conversation {
                     .unwrap_or(self.generation);
                 self.pilot_present = other.fields["pilot"].as_bool().unwrap_or(false);
             }
+            v2::SessionUpdate::Other(other) if other.session_update == "_hive_usage" => {
+                if seq > self.usage_seq
+                    && let Some(session) = other.fields.get("session")
+                {
+                    self.usage = session.clone();
+                    self.usage_seq = seq;
+                }
+            }
             v2::SessionUpdate::Other(other) if other.session_update == "_hive_activity" => {
                 let value = serde_json::to_value(other.fields).unwrap_or_default();
                 if seq > self.activity_seq {
@@ -240,6 +257,36 @@ mod tests {
         let mut meta = v2::Meta::new();
         meta.insert("hive".into(), serde_json::json!({"seq": seq}));
         v2::UpdateSessionNotification::new(v2::SessionId::new("hive-test"), update).meta(meta)
+    }
+
+    #[test]
+    fn a_usage_snapshot_ignores_old_replay_and_accepts_a_new_authoritative_cost() {
+        let mut conversation = Conversation::default();
+        conversation.usage_snapshot(
+            &serde_json::json!({"turns": 1, "tokens": {"totalTokens": 30}}),
+            3,
+        );
+        conversation.apply(event(
+            3,
+            v2::SessionUpdate::Other(v2::OtherSessionUpdate::new(
+                "_hive_usage",
+                BTreeMap::from([("session".into(), serde_json::json!({"turns": 0}))]),
+            )),
+        ));
+        assert_eq!(conversation.usage["turns"], 1);
+        conversation.apply(event(
+            4,
+            v2::SessionUpdate::Other(v2::OtherSessionUpdate::new(
+                "_hive_usage",
+                BTreeMap::from([(
+                    "session".into(),
+                    serde_json::json!({
+                        "turns": 1, "actualSessionCost": {"amount": 0.04, "currency": "USD"}
+                    }),
+                )]),
+            )),
+        ));
+        assert_eq!(conversation.usage["actualSessionCost"]["amount"], 0.04);
     }
 
     #[test]

@@ -73,7 +73,7 @@ async fn main() -> agent_client_protocol::Result<()> {
                 let state = state.clone();
                 async move |request: v2::NewSessionRequest,
                             responder: Responder<v2::NewSessionResponse>,
-                            cx: V2ConnectionTo<Client>| {
+                            _cx: V2ConnectionTo<Client>| {
                     let id = {
                         let mut state = state.lock().map_err(|_| Error::internal_error())?;
                         state.next += 1;
@@ -82,14 +82,11 @@ async fn main() -> agent_client_protocol::Result<()> {
                         save(&state)?;
                         id
                     };
-                    responder.respond(v2::NewSessionResponse::new(id.clone()))?;
-                    notify(
-                        &cx,
-                        &id,
-                        v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(
-                            v2::IdleStateUpdate::new(),
-                        )),
-                    )
+                    // No unsolicited `idle` here. Hive only routes updates for a session once it has
+                    // handled this response, so such an idle was either dropped or, on a loaded
+                    // machine, arrived after the client's first prompt and closed that turn with
+                    // no usage. Tests could not tell the two outcomes apart.
+                    responder.respond(v2::NewSessionResponse::new(id.clone()))
                 }
             },
             agent_client_protocol::on_receive_request!(),

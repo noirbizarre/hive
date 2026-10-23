@@ -60,11 +60,7 @@ fn parse(value: &Value, retrieved_at: u64) -> HashMap<(String, String), Rate> {
     rates
 }
 
-async fn download(url: &str) -> Option<HashMap<(String, String), Rate>> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(8))
-        .build()
-        .ok()?;
+async fn download(client: &reqwest::Client, url: &str) -> Option<HashMap<(String, String), Rate>> {
     let mut response = client.get(url).send().await.ok()?.error_for_status().ok()?;
     if response
         .content_length()
@@ -114,11 +110,18 @@ impl Catalog {
 
 pub(crate) async fn lookup(provider: &str, model: &str) -> Option<Rate> {
     static CATALOG: OnceLock<Mutex<Catalog>> = OnceLock::new();
+    let refresh = async {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(8))
+            .build()
+            .ok()?;
+        download(&client, URL).await
+    };
     CATALOG
         .get_or_init(|| Mutex::new(Catalog::default()))
         .lock()
         .await
-        .lookup_with(provider, model, now_millis(), download(URL))
+        .lookup_with(provider, model, now_millis(), refresh)
         .await
 }
 
@@ -185,42 +188,67 @@ impl Rate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use axum::{
+        Router,
+        body::Body,
+        http::{Response, StatusCode, header},
+        routing::get,
+    };
 
-    async fn catalog_response(status: &str, body: &str, length: usize) -> String {
+    async fn catalog_response(
+        status: StatusCode,
+        body: &str,
+        length: usize,
+    ) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/api.json", listener.local_addr().unwrap());
-        let response = format!(
-            "HTTP/1.1 {status}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n{body}"
-        );
-        tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            // Wait until the client has sent a request before replying; its contents
-            // do not affect this fixed catalog fixture.
-            socket.read_exact(&mut [0]).await.unwrap();
-            socket.write_all(response.as_bytes()).await.unwrap();
+        let body = body.to_owned();
+        let server = tokio::spawn(async move {
+            let app = Router::new().route(
+                "/api.json",
+                get(move || {
+                    let body = body.clone();
+                    async move {
+                        Response::builder()
+                            .status(status)
+                            .header(header::CONTENT_LENGTH, length.to_string())
+                            .body(Body::from(body))
+                            .unwrap()
+                    }
+                }),
+            );
+            axum::serve(listener, app).await.unwrap();
         });
-        url
+        (url, server)
     }
 
     #[tokio::test]
     async fn a_valid_catalog_is_downloaded_but_errors_and_oversized_responses_are_ignored() {
         let fixture = r#"{"anthropic":{"models":{"example":{"cost":{"input":2,"output":8}}}}}"#;
-        let url = catalog_response("200 OK", fixture, fixture.len()).await;
-        let prices = download(&url).await.unwrap();
+        // CI runners may install a system proxy; these fixtures are always loopback.
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(8))
+            .build()
+            .unwrap();
+        let (url, server) = catalog_response(StatusCode::OK, fixture, fixture.len()).await;
+        let prices = download(&client, &url).await.unwrap();
         assert_eq!(
             prices[&("anthropic".into(), "example".into())].output,
             Some(8.0)
         );
+        server.abort();
 
-        let url = catalog_response("503 Service Unavailable", "", 0).await;
-        assert!(download(&url).await.is_none());
-        let url = catalog_response("200 OK", "", MAX_BYTES + 1).await;
-        assert!(download(&url).await.is_none());
-        let url = catalog_response("200 OK", "not json", 8).await;
-        assert!(download(&url).await.is_none());
-        let url = catalog_response("200 OK", "{}", 2).await;
-        assert!(download(&url).await.is_none());
+        for (status, body, length) in [
+            (StatusCode::SERVICE_UNAVAILABLE, "", 0),
+            (StatusCode::OK, "", MAX_BYTES + 1),
+            (StatusCode::OK, "not json", 8),
+            (StatusCode::OK, "{}", 2),
+        ] {
+            let (url, server) = catalog_response(status, body, length).await;
+            assert!(download(&client, &url).await.is_none());
+            server.abort();
+        }
     }
 
     #[tokio::test]

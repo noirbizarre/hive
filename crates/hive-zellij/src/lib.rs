@@ -1,44 +1,394 @@
-//! ZJHive: Zellij's host WebAccess performs a one-shot operational status query.
+//! ZJHive's modal client: the daemon catalog is authoritative, and a local
+//! native ACP client bridges Zellij's completion-based WebAccess requests.
 
-use std::collections::BTreeMap;
+use serde_json::{Value, json};
+use std::collections::{BTreeMap, HashMap};
 use zellij_tile::prelude::*;
 
 #[derive(Default)]
 struct ZjHive {
     url: String,
-    status: String,
+    bridge: String,
     permitted: bool,
+    command_permitted: bool,
+    client: Option<String>,
+    sessions: Vec<Value>,
+    selected: usize,
+    active: Option<String>,
+    view: Value,
+    seq: u64,
+    lines: Vec<String>,
+    input: String,
+    status: String,
+    stale: bool,
+    skip_history: bool,
+    sending: bool,
+    tick: u64,
+    last_view_tick: u64,
+    last_catalog_tick: u64,
+    serial: u64,
+    epoch: u64,
+    inflight: HashMap<u64, (String, u64)>,
+    failures: u32,
+    next_retry: u64,
+    launching: bool,
 }
 
 register_plugin!(ZjHive);
 
 impl ZjHive {
-    fn refresh(&mut self) {
+    fn request(&mut self, kind: &str, url: String, verb: HttpVerb, body: Value) {
+        self.serial += 1;
+        let serial = self.serial;
+        self.inflight.insert(serial, (kind.into(), self.epoch));
+        let mut context = BTreeMap::new();
+        context.insert("serial".into(), serial.to_string());
+        let mut headers = BTreeMap::new();
+        if matches!(verb, HttpVerb::Post) {
+            headers.insert("Content-Type".into(), "application/json".into());
+        }
+        web_request(
+            url,
+            verb,
+            headers,
+            if matches!(verb, HttpVerb::Post) {
+                body.to_string().into_bytes()
+            } else {
+                vec![]
+            },
+            context,
+        );
+    }
+
+    fn catalog(&mut self) {
+        if self.permitted && !self.inflight.values().any(|(k, _)| k == "catalog") {
+            self.request(
+                "catalog",
+                format!("{}/hive/v1/sessions", self.url.trim_end_matches('/')),
+                HttpVerb::Get,
+                Value::Null,
+            );
+        }
+    }
+
+    fn action(&mut self, kind: &str, payload: Value) {
         if !self.permitted {
             return;
         }
-        self.status = "Connecting to Hive…".into();
-        web_request(
-            format!("{}/hive/v1/status", self.url.trim_end_matches('/')),
-            HttpVerb::Get,
-            BTreeMap::new(),
-            Vec::new(),
-            BTreeMap::new(),
+        let mut payload = payload;
+        payload["action"] = json!(kind);
+        if let Some(client) = &self.client {
+            payload["client"] = json!(client);
+        }
+        self.request(
+            kind,
+            format!("{}/bridge", self.bridge.trim_end_matches('/')),
+            HttpVerb::Post,
+            payload,
         );
     }
-}
 
-fn status_line(code: u16, body: &[u8]) -> String {
-    if code != 200 {
-        return format!("Hive unavailable (HTTP {code})");
+    fn activate(&mut self, kind: &str) {
+        let Some(session) = self.sessions.get(self.selected) else {
+            return;
+        };
+        let Some(id) = session["sessionId"].as_str().map(str::to_owned) else {
+            return;
+        };
+        let Some(cwd) = session["cwd"].as_str().map(str::to_owned) else {
+            return;
+        };
+        if kind == "attach" || kind == "live" {
+            self.epoch += 1;
+            self.active = Some(id.clone());
+            self.lines.clear();
+            self.seq = 0;
+            self.view = Value::Null;
+        }
+        self.action(kind, json!({"sessionId":id,"cwd":cwd}));
     }
-    match serde_json::from_slice::<serde_json::Value>(body) {
-        Ok(value) => format!(
-            "Hive {} — {} sessions",
-            value["version"].as_str().unwrap_or("?"),
-            value["sessions"]
-        ),
-        Err(_) => "Hive returned invalid status JSON".into(),
+
+    fn consume_view(&mut self, view: Value) {
+        let Some(id) = view["sessionId"].as_str() else {
+            return;
+        };
+        if self.active.as_deref() != Some(id) {
+            return;
+        }
+        if view["seq"].as_u64().is_some_and(|n| n < self.seq) {
+            self.status = "Daemon restarted or replay reset; reopen this session".into();
+            self.stale = true;
+            return;
+        }
+        if let Some(updates) = view["updates"].as_array() {
+            for entry in updates {
+                let Some(seq) = entry["seq"].as_u64() else {
+                    continue;
+                };
+                if seq <= self.seq {
+                    continue;
+                }
+                if seq != self.seq + 1 {
+                    self.status = "History gap: press Ctrl-R for live-only attach".into();
+                    self.stale = true;
+                    self.skip_history = true;
+                    return;
+                }
+                self.seq = seq;
+                let update = &entry["update"];
+                if let Some(text) = update["content"]["text"].as_str() {
+                    let who = if update["sessionUpdate"]
+                        .as_str()
+                        .unwrap_or("")
+                        .starts_with("user")
+                    {
+                        "You"
+                    } else {
+                        "Agent"
+                    };
+                    self.lines.push(format!("{who}: {text}"));
+                } else if update["sessionUpdate"] == "state_update" {
+                    self.lines.push(format!(
+                        "Activity: {}",
+                        update["state"].as_str().unwrap_or("unknown")
+                    ));
+                } else if update["sessionUpdate"] == "_hive_control" {
+                    self.lines.push("Control changed".into());
+                }
+            }
+        }
+        self.view = view;
+        self.stale = false;
+        self.last_view_tick = self.tick;
+        self.failures = 0;
+        self.status = if self.view["pilot"] == true {
+            "Pilot — Enter sends; Ctrl-C cancels; h relinquishes".into()
+        } else {
+            "Observer — t takes control; prompts are read-only".into()
+        };
+    }
+
+    fn failed(&mut self, kind: &str, message: String) {
+        self.status = message;
+        if kind == "catalog" || kind == "poll" || kind == "register" {
+            self.stale = true;
+            self.failures = self.failures.saturating_add(1);
+            self.next_retry = self.tick + (1 << self.failures.min(3));
+        }
+    }
+
+    fn result(&mut self, code: u16, body: &[u8], context: BTreeMap<String, String>) -> bool {
+        let Some(serial) = context.get("serial").and_then(|n| n.parse::<u64>().ok()) else {
+            return false;
+        };
+        let Some((kind, epoch)) = self.inflight.remove(&serial) else {
+            return false;
+        };
+        if epoch != self.epoch && kind != "catalog" && kind != "register" {
+            return false;
+        }
+        let value: Value = match serde_json::from_slice(body) {
+            Ok(value) => value,
+            Err(_) => {
+                self.failed(&kind, format!("{kind}: invalid HTTP response ({code})"));
+                return true;
+            }
+        };
+        if code != 200 {
+            if kind == "prompt" || kind == "retry" {
+                self.sending = false;
+            }
+            let message = value["error"].as_str().unwrap_or("Request failed");
+            self.failed(&kind, format!("{kind}: {message} (HTTP {code})"));
+            if message.contains("History expired") {
+                self.skip_history = true;
+            }
+            if code == 404 && kind != "catalog" {
+                self.client = None;
+            }
+            return true;
+        }
+        match kind.as_str() {
+            "catalog" => {
+                if let Some(sessions) = value["sessions"].as_array() {
+                    let selected_id = self
+                        .sessions
+                        .get(self.selected)
+                        .and_then(|s| s["sessionId"].as_str())
+                        .map(str::to_owned);
+                    self.sessions = sessions.clone();
+                    self.last_catalog_tick = self.tick;
+                    if self.active.is_none() {
+                        self.stale = false;
+                    }
+                    self.selected = selected_id
+                        .and_then(|id| self.sessions.iter().position(|s| s["sessionId"] == id))
+                        .unwrap_or_else(|| {
+                            self.selected.min(self.sessions.len().saturating_sub(1))
+                        });
+                    self.failures = 0;
+                    if self
+                        .active
+                        .as_ref()
+                        .is_some_and(|id| !self.sessions.iter().any(|s| s["sessionId"] == *id))
+                    {
+                        self.active = None;
+                        self.stale = true;
+                        self.status = "Session no longer exists in the daemon".into();
+                    }
+                } else {
+                    self.failed(&kind, "Invalid session catalog".into());
+                }
+            }
+            "health" => self.action("register", json!({})),
+            "register" => {
+                self.client = value["client"].as_str().map(str::to_owned);
+                self.status = "Select a Hive session with ↑/↓ and Enter".into();
+                if let Some(index) = self
+                    .sessions
+                    .iter()
+                    .position(|s| s["sessionId"] == self.active.as_deref().unwrap_or(""))
+                {
+                    self.selected = index;
+                    self.activate("attach");
+                }
+            }
+            "poll" | "attach" | "takeover" | "relinquish" | "live" => {
+                if kind == "live" {
+                    self.seq = value["seq"].as_u64().unwrap_or(0);
+                    self.lines.push("[Earlier history unavailable]".into());
+                }
+                self.consume_view(value);
+            }
+            "prompt" => {
+                self.sending = false;
+                self.input.clear();
+                self.status = "Prompt accepted".into();
+            }
+            "retry" => {
+                self.sending = false;
+                self.input.clear();
+                self.status = "Prompt retry acknowledged".into();
+            }
+            "detach" => {
+                self.active = None;
+                self.view = Value::Null;
+                self.epoch += 1;
+            }
+            _ => {
+                self.status = format!("{kind} succeeded");
+            }
+        }
+        true
+    }
+
+    fn on_key(&mut self, key: KeyWithModifier) -> bool {
+        let ctrl = key.key_modifiers.contains(&KeyModifier::Ctrl);
+        if ctrl && key.bare_key == BareKey::Char('c') && self.view["pilot"] == true && !self.stale {
+            self.action("cancel", json!({}));
+            return true;
+        }
+        if let Some(request) = self.view["interaction"]["request"].as_object()
+            && self.view["pilot"] == true
+            && !self.stale
+        {
+            match key.bare_key {
+                BareKey::Esc => {
+                    self.action("answer", json!({"answer": if self.view["interaction"]["type"] == "permission" { json!({}) } else { json!({"action":"decline"}) }}));
+                    return true;
+                }
+                BareKey::Enter => {
+                    let answer = if self.view["interaction"]["type"] == "permission" {
+                        let index = self.input.parse::<usize>().unwrap_or(0).saturating_sub(1);
+                        let Some(option) = request
+                            .get("options")
+                            .and_then(Value::as_array)
+                            .and_then(|a| a.get(index))
+                        else {
+                            self.status = "Enter a listed permission number".into();
+                            return true;
+                        };
+                        json!({"optionId":option["optionId"]})
+                    } else if request.get("mode").and_then(Value::as_str) == Some("url") {
+                        json!({"action":"accept"})
+                    } else {
+                        let mut content = serde_json::Map::new();
+                        for pair in self.input.split(',').filter(|p| !p.trim().is_empty()) {
+                            let Some((k, v)) = pair.split_once('=') else {
+                                self.status = "Use key=value pairs".into();
+                                return true;
+                            };
+                            content.insert(k.trim().into(), json!(v.trim()));
+                        }
+                        json!({"action":"accept", "content":content})
+                    };
+                    self.action("answer", json!({"answer":answer}));
+                    self.input.clear();
+                    return true;
+                }
+                BareKey::Backspace => {
+                    self.input.pop();
+                    return true;
+                }
+                BareKey::Char(ch) if !ctrl => {
+                    self.input.push(ch);
+                    return true;
+                }
+                _ => return false,
+            }
+        }
+        match key.bare_key {
+            BareKey::Up if self.active.is_none() => self.selected = self.selected.saturating_sub(1),
+            BareKey::Down if self.active.is_none() => {
+                self.selected = (self.selected + 1).min(self.sessions.len().saturating_sub(1))
+            }
+            BareKey::Enter if self.active.is_none() && self.client.is_some() => {
+                self.activate("attach")
+            }
+            BareKey::Enter
+                if self.view["pilot"] == true
+                    && !self.stale
+                    && !self.sending
+                    && !self.input.trim().is_empty() =>
+            {
+                let text = self.input.clone();
+                self.sending = true;
+                self.action("prompt", json!({"text":text,"key":format!("zellij-{}-{}", self.client.as_deref().unwrap_or(""), self.serial + 1)}));
+                self.status = "Awaiting prompt acknowledgement…".into();
+            }
+            BareKey::Backspace if self.active.is_some() => {
+                self.input.pop();
+            }
+            BareKey::Char('t') if ctrl && self.active.is_some() && !self.stale => {
+                self.activate("takeover")
+            }
+            BareKey::Char('h') if ctrl && self.active.is_some() && self.view["pilot"] == true => {
+                self.activate("relinquish")
+            }
+            BareKey::Char('r') if ctrl && self.skip_history && self.active.is_some() => {
+                self.skip_history = false;
+                self.activate("live");
+            }
+            BareKey::Char('r') if ctrl && self.active.is_some() => self.action("retry", json!({})),
+            BareKey::Esc if self.active.is_some() => {
+                self.action("detach", json!({}));
+                // A fresh ACP connection keeps a late detach from affecting the next selection.
+                self.client = None;
+                self.active = None;
+                self.view = Value::Null;
+                self.epoch += 1;
+                self.input.clear();
+                self.sending = false;
+                self.status = "Detached; the Hive session remains running".into();
+            }
+            BareKey::Char(ch)
+                if self.active.is_some() && self.view["pilot"] == true && !self.stale && !ctrl =>
+            {
+                self.input.push(ch)
+            }
+            _ => return false,
+        }
+        true
     }
 }
 
@@ -48,59 +398,286 @@ impl ZellijPlugin for ZjHive {
             .get("url")
             .cloned()
             .unwrap_or_else(|| "http://127.0.0.1:8765".into());
-        self.status = "Waiting for WebAccess permission".into();
+        self.bridge = config
+            .get("bridge")
+            .cloned()
+            .unwrap_or_else(|| "http://127.0.0.1:8766".into());
+        self.status = "Waiting for WebAccess and RunCommands permissions".into();
         subscribe(&[
             EventType::PermissionRequestResult,
             EventType::WebRequestResult,
+            EventType::RunCommandResult,
             EventType::Timer,
+            EventType::Key,
         ]);
-        request_permission(&[PermissionType::WebAccess]);
+        request_permission(&[PermissionType::WebAccess, PermissionType::RunCommands]);
     }
 
     fn update(&mut self, event: Event) -> bool {
         match event {
             Event::PermissionRequestResult(PermissionStatus::Granted) => {
                 self.permitted = true;
-                self.refresh();
-                set_timeout(5.0);
+                self.command_permitted = true;
+                self.catalog();
+                // A running helper answers health; a missing one is launched below.
+                self.request(
+                    "health",
+                    format!("{}/health", self.bridge),
+                    HttpVerb::Get,
+                    Value::Null,
+                );
+                set_timeout(2.0);
                 true
             }
             Event::PermissionRequestResult(PermissionStatus::Denied) => {
-                self.status = "WebAccess denied".into();
+                self.status = "WebAccess/RunCommands denied; grant permissions to attach".into();
                 true
             }
-            Event::WebRequestResult(code, _, body, _) => {
-                self.status = status_line(code, &body);
+            Event::WebRequestResult(code, _, body, context) => {
+                if context
+                    .get("serial")
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .and_then(|s| self.inflight.get(&s))
+                    .is_some_and(|(kind, _)| kind == "health")
+                    && code != 200
+                {
+                    if let Some(serial) = context.get("serial").and_then(|s| s.parse::<u64>().ok())
+                    {
+                        self.inflight.remove(&serial);
+                    }
+                    if self.command_permitted && !self.launching {
+                        let listen = self.bridge.trim_start_matches("http://").to_owned();
+                        run_command(
+                            &[
+                                "hive",
+                                "zellij-bridge",
+                                "--listen",
+                                &listen,
+                                "--url",
+                                &self.url,
+                            ],
+                            BTreeMap::new(),
+                        );
+                        self.launching = true;
+                        self.status = "Starting local Hive ACP bridge…".into();
+                    }
+                    return true;
+                }
+                self.result(code, &body, context)
+            }
+            Event::RunCommandResult(_, _, _, _) => {
+                self.launching = false;
+                self.status = "Bridge process exited; retrying".into();
                 true
             }
             Event::Timer(_) => {
-                self.refresh();
-                set_timeout(5.0);
+                self.tick += 1;
+                // A request whose host callback never arrives must not leave pilot controls enabled.
+                if self.active.is_some() && self.tick.saturating_sub(self.last_view_tick) > 3
+                    || self.active.is_none() && self.tick.saturating_sub(self.last_catalog_tick) > 4
+                {
+                    self.stale = true;
+                }
+                if self.permitted && self.tick >= self.next_retry {
+                    if self.tick.is_multiple_of(2) {
+                        self.catalog();
+                    }
+                    if self.client.is_none()
+                        && !self
+                            .inflight
+                            .values()
+                            .any(|(k, _)| k == "health" || k == "register")
+                    {
+                        self.request(
+                            "health",
+                            format!("{}/health", self.bridge),
+                            HttpVerb::Get,
+                            Value::Null,
+                        );
+                    }
+                    if self.active.is_some()
+                        && self.client.is_some()
+                        && !self.inflight.values().any(|(k, _)| k == "poll")
+                    {
+                        self.action("poll", json!({"seq":self.seq+1}));
+                    }
+                }
+                set_timeout(2.0);
                 true
             }
+            Event::Key(key) => self.on_key(key),
             _ => false,
         }
     }
 
-    fn render(&mut self, _rows: usize, _cols: usize) {
-        println!("ZJHive | {}", self.status);
+    fn render(&mut self, rows: usize, cols: usize) {
+        let mut lines = vec!["╭ ZJHive · Hive sessions ╮".to_owned()];
+        if self.active.is_none() {
+            if self.sessions.is_empty() {
+                lines.push("No Hive sessions; start one in TUI/WebUI".into());
+            }
+            for (i, session) in self.sessions.iter().enumerate() {
+                let owner = if session["controlOwner"].is_null() {
+                    "free"
+                } else {
+                    "owned"
+                };
+                lines.push(format!(
+                    "{} {} · {} · {} · {}",
+                    if i == self.selected { "▶" } else { " " },
+                    session["sessionId"].as_str().unwrap_or("?"),
+                    session["title"]
+                        .as_str()
+                        .unwrap_or(session["agent"].as_str().unwrap_or("?")),
+                    session["activity"].as_str().unwrap_or("unknown"),
+                    owner
+                ));
+            }
+            lines.push("↑/↓ select · Enter observe".into());
+        } else {
+            let owner = self
+                .sessions
+                .iter()
+                .find(|s| s["sessionId"] == self.active.as_deref().unwrap_or(""))
+                .is_some_and(|s| !s["controlOwner"].is_null());
+            let control = if self.view["pilot"] == true {
+                "pilot"
+            } else if owner {
+                "another client owns control"
+            } else {
+                "no pilot"
+            };
+            lines.push(format!(
+                "{} · {} · {}",
+                self.active.as_deref().unwrap_or("?"),
+                control,
+                if self.view["running"] == true {
+                    "running"
+                } else {
+                    "idle/unknown"
+                }
+            ));
+            let visible = rows.saturating_sub(7);
+            lines.extend(self.lines.iter().rev().take(visible).rev().cloned());
+            if !self.view["interaction"].is_null() {
+                let req = &self.view["interaction"]["request"];
+                if self.view["interaction"]["type"] == "permission" {
+                    lines.push(format!(
+                        "Permission: {}",
+                        req["title"].as_str().unwrap_or("Agent request")
+                    ));
+                    if let Some(options) = req["options"].as_array() {
+                        for (i, option) in options.iter().enumerate() {
+                            lines.push(format!(
+                                "{}: {}",
+                                i + 1,
+                                option["name"].as_str().unwrap_or("?")
+                            ));
+                        }
+                    }
+                    lines.push("Enter option number · Esc decline".into());
+                } else {
+                    lines.push(format!(
+                        "Input: {}",
+                        req["message"].as_str().unwrap_or("Agent request")
+                    ));
+                    if req["mode"] == "url" {
+                        lines.push(format!(
+                            "Open {} then press Enter",
+                            req["url"].as_str().unwrap_or("?")
+                        ));
+                    } else {
+                        let fields = req["requestedSchema"]["properties"]
+                            .as_object()
+                            .map(|p| p.keys().cloned().collect::<Vec<_>>().join(", "))
+                            .unwrap_or_default();
+                        lines.push(format!("Fields: {fields} · enter key=value pairs"));
+                    }
+                    lines.push("Enter accept · Esc decline".into());
+                }
+            }
+            lines.push(format!("› {}", self.input));
+            lines.push("Ctrl-T takeover · Ctrl-H release · Ctrl-R retry · Esc detach".into());
+        }
+        lines.push(format!(
+            "{}{}",
+            if self.stale { "STALE · " } else { "" },
+            self.status
+        ));
+        for line in lines.into_iter().take(rows) {
+            // Control characters in daemon-provided titles or chunks must not escape the pane.
+            let printable: String = line
+                .chars()
+                .filter(|ch| !ch.is_control())
+                .take(cols)
+                .collect();
+            println!("{printable}");
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::status_line;
+    use super::*;
 
     #[test]
-    fn an_unavailable_daemon_is_displayed_as_a_failure() {
-        assert_eq!(status_line(503, b"{}"), "Hive unavailable (HTTP 503)");
-        assert_eq!(
-            status_line(200, b"broken"),
-            "Hive returned invalid status JSON"
-        );
-        assert_eq!(
-            status_line(200, br#"{"version":"0.1.0","sessions":2}"#),
-            "Hive 0.1.0 — 2 sessions"
-        );
+    fn a_late_selection_result_cannot_replace_the_active_session() {
+        let mut plugin = ZjHive {
+            permitted: true,
+            sessions: vec![
+                json!({"sessionId":"hive-a", "cwd":"/tmp"}),
+                json!({"sessionId":"hive-b", "cwd":"/tmp"}),
+            ],
+            ..ZjHive::default()
+        };
+        plugin.activate("attach");
+        plugin.selected = 1;
+        plugin.activate("attach");
+        assert_eq!(plugin.active.as_deref(), Some("hive-b"));
+        plugin.consume_view(json!({"sessionId":"hive-a", "updates":[]}));
+        assert_eq!(plugin.active.as_deref(), Some("hive-b"));
+    }
+
+    #[test]
+    fn missing_updates_are_not_presented_as_current_activity() {
+        let mut plugin = ZjHive {
+            active: Some("hive-a".into()),
+            seq: 3,
+            ..ZjHive::default()
+        };
+        plugin.consume_view(json!({"sessionId":"hive-a","seq":5,"pilot":true,"updates":[{"seq":5,"update":{"sessionUpdate":"state_update","state":"idle"}}]}));
+        assert!(plugin.stale);
+        assert!(plugin.skip_history);
+        assert!(plugin.lines.is_empty());
+        assert_ne!(plugin.view["pilot"], true);
+    }
+
+    #[test]
+    fn a_pilot_loses_controls_when_the_next_snapshot_reports_an_observer() {
+        let mut plugin = ZjHive {
+            active: Some("hive-a".into()),
+            ..ZjHive::default()
+        };
+        plugin.consume_view(json!({"sessionId":"hive-a","seq":0,"pilot":true,"updates":[]}));
+        assert_eq!(plugin.view["pilot"], true);
+        plugin.consume_view(json!({"sessionId":"hive-a","seq":0,"pilot":false,"updates":[]}));
+        assert_eq!(plugin.view["pilot"], false);
+    }
+
+    #[test]
+    fn a_late_poll_result_from_an_old_selection_is_ignored() {
+        let mut plugin = ZjHive {
+            active: Some("hive-new".into()),
+            epoch: 2,
+            ..ZjHive::default()
+        };
+        plugin.inflight.insert(7, ("poll".into(), 1));
+        assert!(!plugin.result(
+            200,
+            br#"{"sessionId":"hive-old","pilot":true}"#,
+            BTreeMap::from([("serial".into(), "7".into())])
+        ));
+        assert_eq!(plugin.active.as_deref(), Some("hive-new"));
+        assert_eq!(plugin.view, Value::Null);
     }
 }

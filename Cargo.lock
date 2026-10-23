@@ -1528,13 +1528,20 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 name = "hive-cli"
 version = "0.1.0"
 dependencies = [
+ "agent-client-protocol",
+ "agent-client-protocol-http",
+ "axum",
  "clap",
  "clap_complete",
  "hive-daemon",
+ "hive-protocol",
  "hive-tui",
  "miette 7.6.0",
  "reqwest",
+ "serde",
+ "serde_json",
  "tokio",
+ "tracing",
  "tracing-subscriber",
  "uuid",
  "webbrowser",

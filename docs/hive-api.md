@@ -24,10 +24,11 @@ running state, current `activitySnapshot` and role; only pilot responses include
 an opaque token;
 all mutating ACP calls must include that generation/token. Prompts additionally
 require a stable idempotency key. See [ACP compatibility](acp-compatibility.md)
-for the exact wire contract, replay cursor and retention guarantees. The TUI
-and browser are both clients of this daemon contract. ZJHive's current Zellij
-WebAccess integration reports one-shot status only; its host API does not
-provide the persistent WebSocket/SSE connection needed for an ACP controller.
+for the exact wire contract, replay cursor and retention guarantees. The TUI,
+browser and ZJHive are clients of this daemon contract. ZJHive uses the existing
+catalog for discovery and a native `hive zellij-bridge` ACP client for
+attachment; the bridge supplies short loopback HTTP replies to Zellij's
+one-shot WebAccess API. The daemon exposes no Zellij-specific session routes.
 
 ## Session catalog
 
@@ -105,6 +106,14 @@ Daemon restart retains session records and prompt keys, but loses replay
 events and activity snapshots. The browser reports the history gap and offers
 live-only attachment; interrupted work requires a separate explicit
 acknowledgement before new prompts.
+
+ZJHive's picker uses this catalog and displays the same Hive session IDs,
+activity and owner information. Selecting a session observes it first; an
+explicit takeover through `/acp` is required before prompts, cancellation or
+interaction replies. The local bridge keeps a separate ACP connection per
+plugin instance. Losing or reloading the plugin detaches that connection; the
+daemon-owned agent session continues running. The bridge does not persist
+session history or create sessions on behalf of the plugin.
 
 To observe the catalog, open `GET /hive/v1/sessions/events` as an EventSource
 (or another SSE client), **then** fetch `/hive/v1/sessions`. Each event is named

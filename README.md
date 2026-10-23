@@ -87,8 +87,14 @@ Bash). Run `hive completions --help` for other supported shells.
 Build the Zellij plugin separately with
 `cargo build -p hive-zellij --target wasm32-wasip1`, then load
 `target/wasm32-wasip1/debug/hive_zellij.wasm` through Zellij's plugin loader;
-grant its WebAccess permission. Configure its `url` setting for a non-default
-loopback daemon. The full-screen TUI lists sessions across directories.
+grant its WebAccess and RunCommands permissions. Install the `hive` executable
+in `PATH`: the plugin automatically starts `hive zellij-bridge` to hold its ACP
+connection. Configure its `url` setting for a non-default loopback daemon and
+`bridge` for a non-default bridge URL (default `http://127.0.0.1:8766`). The
+plugin lists sessions by Hive ID; use arrows and Enter to observe, Ctrl-T to take
+control, Enter to send typed text, Ctrl-C to cancel, Ctrl-H to relinquish,
+Ctrl-R to retry an uncertain prompt or recover expired history, and Esc to detach. The
+full-screen TUI lists sessions across directories.
 Press `Ctrl-N` to create one, select a profile with the arrow keys and Enter,
 then type prompts in the bottom composer. The border-light transcript and
 session details follow your terminal's foreground/background and ANSI color

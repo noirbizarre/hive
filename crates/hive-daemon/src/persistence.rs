@@ -2,6 +2,7 @@
 
 use std::{path::PathBuf, sync::Mutex};
 
+use crate::usage::Ledger;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
@@ -47,6 +48,8 @@ pub struct Record {
     pub outcome: Outcome,
     pub reason: Option<String>,
     pub uncertain: bool,
+    #[serde(default)]
+    pub usage: Ledger,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -356,7 +359,33 @@ mod tests {
             outcome: Outcome::Active,
             reason: None,
             uncertain: false,
+            usage: Ledger::default(),
         }
+    }
+
+    #[test]
+    fn usage_records_survive_restart_without_changing_legacy_record_shape() {
+        let path = temporary();
+        let store = Store::open(path.clone()).unwrap();
+        let mut session = record("one");
+        session.usage.record(crate::usage::Turn {
+            id: "prompt-key".into(),
+            agent: "mock".into(),
+            timestamp: 12,
+            tokens: Some(crate::usage::Tokens {
+                total_tokens: Some(30),
+                input_tokens: Some(20),
+                output_tokens: Some(10),
+                ..Default::default()
+            }),
+            estimate: None,
+        });
+        store.save(&session).unwrap();
+        drop(store);
+        let reopened = Store::open(path).unwrap();
+        let saved = reopened.records().unwrap().pop().unwrap();
+        assert_eq!(saved.usage.summary().tokens.total_tokens, Some(30));
+        assert!(!saved.usage.clone().record(saved.usage.turns[0].clone()));
     }
 
     #[test]

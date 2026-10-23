@@ -9,11 +9,20 @@ export function conversation() {
   let pilot = false;
   let activity = { version: 1, seq: 0, session: 'active', foreground: 'unknown', tools: {}, plans: {}, tasks: {},
     support: { tools: 'unknown', plans: 'unknown', tasks: 'unknown' } };
+  let usage = {};
+  let usageSeq = 0;
   let gap = false;
 
   function reconcile(snapshot) {
     if (snapshot?.version === 1 && snapshot.seq >= activity.seq) activity = structuredClone(snapshot);
     gap = false;
+  }
+
+  function reconcileUsage(snapshot, number) {
+    if (snapshot && Number.isSafeInteger(number) && number >= usageSeq) {
+      usage = structuredClone(snapshot);
+      usageSeq = number;
+    }
   }
 
   function upsert(map, key, kind, text, replace = false) {
@@ -57,6 +66,9 @@ export function conversation() {
         if (id && value) { activity[type][id] = value; activity.support[type] = 'observed'; }
       }
       activity.seq = number;
+    } else if (kind === '_hive_usage' && number > usageSeq && update.session) {
+      usage = structuredClone(update.session);
+      usageSeq = number;
     }
     seq = number;
     return true;
@@ -67,6 +79,7 @@ export function conversation() {
     notice(text) { lines.push({ kind: 'notice', text }); },
     skip(nextSeq) { seq = Math.max(seq, nextSeq - 1); gap = false; },
     reconcile,
+    reconcileUsage,
     running(value) { running = value; },
     get seq() { return seq; },
     get runningNow() { return running; },
@@ -74,6 +87,7 @@ export function conversation() {
     get pilot() { return pilot; },
     get lines() { return lines.map(line => ({ ...line })); },
     get activity() { return structuredClone(activity); },
+    get usage() { return structuredClone(usage); },
     get gap() { return gap; },
   };
 }
@@ -106,7 +120,7 @@ export function connect(url, onChange = () => {}) {
 
   const snapshot = () => ({ connected, status, session: selected && { ...selected }, role: owner?.role || 'observer',
     generation: owner?.generation,
-    running: history.runningNow, lines: history.lines, activity: history.activity, seq: history.seq, gap, interaction,
+    running: history.runningNow, lines: history.lines, activity: history.activity, usage: history.usage, seq: history.seq, gap, interaction,
     uncertain: uncertain && { ...uncertain }, recoveryRequired, takingControl: Boolean(takingControl) });
   const publish = () => onChange(snapshot());
   const errorText = error => error?.data || error?.message || String(error);
@@ -198,6 +212,7 @@ export function connect(url, onChange = () => {}) {
       }
       const hive = ownership(response);
       history.reconcile(hive.activitySnapshot);
+      history.reconcileUsage(hive.usageSnapshot, hive.usageSeq);
       if (!replay) {
         // With no retained events, move the cursor to the daemon's atomic attachment boundary.
         history.skip(hive.nextSeq);
@@ -337,7 +352,8 @@ export function connect(url, onChange = () => {}) {
         creationUncertain = false;
         store?.removeItem('hive.creating');
         history = conversation();
-        ownership(created);
+        const hive = ownership(created);
+        history.reconcileUsage(hive.usageSnapshot, hive.usageSeq);
       }
       if (owner?.role !== 'pilot') throw new Error('Start typing to take control first');
       if (uncertain && uncertain.text !== text) throw new Error('Retry the uncertain prompt with its original text first');
@@ -492,6 +508,15 @@ export function mount(client, root = document) {
     }
     output.replaceChildren();
     for (const line of state.lines) add(output, 'div', `${line.kind === 'notice' ? '' : `${line.kind}: `}${line.text}`);
+    const usage = state.usage || {};
+    const actual = usage.actualSessionCost;
+    const estimated = usage.estimatedCost;
+    const price = actual?.amount != null ? `actual ${actual.amount.toFixed(4)} ${actual.currency}`
+      : estimated?.amount != null ? `estimated ${estimated.amount.toFixed(4)} ${estimated.currency}` : 'unknown';
+    const usagePanel = add(output, 'section', '');
+    add(usagePanel, 'h3', 'Usage');
+    add(usagePanel, 'div', `Tokens: ${usage.tokens?.totalTokens ?? 'unknown'} · Cost: ${price}`);
+    add(usagePanel, 'div', `Reported turns: ${usage.reportedTurns ?? 0} / ${usage.turns ?? 0}`);
     const activity = state.activity;
     if (activity) {
       const panel = add(output, 'section', '');

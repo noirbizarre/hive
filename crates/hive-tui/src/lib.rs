@@ -152,6 +152,10 @@ async fn resume(
     conversation.running = hive["running"].as_bool().unwrap_or(false);
     conversation.pilot_present = hive["pilot"].as_bool().unwrap_or(false);
     conversation.snapshot(&hive["activitySnapshot"]);
+    conversation.usage_snapshot(
+        &hive["usageSnapshot"],
+        hive["usageSeq"].as_u64().unwrap_or(0),
+    );
     conversation.gap = false;
     let next_seq = hive["nextSeq"].as_u64().unwrap_or(1);
     app.owner = response.meta;

@@ -7,6 +7,12 @@ codecov:
   notify:
     after_n_builds: 3
 
+# The mock agent is a subprocess fixture, not shipped application code. llvm-cov
+# does not attribute its child-process execution to the test reports, so counting
+# it as production code makes coverage fall when tests gain new fixtures.
+ignore:
+  - "crates/hive-mock-agent"
+
 # Every leg runs on every commit, so a missing report means a broken run,
 # not an untested platform — nothing should be carried forward to hide it.
 flags:

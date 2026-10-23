@@ -136,6 +136,20 @@ test('replay folds chunks into full messages without duplicating them', () => {
   assert.equal(history.runningNow, false);
 });
 
+test('usage snapshots and repricing events replace totals without adding a replayed turn', () => {
+  const view = conversation();
+  view.reconcileUsage({ turns: 1, tokens: { totalTokens: 120 }, actualSessionCost: null }, 4);
+  view.skip(5);
+  assert.equal(view.apply(update(5, { sessionUpdate: '_hive_usage', turn: { id: 'one' },
+    session: { turns: 1, tokens: { totalTokens: 120 }, estimatedCost: { amount: 0.004, currency: 'USD' } } }).params), true);
+  assert.equal(view.apply(update(5, { sessionUpdate: '_hive_usage', session: { turns: 2 } }).params), false);
+  view.reconcileUsage({ turns: 0 }, 3);
+  assert.equal(view.usage.turns, 1);
+  view.apply(update(6, { sessionUpdate: '_hive_usage', turn: null,
+    session: { turns: 1, tokens: { totalTokens: 120 }, actualSessionCost: { amount: 0.003, currency: 'USD' } } }).params);
+  assert.equal(view.usage.actualSessionCost.amount, 0.003);
+});
+
 test('activity snapshots reconcile missed tools and later task updates without reopening idle', () => {
   const view = conversation();
   view.reconcile({ version: 1, seq: 14, foreground: 'idle', tools: {

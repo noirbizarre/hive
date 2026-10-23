@@ -35,9 +35,12 @@ use tokio_stream::{StreamExt, wrappers::WatchStream};
 mod activity;
 pub mod config;
 mod persistence;
+mod pricing;
+mod usage;
 use activity::Activity;
-use config::{Config, Profile};
+use config::{Config, Pricing, Profile};
 use persistence::{Outcome, Record, Store};
+use usage::{Ledger, Money, Tokens, Turn};
 
 fn storage_error(error: persistence::StoreError) -> Error {
     Error::internal_error().data(error.to_string())
@@ -132,6 +135,11 @@ struct Control {
     reattached: bool,
     store: Option<Arc<Store>>,
     record: Option<Arc<Mutex<Record>>>,
+    usage: Ledger,
+    active_turn: Option<String>,
+    agent: String,
+    pricing: Pricing,
+    selected_model: Option<String>,
 }
 
 struct PromptRecord {
@@ -158,6 +166,7 @@ impl Control {
         record: &Record,
         store: Arc<Store>,
         saved: Arc<Mutex<Record>>,
+        pricing: Pricing,
     ) -> Self {
         let (changed, _) = watch::channel(record.generation);
         let mut activity = Activity::new();
@@ -184,6 +193,11 @@ impl Control {
             reattached: true,
             store: Some(store),
             record: Some(saved),
+            usage: record.usage.clone(),
+            active_turn: None,
+            agent: record.profile.clone(),
+            pricing,
+            selected_model: None,
         }
     }
     fn new(
@@ -191,6 +205,8 @@ impl Control {
         gateway: V2ConnectionTo<Client>,
         catalog: watch::Sender<u64>,
         version: AgentVersion,
+        agent: String,
+        pricing: Pricing,
     ) -> Self {
         let (changed, _) = watch::channel(1);
         let mut activity = Activity::new();
@@ -218,6 +234,11 @@ impl Control {
             reattached: false,
             store: None,
             record: None,
+            usage: Ledger::default(),
+            active_turn: None,
+            agent,
+            pricing,
+            selected_model: None,
         }
     }
 
@@ -227,6 +248,8 @@ impl Control {
             "generation": self.generation, "nextSeq": self.next_seq,
             "running": self.running, "pilot": self.pilot.is_some(),
             "activitySnapshot": self.activity,
+            "usageSnapshot": self.usage.summary(),
+            "usageSeq": self.next_seq.saturating_sub(1),
             "recoveryRequired": self.recovery_required,
             "role": if self.pilot.as_deref() == Some(client_id) { "pilot" } else { "observer" },
         });
@@ -317,6 +340,7 @@ pub struct SessionSummary {
     control_owner: Option<String>,
     generation: u64,
     observers: usize,
+    usage: usage::Summary,
 }
 
 impl SessionSummary {
@@ -345,6 +369,7 @@ impl SessionSummary {
                     .as_ref()
                     .is_some_and(|id| state.subscribers.contains_key(id)),
             )),
+            usage: state.usage.summary(),
         }
     }
 
@@ -362,6 +387,7 @@ impl SessionSummary {
             control_owner: None,
             generation: record.generation,
             observers: 0,
+            usage: record.usage.summary(),
         }
     }
 }
@@ -371,6 +397,7 @@ impl SessionSummary {
 pub struct SessionSnapshot {
     revision: u64,
     sessions: Vec<SessionSummary>,
+    usage_by_agent: BTreeMap<String, usage::Summary>,
 }
 
 fn event_meta(seq: u64) -> v2::Meta {
@@ -494,6 +521,7 @@ impl Broker {
             &record,
             store.clone(),
             saved.clone(),
+            provider.pricing.clone(),
         )));
         let (tx, rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = oneshot::channel();
@@ -691,9 +719,21 @@ impl Broker {
             let after = *self.catalog.borrow();
             if before == after {
                 summaries.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+                let mut usage_by_agent: BTreeMap<String, usage::Summary> = BTreeMap::new();
+                for summary in &summaries {
+                    match usage_by_agent.entry(summary.agent.clone()) {
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(summary.usage.clone());
+                        }
+                        std::collections::btree_map::Entry::Occupied(mut entry) => {
+                            entry.get_mut().combine(&summary.usage);
+                        }
+                    }
+                }
                 return Ok(SessionSnapshot {
                     revision: after,
                     sessions: summaries,
+                    usage_by_agent,
                 });
             }
         }
@@ -790,6 +830,7 @@ impl Broker {
                 waiters: vec![tx],
             },
         );
+        state.active_turn = Some(key.clone());
         if let (Some(store), Some(record)) = (state.store.clone(), state.record.clone()) {
             let mut record = record.lock().map_err(|_| Error::internal_error())?;
             record.uncertain = true;
@@ -799,6 +840,7 @@ impl Broker {
                 serde_json::to_string(&request.prompt).map_err(Error::into_internal_error)?;
             if let Err(error) = store.reserve_prompt(&record, &key, &content) {
                 state.prompts.remove(&key);
+                state.active_turn = None;
                 state.running = false;
                 state.recovery_required = true;
                 return Err(storage_error(error));
@@ -1031,6 +1073,8 @@ impl Broker {
             gateway,
             self.catalog.clone(),
             provider.preferred_version(),
+            chosen.clone(),
+            provider.pricing.clone(),
         )));
         let cwd = request.cwd.clone();
         let entry_control = control.clone();
@@ -1062,6 +1106,7 @@ impl Broker {
                 outcome: Outcome::Active,
                 reason: None,
                 uncertain: false,
+                usage: Ledger::default(),
             }))
         });
         let worker_record = stored_record.clone();
@@ -1229,6 +1274,53 @@ fn forward_v1(
     Ok(())
 }
 
+fn publish_usage(
+    state: &mut Control,
+    id: &v2::SessionId,
+    turn: Option<&Turn>,
+) -> agent_client_protocol::Result<()> {
+    let value = serde_json::json!({
+        "version": 1, "scope": "turn", "source": "acp",
+        "turn": turn, "session": state.usage.summary(),
+    });
+    let serde_json::Value::Object(fields) = value else {
+        unreachable!()
+    };
+    forward_locked(
+        state,
+        id,
+        Some(v2::SessionUpdate::Other(v2::OtherSessionUpdate::new(
+            "_hive_usage",
+            fields.into_iter().collect(),
+        ))),
+    )
+}
+
+fn save_usage(state: &mut Control) -> agent_client_protocol::Result<()> {
+    if let (Some(store), Some(record)) = (&state.store, &state.record) {
+        let mut record = record.lock().map_err(|_| Error::internal_error())?;
+        record.usage = state.usage.clone();
+        store.save(&record).map_err(storage_error)?;
+    }
+    Ok(())
+}
+
+fn report_v1_cost(
+    control: &Mutex<Control>,
+    id: &v2::SessionId,
+    update: &v1::UsageUpdate,
+) -> agent_client_protocol::Result<()> {
+    let mut usage = v2::UsageUpdate::new(update.used, update.size);
+    if let Some(cost) = update
+        .cost
+        .as_ref()
+        .and_then(|cost| Money::valid(cost.amount, &cost.currency))
+    {
+        usage = usage.cost(v2::Cost::new(cost.amount, cost.currency));
+    }
+    forward(control, id, v2::SessionUpdate::UsageUpdate(usage))
+}
+
 fn publish_activity(
     state: &mut Control,
     id: &v2::SessionId,
@@ -1256,9 +1348,41 @@ fn forward_locked(
 ) -> agent_client_protocol::Result<()> {
     let is_agent_update = update.is_some();
     let update = update.unwrap_or_else(|| state.status_update());
+    if let v2::SessionUpdate::UsageUpdate(usage) = &update {
+        let cost = usage
+            .cost
+            .as_ref()
+            .and_then(|cost| Money::valid(cost.amount, &cost.currency));
+        state.usage.report_cost(usage.used, usage.size, cost);
+        save_usage(state)?;
+    }
+    if let v2::SessionUpdate::ConfigOptionUpdate(options) = &update {
+        state.selected_model = selected_model(&options.config_options);
+    }
     if is_agent_update {
         record_activity(state);
     }
+    // Commit accounting before publishing idle: a crash cannot announce a completed
+    // turn while forgetting the corresponding durable tokens on restart.
+    let finished_turn = if let v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(idle)) = &update
+        && let Some(key) = state.active_turn.take()
+    {
+        let turn = Turn {
+            id: key,
+            agent: state.agent.clone(),
+            timestamp: now_millis(),
+            tokens: idle.usage.as_deref().map(Tokens::from),
+            estimate: None,
+        };
+        if state.usage.record(turn.clone()) {
+            save_usage(state)?;
+            Some(turn)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     if let v2::SessionUpdate::StateUpdate(status) = &update {
         match status {
             v2::StateUpdate::Running(_) => {
@@ -1311,7 +1435,80 @@ fn forward_locked(
     if let Some(event) = state.activity.v2(&update) {
         publish_activity(state, id, event)?;
     }
+    if let Some(turn) = finished_turn {
+        publish_usage(state, id, Some(&turn))?;
+    } else if matches!(update, v2::SessionUpdate::UsageUpdate(_)) {
+        publish_usage(state, id, None)?;
+    }
     Ok(())
+}
+
+fn selected_model(options: &[v2::SessionConfigOption]) -> Option<String> {
+    let models = options
+        .iter()
+        .filter_map(|option| {
+            let value = serde_json::to_value(option).ok()?;
+            (value["category"] == "model")
+                .then(|| value["currentValue"].as_str().map(str::to_owned))
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    (models.len() == 1)
+        .then(|| models.into_iter().next())
+        .flatten()
+}
+
+fn schedule_price(control: Arc<Mutex<Control>>, id: v2::SessionId) {
+    let target = control.lock().ok().and_then(|state| {
+        let turn = state.usage.turns.last()?;
+        if turn.estimate.is_some() || turn.tokens.is_none() {
+            return None;
+        }
+        let provider = state.pricing.provider.clone()?;
+        let model = if state.pricing.models.is_empty() {
+            state.pricing.model.clone()?
+        } else {
+            state
+                .pricing
+                .models
+                .get(state.selected_model.as_ref()?)?
+                .clone()
+        };
+        Some((
+            turn.id.clone(),
+            provider,
+            model,
+            state.pricing.cached_input_included,
+        ))
+    });
+    let Some((key, provider, model, cached_input_included)) = target else {
+        return;
+    };
+    tokio::spawn(async move {
+        let Some(rate) = pricing::lookup(&provider, &model).await else {
+            return;
+        };
+        if let Ok(mut state) = control.lock() {
+            let Some(turn) = state
+                .usage
+                .turns
+                .iter_mut()
+                .find(|turn| turn.id == key && turn.estimate.is_none())
+            else {
+                return;
+            };
+            let Some(tokens) = &turn.tokens else {
+                return;
+            };
+            turn.estimate = Some(rate.estimate(&provider, &model, tokens, cached_input_included));
+            let turn = turn.clone();
+            if let Err(error) =
+                save_usage(&mut state).and_then(|()| publish_usage(&mut state, &id, Some(&turn)))
+            {
+                tracing::warn!(%error, "could not publish usage price");
+            }
+        }
+    });
 }
 
 fn current(control: &Mutex<Control>, generation: u64) -> bool {
@@ -1467,7 +1664,10 @@ async fn run_agent(
                     {
                         return Ok(());
                     }
-                    forward(&control, &hive_id, notification.update)
+                    let idle = matches!(notification.update, v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(_)));
+                    forward(&control, &hive_id, notification.update)?;
+                    if idle { schedule_price(control.clone(), hive_id.clone()); }
+                    Ok(())
                 }
             },
             agent_client_protocol::on_receive_notification!(),
@@ -1566,6 +1766,9 @@ async fn run_agent(
             };
             if let Ok(mut route) = downstream.lock() {
                 *route = Some(downstream_id.clone());
+            }
+            if let Ok(mut state) = control.lock() {
+                state.selected_model = selected_model(&opened.config_options);
             }
             let _ = ready.send(Ok((opened, downstream_id.to_string())));
             if active.await.is_err() { return Ok(()); }
@@ -1670,6 +1873,9 @@ async fn run_v1_agent(
                     // V1 chunks have no message ID: assign one per Hive prompt.
                     let source = notification.update.clone();
                     match notification.update {
+                        v1::SessionUpdate::UsageUpdate(update) => {
+                            report_v1_cost(&control, &hive_id, &update)?;
+                        }
                         v1::SessionUpdate::AgentMessageChunk(chunk) => {
                             if let v1::ContentBlock::Text(text) = chunk.content {
                                 let id = chunk_message_id.lock().map_err(|_| Error::internal_error())?.clone().ok_or_else(Error::internal_error)?;
@@ -1865,29 +2071,34 @@ async fn run_v1_agent(
                                 }
                             }
                         };
-                        let stop = match result {
-                            Ok(response) => match response.stop_reason {
+                        let (stop, tokens) = match result {
+                            Ok(response) => (match response.stop_reason {
                                 v1::StopReason::EndTurn => v2::StopReason::EndTurn,
                                 _ => v2::StopReason::Other(v2::OtherStopReason::new(
                                     "_v1_stop",
                                     Default::default(),
                                 )),
-                            },
+                            }, response.usage),
                             Err(error) => {
                                 tracing::warn!(%error, "v1 prompt failed");
-                                v2::StopReason::Other(v2::OtherStopReason::new(
+                                (v2::StopReason::Other(v2::OtherStopReason::new(
                                     "_v1_error",
                                     Default::default(),
-                                ))
+                                )), None)
                             }
                         };
+                        let usage = tokens.map(|usage| v2::Usage::new(usage.total_tokens, usage.input_tokens, usage.output_tokens)
+                            .thought_tokens(usage.thought_tokens)
+                            .cached_read_tokens(usage.cached_read_tokens)
+                            .cached_write_tokens(usage.cached_write_tokens));
                         let _ = forward(
                             &control,
                             &hive_id,
                             v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(
-                                v2::IdleStateUpdate::new().stop_reason(stop),
+                                v2::IdleStateUpdate::new().stop_reason(stop).usage(usage),
                             )),
                         );
+                        schedule_price(control.clone(), hive_id.clone());
                     }
                     Command::Cancel(epoch) => {
                         if epoch == 0 || current(&control, epoch) {
@@ -2354,7 +2565,59 @@ mod control_tests {
             reattached: false,
             store: None,
             record: None,
+            usage: Ledger::default(),
+            active_turn: None,
+            agent: "test".into(),
+            pricing: Pricing::default(),
+            selected_model: None,
         }
+    }
+
+    #[test]
+    fn a_reported_session_cost_does_not_duplicate_a_turn_or_replace_its_tokens() {
+        let mut state = detached();
+        let id = v2::SessionId::new("hive-usage");
+        state.active_turn = Some("one".into());
+        let idle = v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(
+            v2::IdleStateUpdate::new().usage(v2::Usage::new(12, 8, 4)),
+        ));
+        forward_locked(&mut state, &id, Some(idle.clone())).unwrap();
+        forward_locked(&mut state, &id, Some(idle)).unwrap();
+        assert_eq!(state.usage.turns.len(), 1);
+        forward_locked(
+            &mut state,
+            &id,
+            Some(v2::SessionUpdate::UsageUpdate(
+                v2::UsageUpdate::new(12, 200_000).cost(v2::Cost::new(0.003, "USD")),
+            )),
+        )
+        .unwrap();
+        assert_eq!(state.usage.summary().turns, 1);
+        assert_eq!(state.usage.summary().tokens.total_tokens, Some(12));
+        assert_eq!(
+            state.usage.summary().actual_session_cost.unwrap().amount,
+            0.003
+        );
+        assert_eq!(state.usage.summary().context_used, Some(12));
+        assert!(state.events.iter().any(|(_, event)| matches!(event,
+            v2::SessionUpdate::Other(other) if other.session_update == "_hive_usage" && other.fields["turn"].is_null()
+        )));
+    }
+
+    #[test]
+    fn ambiguous_model_options_do_not_choose_a_billable_identity() {
+        let option = |id: &str| {
+            v2::SessionConfigOption::select(
+                id,
+                "Model",
+                "model-a",
+                vec![v2::SessionConfigSelectOption::new("model-a", "Model A")],
+            )
+            .category(v2::SessionConfigOptionCategory::Model)
+        };
+        assert_eq!(selected_model(&[option("model")]), Some("model-a".into()));
+        assert_eq!(selected_model(&[option("first"), option("second")]), None);
+        assert_eq!(selected_model(&[]), None);
     }
 
     #[test]

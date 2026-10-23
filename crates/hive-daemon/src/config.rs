@@ -27,6 +27,23 @@ pub struct Profile {
     pub headers: BTreeMap<String, String>,
     #[serde(default = "v2_only")]
     pub versions: Vec<AgentVersion>,
+    #[serde(default)]
+    pub pricing: Pricing,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Pricing {
+    /// Exact models.dev provider ID, never inferred from the Hive agent profile.
+    pub provider: Option<String>,
+    /// Fixed model ID when this agent cannot switch models during a session.
+    pub model: Option<String>,
+    /// ACP model-selector value to models.dev model ID mapping.
+    #[serde(default)]
+    pub models: BTreeMap<String, String>,
+    /// Opt in only when the agent's ACP inputTokens includes both cache categories.
+    #[serde(default)]
+    pub cached_input_included: bool,
 }
 
 fn v2_only() -> Vec<AgentVersion> {
@@ -88,6 +105,34 @@ impl Config {
             ));
         }
         for (id, profile) in &self.agents {
+            if let Some(pricing) = &profile.pricing.provider {
+                if pricing.trim().is_empty()
+                    || (profile.pricing.model.is_none() && profile.pricing.models.is_empty())
+                {
+                    return Err(format!(
+                        "agent '{id}' pricing needs a provider and a fixed model or selector mapping"
+                    ));
+                }
+            } else if profile.pricing.model.is_some() || !profile.pricing.models.is_empty() {
+                return Err(format!(
+                    "agent '{id}' pricing needs a models.dev provider ID"
+                ));
+            }
+            if profile
+                .pricing
+                .model
+                .as_ref()
+                .is_some_and(|model| model.trim().is_empty())
+                || profile
+                    .pricing
+                    .models
+                    .iter()
+                    .any(|(selector, model)| selector.trim().is_empty() || model.trim().is_empty())
+            {
+                return Err(format!(
+                    "agent '{id}' pricing model IDs and selector values must not be empty"
+                ));
+            }
             if id.is_empty()
                 || !id
                     .chars()
@@ -208,5 +253,37 @@ mod tests {
     fn a_bad_default_is_rejected_before_the_listener_starts() {
         let config: Config = toml::from_str("default_agent = 'missing'").unwrap();
         assert!(config.validate().unwrap_err().contains("not configured"));
+    }
+
+    #[test]
+    fn pricing_requires_explicit_catalog_identity_and_keeps_it_out_of_public_profiles() {
+        let missing: Config = toml::from_str(
+            r#"[agents.worker]
+            command = "mock"
+            [agents.worker.pricing]
+            model = "example"
+        "#,
+        )
+        .unwrap();
+        assert!(missing.validate().unwrap_err().contains("provider ID"));
+        let configured: Config = toml::from_str(
+            r#"[agents.worker]
+            command = "mock"
+            [agents.worker.pricing]
+            provider = "anthropic"
+            models = { "agent-alias" = "claude-example" }
+        "#,
+        )
+        .unwrap();
+        configured.validate().unwrap();
+        assert_eq!(
+            configured.agents["worker"].pricing.models["agent-alias"],
+            "claude-example"
+        );
+        assert!(
+            !serde_json::to_string(&configured.public_profiles())
+                .unwrap()
+                .contains("claude-example")
+        );
     }
 }

@@ -99,51 +99,237 @@ fn is_loopback_host(host: &str) -> bool {
             .is_ok_and(|ip| ip.is_loopback())
 }
 
-fn validate_opencode_server(id: &str, profile: &Profile) -> Result<(), String> {
+/// Why a configuration cannot be used. Codes are public identifiers: never rename one.
+///
+/// The text never quotes a profile value (URL, header, env, args): config files are routinely
+/// pasted into bug reports and these messages are printed by `hive doctor`.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error, miette::Diagnostic)]
+pub enum ConfigError {
+    #[error("{0}")]
+    #[diagnostic(
+        code(hive::config::unreadable),
+        help("check the path and its permissions, or pass --config / set HIVE_CONFIG")
+    )]
+    Unreadable(String),
+
+    #[error("{0}")]
+    #[diagnostic(
+        code(hive::config::syntax),
+        help("fix the TOML near the reported line; unknown profile fields are rejected")
+    )]
+    Syntax(String),
+
+    #[error("{0}")]
+    #[diagnostic(
+        code(hive::config::default_agent),
+        help("set default_agent (or HIVE_DEFAULT_AGENT) to one of the ids under [agents]")
+    )]
+    DefaultAgent(String),
+
+    #[error("{0}")]
+    #[diagnostic(
+        code(hive::config::agent_id),
+        help("rename the table to [agents.<id>] using letters, digits, '-' or '_'")
+    )]
+    AgentId(String),
+
+    #[error("{0}")]
+    #[diagnostic(
+        code(hive::config::pricing),
+        help("give the profile's pricing a models.dev provider and a model or selector mapping")
+    )]
+    Pricing(String),
+
+    #[error("{0}")]
+    #[diagnostic(
+        code(hive::config::versions),
+        help("set versions = [\"v2\"], [\"v1\"] or both on the profile")
+    )]
+    Versions(String),
+
+    #[error("{0}")]
+    #[diagnostic(
+        code(hive::config::profile),
+        help(
+            "give the profile either a stdio `command` (with args/env) or an `endpoint` (with headers), not both"
+        )
+    )]
+    Profile(String),
+
+    #[error("{0}")]
+    #[diagnostic(
+        code(hive::config::endpoint),
+        help("use a full ws://, wss://, http:// or https:// URL without embedded credentials")
+    )]
+    Endpoint(String),
+
+    #[error("{0}")]
+    #[diagnostic(
+        code(hive::config::header),
+        help("use standard HTTP header names and printable single-line values")
+    )]
+    Header(String),
+
+    #[error("{0}")]
+    #[diagnostic(
+        code(hive::config::credentials),
+        help(
+            "name an environment variable in password_env; credentials fields only apply to kind = \"opencode-server\""
+        )
+    )]
+    Credentials(String),
+}
+
+/// One thing wrong with a configuration, attributed to a profile where there is one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Problem {
+    pub agent: Option<String>,
+    pub error: ConfigError,
+}
+
+/// Header names and values are only parsed when a session connects; checking them here
+/// surfaces the mistake at startup. Neither is echoed: values routinely hold tokens.
+fn header_problems(id: &str, profile: &Profile, out: &mut Vec<ConfigError>) {
+    for (name, value) in &profile.headers {
+        if reqwest::header::HeaderName::from_bytes(name.as_bytes()).is_err() {
+            out.push(ConfigError::Header(format!(
+                "agent '{id}' has a header with an invalid name"
+            )));
+        }
+        if reqwest::header::HeaderValue::from_str(value).is_err() {
+            out.push(ConfigError::Header(format!(
+                "agent '{id}' has a header with an invalid value"
+            )));
+        }
+    }
+}
+
+fn validate_opencode_server(id: &str, profile: &Profile, out: &mut Vec<ConfigError>) {
     let Some(endpoint) = profile.endpoint.as_deref() else {
-        return Err(format!(
+        out.push(ConfigError::Endpoint(format!(
             "agent '{id}' (kind = 'opencode-server') needs an http(s) endpoint, for example endpoint = 'http://127.0.0.1:4096'"
-        ));
+        )));
+        return;
     };
     if profile.command.is_some() || !profile.args.is_empty() || !profile.env.is_empty() {
-        return Err(format!(
+        out.push(ConfigError::Profile(format!(
             "agent '{id}' (kind = 'opencode-server') connects to a running server; remove command, args and env"
-        ));
+        )));
     }
     // Parsing (rather than prefix checks) is what lets us inspect scheme, host and userinfo reliably.
-    let url = reqwest::Url::parse(endpoint).map_err(|_| {
-        format!(
+    match reqwest::Url::parse(endpoint) {
+        Err(_) => out.push(ConfigError::Endpoint(format!(
             "agent '{id}' has an invalid endpoint; use a full URL such as http://127.0.0.1:4096"
-        )
-    })?;
-    if !matches!(url.scheme(), "http" | "https") {
-        return Err(format!(
-            "agent '{id}' (kind = 'opencode-server') needs an http or https endpoint, not {}",
-            url.scheme()
-        ));
-    }
-    if !url.username().is_empty() || url.password().is_some() {
-        return Err(format!(
-            "agent '{id}' embeds credentials in its endpoint; use username and password_env instead"
-        ));
-    }
-    if url.scheme() == "http" && !url.host_str().is_some_and(is_loopback_host) {
-        return Err(format!(
-            "agent '{id}' sends OpenCode credentials over plain HTTP to a non-loopback host; use https or an SSH tunnel to a loopback address"
-        ));
+        ))),
+        Ok(url) => {
+            if !matches!(url.scheme(), "http" | "https") {
+                out.push(ConfigError::Endpoint(format!(
+                    "agent '{id}' (kind = 'opencode-server') needs an http or https endpoint, not {}",
+                    url.scheme()
+                )));
+            }
+            if !url.username().is_empty() || url.password().is_some() {
+                out.push(ConfigError::Endpoint(format!(
+                    "agent '{id}' embeds credentials in its endpoint; use username and password_env instead"
+                )));
+            }
+            if url.scheme() == "http" && !url.host_str().is_some_and(is_loopback_host) {
+                out.push(ConfigError::Endpoint(format!(
+                    "agent '{id}' sends OpenCode credentials over plain HTTP to a non-loopback host; use https or an SSH tunnel to a loopback address"
+                )));
+            }
+        }
     }
     if let Some(var) = &profile.password_env
         && (var.is_empty() || !var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
     {
-        return Err(format!(
+        out.push(ConfigError::Credentials(format!(
             "agent '{id}' password_env must be an environment variable name, not the password itself"
-        ));
+        )));
     }
-    Ok(())
+}
+
+fn validate_profile(id: &str, profile: &Profile, out: &mut Vec<ConfigError>) {
+    if let Some(pricing) = &profile.pricing.provider {
+        if pricing.trim().is_empty()
+            || (profile.pricing.model.is_none() && profile.pricing.models.is_empty())
+        {
+            out.push(ConfigError::Pricing(format!(
+                "agent '{id}' pricing needs a provider and a fixed model or selector mapping"
+            )));
+        }
+    } else if profile.pricing.model.is_some() || !profile.pricing.models.is_empty() {
+        out.push(ConfigError::Pricing(format!(
+            "agent '{id}' pricing needs a models.dev provider ID"
+        )));
+    }
+    if profile
+        .pricing
+        .model
+        .as_ref()
+        .is_some_and(|model| model.trim().is_empty())
+        || profile
+            .pricing
+            .models
+            .iter()
+            .any(|(selector, model)| selector.trim().is_empty() || model.trim().is_empty())
+    {
+        out.push(ConfigError::Pricing(format!(
+            "agent '{id}' pricing model IDs and selector values must not be empty"
+        )));
+    }
+    if id.is_empty()
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        out.push(ConfigError::AgentId(format!(
+            "invalid agent ID '{id}'; use letters, digits, '-' or '_'"
+        )));
+    }
+    if profile.versions.is_empty() {
+        out.push(ConfigError::Versions(format!(
+            "agent '{id}' has no protocol versions; set versions = ['v2'] or ['v1']"
+        )));
+    }
+    if profile.kind == ProfileKind::OpencodeServer {
+        validate_opencode_server(id, profile, out);
+        header_problems(id, profile, out);
+        return;
+    }
+    if profile.username.is_some() || profile.password_env.is_some() {
+        out.push(ConfigError::Credentials(format!(
+            "agent '{id}' sets username or password_env, which only apply to kind = 'opencode-server'; use headers for ACP endpoints"
+        )));
+    }
+    match (&profile.command, &profile.endpoint) {
+        (Some(command), None) if !command.trim().is_empty() && profile.headers.is_empty() => {}
+        (None, Some(url))
+            if profile.args.is_empty()
+                && profile.env.is_empty()
+                && (url.starts_with("ws://")
+                    || url.starts_with("wss://")
+                    || url.starts_with("http://")
+                    || url.starts_with("https://")) =>
+        {
+            // The prefix alone accepts `http://` or `ws://a b`; the URL must actually parse.
+            if reqwest::Url::parse(url).is_err() {
+                out.push(ConfigError::Endpoint(format!(
+                    "agent '{id}' has an invalid endpoint; use a full URL such as wss://agent.example.net/acp"
+                )));
+            }
+        }
+        _ => out.push(ConfigError::Profile(format!(
+            "agent '{id}' needs either a nonempty stdio command (+ args/env) or an HTTP/WebSocket endpoint (+ headers)"
+        ))),
+    }
+    header_problems(id, profile, out);
 }
 
 impl Config {
-    pub fn load(path: Option<PathBuf>) -> Result<Self, String> {
+    /// Reads and parses the file without validating it, so `hive doctor` can report every
+    /// problem rather than stop at the first.
+    pub fn read(path: Option<PathBuf>) -> Result<Self, ConfigError> {
         let explicit = path.is_some();
         let path = path.unwrap_or_else(default_path);
         let mut config: Self = match std::fs::read_to_string(&path) {
@@ -155,107 +341,64 @@ impl Config {
                         .count()
                         + 1
                 });
-                format!(
+                // The toml message can quote values, so only the position is reported.
+                ConfigError::Syntax(format!(
                     "invalid Hive config {}{}; check TOML syntax and profile fields",
                     path.display(),
                     line.map_or(String::new(), |line| format!(" near line {line}"))
-                )
+                ))
             })?,
             Err(error) if !explicit && error.kind() == std::io::ErrorKind::NotFound => {
                 Self::default()
             }
             Err(error) => {
-                return Err(format!(
+                return Err(ConfigError::Unreadable(format!(
                     "cannot read Hive config {}: {error}",
                     path.display()
-                ));
+                )));
             }
         };
         if let Ok(default) = std::env::var("HIVE_DEFAULT_AGENT") {
             config.default_agent = Some(default);
         }
+        Ok(config)
+    }
+
+    pub fn load(path: Option<PathBuf>) -> Result<Self, String> {
+        let config = Self::read(path).map_err(|error| error.to_string())?;
         config.validate()?;
         Ok(config)
     }
 
-    pub fn validate(&self) -> Result<(), String> {
+    /// Every problem, in the order `validate` would meet them.
+    pub fn problems(&self) -> Vec<Problem> {
+        let mut problems = Vec::new();
         if let Some(default) = &self.default_agent
             && !self.agents.contains_key(default)
         {
-            return Err(format!(
-                "default agent '{default}' is not configured in [agents]"
-            ));
+            problems.push(Problem {
+                agent: None,
+                error: ConfigError::DefaultAgent(format!(
+                    "default agent '{default}' is not configured in [agents]"
+                )),
+            });
         }
         for (id, profile) in &self.agents {
-            if let Some(pricing) = &profile.pricing.provider {
-                if pricing.trim().is_empty()
-                    || (profile.pricing.model.is_none() && profile.pricing.models.is_empty())
-                {
-                    return Err(format!(
-                        "agent '{id}' pricing needs a provider and a fixed model or selector mapping"
-                    ));
-                }
-            } else if profile.pricing.model.is_some() || !profile.pricing.models.is_empty() {
-                return Err(format!(
-                    "agent '{id}' pricing needs a models.dev provider ID"
-                ));
-            }
-            if profile
-                .pricing
-                .model
-                .as_ref()
-                .is_some_and(|model| model.trim().is_empty())
-                || profile
-                    .pricing
-                    .models
-                    .iter()
-                    .any(|(selector, model)| selector.trim().is_empty() || model.trim().is_empty())
-            {
-                return Err(format!(
-                    "agent '{id}' pricing model IDs and selector values must not be empty"
-                ));
-            }
-            if id.is_empty()
-                || !id
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-            {
-                return Err(format!(
-                    "invalid agent ID '{id}'; use letters, digits, '-' or '_'"
-                ));
-            }
-            if profile.versions.is_empty() {
-                return Err(format!(
-                    "agent '{id}' has no protocol versions; set versions = ['v2'] or ['v1']"
-                ));
-            }
-            if profile.kind == ProfileKind::OpencodeServer {
-                validate_opencode_server(id, profile)?;
-                continue;
-            }
-            if profile.username.is_some() || profile.password_env.is_some() {
-                return Err(format!(
-                    "agent '{id}' sets username or password_env, which only apply to kind = 'opencode-server'; use headers for ACP endpoints"
-                ));
-            }
-            match (&profile.command, &profile.endpoint) {
-                (Some(command), None)
-                    if !command.trim().is_empty() && profile.headers.is_empty() => {}
-                (None, Some(url))
-                    if profile.args.is_empty()
-                        && profile.env.is_empty()
-                        && (url.starts_with("ws://")
-                            || url.starts_with("wss://")
-                            || url.starts_with("http://")
-                            || url.starts_with("https://")) => {}
-                _ => {
-                    return Err(format!(
-                        "agent '{id}' needs either a nonempty stdio command (+ args/env) or an HTTP/WebSocket endpoint (+ headers)"
-                    ));
-                }
-            }
+            let mut found = Vec::new();
+            validate_profile(id, profile, &mut found);
+            problems.extend(found.into_iter().map(|error| Problem {
+                agent: Some(id.clone()),
+                error,
+            }));
         }
-        Ok(())
+        problems
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        match self.problems().into_iter().next() {
+            Some(problem) => Err(problem.error.to_string()),
+            None => Ok(()),
+        }
     }
 
     pub fn public_profiles(&self) -> Vec<PublicProfile<'_>> {
@@ -432,6 +575,103 @@ mod tests {
                 .unwrap_err()
                 .contains("only apply to kind")
         );
+    }
+
+    #[test]
+    fn every_problem_is_reported_rather_than_only_the_first() {
+        let config: Config = toml::from_str(
+            r#"default_agent = "missing"
+            [agents.a]
+            [agents."bad id"]
+            command = "x"
+            versions = []
+        "#,
+        )
+        .unwrap();
+        let codes: Vec<_> = config
+            .problems()
+            .iter()
+            .map(|p| miette::Diagnostic::code(&p.error).unwrap().to_string())
+            .collect();
+        assert_eq!(
+            codes,
+            [
+                "hive::config::default_agent",
+                "hive::config::profile",
+                "hive::config::agent_id",
+                "hive::config::versions",
+            ]
+        );
+    }
+
+    #[test]
+    fn validate_reports_the_same_first_message_as_before() {
+        let config: Config =
+            toml::from_str("default_agent = 'missing'\n[agents.a]\ncommand = 'x'").unwrap();
+        assert_eq!(
+            config.validate().unwrap_err(),
+            "default agent 'missing' is not configured in [agents]"
+        );
+    }
+
+    #[test]
+    fn invalid_headers_and_endpoints_are_rejected_without_echoing_them() {
+        let config: Config = toml::from_str(
+            r#"[agents.badheader]
+            endpoint = "https://agent.example.net"
+            headers = { "X-Token" = "secret-value\nsecond-line" }
+            [agents.badurl]
+            endpoint = "http://secret host"
+        "#,
+        )
+        .unwrap();
+        let problems = config.problems();
+        let codes: Vec<_> = problems
+            .iter()
+            .map(|p| miette::Diagnostic::code(&p.error).unwrap().to_string())
+            .collect();
+        assert_eq!(codes, ["hive::config::header", "hive::config::endpoint"]);
+        let text = format!("{problems:?}");
+        for secret in ["secret-value", "secret host", "X-Token"] {
+            assert!(!text.contains(secret), "{secret} leaked");
+        }
+    }
+
+    #[test]
+    fn config_diagnostic_codes_are_stable_public_identifiers() {
+        use miette::Diagnostic;
+        let errors = [
+            super::ConfigError::Unreadable(String::new()),
+            super::ConfigError::Syntax(String::new()),
+            super::ConfigError::DefaultAgent(String::new()),
+            super::ConfigError::AgentId(String::new()),
+            super::ConfigError::Pricing(String::new()),
+            super::ConfigError::Versions(String::new()),
+            super::ConfigError::Profile(String::new()),
+            super::ConfigError::Endpoint(String::new()),
+            super::ConfigError::Header(String::new()),
+            super::ConfigError::Credentials(String::new()),
+        ];
+        let codes: Vec<_> = errors
+            .iter()
+            .map(|e| e.code().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            codes,
+            [
+                "hive::config::unreadable",
+                "hive::config::syntax",
+                "hive::config::default_agent",
+                "hive::config::agent_id",
+                "hive::config::pricing",
+                "hive::config::versions",
+                "hive::config::profile",
+                "hive::config::endpoint",
+                "hive::config::header",
+                "hive::config::credentials",
+            ]
+        );
+        assert!(errors.iter().all(|e| e.help().is_some()));
     }
 
     #[test]

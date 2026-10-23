@@ -6,6 +6,7 @@ use clap_complete::{Shell, generate};
 use hive_daemon::config::Config;
 use hive_tui::Options as TuiOptions;
 
+mod doctor;
 mod zellij_bridge;
 
 const HELP_STYLES: Styles = Styles::styled()
@@ -42,6 +43,8 @@ enum Command {
         #[arg(long, env = "HIVE_URL")]
         url: Option<String>,
     },
+    /// Diagnose configuration, agent compatibility and daemon state.
+    Doctor(DoctorOptions),
     /// Generate shell completions on stdout.
     Completions { shell: Shell },
     /// Legacy alias for `hive daemon`.
@@ -77,6 +80,20 @@ struct ServeOptions {
     listen: SocketAddr,
     #[arg(long, env = "HIVE_CONFIG")]
     config: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct DoctorOptions {
+    /// Address the daemon would listen on (checked, never bound for good).
+    #[arg(long, default_value = "127.0.0.1:8765", env = "HIVE_LISTEN")]
+    listen: SocketAddr,
+    #[arg(long, env = "HIVE_CONFIG")]
+    config: Option<PathBuf>,
+    /// Print the report as JSON on stdout, for scripts.
+    #[arg(long)]
+    json: bool,
+    /// Agent profiles to check; every profile when omitted.
+    agents: Vec<String>,
 }
 
 #[derive(Args)]
@@ -129,6 +146,18 @@ async fn status(options: StatusOptions) -> miette::Result<()> {
     Ok(())
 }
 
+async fn doctor(options: DoctorOptions) -> miette::Result<()> {
+    let mut checks = hive_daemon::doctor::Options::new(options.listen);
+    checks.config = options.config;
+    checks.agents = options.agents;
+    let report = hive_daemon::doctor::run(checks).await;
+    // The report is the diagnostic; a miette error on top would print it twice.
+    if !doctor::print(&report, options.json)? {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 fn web(url: Option<String>) -> miette::Result<()> {
     let url = web_url(url);
     open_web(&url, webbrowser::open)
@@ -165,6 +194,7 @@ async fn main() -> miette::Result<()> {
         }))
         | Some(Command::Serve(options)) => serve(options).await,
         Some(Command::Web { url }) => web(url),
+        Some(Command::Doctor(options)) => doctor(options).await,
         Some(Command::Completions { shell }) => {
             generate(shell, &mut Cli::command(), "hive", &mut std::io::stdout());
             Ok(())
@@ -276,6 +306,26 @@ mod tests {
     }
 
     #[test]
+    fn doctor_accepts_a_json_flag_and_an_agent_filter() {
+        let cli = Cli::try_parse_from([
+            "hive",
+            "doctor",
+            "--json",
+            "--listen",
+            "127.0.0.1:1",
+            "pi",
+            "other",
+        ])
+        .unwrap();
+        let Some(Command::Doctor(options)) = cli.command else {
+            panic!("doctor subcommand not parsed");
+        };
+        assert!(options.json);
+        assert_eq!(options.agents, ["pi", "other"]);
+        assert_eq!(options.listen.port(), 1);
+    }
+
+    #[test]
     fn web_address_points_to_the_existing_daemon_route() {
         assert_eq!(
             web_url(Some("http://127.0.0.1:9000/".into())),
@@ -299,7 +349,7 @@ mod tests {
         let mut output = Vec::new();
         generate(Shell::Bash, &mut Cli::command(), "hive", &mut output);
         let script = String::from_utf8(output).unwrap();
-        for name in ["tui", "daemon", "web", "completions"] {
+        for name in ["tui", "daemon", "web", "doctor", "completions"] {
             assert!(
                 script.contains(name),
                 "missing {name} in generated completions"

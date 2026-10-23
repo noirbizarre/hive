@@ -107,6 +107,15 @@ different loopback address and `hive daemon --config` for another profile file;
 daemon, and `--transport http` to use HTTP/SSE instead of WebSocket. The legacy
 `hive serve` and `hive status` commands remain available as aliases.
 
+Run `hive doctor` when an agent will not start: it validates the config,
+launches each profile's initialize-only probe (no prompt, no model cost),
+checks endpoint profiles and OpenCode servers for reachability, and inspects
+the daemon's listen address, lock and state directory. It prints the failing
+check's `hive::*` code with what to do, never prints endpoint URLs, headers,
+environment values or agent output, and exits non-zero when anything fails.
+Pass profile ids to check only those, `--json` for scripts, and `--config` or
+`--listen` to diagnose a non-default setup.
+
 Generate shell completions with `hive completions bash` or
 `hive completions zsh`, redirecting the output to your shell's completion
 directory (for example, `~/.local/share/bash-completion/completions/hive` for

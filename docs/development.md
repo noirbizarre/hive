@@ -84,7 +84,8 @@ HIVE_REAL_OPENCODE=1 HIVE_REAL_OPENCODE_WIRE=v1 HIVE_REAL_OPENCODE_CWD=/absolute
 ```
 
 Pi defaults to an installed `pi-acp` (otherwise `npx -y pi-acp`) on wire v1.
-The initialize-only probe sends no prompt and costs nothing; it prints a
+`hive doctor pi` runs the same probe from the CLI. The initialize-only probe
+sends no prompt and costs nothing; it prints a
 `CAPABILITIES` line and fails with a `hive::compat::*` diagnostic naming the fix
 for a missing adapter or a bare `pi` command:
 

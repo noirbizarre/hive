@@ -340,15 +340,19 @@ impl Store {
     }
 }
 
-pub fn default_path() -> Result<PathBuf, StoreError> {
-    let base = std::env::var_os("XDG_STATE_HOME")
+/// Parent of the `hive/` state directory. Shared with `hive doctor` so both agree on it.
+pub(crate) fn state_base() -> Result<PathBuf, StoreError> {
+    std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
         .ok_or_else(|| StoreError::Directory {
             path: PathBuf::from("hive"),
             source: std::io::Error::other("set XDG_STATE_HOME or HOME"),
-        })?;
-    Ok(base.join("hive/sessions.sqlite3"))
+        })
+}
+
+pub fn default_path() -> Result<PathBuf, StoreError> {
+    Ok(state_base()?.join("hive/sessions.sqlite3"))
 }
 
 #[cfg(test)]

@@ -35,6 +35,7 @@ use tokio_stream::{StreamExt, wrappers::WatchStream};
 mod activity;
 pub mod compat;
 pub mod config;
+pub mod doctor;
 mod opencode;
 mod persistence;
 mod pricing;
@@ -2753,13 +2754,17 @@ pub async fn serve(addr: SocketAddr, registry: Config) -> std::io::Result<()> {
     }
 }
 
-fn instance_lock() -> std::io::Result<File> {
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
+/// Parent of the Hive runtime directory. Shared with `hive doctor` so that the two can never
+/// disagree about where the lock lives.
+pub(crate) fn runtime_base() -> std::io::Result<PathBuf> {
+    std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
-        .ok_or_else(|| {
-            std::io::Error::other("set XDG_RUNTIME_DIR or HOME to locate the Hive lock")
-        })?;
+        .ok_or_else(|| std::io::Error::other("set XDG_RUNTIME_DIR or HOME to locate the Hive lock"))
+}
+
+fn instance_lock() -> std::io::Result<File> {
+    let base = runtime_base()?;
     let dir = base.join("hive");
     std::fs::create_dir_all(&base)?;
     if !dir.exists() {

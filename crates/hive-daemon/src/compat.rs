@@ -18,10 +18,16 @@ use hive_protocol::AgentVersion;
 use miette::Diagnostic;
 use thiserror::Error;
 
-use crate::{config::Profile, transport};
+use crate::{
+    config::{Profile, ProfileKind},
+    transport,
+};
 
 /// Long enough for a cold `npx -y pi-acp`, short enough to fail before a user gives up.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A host that is down should fail fast, well before the handshake budget is spent.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Why an agent cannot be used through Hive. Codes are public identifiers: never rename one.
 #[derive(Debug, Error, Diagnostic, PartialEq, Eq)]
@@ -65,7 +71,7 @@ pub enum CompatError {
     #[diagnostic(
         code(hive::compat::startup_timeout),
         help(
-            "run the profile's command by hand to see why it stalls; interactive programs (such as a bare TUI) never answer ACP"
+            "run the profile's command by hand to see why it stalls (interactive programs such as a bare TUI never answer ACP), or check that the endpoint serves ACP"
         )
     )]
     StartupTimeout { seconds: u64 },
@@ -74,7 +80,7 @@ pub enum CompatError {
     #[diagnostic(
         code(hive::compat::initialize_failed),
         help(
-            "run the profile's command by hand and check that it speaks ACP on stdio and exits cleanly; its stderr usually names the cause"
+            "run the profile's command by hand and check that it speaks ACP on stdio and exits cleanly (its stderr usually names the cause), or check the endpoint, its headers and its declared `versions`"
         )
     )]
     InitializeFailed,
@@ -82,9 +88,20 @@ pub enum CompatError {
     #[error("profile has no agent command to probe")]
     #[diagnostic(
         code(hive::compat::not_probeable),
-        help("the probe launches stdio agents only; set `command` on the profile")
+        help(
+            "the stdio probe needs `command` on the profile; endpoint profiles use the endpoint probe"
+        )
     )]
     NotProbeable,
+
+    #[error("the agent endpoint did not accept a connection ({reason})")]
+    #[diagnostic(
+        code(hive::compat::endpoint_unreachable),
+        help(
+            "check that the agent is running and that the profile's `endpoint` is correct; Hive never prints the endpoint or headers, so compare them with the config by hand"
+        )
+    )]
+    EndpointUnreachable { reason: &'static str },
 }
 
 /// What an agent said about itself at `initialize`. Capabilities the wire cannot express are `false`.
@@ -131,7 +148,7 @@ fn wire_name(version: AgentVersion) -> &'static str {
 }
 
 /// Keeps an agent-supplied string printable on one line, so it cannot forge extra report fields.
-fn sanitize(value: &str) -> String {
+pub(crate) fn sanitize(value: &str) -> String {
     value
         .chars()
         .filter(|ch| ch.is_ascii_alphanumeric() || ".-_+".contains(*ch))
@@ -170,7 +187,7 @@ fn is_pi(command: &str) -> bool {
         .is_some_and(|name| name == "pi")
 }
 
-fn executable_exists(command: &str, path: Option<&std::ffi::OsStr>) -> bool {
+pub(crate) fn executable_exists(command: &str, path: Option<&std::ffi::OsStr>) -> bool {
     // A path with a separator is used as given; `PATH` is only for bare names.
     if command.contains(std::path::MAIN_SEPARATOR) {
         return Path::new(command).is_file();
@@ -193,6 +210,57 @@ pub async fn probe_initialize(profile: &Profile) -> Result<CapabilityReport, Com
     let declared = profile.preferred_version();
     let probe = async {
         match declared {
+            AgentVersion::V1 => probe_v1(agent).await,
+            AgentVersion::V2 => probe_v2(agent).await,
+        }
+    };
+    tokio::time::timeout(PROBE_TIMEOUT, probe)
+        .await
+        .map_err(|_| CompatError::StartupTimeout {
+            seconds: PROBE_TIMEOUT.as_secs(),
+        })?
+}
+
+/// Connects to an ACP endpoint profile, runs `initialize` and reports what it advertised.
+///
+/// Like [`probe_initialize`] it sends no session or prompt. Failures carry fixed labels only:
+/// the transport errors embed the endpoint URL, which may hold credentials.
+pub async fn probe_endpoint(profile: &Profile) -> Result<CapabilityReport, CompatError> {
+    let endpoint = match (&profile.command, &profile.endpoint, profile.kind) {
+        (None, Some(endpoint), ProfileKind::Acp) => endpoint,
+        _ => return Err(CompatError::NotProbeable),
+    };
+    let url = reqwest::Url::parse(endpoint).map_err(|_| CompatError::EndpointUnreachable {
+        reason: "invalid endpoint",
+    })?;
+    let (Some(host), Some(port)) = (url.host_str(), url.port_or_known_default()) else {
+        return Err(CompatError::EndpointUnreachable {
+            reason: "invalid endpoint",
+        });
+    };
+    // A plain TCP connect first: it separates "nothing is listening" from "it does not speak ACP".
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    match tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        tokio::net::TcpStream::connect((host, port)),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(_)) => {
+            return Err(CompatError::EndpointUnreachable {
+                reason: "connection failed",
+            });
+        }
+        Err(_) => {
+            return Err(CompatError::EndpointUnreachable {
+                reason: "timed out",
+            });
+        }
+    }
+    let agent = transport(profile).map_err(|_| CompatError::InitializeFailed)?;
+    let probe = async {
+        match profile.preferred_version() {
             AgentVersion::V1 => probe_v1(agent).await,
             AgentVersion::V2 => probe_v2(agent).await,
         }
@@ -418,6 +486,7 @@ mod tests {
             CompatError::StartupTimeout { seconds: 1 },
             CompatError::InitializeFailed,
             CompatError::NotProbeable,
+            CompatError::EndpointUnreachable { reason: "x" },
         ]
         .map(|error| code(&error));
         assert_eq!(
@@ -430,6 +499,7 @@ mod tests {
                 "hive::compat::startup_timeout",
                 "hive::compat::initialize_failed",
                 "hive::compat::not_probeable",
+                "hive::compat::endpoint_unreachable",
             ]
         );
     }

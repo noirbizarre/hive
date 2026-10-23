@@ -1042,13 +1042,25 @@ async fn disconnecting_one_client_does_not_lose_its_resumable_agent_session() {
                 )
                 .block_task()
                 .await?;
-                let saw_reply = timeout(Duration::from_secs(5), async {
+                let saw_reply_and_idle = timeout(Duration::from_secs(5), async {
+                    let mut saw_reply = false;
+                    let mut saw_idle = false;
                     while let Some(update) = rx.recv().await {
-                        if update.session_id == id
-                            && let v2::SessionUpdate::AgentMessageChunk(chunk) = update.update
-                            && let v2::ContentBlock::Text(text) = chunk.content
-                            && text.text == "Echo: after"
-                        {
+                        if update.session_id != id {
+                            continue;
+                        }
+                        match update.update {
+                            v2::SessionUpdate::AgentMessageChunk(chunk)
+                                if matches!(chunk.content, v2::ContentBlock::Text(ref text) if text.text == "Echo: after") =>
+                            {
+                                saw_reply = true;
+                            }
+                            v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(_)) => {
+                                saw_idle = true;
+                            }
+                            _ => {}
+                        }
+                        if saw_reply && saw_idle {
                             return true;
                         }
                     }
@@ -1056,7 +1068,7 @@ async fn disconnecting_one_client_does_not_lose_its_resumable_agent_session() {
                 })
                 .await
                 .map_err(Error::into_internal_error)?;
-                assert!(saw_reply);
+                assert!(saw_reply_and_idle);
                 cx.send_request(v2::CloseSessionRequest::new(id).meta(resumed.meta.unwrap()))
                     .block_task()
                     .await?;

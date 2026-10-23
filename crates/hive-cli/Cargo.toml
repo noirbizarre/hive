@@ -11,15 +11,23 @@ name = "hive"
 path = "src/main.rs"
 
 [dependencies]
+agent-client-protocol = { workspace = true }
+agent-client-protocol-http = { workspace = true }
+axum = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 hive-daemon = { path = "../hive-daemon" }
 hive-tui = { path = "../hive-tui" }
 miette = { workspace = true }
 reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
 webbrowser = { workspace = true }
 
 [dev-dependencies]
+hive-protocol = { path = "../hive-protocol" }
 uuid = { workspace = true }

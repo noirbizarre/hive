@@ -6,6 +6,8 @@ use clap_complete::{Shell, generate};
 use hive_daemon::config::Config;
 use hive_tui::Options as TuiOptions;
 
+mod zellij_bridge;
+
 const HELP_STYLES: Styles = Styles::styled()
     .header(AnsiColor::Cyan.on_default().bold())
     .usage(AnsiColor::Cyan.on_default().bold())
@@ -46,6 +48,13 @@ enum Command {
     Serve(ServeOptions),
     /// Legacy alias for `hive daemon status`.
     Status(StatusOptions),
+    /// Serve short HTTP requests for the Zellij ACP client.
+    ZellijBridge {
+        #[arg(long, default_value = "127.0.0.1:8766")]
+        listen: SocketAddr,
+        #[arg(long, env = "HIVE_URL")]
+        url: Option<String>,
+    },
 }
 
 #[derive(Args)]
@@ -159,6 +168,9 @@ async fn main() -> miette::Result<()> {
         Some(Command::Completions { shell }) => {
             generate(shell, &mut Cli::command(), "hive", &mut std::io::stdout());
             Ok(())
+        }
+        Some(Command::ZellijBridge { listen, url }) => {
+            zellij_bridge::serve(listen, daemon_url(url)).await
         }
     }
 }

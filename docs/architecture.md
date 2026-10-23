@@ -47,8 +47,12 @@ currently owns control.
 The browser rail observes catalog revisions via SSE and reconciles full
 snapshots with locally visited sessions; its hide/show state is presentation
 only. Neither client stores a second authoritative session catalog.
-ZJHive uses Zellij's host WebAccess permission for one-shot daemon status;
-Zellij's `web_request` is not a persistent WebSocket or SSE transport.
+ZJHive polls the same daemon catalog with WebAccess. Its automatically started
+native `hive zellij-bridge` helper holds one SDK WebSocket ACP connection per
+plugin instance, forwarding short requests and bounded update snapshots over a
+separate loopback HTTP port. This is transient client state, not a second session
+manager. Zellij's `web_request` cannot hold an ACP WebSocket or SSE stream;
+plugin detach and helper exit only release upstream connections, not workers.
 
 The current security boundary is one trusted local OS user. Session routing
 checks the exact Hive session ID and downstream ID. Mutating requests also

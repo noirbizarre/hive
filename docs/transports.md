@@ -8,6 +8,7 @@
 | Hive to agent | v1 | stdio | Integration-tested text prompt compatibility adapter |
 | Hive to agent | v2/v1 | WebSocket, HTTP/SSE | SDK client transport; v2 HTTP/SSE and WS integration-tested with mock |
 | Client to Hive | v1 | Any | Rejected by v2 gateway |
+| ZJHive to Hive | v2 | Native bridge client to WebSocket `/acp`; plugin polls HTTP catalog and local bridge | Integration-tested against mock agent |
 
 HTTP/SSE uses connection- and session-scoped GET streams for server events;
 requests and cancellation travel by POST. The SDK handles its connection ID,

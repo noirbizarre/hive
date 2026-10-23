@@ -17,7 +17,21 @@ has zero third-party dependencies: `npm run build --prefix clients/hive-web`
 checks JavaScript syntax and `npm run test --prefix clients/hive-web` exercises
 its browser adapter. Plugin WASM: `rustup target add wasm32-wasip1` then
 `cargo build -p hive-zellij --target wasm32-wasip1`. Native plugin tests do
-not replace a live Zellij host integration run.
+not replace a live Zellij host integration run. The plugin requires WebAccess
+and RunCommands and starts an installed `hive zellij-bridge` on demand; its
+default loopback IPC address is `127.0.0.1:8766`. The bridge uses the existing
+daemon `/acp` WebSocket and is not a second session manager. Plugin catalog
+polling is every four seconds, attached conversation polling every two seconds,
+and failed requests back off up to sixteen seconds. Bridge client handles expire
+after thirty seconds of inactivity; expiration drops the ACP connection and
+never calls `session/close`.
+
+Live Zellij smoke test: create a session in TUI/WebUI, load the floating plugin,
+grant both permissions, check that the same ID and activity appear, observe it,
+take over, prompt and verify the previous pilot is fenced; exercise cancellation
+and permission/form/URL responses, transfer control back and check read-only
+status; reload while the agent is running and ensure the session survives,
+then interrupt the daemon connection to check stale state and replay recovery.
 
 The daemon refuses non-loopback listener addresses. The default is
 `127.0.0.1:8765`; use `--listen` / `HIVE_LISTEN` for a different loopback

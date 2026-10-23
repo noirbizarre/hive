@@ -87,7 +87,10 @@ async fn provider_turn_usage_and_missing_usage_are_isolated_and_not_charged_on_r
                     })
                     .await
                     .map_err(Error::into_internal_error)?;
-                    assert_eq!(first["turn"]["tokens"]["inputTokens"], 80);
+                    assert_eq!(
+                        first["turn"]["tokens"]["inputTokens"], 80,
+                        "billed turn event: {first:?}"
+                    );
                     assert_eq!(first["turn"]["tokens"]["cachedReadTokens"], 20);
                     assert_eq!(first["session"]["turns"], 1);
                     cx.send_request(prompt()).block_task().await?;

@@ -75,6 +75,8 @@ struct ClientState {
     interaction: Option<Interaction>,
     // A disconnected acknowledgement must never be retried under a new key.
     pending_prompt: Option<(String, String)>,
+    // Keep the last acknowledged key for a WebAccess timeout that hid its response.
+    last_prompt: Option<(String, String)>,
 }
 
 fn elicitation_answer(
@@ -322,7 +324,11 @@ async fn command(
                     return Err("Wait for idle before prompting".into());
                 }
                 let (key, text) = if request.action == "retry" {
-                    guard.pending_prompt.clone().ok_or("No prompt to retry")?
+                    guard
+                        .pending_prompt
+                        .clone()
+                        .or_else(|| guard.last_prompt.clone())
+                        .ok_or("No prompt to retry")?
                 } else {
                     let text = request.text.ok_or("Enter a prompt")?;
                     if text.trim().is_empty() {
@@ -343,6 +349,7 @@ async fn command(
             };
             let mut owner = owner;
             owner.get_mut("hive").ok_or("Control metadata missing")?["key"] = json!(key);
+            let sent = (key, text.clone());
             let outcome = cx
                 .send_request(
                     v2::PromptRequest::new(v2::SessionId::new(id), vec![text.into()]).meta(owner),
@@ -351,7 +358,11 @@ async fn command(
                 .await;
             match outcome {
                 Ok(_) => {
-                    state.lock().await.pending_prompt = None;
+                    let mut guard = state.lock().await;
+                    if guard.pending_prompt.as_ref() == Some(&sent) {
+                        guard.pending_prompt = None;
+                    }
+                    guard.last_prompt = Some(sent);
                     Ok(json!({"accepted":true}))
                 }
                 Err(error) => Err(format!(
@@ -965,11 +976,13 @@ mod tests {
         let result = post(json!({"action":"prompt","client":client,"text":"interact","key":"two"}))
             .await
             .unwrap();
-        assert!(
-            result.status().is_success(),
-            "{}",
-            result.text().await.unwrap()
-        );
+        let accepted = result.status().is_success();
+        if !accepted {
+            // A prompt may reach the agent before its acknowledgement is available.
+            assert_eq!(result.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let error: Value = result.json().await.unwrap();
+            assert!(error["error"].as_str().unwrap_or("").contains("pending"));
+        }
         for (kind, answer) in [
             ("permission", json!({"optionId":"allow"})),
             (
@@ -1008,6 +1021,17 @@ mod tests {
                 response.status().is_success(),
                 "{}",
                 response.text().await.unwrap()
+            );
+        }
+        if !accepted {
+            // Retrying the original key cannot dispatch a second agent prompt.
+            let retried = post(json!({"action":"retry","client":client}))
+                .await
+                .unwrap();
+            assert!(
+                retried.status().is_success(),
+                "{}",
+                retried.text().await.unwrap()
             );
         }
         let detached: Value = post(json!({"action":"detach","client":client}))

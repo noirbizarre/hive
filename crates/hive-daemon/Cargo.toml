@@ -27,6 +27,7 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 rusqlite = { workspace = true }
 thiserror = { workspace = true }
+miette = { workspace = true }
 
 [dev-dependencies]
 serde = { workspace = true }

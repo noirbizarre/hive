@@ -1566,6 +1566,7 @@ dependencies = [
  "fs2",
  "hive-core",
  "hive-protocol",
+ "miette 7.6.0",
  "reqwest",
  "rusqlite",
  "serde",

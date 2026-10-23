@@ -224,9 +224,9 @@ mod tests {
             default_agent = "pi"
             [agents.pi]
             name = "Pi"
-            command = "/secret/bin/pi"
-            args = ["--acp"]
-            versions = ["v2"]
+            command = "/secret/bin/pi-acp"
+            args = ["--private-flag"]
+            versions = ["v1"]
             env = { API_KEY = "private-token" }
             [agents.opencode]
             endpoint = "http://127.0.0.1:9000"
@@ -240,8 +240,8 @@ mod tests {
         assert!(public.contains("opencode"));
         for secret in [
             "private-token",
-            "/secret/bin/pi",
-            "--acp",
+            "/secret/bin/pi-acp",
+            "--private-flag",
             "Authorization",
             "127.0.0.1:9000",
         ] {

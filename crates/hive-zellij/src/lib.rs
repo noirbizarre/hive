@@ -756,7 +756,9 @@ mod tests {
         assert!(plugin.on_key(key(BareKey::Char('t'), false)));
         assert!(plugin.on_key(key(BareKey::Char('h'), false)));
         assert!(plugin.on_key(key(BareKey::Char('r'), false)));
-        assert_eq!(plugin.input, "thr");
+        assert!(plugin.on_key(key(BareKey::Char('e'), false)));
+        assert!(plugin.on_key(key(BareKey::Char('e'), false)));
+        assert_eq!(plugin.input, "three");
         assert!(plugin.on_key(key(BareKey::Enter, false)));
         assert!(plugin.sending);
         assert!(!plugin.on_key(key(BareKey::Enter, false)));

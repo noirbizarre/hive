@@ -116,3 +116,69 @@ async fn a_stdio_profile_is_not_an_endpoint_probe_target() {
         CompatError::NotProbeable
     );
 }
+
+/// A real ACP endpoint without a real agent: the gateway itself answers `initialize`.
+async fn gateway() -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let origin = format!("http://{address}");
+    let router = hive_daemon::router_with_origin(
+        hive_daemon::Broker::new(hive_daemon::config::Config::default()),
+        Some(&origin),
+    );
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    address
+}
+
+fn endpoint(url: String) -> Profile {
+    let mut network = profile(MOCK, &[], AgentVersion::V2);
+    network.command = None;
+    network.endpoint = Some(url);
+    network
+}
+
+#[tokio::test]
+async fn a_reachable_endpoint_is_reported_over_websocket_and_http() {
+    let address = gateway().await;
+    for url in [format!("ws://{address}"), format!("http://{address}")] {
+        let report = hive_daemon::compat::probe_endpoint(&endpoint(url.clone()))
+            .await
+            .unwrap_or_else(|error| panic!("{url}: {error:?}"));
+        assert_eq!(report.protocol, AgentVersion::V2, "{url}");
+    }
+}
+
+#[tokio::test]
+async fn an_endpoint_that_accepts_connections_but_is_not_acp_fails_the_handshake() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    // Accept and hang up straight away: reachable, but nothing speaks ACP.
+    tokio::spawn(async move {
+        loop {
+            drop(listener.accept().await);
+        }
+    });
+    let error = hive_daemon::compat::probe_endpoint(&endpoint(format!("http://{address}")))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            CompatError::InitializeFailed | CompatError::StartupTimeout { .. }
+        ),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_endpoint_is_reported_without_echoing_it() {
+    let error = hive_daemon::compat::probe_endpoint(&endpoint("http://".into()))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        CompatError::EndpointUnreachable {
+            reason: "invalid endpoint"
+        }
+    );
+}

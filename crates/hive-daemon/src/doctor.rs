@@ -6,6 +6,7 @@
 //! headers, environment values, arguments and agent output are never copied into a report.
 
 use std::{
+    ffi::OsStr,
     net::SocketAddr,
     path::{Path, PathBuf},
     time::Duration,
@@ -89,6 +90,27 @@ pub enum DoctorError {
         )
     )]
     UnsafeRuntimeDir { path: String },
+
+    #[error("Hive cannot locate its runtime directory")]
+    #[diagnostic(
+        code(hive::doctor::no_runtime_dir),
+        help("set XDG_RUNTIME_DIR or HOME so Hive can locate its lock")
+    )]
+    NoRuntimeDir,
+
+    #[error("Hive cannot locate its state directory")]
+    #[diagnostic(
+        code(hive::doctor::no_state_dir),
+        help("set XDG_STATE_HOME or HOME so Hive can store its sessions")
+    )]
+    NoStateDir,
+
+    #[error("the probe stopped unexpectedly")]
+    #[diagnostic(
+        code(hive::doctor::probe_panicked),
+        help("re-run with RUST_BACKTRACE=1 and report a bug")
+    )]
+    ProbePanicked,
 
     #[error("the Hive state directory or database is not private: {path}")]
     #[diagnostic(
@@ -372,12 +394,10 @@ async fn check_profiles(profiles: Vec<(String, Profile)>) -> Vec<ProfileReport> 
                 &profile,
                 Status::Fail,
                 None,
-                vec![Finding {
-                    status: Status::Fail,
-                    code: Some("hive::doctor::probe_panicked".into()),
-                    message: "the probe stopped unexpectedly".into(),
-                    help: Some("re-run with RUST_BACKTRACE=1 and report a bug".into()),
-                }],
+                vec![Finding::from_diagnostic(
+                    Status::Fail,
+                    &DoctorError::ProbePanicked,
+                )],
             ),
         });
     }
@@ -403,7 +423,8 @@ async fn check_profile(id: &str, profile: &Profile) -> ProfileReport {
         }
     } else {
         if let Some(command) = &profile.command {
-            for error in pi_prerequisites(command, &profile.args).await {
+            let path = std::env::var_os("PATH");
+            for error in pi_prerequisites(command, &profile.args, path.as_deref()).await {
                 findings.push(Finding::from_diagnostic(Status::Warn, &error));
             }
         }
@@ -456,30 +477,40 @@ fn is_pi_adapter(command: &str, args: &[String]) -> bool {
                 .any(|arg| arg == "pi-acp" || arg.starts_with("pi-acp@")))
 }
 
-fn on_path(name: &str) -> bool {
-    compat::executable_exists(name, std::env::var_os("PATH").as_deref())
+fn find_on_path(name: &str, path: Option<&OsStr>) -> Option<PathBuf> {
+    // Resolved here (rather than left to `Command`) so a test can supply its own search path.
+    std::env::split_paths(path?)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
 }
 
 /// `pi-acp` is a Node program that spawns Pi: when either is missing the failure shows up
 /// as a bare handshake error, so name the cause up front. Warnings only: the probe decides.
-async fn pi_prerequisites(command: &str, args: &[String]) -> Vec<DoctorError> {
+async fn pi_prerequisites(
+    command: &str,
+    args: &[String],
+    path: Option<&OsStr>,
+) -> Vec<DoctorError> {
     let mut missing = Vec::new();
     if !is_pi_adapter(command, args) {
         return missing;
     }
-    if !on_path("node") {
-        missing.push(DoctorError::MissingPrerequisite {
+    match find_on_path("node", path) {
+        None => missing.push(DoctorError::MissingPrerequisite {
             what: "Node.js 22 or newer (`node`)",
-        });
-    } else if node_major()
-        .await
-        .is_some_and(|major| major < PI_NODE_MAJOR)
-    {
-        missing.push(DoctorError::MissingPrerequisite {
-            what: "Node.js 22 or newer (found an older `node`)",
-        });
+        }),
+        Some(node) => {
+            if node_major(&node)
+                .await
+                .is_some_and(|major| major < PI_NODE_MAJOR)
+            {
+                missing.push(DoctorError::MissingPrerequisite {
+                    what: "Node.js 22 or newer (found an older `node`)",
+                });
+            }
+        }
     }
-    if !on_path("pi") {
+    if find_on_path("pi", path).is_none() {
         missing.push(DoctorError::MissingPrerequisite {
             what: "the `pi` command",
         });
@@ -487,10 +518,10 @@ async fn pi_prerequisites(command: &str, args: &[String]) -> Vec<DoctorError> {
     missing
 }
 
-async fn node_major() -> Option<u32> {
+async fn node_major(node: &Path) -> Option<u32> {
     let output = tokio::time::timeout(
         TOOL_TIMEOUT,
-        tokio::process::Command::new("node")
+        tokio::process::Command::new(node)
             .arg("--version")
             .stdin(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -629,13 +660,11 @@ async fn check_daemon(options: &Options) -> DaemonReport {
     let runtime = options.runtime_dir.clone().map_or_else(runtime_base, Ok);
     let lock = match runtime {
         Ok(base) => inspect_lock(&base),
-        Err(error) => {
-            findings.push(Finding {
-                status: Status::Warn,
-                code: Some("hive::doctor::no_runtime_dir".into()),
-                message: error.to_string(),
-                help: Some("set XDG_RUNTIME_DIR or HOME so Hive can locate its lock".into()),
-            });
+        Err(_) => {
+            findings.push(Finding::from_diagnostic(
+                Status::Warn,
+                &DoctorError::NoRuntimeDir,
+            ));
             Ok(Lock::Absent)
         }
     };
@@ -668,7 +697,7 @@ async fn check_daemon(options: &Options) -> DaemonReport {
     let state = options
         .state_dir
         .clone()
-        .map_or_else(|| persistence::state_base().map_err(|e| e.to_string()), Ok);
+        .map_or_else(|| persistence::state_base().map_err(|_| ()), Ok);
     match state {
         Ok(base) => match inspect_state(&base) {
             Ok(true) => findings.push(Finding::pass(
@@ -679,12 +708,10 @@ async fn check_daemon(options: &Options) -> DaemonReport {
             )),
             Err(error) => findings.push(Finding::from_diagnostic(Status::Fail, &error)),
         },
-        Err(message) => findings.push(Finding {
-            status: Status::Warn,
-            code: Some("hive::doctor::no_state_dir".into()),
-            message,
-            help: Some("set XDG_STATE_HOME or HOME so Hive can store its sessions".into()),
-        }),
+        Err(()) => findings.push(Finding::from_diagnostic(
+            Status::Warn,
+            &DoctorError::NoStateDir,
+        )),
     }
 
     DaemonReport {
@@ -746,6 +773,9 @@ mod tests {
             DoctorError::PortInUse,
             DoctorError::DaemonLocked,
             DoctorError::UnsafeRuntimeDir { path: "x".into() },
+            DoctorError::NoRuntimeDir,
+            DoctorError::NoStateDir,
+            DoctorError::ProbePanicked,
             DoctorError::UnsafeStateDir { path: "x".into() },
         ];
         let codes: Vec<_> = errors
@@ -762,6 +792,9 @@ mod tests {
                 "hive::doctor::port_in_use",
                 "hive::doctor::daemon_locked",
                 "hive::doctor::unsafe_runtime_dir",
+                "hive::doctor::no_runtime_dir",
+                "hive::doctor::no_state_dir",
+                "hive::doctor::probe_panicked",
                 "hive::doctor::unsafe_state_dir",
             ]
         );
@@ -838,6 +871,97 @@ mod tests {
         assert_eq!(inspect_state(&base), Ok(false));
         std::fs::set_permissions(base.join("hive"), std::fs::Permissions::from_mode(0o755))
             .unwrap();
+        assert!(matches!(
+            inspect_state(&base),
+            Err(DoctorError::UnsafeStateDir { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_pi_adapter_without_node_or_pi_gets_a_warning_for_each() {
+        let empty = temporary();
+        std::fs::create_dir_all(&empty).unwrap();
+        let missing = pi_prerequisites("pi-acp", &[], Some(empty.as_os_str())).await;
+        assert_eq!(missing.len(), 2, "{missing:?}");
+        assert!(
+            missing
+                .iter()
+                .all(|e| e.code().unwrap().to_string() == "hive::doctor::missing_prerequisite")
+        );
+    }
+
+    #[tokio::test]
+    async fn other_commands_are_never_checked_for_pi_prerequisites() {
+        let empty = temporary();
+        assert!(
+            pi_prerequisites("some-agent", &[], Some(empty.as_os_str()))
+                .await
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_old_node_is_reported_and_a_new_one_is_not() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temporary();
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = |name: &str, body: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        script("pi", "exit 0");
+        script("node", "echo v18.19.0");
+        let old = pi_prerequisites("pi-acp", &[], Some(dir.as_os_str())).await;
+        assert_eq!(old.len(), 1, "{old:?}");
+        assert!(old[0].to_string().contains("older"));
+        script("node", "echo v22.1.0");
+        assert!(
+            pi_prerequisites("pi-acp", &[], Some(dir.as_os_str()))
+                .await
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_that_is_a_symlink_or_group_readable_is_reported_as_unsafe() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let base = temporary();
+        private_dir(&base.join("hive"));
+        let path = base.join("hive/daemon.lock");
+        std::os::unix::fs::symlink("/dev/null", &path).unwrap();
+        assert!(matches!(
+            inspect_lock(&base),
+            Err(DoctorError::UnsafeRuntimeDir { .. })
+        ));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o644)
+            .open(&path)
+            .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            inspect_lock(&base),
+            Err(DoctorError::UnsafeRuntimeDir { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_group_readable_database_is_reported_as_unsafe() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = temporary();
+        private_dir(&base.join("hive"));
+        let database = base.join("hive/sessions.sqlite3");
+        std::fs::write(&database, b"").unwrap();
+        std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(inspect_state(&base), Ok(true));
+        std::fs::set_permissions(&database, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(matches!(
             inspect_state(&base),
             Err(DoctorError::UnsafeStateDir { .. })

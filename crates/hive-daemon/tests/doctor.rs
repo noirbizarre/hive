@@ -1,5 +1,8 @@
 //! `hive_daemon::doctor::run` against the deterministic mock agent: no real agent, no model costs.
 
+#[path = "support/fake_opencode.rs"]
+mod fake_opencode;
+
 use std::path::{Path, PathBuf};
 
 use hive_daemon::doctor::{Options, Report, Status, run};
@@ -211,4 +214,89 @@ async fn an_unreachable_endpoint_profile_fails_without_leaking_its_url_or_header
     for secret in ["secret-path", "secret-token", "secret-env", "X-Secret"] {
         assert!(!text.contains(secret), "{secret} leaked into the report");
     }
+}
+
+#[tokio::test]
+async fn a_listen_address_held_by_another_program_fails() {
+    let sandbox = Sandbox::new();
+    let held = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut options = sandbox.options("");
+    options.listen = held.local_addr().unwrap();
+    let report = run(options).await;
+    assert!(report.failed());
+    assert!(codes(&report.daemon.findings).contains(&"hive::doctor::port_in_use"));
+}
+
+#[tokio::test]
+async fn a_healthy_opencode_server_is_reported_with_its_version() {
+    let (_fake, url) = fake_opencode::start(fake_opencode::Options::default()).await;
+    let report = run(Sandbox::new().options(&format!(
+        "[agents.oc]\nkind = 'opencode-server'\nendpoint = '{url}'\n"
+    )))
+    .await;
+    assert!(!report.failed(), "{report:#?}");
+    let finding = &profile(&report, "oc").findings[0];
+    assert_eq!(finding.status, Status::Pass);
+    assert!(finding.message.contains("1.19.3"), "{}", finding.message);
+    // The server's address must stay out of the report.
+    assert!(!serde_json::to_string(&report).unwrap().contains(&url));
+}
+
+#[tokio::test]
+async fn an_unsupported_opencode_server_fails_with_its_opencode_code() {
+    let (_fake, url) = fake_opencode::start(fake_opencode::Options {
+        version: "1.2.0",
+        ..Default::default()
+    })
+    .await;
+    let report = run(Sandbox::new().options(&format!(
+        "[agents.oc]\nkind = 'opencode-server'\nendpoint = '{url}'\n"
+    )))
+    .await;
+    assert!(report.failed());
+    assert_eq!(
+        profile(&report, "oc").findings[0].code.as_deref(),
+        Some("hive::opencode::unsupported_version")
+    );
+}
+
+#[tokio::test]
+async fn an_opencode_server_that_rejects_the_credentials_names_the_fix_not_the_secret() {
+    let (_fake, url) = fake_opencode::start(fake_opencode::Options {
+        password: Some("right-password".into()),
+        ..Default::default()
+    })
+    .await;
+    // The variable is only ever read by name; this one is deliberately unset in the test process.
+    let report = run(Sandbox::new().options(&format!(
+        "[agents.oc]\nkind = 'opencode-server'\nendpoint = '{url}'\npassword_env = 'HIVE_DOCTOR_TEST_UNSET_PASSWORD'\n"
+    )))
+    .await;
+    let finding = &profile(&report, "oc").findings[0];
+    assert_eq!(
+        finding.code.as_deref(),
+        Some("hive::opencode::missing_credentials")
+    );
+    assert!(
+        !serde_json::to_string(&report)
+            .unwrap()
+            .contains("right-password")
+    );
+}
+
+#[tokio::test]
+async fn an_opencode_server_with_nothing_listening_is_unreachable() {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let report = run(Sandbox::new().options(&format!(
+        "[agents.oc]\nkind = 'opencode-server'\nendpoint = 'http://127.0.0.1:{port}'\n"
+    )))
+    .await;
+    assert_eq!(
+        profile(&report, "oc").findings[0].code.as_deref(),
+        Some("hive::opencode::unreachable")
+    );
 }

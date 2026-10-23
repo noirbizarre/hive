@@ -321,6 +321,9 @@ printable characters. A missing-binary message does name the configured
 | `hive::doctor::listen_not_loopback` | The daemon refuses non-loopback listen addresses. |
 | `hive::doctor::port_in_use` | Another program holds the listen address. |
 | `hive::doctor::daemon_locked` | Another daemon holds the lock but does not answer on the listen address (warning). |
+| `hive::doctor::no_runtime_dir` | Neither `XDG_RUNTIME_DIR` nor `HOME` is set, so the lock cannot be located (warning). |
+| `hive::doctor::no_state_dir` | Neither `XDG_STATE_HOME` nor `HOME` is set, so the state directory cannot be located (warning). |
+| `hive::doctor::probe_panicked` | A probe stopped unexpectedly; re-run with `RUST_BACKTRACE=1` and report a bug. |
 | `hive::doctor::unsafe_runtime_dir` | The runtime directory or lock is not private; the daemon would refuse to start. |
 | `hive::doctor::unsafe_state_dir` | The state directory or database is not private; the daemon would refuse to start. |
 

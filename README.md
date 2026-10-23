@@ -69,6 +69,23 @@ is separate work ([#6](https://github.com/noirbizarre/hive/issues/6)). Profiles 
 `env = { KEY = "value" }`; an endpoint profile uses
 `endpoint = "http://127.0.0.1:9000"` (or `ws://...`) and optional
 `headers = { Authorization = "Bearer ..." }`. Keep the config file private.
+
+To continue a conversation started in the OpenCode TUI (or resume a Hive one
+there), point a profile at a running OpenCode server instead of `opencode acp`:
+
+```toml
+[agents.opencode-server]
+kind = "opencode-server"
+endpoint = "http://127.0.0.1:4096"          # opencode serve --port 4096
+password_env = "OPENCODE_SERVER_PASSWORD"    # the variable's name, not the secret
+```
+
+List adoptable sessions with
+`GET /hive/v1/providers/opencode-server/native-sessions?directory=<cwd>` and
+adopt one with `session/new` and `_meta.hive.adopt = {"nativeId": "ses_…"}`. Hive
+cannot lock the OpenCode client out, so it detects work the other client started
+and refuses its own prompts until that finishes. Set a server password and read
+[the adapter's setup, limits and security notes](docs/acp-compatibility.md#opencode-server-adapter).
 No default is required to start Hive; without one, each session must select a
 profile. `HIVE_DEFAULT_AGENT` overrides `default_agent`, `HIVE_CONFIG` or
 `--config` chooses a different file, and `HIVE_LISTEN` overrides the loopback

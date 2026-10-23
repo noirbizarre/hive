@@ -507,6 +507,9 @@ fn config_with_agent(id: &str, command: &str, version: AgentVersion) -> Config {
             headers: BTreeMap::new(),
             versions: vec![version],
             pricing: Default::default(),
+            kind: Default::default(),
+            username: None,
+            password_env: None,
         },
     );
     Config {
@@ -1079,6 +1082,9 @@ async fn declared_http_and_websocket_agents_are_reached_through_the_sdk() {
                 headers: BTreeMap::new(),
                 versions: vec![AgentVersion::V2],
                 pricing: Default::default(),
+                kind: Default::default(),
+                username: None,
+                password_env: None,
             },
         );
     }
@@ -1478,6 +1484,9 @@ async fn a_disconnect_and_handoff_during_generation_do_not_restart_the_prompt() 
             headers: BTreeMap::new(),
             versions: vec![AgentVersion::V2],
             pricing: Default::default(),
+            kind: Default::default(),
+            username: None,
+            password_env: None,
         },
     );
     let (address, gateway) = start_gateway(config).await;
@@ -1930,6 +1939,9 @@ async fn permission_and_form_and_url_elicitation_reach_the_current_pilot() {
             headers: BTreeMap::new(),
             versions: vec![AgentVersion::V2],
             pricing: Default::default(),
+            kind: Default::default(),
+            username: None,
+            password_env: None,
         },
     );
     let (address, gateway) = start_gateway(config).await;

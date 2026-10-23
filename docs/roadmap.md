@@ -121,7 +121,10 @@ These are separate, longer-term integrations and are not first-release blockers:
 
 - [#5 — OpenCode server v2 persistent sessions](https://github.com/noirbizarre/hive/issues/5)
   — discover and attach to sessions created directly in OpenCode, and resume
-  Hive-created sessions there where its server APIs allow it.
+  Hive-created sessions there where its server APIs allow it. **Implemented**
+  through the `opencode-server` profile kind; see
+  [ADR-002](adr/002-opencode-server-adoption.md) and its
+  [capability matrix](acp-compatibility.md#opencode-server-adapter).
 - [#6 — Pi persistent sessions](https://github.com/noirbizarre/hive/issues/6)
   — discover and attach to sessions created directly in Pi, and resume
   Hive-created sessions in Pi where its supported persistence APIs allow it.

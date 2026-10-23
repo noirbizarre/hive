@@ -19,6 +19,9 @@ fn profile(command: &str, args: &[&str], version: AgentVersion) -> Profile {
         headers: BTreeMap::new(),
         versions: vec![version],
         pricing: Default::default(),
+        kind: Default::default(),
+        username: None,
+        password_env: None,
     }
 }
 

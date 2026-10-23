@@ -55,7 +55,10 @@ upgrading either agent and record results with its product version and transport
 | Pi 1.3.0 via `pi-acp` 0.0.34 | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified |
 | OpenCode 1.18.35 | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified |
 
-The OpenCode ACP command/documented v1 behavior comes from its
+An ad-hoc `opencode acp` run on 1.19.3 advertised `loadSession` and loaded a
+session created through `opencode serve`, so the "ACP load unverified" cell
+above is stale; no retained `NATIVE` probe backs that observation yet, so it
+is not upgraded. The OpenCode ACP command/documented v1 behavior comes from its
 [ACP CLI reference](https://opencode.ai/docs/acp/); its implementation may
 change between releases. Pi's CLI session flags demonstrate *native* persistence,
 not ACP support. For each successful local run, retain the `PROBE`, `FIRST`,
@@ -63,9 +66,11 @@ not ACP support. For each successful local run, retain the `PROBE`, `FIRST`,
 wire version before upgrading any cell to guaranteed/best-effort. Failed
 initialization is **not** evidence that session creation, load, or prompts work.
 
-For both agents, Hive's upstream ACPv2 resume is guaranteed by deterministic
-mock tests **only for an existing live Hive session**; native session adoption
-through Hive remains unsupported. Daemon-restart recovery attempts the saved
+For both agents over **ACP**, Hive's upstream ACPv2 resume is guaranteed by
+deterministic mock tests **only for an existing live Hive session**; native
+session adoption through an ACP profile remains unsupported. OpenCode sessions
+can be adopted through its server API instead; see
+[the OpenCode server adapter](#opencode-server-adapter). Daemon-restart recovery attempts the saved
 downstream ID through v2 `session/resume` or advertised v1 `session/resume` or
 `session/load`. Capability negotiation does not guarantee downstream persistence:
 failure retains a visible offline record, never a replacement session. Direct native ACP
@@ -293,6 +298,8 @@ selected by `kind`:
 | `foreground` | `state`, `source` | ACP foreground running, idle (with stop reason), or requires-action state. Idle ends foreground work only. |
 | `session` | `status`, `source` | Hive worker ended (`ended`), distinct from turn idle or background task completion. |
 | `task` | `taskId`, `task`, `source` | Explicitly identified background task update from a `_hive_task` downstream extension; unrecognized extensions are forwarded unchanged. |
+| `external` | `active`, `source` | A native OpenCode client, not Hive, started (`true`) or ended (`false`) foreground work on an adopted session. Hive prompts are refused while it is active. |
+| `connection` | `status`, `source` | The adapter's link to the OpenCode event stream: `lost`, `restored` or `failed` (given up; the session becomes unavailable). |
 
 `source` is `acp-v1`, `acp-v2`, `acp` (v1/v2 tool patches), or `extension`.
 `_meta.hive.seq` is the ordinary per-session event cursor, including normalized
@@ -331,3 +338,138 @@ activity resumes as unknown rather than assuming the interrupted turn was idle.
 V1 tool calls and plans are adapted; ACPv2 provides tool, plan, and foreground
 updates natively. Background tasks require explicit provider extension events;
 neither wire version guarantees them.
+
+## OpenCode server adapter
+
+A profile with `kind = "opencode-server"` talks to a running OpenCode server
+(`opencode serve`, or the TUI started with `--port`) over its REST + SSE API
+instead of spawning an ACP process. Clients still speak ACPv2; the decision and
+its trade-offs are recorded in [ADR-002](adr/002-opencode-server-adoption.md).
+
+```toml
+[agents.opencode-server]
+kind = "opencode-server"
+endpoint = "http://127.0.0.1:4096"
+username = "opencode"                    # optional; this is OpenCode's default
+password_env = "OPENCODE_SERVER_PASSWORD" # name of a variable, never the secret
+```
+
+Adopt a native session in two steps. List candidates (the `directory` scopes
+OpenCode's project lookup and should be the session's working directory), then
+send `session/new` with the native ID:
+
+```sh
+curl 'http://127.0.0.1:PORT/hive/v1/providers/opencode-server/native-sessions?directory=/work/app'
+```
+
+```json
+{"cwd":"/work/app","mcpServers":[],"_meta":{"hive":{"agent":"opencode-server","adopt":{"nativeId":"ses_…"}}}}
+```
+
+Adoption attaches to the existing session and never creates one. The response
+and catalog carry a stable Hive session ID; the catalog also exposes
+`origin` (`adopted`, or `hive` for sessions Hive created), `nativeId` and
+`externalActivity`. A session Hive creates on this profile is a real OpenCode
+session: resume it there with `opencode attach <url> -s <nativeId>`. Closing a
+Hive session only detaches; it never deletes the OpenCode session, and the same
+native session can be adopted again afterwards.
+
+Up to the 50 most recent native messages are replayed into the session's
+256-update ring (not pushed live to the adopting client): resume with
+`replayFrom: {"type":"start"}` to read them. Older history stays in OpenCode.
+
+### Capability and version matrix
+
+Evidence: the opt-in `real_opencode_server` probe, run on 2026-10-23 against a
+throwaway `opencode serve` (temporary XDG directories, free
+`opencode/big-pickle` model), plus the deterministic fake-server suite in
+`crates/hive-daemon/tests/opencode.rs`. `Guaranteed` is limited to what the
+retained probe demonstrated; "fake only" means the behavior is covered by the
+fake server but not yet by a real OpenCode run.
+
+| OpenCode | API used | Discover | Adopt without a duplicate | Text prompt, stream, idle | Continue native context | Resume in OpenCode |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1.19.3 | v1 routes | Guaranteed | Guaranteed | best-effort (model dependent) | Guaranteed | Guaranteed |
+| 1.19.3 | `/api/*` v2 preview | Fake only | Fake only | Fake only | Fake only | Unverified |
+| below 1.19.0 | any | unsupported: `hive::opencode::unsupported_version` | unsupported | unsupported | unsupported | unsupported |
+
+| OpenCode | Cancel | Permissions | Questions | Stream drop and reconnect | Restart recovery | External client detected |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1.19.3 v1 | Fake only | Fake only | Fake only | Fake only | Fake only | Fake only |
+| 1.19.3 v2 preview | Fake only | Fake only (polled) | unsupported | Fake only | Fake only | Fake only |
+
+The probe printed these markers (retain them when changing a cell):
+`PROBE server=opencode version=1.19.3 api=v1`, `NATIVE discovered=true`,
+`ADOPTED … native_session_reused=true`, `FIRST text_observed=true
+recalled_context=true`, `RESUMED duplicate_session=false native_messages=4`.
+
+Versions below 1.19.0, and servers answering neither `/global/health` nor
+`/api/health` with a valid JSON body (an HTML catch-all is not mistaken for an
+API), fail with an actionable diagnostic rather than creating a session. The
+minimum is the oldest release the adapter was tested against, not a proven
+floor; older ones may work and are simply untested.
+
+### API flavors
+
+OpenCode 1.19.3 serves two session APIs with **separate message stores**. Hive
+prefers the documented v1 routes, which the TUI uses, and falls back to the
+`/api/*` preview only when v1 is unavailable or does not know the session. The
+choice is made once per session and saved: recovery uses the same flavor or
+fails with `hive::opencode::api_unavailable`; it never switches. The v1 event
+stream has no replay cursor, so after a dropped stream Hive re-reads status and
+recent history and de-duplicates by part, whereas the v2 stream resumes from its
+durable sequence number. The v2 preview does not support questions, and its
+permission requests are polled rather than pushed.
+
+### Single controller
+
+OpenCode does not arbitrate between clients: any client can prompt, abort or
+answer permissions at any time, and Hive cannot lock them out. Among Hive
+clients the usual pilot/observer fencing applies. Against native clients Hive
+detects and refuses:
+
+- A turn Hive did not start (the session goes busy with no Hive prompt in
+  flight) sets `externalActivity`, publishes `running` and an `external`
+  activity event, and makes Hive prompts fail with
+  `hive::opencode::externally_controlled` until the session is idle. The pilot
+  may still cancel it.
+- A permission or question answered in OpenCode first is withdrawn from Hive's
+  pilot and never answered twice. One left unanswered (timeout or cancel) stays
+  pending in OpenCode, where a native client can still answer it, and is offered
+  to Hive again.
+
+### OpenCode diagnostics
+
+Failures carry a stable code, what failed and what to do. They never include the
+endpoint, headers, credentials or server response bodies.
+
+| Code | Meaning |
+| --- | --- |
+| `hive::opencode::unreachable` | The server did not answer or the connection failed. Recovery retries this. |
+| `hive::opencode::unauthorized` | Credentials were rejected. |
+| `hive::opencode::missing_credentials` | `password_env` names a variable that is not set. |
+| `hive::opencode::unsupported_version` | Older than the tested minimum. |
+| `hive::opencode::api_unavailable` | A required API is not offered. The session is `orphaned`. |
+| `hive::opencode::session_not_found` | The native session is gone. The session is `lost`. |
+| `hive::opencode::directory_mismatch` | The session belongs to a different project than the requested `cwd`. |
+| `hive::opencode::already_adopted` | Carries `hiveSessionId` of the existing session. |
+| `hive::opencode::adoption_in_progress` | Another request is adopting the same session. |
+| `hive::opencode::externally_controlled` | A native client is driving the session. |
+| `hive::opencode::stream_lost` | The event stream dropped. Recovery retries this. |
+| `hive::opencode::unsupported_prompt` | Only text prompt content is forwarded. |
+| `hive::opencode::http_status` | An unexpected HTTP status. |
+| `hive::opencode::protocol` | A response did not have the expected shape. |
+
+### Security and unsupported workflows
+
+- `opencode serve` is **unauthenticated** unless `OPENCODE_SERVER_PASSWORD` is
+  set on the server. Set it, and give Hive the variable *name* in `password_env`.
+  Profile validation refuses plain `http://` to a non-loopback host and
+  credentials embedded in the endpoint; use `https://` or an SSH tunnel.
+- Anyone who can reach Hive's own (loopback) gateway can act through its
+  OpenCode credentials, and the native-sessions route reveals session titles and
+  directories. The existing single-user loopback policy applies.
+- Not supported: simultaneous control from the OpenCode TUI and Hive (detected,
+  not prevented); deleting or forking sessions from Hive; unifying the v1 and v2
+  stores; history older than the 50-message backfill; MCP server declarations in
+  `session/new`; non-text prompt content; questions over the v2 preview.

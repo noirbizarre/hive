@@ -831,6 +831,9 @@ mod tests {
                 headers: BTreeMap::new(),
                 versions: vec![AgentVersion::V2],
                 pricing: Default::default(),
+                kind: Default::default(),
+                username: None,
+                password_env: None,
             },
         );
         let gateway = tokio::spawn(async move {

@@ -35,11 +35,12 @@ use tokio_stream::{StreamExt, wrappers::WatchStream};
 mod activity;
 pub mod compat;
 pub mod config;
+mod opencode;
 mod persistence;
 mod pricing;
 mod usage;
 use activity::Activity;
-use config::{Config, Pricing, Profile};
+use config::{Config, Pricing, Profile, ProfileKind};
 use persistence::{Outcome, Record, Store};
 use usage::{Ledger, Money, Tokens, Turn};
 
@@ -105,6 +106,23 @@ pub struct Broker {
     catalog: watch::Sender<u64>,
     store: Option<Arc<Store>>,
     offline: Arc<Mutex<HashMap<String, Record>>>,
+    /// `(profile, native id)` pairs being adopted right now. Without it two simultaneous
+    /// adoptions of one native session could both pass the "already attached?" check.
+    adopting: Arc<Mutex<std::collections::HashSet<(String, String)>>>,
+}
+
+/// Releases an in-flight adoption claim however `create` exits.
+struct AdoptGuard {
+    adopting: Arc<Mutex<std::collections::HashSet<(String, String)>>>,
+    key: (String, String),
+}
+
+impl Drop for AdoptGuard {
+    fn drop(&mut self) {
+        if let Ok(mut adopting) = self.adopting.lock() {
+            adopting.remove(&self.key);
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -141,6 +159,20 @@ struct Control {
     agent: String,
     pricing: Pricing,
     selected_model: Option<String>,
+    /// Set while a native client (not Hive) is driving the session. Hive prompts are refused
+    /// meanwhile: OpenCode cannot arbitrate between clients, so Hive must not add a second writer.
+    external_activity: bool,
+    /// Identity of the native session behind an `opencode-server` session.
+    native: Option<NativeMeta>,
+}
+
+/// Where a Hive session lives in OpenCode, so it can be resumed there.
+struct NativeMeta {
+    id: String,
+    /// `hive` (created by Hive) or `adopted` (found natively).
+    origin: &'static str,
+    /// API flavor pinned at attach time.
+    api: &'static str,
 }
 
 struct PromptRecord {
@@ -199,6 +231,8 @@ impl Control {
             agent: record.profile.clone(),
             pricing,
             selected_model: None,
+            external_activity: false,
+            native: None,
         }
     }
     fn new(
@@ -240,6 +274,8 @@ impl Control {
             agent,
             pricing,
             selected_model: None,
+            external_activity: false,
+            native: None,
         }
     }
 
@@ -342,6 +378,12 @@ pub struct SessionSummary {
     generation: u64,
     observers: usize,
     usage: usage::Summary,
+    /// `hive` when Hive created the downstream session, `adopted` when it was found natively.
+    origin: String,
+    /// The OpenCode session ID, for resuming the conversation in OpenCode itself.
+    native_id: Option<String>,
+    /// A native client is driving the session; Hive prompts are refused until it is idle.
+    external_activity: bool,
 }
 
 impl SessionSummary {
@@ -371,6 +413,13 @@ impl SessionSummary {
                     .is_some_and(|id| state.subscribers.contains_key(id)),
             )),
             usage: state.usage.summary(),
+            origin: state
+                .native
+                .as_ref()
+                .map_or("hive", |native| native.origin)
+                .to_owned(),
+            native_id: state.native.as_ref().map(|native| native.id.clone()),
+            external_activity: state.external_activity,
         }
     }
 
@@ -389,6 +438,10 @@ impl SessionSummary {
             generation: record.generation,
             observers: 0,
             usage: record.usage.summary(),
+            origin: record.origin.clone(),
+            native_id: (record.kind == ProfileKind::OpencodeServer.as_str())
+                .then(|| record.downstream_id.clone()),
+            external_activity: false,
         }
     }
 }
@@ -441,6 +494,12 @@ fn replay_start(
     Ok(from)
 }
 
+#[derive(serde::Deserialize)]
+struct NativeQuery {
+    directory: Option<String>,
+    limit: Option<usize>,
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Status {
@@ -469,7 +528,9 @@ impl Broker {
                     broker.recover(&id).await;
                     let retry = broker.offline.lock().ok().and_then(|records| records.get(&id).cloned())
                         .is_some_and(|record| matches!(record.outcome, Outcome::Unavailable)
-                            && record.reason.as_deref().is_some_and(|reason| reason.contains("timed out") || reason.contains("reattachment failed") || reason.contains("session/resume failed")));
+                            && record.reason.as_deref().is_some_and(|reason| reason.contains("timed out") || reason.contains("reattachment failed") || reason.contains("session/resume failed")
+                            // A server that is merely down comes back; a missing or unsupported one does not.
+                            || reason.contains(opencode::error::code::UNREACHABLE) || reason.contains(opencode::error::code::STREAM_LOST)));
                     if !retry { break; }
                     if attempt == 2 {
                         if let Ok(mut offline) = broker.offline.lock() && let Some(record) = offline.get_mut(&id) {
@@ -504,6 +565,18 @@ impl Broker {
             self.update_offline(record);
             return;
         };
+        if record.kind != provider.kind.as_str() {
+            // Replaying an ACP session through the REST adapter (or the reverse) would address
+            // a different conversation; refuse instead of guessing.
+            record.outcome = Outcome::Unavailable;
+            record.reason = Some(format!(
+                "agent profile no longer uses adapter kind '{}'; restore it and restart Hive",
+                record.kind
+            ));
+            self.update_offline(record);
+            return;
+        }
+        let kind = provider.kind;
         let version = if record.version == "v1" {
             AgentVersion::V1
         } else {
@@ -535,8 +608,29 @@ impl Broker {
         let broker = self.clone();
         let worker_id = id.to_owned();
         let worker_saved = saved.clone();
+        let attach_api = record.api.as_deref().and_then(opencode::api::Flavor::parse);
+        let attach_origin = if record.origin == "adopted" {
+            "adopted"
+        } else {
+            "hive"
+        };
         let worker = tokio::spawn(async move {
-            if version == AgentVersion::V1 {
+            if kind == ProfileKind::OpencodeServer {
+                opencode::run_opencode_agent(
+                    provider,
+                    request,
+                    hive_id,
+                    rx,
+                    (ready_tx, active_rx),
+                    worker_control.clone(),
+                    opencode::Attach::Recover {
+                        id: downstream_id,
+                        api: attach_api,
+                        origin: attach_origin,
+                    },
+                )
+                .await;
+            } else if version == AgentVersion::V1 {
                 run_v1_agent(
                     provider,
                     request,
@@ -626,9 +720,12 @@ impl Broker {
                 return;
             }
             Ok(Ok(Err(error))) => {
-                record.outcome = if error.contains("saved session not found") {
+                record.outcome = if error.contains("saved session not found")
+                    || error.contains(opencode::error::code::SESSION_NOT_FOUND)
+                {
                     Outcome::Lost
                 } else if error.contains("does not advertise")
+                    || error.contains(opencode::error::code::API_UNAVAILABLE)
                     || error.contains("-32601")
                     || error.contains("-32602")
                 {
@@ -667,6 +764,7 @@ impl Broker {
             catalog,
             store: None,
             offline: Arc::new(Mutex::new(HashMap::new())),
+            adopting: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 
@@ -754,6 +852,66 @@ impl Broker {
             })
     }
 
+    /// The Hive session already bound to a native OpenCode session, if any.
+    ///
+    /// One native session maps to exactly one Hive session: this is what keeps adoption from
+    /// creating a duplicate conversation, so it covers both live and offline (recovering) sessions.
+    fn find_native(&self, profile: &str, native_id: &str) -> Option<String> {
+        if let Ok(sessions) = self.sessions.lock() {
+            for (id, entry) in sessions.iter() {
+                if entry.profile == profile
+                    && entry
+                        .control
+                        .lock()
+                        .is_ok_and(|state| state.native.as_ref().is_some_and(|n| n.id == native_id))
+                {
+                    return Some(id.clone());
+                }
+            }
+        }
+        let offline = self.offline.lock().ok()?;
+        offline
+            .values()
+            .find(|record| {
+                record.profile == profile
+                    && record.kind == ProfileKind::OpencodeServer.as_str()
+                    && record.downstream_id == native_id
+            })
+            .map(|record| record.id.clone())
+    }
+
+    /// Claims a native session for adoption, or explains who already holds it.
+    fn begin_adopt(
+        &self,
+        profile: &str,
+        native_id: &str,
+    ) -> Result<AdoptGuard, opencode::error::OpencodeError> {
+        let key = (profile.to_owned(), native_id.to_owned());
+        // Claim first, then look: a concurrent adopter now sees our claim, and we see its
+        // finished session.
+        let claimed = self
+            .adopting
+            .lock()
+            .is_ok_and(|mut adopting| adopting.insert(key.clone()));
+        if !claimed {
+            return Err(opencode::error::OpencodeError::AdoptionInProgress {
+                native_id: native_id.to_owned(),
+            });
+        }
+        // Built only after a successful claim, so dropping it never releases someone else's.
+        let guard = AdoptGuard {
+            adopting: self.adopting.clone(),
+            key,
+        };
+        match self.find_native(profile, native_id) {
+            Some(hive_id) => Err(opencode::error::OpencodeError::AlreadyAdopted {
+                native_id: native_id.to_owned(),
+                hive_id,
+            }),
+            None => Ok(guard),
+        }
+    }
+
     fn prompt(
         &self,
         client_id: &str,
@@ -807,6 +965,10 @@ impl Broker {
         }
         if state.recovery_required {
             return Err(Error::invalid_request().data("session recovery requires explicit acknowledgement on session/resume before new prompts"));
+        }
+        if state.external_activity {
+            // Say *why* it is busy: the generic message would send users hunting for a Hive prompt.
+            return Err(opencode::error::OpencodeError::ExternallyControlled.to_acp());
         }
         if state.running || state.closing {
             return Err(Error::invalid_request().data(
@@ -1005,6 +1167,72 @@ impl Broker {
         }
     }
 
+    /// Native sessions an `opencode-server` profile can adopt, marked with their Hive ID if any.
+    async fn native_sessions(
+        &self,
+        agent: &str,
+        query: NativeQuery,
+    ) -> Result<serde_json::Value, (axum::http::StatusCode, Json<serde_json::Value>)> {
+        use axum::http::StatusCode;
+        let problem = |status, code: &str, message: String| {
+            (
+                status,
+                Json(serde_json::json!({ "code": code, "message": message })),
+            )
+        };
+        let profile = self.registry.agents.get(agent).ok_or_else(|| {
+            problem(
+                StatusCode::NOT_FOUND,
+                "hive::providers::unknown",
+                format!("unknown agent profile '{agent}'; query GET /hive/v1/providers"),
+            )
+        })?;
+        if profile.kind != ProfileKind::OpencodeServer {
+            return Err(problem(
+                StatusCode::BAD_REQUEST,
+                "hive::providers::not_adoptable",
+                format!(
+                    "agent '{agent}' has no native sessions; only kind = 'opencode-server' profiles do"
+                ),
+            ));
+        }
+        let discovery = opencode::discover(
+            profile,
+            query
+                .directory
+                .as_deref()
+                .filter(|directory| !directory.is_empty()),
+            query.limit.unwrap_or(50).clamp(1, 200),
+        )
+        .await
+        .map_err(|error| {
+            let data = serde_json::json!({
+                "code": error.code(), "message": error.to_string(), "help": error.help(),
+            });
+            // 502: the failure is upstream (the OpenCode server), not in the caller's request.
+            (StatusCode::BAD_GATEWAY, Json(data))
+        })?;
+        let sessions = discovery
+            .sessions
+            .into_iter()
+            .map(|found| {
+                serde_json::json!({
+                    "nativeId": found.session.id,
+                    "title": found.session.title,
+                    "directory": found.session.directory,
+                    "updatedAt": found.session.updated,
+                    "busy": found.busy,
+                    "adoptedAs": self.find_native(agent, &found.session.id),
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(serde_json::json!({
+            "agent": agent,
+            "server": { "version": discovery.version, "api": discovery.api },
+            "sessions": sessions,
+        }))
+    }
+
     fn provider_info(&self) -> serde_json::Value {
         serde_json::json!({ "defaultAgent": self.registry.default_agent, "agents": self.registry.public_profiles() })
     }
@@ -1035,8 +1263,21 @@ impl Broker {
         gateway: V2ConnectionTo<Client>,
     ) -> agent_client_protocol::Result<v2::NewSessionResponse> {
         let requested = request.meta.as_mut().and_then(|meta| meta.get_mut("hive"));
+        let mut adopt: Option<String> = None;
         let chosen = match requested {
             Some(serde_json::Value::Object(hive)) => {
+                if let Some(value) = hive.remove("adopt") {
+                    adopt = Some(
+                        value
+                            .get("nativeId")
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|id| !id.is_empty())
+                            .map(str::to_owned)
+                            .ok_or_else(|| Error::invalid_params().data(
+                                "_meta.hive.adopt must be an object with a nonempty nativeId; list candidates with GET /hive/v1/providers/<agent>/native-sessions",
+                            ))?,
+                    );
+                }
                 let id = match hive.remove("agent") {
                     Some(serde_json::Value::String(id)) if !id.is_empty() => id,
                     _ => return Err(Error::invalid_params().data(
@@ -1065,6 +1306,20 @@ impl Broker {
                 "unknown agent profile '{chosen}'; query GET /hive/v1/providers"
             ))
         })?;
+        let kind = provider.kind;
+        if adopt.is_some() && kind != ProfileKind::OpencodeServer {
+            return Err(Error::invalid_params().data(format!(
+                "agent '{chosen}' cannot adopt native sessions; _meta.hive.adopt needs a profile with kind = 'opencode-server'"
+            )));
+        }
+        // Held until this function returns: the session is registered (and findable) or failed.
+        let _adoption = match &adopt {
+            Some(native_id) => Some(
+                self.begin_adopt(&chosen, native_id)
+                    .map_err(|error| error.to_acp())?,
+            ),
+            None => None,
+        };
         let hive_id = v2::SessionId::new(SessionId::new().as_str());
         let (tx, rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = oneshot::channel();
@@ -1108,12 +1363,29 @@ impl Broker {
                 reason: None,
                 uncertain: false,
                 usage: Ledger::default(),
+                kind: kind.as_str().into(),
+                api: None,
+                origin: if adopt.is_some() { "adopted" } else { "hive" }.into(),
             }))
         });
         let worker_record = stored_record.clone();
         // Each session owns its subprocess: no guessed transport support or duplicate probing.
         let task = tokio::spawn(async move {
-            if provider.preferred_version() == AgentVersion::V1 {
+            if kind == ProfileKind::OpencodeServer {
+                opencode::run_opencode_agent(
+                    provider,
+                    request,
+                    id.clone(),
+                    rx,
+                    (ready_tx, active_rx),
+                    control,
+                    match adopt {
+                        Some(native_id) => opencode::Attach::Adopt(native_id),
+                        None => opencode::Attach::New,
+                    },
+                )
+                .await;
+            } else if provider.preferred_version() == AgentVersion::V1 {
                 run_v1_agent(
                     provider,
                     request,
@@ -1206,6 +1478,17 @@ impl Broker {
                 if let (Some(store), Some(record)) = (&self.store, &stored_record) {
                     let mut record = record.lock().map_err(|_| Error::internal_error())?;
                     record.downstream_id = downstream_id;
+                    {
+                        let state = entry_control.lock().map_err(|_| Error::internal_error())?;
+                        // Pin what the worker decided at attach time, so recovery never swaps it.
+                        if let Some(native) = &state.native {
+                            record.api = Some(native.api.to_owned());
+                        }
+                        if state.title.is_some() {
+                            record.title = state.title.clone();
+                        }
+                        record.last_activity_at = state.last_activity_at;
+                    }
                     record.next_seq = entry_control
                         .lock()
                         .map_err(|_| Error::internal_error())?
@@ -1236,7 +1519,7 @@ impl Broker {
             }
             Ok(Ok(Err(message))) => {
                 task.abort();
-                Err(Error::internal_error().data(message))
+                Err(startup_error(message))
             }
             Ok(Err(_)) => {
                 task.abort();
@@ -1249,6 +1532,17 @@ impl Broker {
                     .data("agent startup timed out; check the profile endpoint or command"))
             }
         }
+    }
+}
+
+/// Startup failures arrive as text. Diagnostics from the OpenCode adapter lead with their
+/// `hive::opencode::<kind>` code; surface that as a field so clients need not parse prose.
+fn startup_error(message: String) -> Error {
+    match message.split_once(": ") {
+        Some((code, rest)) if code.starts_with("hive::opencode::") => {
+            Error::internal_error().data(serde_json::json!({ "code": code, "message": rest }))
+        }
+        _ => Error::internal_error().data(message),
     }
 }
 
@@ -2170,6 +2464,22 @@ pub fn router_with_origin(broker: Broker, origin: Option<&str>) -> Router {
             }),
         )
         .route(
+            "/hive/v1/providers/{agent}/native-sessions",
+            get({
+                let broker = broker.clone();
+                move |axum::extract::Path(agent): axum::extract::Path<String>,
+                      axum::extract::Query(query): axum::extract::Query<NativeQuery>| {
+                    let broker = broker.clone();
+                    async move {
+                        broker
+                            .native_sessions(&agent, query)
+                            .await
+                            .map(Json)
+                    }
+                }
+            }),
+        )
+        .route(
             "/hive/v1/sessions",
             get({
                 let broker = broker.clone();
@@ -2571,6 +2881,8 @@ mod control_tests {
             agent: "test".into(),
             pricing: Pricing::default(),
             selected_model: None,
+            external_activity: false,
+            native: None,
         }
     }
 

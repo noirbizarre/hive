@@ -17,6 +17,7 @@ axum = { workspace = true }
 fs2 = { workspace = true }
 hive-core = { path = "../hive-core" }
 hive-protocol = { path = "../hive-protocol" }
+miette = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -27,7 +28,6 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 rusqlite = { workspace = true }
 thiserror = { workspace = true }
-miette = { workspace = true }
 
 [dev-dependencies]
 serde = { workspace = true }

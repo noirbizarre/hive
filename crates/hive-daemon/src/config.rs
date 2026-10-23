@@ -13,10 +13,34 @@ pub struct Config {
     pub agents: BTreeMap<String, Profile>,
 }
 
+/// Which downstream adapter speaks for a profile.
+///
+/// Explicit rather than inferred from `endpoint`: an OpenCode server and an ACP
+/// HTTP agent are both plain `http://` URLs, and guessing wrong would send ACP
+/// frames to a REST server (or the reverse) with an unhelpful failure.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProfileKind {
+    #[default]
+    Acp,
+    OpencodeServer,
+}
+
+impl ProfileKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Acp => "acp",
+            Self::OpencodeServer => "opencode-server",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
     pub name: Option<String>,
+    #[serde(default)]
+    pub kind: ProfileKind,
     pub command: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
@@ -27,6 +51,11 @@ pub struct Profile {
     pub headers: BTreeMap<String, String>,
     #[serde(default = "v2_only")]
     pub versions: Vec<AgentVersion>,
+    /// HTTP basic-auth user for an `opencode-server` profile (OpenCode defaults to `opencode`).
+    pub username: Option<String>,
+    /// Name of the environment variable holding the server password. The secret itself
+    /// never lives in the config file, which is routinely copied into bug reports.
+    pub password_env: Option<String>,
     #[serde(default)]
     pub pricing: Pricing,
 }
@@ -55,9 +84,62 @@ fn v2_only() -> Vec<AgentVersion> {
 pub struct PublicProfile<'a> {
     pub id: &'a str,
     pub name: &'a str,
+    pub kind: &'static str,
     pub transport: &'a str,
     pub versions: &'a [AgentVersion],
     pub is_default: bool,
+}
+
+/// Plain HTTP is only acceptable where the traffic cannot leave the machine.
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+fn validate_opencode_server(id: &str, profile: &Profile) -> Result<(), String> {
+    let Some(endpoint) = profile.endpoint.as_deref() else {
+        return Err(format!(
+            "agent '{id}' (kind = 'opencode-server') needs an http(s) endpoint, for example endpoint = 'http://127.0.0.1:4096'"
+        ));
+    };
+    if profile.command.is_some() || !profile.args.is_empty() || !profile.env.is_empty() {
+        return Err(format!(
+            "agent '{id}' (kind = 'opencode-server') connects to a running server; remove command, args and env"
+        ));
+    }
+    // Parsing (rather than prefix checks) is what lets us inspect scheme, host and userinfo reliably.
+    let url = reqwest::Url::parse(endpoint).map_err(|_| {
+        format!(
+            "agent '{id}' has an invalid endpoint; use a full URL such as http://127.0.0.1:4096"
+        )
+    })?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(format!(
+            "agent '{id}' (kind = 'opencode-server') needs an http or https endpoint, not {}",
+            url.scheme()
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(format!(
+            "agent '{id}' embeds credentials in its endpoint; use username and password_env instead"
+        ));
+    }
+    if url.scheme() == "http" && !url.host_str().is_some_and(is_loopback_host) {
+        return Err(format!(
+            "agent '{id}' sends OpenCode credentials over plain HTTP to a non-loopback host; use https or an SSH tunnel to a loopback address"
+        ));
+    }
+    if let Some(var) = &profile.password_env
+        && (var.is_empty() || !var.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
+    {
+        return Err(format!(
+            "agent '{id}' password_env must be an environment variable name, not the password itself"
+        ));
+    }
+    Ok(())
 }
 
 impl Config {
@@ -147,6 +229,15 @@ impl Config {
                     "agent '{id}' has no protocol versions; set versions = ['v2'] or ['v1']"
                 ));
             }
+            if profile.kind == ProfileKind::OpencodeServer {
+                validate_opencode_server(id, profile)?;
+                continue;
+            }
+            if profile.username.is_some() || profile.password_env.is_some() {
+                return Err(format!(
+                    "agent '{id}' sets username or password_env, which only apply to kind = 'opencode-server'; use headers for ACP endpoints"
+                ));
+            }
             match (&profile.command, &profile.endpoint) {
                 (Some(command), None)
                     if !command.trim().is_empty() && profile.headers.is_empty() => {}
@@ -173,6 +264,7 @@ impl Config {
             .map(|(id, profile)| PublicProfile {
                 id,
                 name: profile.name.as_deref().unwrap_or(id),
+                kind: profile.kind.as_str(),
                 transport: profile.transport(),
                 versions: &profile.versions,
                 is_default: self.default_agent.as_deref() == Some(id),
@@ -183,7 +275,9 @@ impl Config {
 
 impl Profile {
     pub fn transport(&self) -> &'static str {
-        if self.command.is_some() {
+        if self.kind == ProfileKind::OpencodeServer {
+            "opencode-rest+sse"
+        } else if self.command.is_some() {
             "stdio"
         } else if self
             .endpoint
@@ -247,6 +341,97 @@ mod tests {
         ] {
             assert!(!public.contains(secret));
         }
+    }
+
+    fn opencode(extra: &str) -> Result<(), String> {
+        let config: Config =
+            toml::from_str(&format!("[agents.oc]\nkind = 'opencode-server'\n{extra}\n")).unwrap();
+        config.validate()
+    }
+
+    #[test]
+    fn an_opencode_server_profile_is_public_without_its_endpoint_or_credentials() {
+        let config: Config = toml::from_str(
+            r#"
+            [agents.oc]
+            kind = "opencode-server"
+            endpoint = "https://oc.example.net:4096"
+            username = "private-user"
+            password_env = "PRIVATE_PASSWORD_VAR"
+        "#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let public = serde_json::to_string(&config.public_profiles()).unwrap();
+        assert!(public.contains("opencode-server"));
+        assert!(public.contains("opencode-rest+sse"));
+        for secret in ["oc.example.net", "private-user", "PRIVATE_PASSWORD_VAR"] {
+            assert!(!public.contains(secret), "{secret} leaked");
+        }
+    }
+
+    #[test]
+    fn an_opencode_server_profile_requires_an_http_endpoint() {
+        assert!(
+            opencode("")
+                .unwrap_err()
+                .contains("needs an http(s) endpoint")
+        );
+        assert!(
+            opencode("endpoint = 'ws://127.0.0.1:1'")
+                .unwrap_err()
+                .contains("http or https")
+        );
+        assert!(
+            opencode("endpoint = 'http://127.0.0.1:1'\ncommand = 'opencode'")
+                .unwrap_err()
+                .contains("remove command")
+        );
+    }
+
+    #[test]
+    fn plain_http_is_refused_off_loopback_but_allowed_on_it() {
+        for ok in [
+            "http://127.0.0.1:4096",
+            "http://localhost:4096",
+            "http://[::1]:4096",
+            "https://oc.example.net",
+        ] {
+            opencode(&format!("endpoint = '{ok}'")).unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+        let error = opencode("endpoint = 'http://oc.example.net:4096'").unwrap_err();
+        assert!(error.contains("plain HTTP"), "{error}");
+    }
+
+    #[test]
+    fn credentials_embedded_in_the_endpoint_are_rejected() {
+        let error = opencode("endpoint = 'https://user:pw@oc.example.net'").unwrap_err();
+        assert!(error.contains("username and password_env"), "{error}");
+        assert!(!error.contains("pw@"), "the error must not echo the secret");
+    }
+
+    #[test]
+    fn password_env_must_name_a_variable_rather_than_hold_a_password() {
+        let error =
+            opencode("endpoint = 'http://127.0.0.1:1'\npassword_env = 'p@ss word'").unwrap_err();
+        assert!(error.contains("environment variable name"), "{error}");
+        assert!(
+            !error.contains("p@ss"),
+            "the error must not echo the secret"
+        );
+    }
+
+    #[test]
+    fn credentials_fields_are_rejected_on_acp_profiles() {
+        let config: Config =
+            toml::from_str("[agents.a]\nendpoint = 'http://127.0.0.1:1'\npassword_env = 'X'\n")
+                .unwrap();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .contains("only apply to kind")
+        );
     }
 
     #[test]

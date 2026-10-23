@@ -243,6 +243,9 @@ async fn run(installation: Installation) -> Result<(), String> {
         headers: BTreeMap::new(),
         versions: vec![installation.wire],
         pricing: Default::default(),
+        kind: Default::default(),
+        username: None,
+        password_env: None,
     };
     let mut agents = BTreeMap::new();
     agents.insert(installation.id.into(), profile);
@@ -471,6 +474,9 @@ async fn pi_initialize_probe_reports_a_capability_report() {
         headers: BTreeMap::new(),
         versions: vec![installation.wire],
         pricing: Default::default(),
+        kind: Default::default(),
+        username: None,
+        password_env: None,
     };
     match hive_daemon::compat::probe_initialize(&profile).await {
         Ok(report) => eprintln!(

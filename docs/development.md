@@ -132,10 +132,41 @@ HIVE_REAL_OPENCODE=1 HIVE_REAL_OPENCODE_WIRE=v1 HIVE_REAL_OPENCODE_CWD=/same/abs
 
 Replace `OPENCODE`/`opencode` with `PI`/`pi` to test Pi through `pi-acp`. The v1 direct probe calls `session/load`; v2 calls
 `session/resume`. A failed load does not establish that native sessions cannot
-be reopened via their own CLI or server. Hive itself cannot adopt a native ID:
-record native-CLI reopen, direct ACP attachment and Hive's live-worker resume
-as **separate** results in the [capability matrix](acp-compatibility.md#installed-agent-capability-matrix-2026-10-11).
+be reopened via their own CLI or server. Hive adopts native IDs only through an
+`opencode-server` profile (below), never an ACP one: record native-CLI reopen,
+direct ACP attachment and Hive's live-worker resume as **separate** results in the [capability matrix](acp-compatibility.md#installed-agent-capability-matrix-2026-10-11).
 For optional tool calls/results, permission requests, user-input requests,
 cancel, and disconnect while generation is active, inspect a deliberately
 configured manual agent session and record unexercised capabilities as
 unverified rather than inferring support from `initialize`.
+
+### OpenCode server adoption probe
+
+`crates/hive-daemon/tests/real_opencode_server.rs` holds one **ignored** test for
+the `opencode-server` adapter. By default it starts its own throwaway
+`opencode serve` with temporary `HOME`/`XDG_*` directories and the free
+`opencode/big-pickle` model, so it touches neither your sessions nor your
+credentials; it needs only the `opencode` binary. It acts as the OpenCode TUI
+would (creates a session and runs a turn natively), then discovers and adopts it
+through Hive, continues it, and checks that OpenCode still holds exactly one
+session containing both turns.
+
+```sh
+HIVE_REAL_OPENCODE_SERVER=1   cargo test -p hive-daemon --test real_opencode_server -- --ignored --nocapture
+```
+
+| Variable | Meaning |
+| --- | --- |
+| `HIVE_REAL_OPENCODE_SERVER` | `1` to opt in; otherwise the test prints `SKIP` and passes |
+| `HIVE_REAL_OPENCODE_SERVER_COMMAND` | `opencode` executable to start (default `opencode`) |
+| `HIVE_REAL_OPENCODE_SERVER_URL` | use an existing server instead of starting one (it **will** create and prompt a session in your current directory) |
+| `HIVE_REAL_OPENCODE_SERVER_PASSWORD_ENV` | name of the variable holding that server's password |
+
+It prints `PROBE`, `NATIVE`, `ADOPTED`, `FIRST` and `RESUMED` markers; retain them
+with the run date before changing a cell of the
+[OpenCode server matrix](acp-compatibility.md#capability-and-version-matrix).
+Failures name a fixed stage and never echo server replies. The deterministic
+equivalent, covering cancel, permissions, questions, reconnect, restart, version
+and credential handling, is `cargo test -p hive-daemon --test opencode`; it runs
+against `tests/support/fake_opencode.rs`, which records every call so tests can
+assert that Hive did **not** create a session.

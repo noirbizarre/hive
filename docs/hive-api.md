@@ -9,6 +9,7 @@ administration and session access MUST NOT be exposed on an external listener.
 | `GET /hive/v1/ready` | `{ "ready": true }` when listener is active (does not probe the provider) |
 | `GET /hive/v1/status` | name, build version, live and persisted session count, default agent ID and active sessions by agent |
 | `GET /hive/v1/providers` | configured agent IDs, display names, declared transports and versions, default indication |
+| `GET /hive/v1/providers/{agent}/native-sessions` | native sessions an `opencode-server` profile can adopt (see below) |
 | `GET /hive/v1/sessions` | current broker-owned session summaries and catalog revision |
 | `GET /hive/v1/sessions/events` | SSE catalog revision notifications; re-list on change |
 | `GET /hive/v1/web` | same-origin browser client |
@@ -66,7 +67,10 @@ sessions, independent of the connection that created them:
         "inputTokens": null, "outputTokens": null, "thoughtTokens": null,
         "cachedReadTokens": null, "cachedWriteTokens": null},
         "estimatedCost": null, "actualSessionCost": null,
-        "contextUsed": null, "contextSize": null}
+        "contextUsed": null, "contextSize": null},
+      "origin": "hive",
+      "nativeId": null,
+      "externalActivity": false
     }
   ]
 }
@@ -100,6 +104,40 @@ controlled until acknowledged.
 person/user identity or a credential. `generation` follows the same fencing
 epoch as ACP `session/resume`. No control token is ever present in a summary.
 `observers` counts attached non-pilot connections.
+
+`origin` is `hive` when Hive created the downstream session and `adopted` when
+it attached to one found natively. `nativeId` is the OpenCode session ID for
+`opencode-server` profiles (`null` for ACP profiles), so a session can be
+resumed in OpenCode itself. `externalActivity` is `true` while a native
+OpenCode client, not Hive, is driving the session; Hive prompts are refused
+until it clears. See [the OpenCode server adapter](acp-compatibility.md#opencode-server-adapter).
+
+## Native session discovery
+
+`GET /hive/v1/providers/{agent}/native-sessions?directory=<cwd>&limit=<n>`
+lists the sessions held by the OpenCode server behind an
+`kind = "opencode-server"` profile, without attaching to any. `directory`
+scopes OpenCode's project lookup (omitted, the server's own default project is
+used); `limit` defaults to 50 and is capped at 200.
+
+```json
+{
+  "agent": "opencode-server",
+  "server": { "version": "1.19.3", "api": "v1" },
+  "sessions": [
+    { "nativeId": "ses_…", "title": "Fix the bug", "directory": "/work/app",
+      "updatedAt": 1791754566280, "busy": false, "adoptedAs": null }
+  ]
+}
+```
+
+`adoptedAs` is the Hive session ID already bound to that native session, or
+`null`. Adopt one with `session/new` and `_meta.hive.adopt = {"nativeId": …}`.
+Errors are `{ "code", "message", "help" }`: `404` for an unknown agent, `400`
+for a profile that has no native sessions, and `502` when the OpenCode server
+itself is unreachable, rejects the credentials or is unsupported (the
+`hive::opencode::*` codes). Responses never contain the endpoint or credentials,
+but they do contain session titles and working directories.
 
 The WebUI lists these summaries and opens a selected session, including one
 created in the TUI, read-only using its `sessionId` and `cwd`. Typing in its

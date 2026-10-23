@@ -22,3 +22,4 @@ by editing the old one. The history is the value.
 ## Index
 
 - [ADR-001](001-session-control-and-replay.md) — In-memory fenced controller and sequenced replay
+- [ADR-002](002-opencode-server-adoption.md) — Adopt OpenCode sessions through the server API, not ACP

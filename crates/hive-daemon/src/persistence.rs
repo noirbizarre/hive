@@ -50,6 +50,25 @@ pub struct Record {
     pub uncertain: bool,
     #[serde(default)]
     pub usage: Ledger,
+    // The fields below were added after the first schema shipped. They are optional in the JSON
+    // blob so records written by earlier builds still decode (no SQL migration needed).
+    /// Adapter that owns the downstream session: `acp` (default) or `opencode-server`.
+    #[serde(default = "default_kind")]
+    pub kind: String,
+    /// OpenCode API flavor pinned at attach time (`v1` or `v2`); never switched silently on recovery.
+    #[serde(default)]
+    pub api: Option<String>,
+    /// `hive` when Hive created the downstream session, `adopted` when it was found natively.
+    #[serde(default = "default_origin")]
+    pub origin: String,
+}
+
+fn default_kind() -> String {
+    "acp".into()
+}
+
+fn default_origin() -> String {
+    "hive".into()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -360,6 +379,9 @@ mod tests {
             reason: None,
             uncertain: false,
             usage: Ledger::default(),
+            kind: "acp".into(),
+            api: None,
+            origin: "hive".into(),
         }
     }
 
@@ -386,6 +408,18 @@ mod tests {
         let saved = reopened.records().unwrap().pop().unwrap();
         assert_eq!(saved.usage.summary().tokens.total_tokens, Some(30));
         assert!(!saved.usage.clone().record(saved.usage.turns[0].clone()));
+    }
+
+    #[test]
+    fn a_record_written_before_native_adoption_decodes_as_an_acp_hive_session() {
+        // The exact shape earlier builds stored: no kind, api or origin.
+        let legacy = r#"{"id":"hive-1","downstream_id":"d","cwd":"/tmp","profile":"p",
+            "version":"v2","created_at":1,"last_activity_at":null,"title":null,"next_seq":1,
+            "reserved_seq":0,"generation":1,"outcome":"active","reason":null,"uncertain":false}"#;
+        let record: Record = serde_json::from_str(legacy).unwrap();
+        assert_eq!(record.kind, "acp");
+        assert_eq!(record.origin, "hive");
+        assert_eq!(record.api, None);
     }
 
     #[test]

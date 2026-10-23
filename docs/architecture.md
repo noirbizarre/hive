@@ -32,6 +32,18 @@ initialization errors. v1
 text chunks are adapted to v2 agent chunks and the v1 prompt response produces
 a v2 idle state. The transport exposed to clients remains v2 regardless.
 
+A profile with `kind = "opencode-server"` selects a third worker,
+`crates/hive-daemon/src/opencode/`, that talks to a running OpenCode server
+over REST + SSE rather than ACP. It plugs into the same per-session worker seam
+(`Command` channel, `forward`, `complete`, pilot permission routing), so
+control, fencing, replay and persistence are shared code. It adds adoption of
+sessions that already exist in OpenCode: one native session maps to exactly one
+Hive session, the native ID and pinned API flavor are persisted, and a session
+that disappears is reported `lost` rather than replaced. A native client that
+starts a turn is detected and surfaced as `externalActivity`; Hive refuses its
+own prompts meanwhile because OpenCode cannot arbitrate between clients. See
+[ADR-002](adr/002-opencode-server-adoption.md).
+
 The full-screen TUI uses the daemon session catalog for discovery and SDK
 `Client.v2()` / `HttpClient` for ACP session creation and interaction. It
 refreshes summaries periodically and preserves session identity across picker

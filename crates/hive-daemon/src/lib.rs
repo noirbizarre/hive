@@ -2574,6 +2574,53 @@ mod control_tests {
     }
 
     #[test]
+    fn a_reported_session_cost_does_not_duplicate_a_turn_or_replace_its_tokens() {
+        let mut state = detached();
+        let id = v2::SessionId::new("hive-usage");
+        state.active_turn = Some("one".into());
+        let idle = v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(
+            v2::IdleStateUpdate::new().usage(v2::Usage::new(12, 8, 4)),
+        ));
+        forward_locked(&mut state, &id, Some(idle.clone())).unwrap();
+        forward_locked(&mut state, &id, Some(idle)).unwrap();
+        assert_eq!(state.usage.turns.len(), 1);
+        forward_locked(
+            &mut state,
+            &id,
+            Some(v2::SessionUpdate::UsageUpdate(
+                v2::UsageUpdate::new(12, 200_000).cost(v2::Cost::new(0.003, "USD")),
+            )),
+        )
+        .unwrap();
+        assert_eq!(state.usage.summary().turns, 1);
+        assert_eq!(state.usage.summary().tokens.total_tokens, Some(12));
+        assert_eq!(
+            state.usage.summary().actual_session_cost.unwrap().amount,
+            0.003
+        );
+        assert_eq!(state.usage.summary().context_used, Some(12));
+        assert!(state.events.iter().any(|(_, event)| matches!(event,
+            v2::SessionUpdate::Other(other) if other.session_update == "_hive_usage" && other.fields["turn"].is_null()
+        )));
+    }
+
+    #[test]
+    fn ambiguous_model_options_do_not_choose_a_billable_identity() {
+        let option = |id: &str| {
+            v2::SessionConfigOption::select(
+                id,
+                "Model",
+                "model-a",
+                vec![v2::SessionConfigSelectOption::new("model-a", "Model A")],
+            )
+            .category(v2::SessionConfigOptionCategory::Model)
+        };
+        assert_eq!(selected_model(&[option("model")]), Some("model-a".into()));
+        assert_eq!(selected_model(&[option("first"), option("second")]), None);
+        assert_eq!(selected_model(&[]), None);
+    }
+
+    #[test]
     fn an_idle_update_after_restart_does_not_acknowledge_an_interrupted_prompt() {
         let mut state = detached();
         state.recovery_required = true;

@@ -22,7 +22,7 @@ fn controlled(meta: &Option<v2::Meta>, key: &str) -> v2::Meta {
 }
 
 async fn summaries(address: SocketAddr) -> serde_json::Value {
-    reqwest::get(format!("http://{address}/hive/v1/sessions"))
+    reqwest::get(format!("http://{address}/v1/sessions"))
         .await
         .unwrap()
         .error_for_status()
@@ -176,7 +176,7 @@ async fn exercise_gateway(transport: &str, version: AgentVersion) {
         .unwrap();
     });
     let url = format!("{transport}://{address}");
-    let status: serde_json::Value = reqwest::get(format!("http://{address}/hive/v1/status"))
+    let status: serde_json::Value = reqwest::get(format!("http://{address}/v1/status"))
         .await
         .unwrap()
         .json()
@@ -190,28 +190,56 @@ async fn exercise_gateway(transport: &str, version: AgentVersion) {
             .len(),
         0
     );
-    let mut events = reqwest::get(format!("http://{address}/hive/v1/sessions/events"))
+    let mut events = reqwest::get(format!("http://{address}/v1/sessions/events"))
         .await
         .unwrap()
         .error_for_status()
         .unwrap();
     let mut pending = String::new();
     let initial = next_revision(&mut events, &mut pending).await;
-    let health: serde_json::Value = reqwest::get(format!("http://{address}/hive/v1/health"))
+    let health: serde_json::Value = reqwest::get(format!("http://{address}/v1/health"))
         .await
         .unwrap()
         .json()
         .await
         .unwrap();
     assert_eq!(health["status"], "ok");
-    let web = reqwest::get(format!("http://{address}/hive/v1/web"))
+    let ready: serde_json::Value = reqwest::get(format!("http://{address}/v1/ready"))
         .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(ready["ready"], true);
+    let web = reqwest::get(format!("http://{address}/ui?session=hive-tui"))
+        .await
+        .unwrap()
+        .error_for_status()
         .unwrap()
         .text()
         .await
         .unwrap();
-    assert!(web.contains("/hive/v1/web/app.js"));
-    let provider: serde_json::Value = reqwest::get(format!("http://{address}/hive/v1/providers"))
+    assert!(web.contains("/ui/app.js"));
+    let script = reqwest::get(format!("http://{address}/ui/app.js"))
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(script.headers()["content-type"], "text/javascript");
+    assert_eq!(
+        script.text().await.unwrap(),
+        include_str!("../../../clients/hive-web/app.js")
+    );
+    // Removed paths must not survive as aliases that keep clients on the old prefix.
+    for path in ["/hive/v1/web", "/hive/v1/web/app.js", "/hive/v1/status"] {
+        let response = reqwest::get(format!("http://{address}{path}"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND, "{path}");
+    }
+    let provider: serde_json::Value = reqwest::get(format!("http://{address}/v1/providers"))
         .await
         .unwrap()
         .json()
@@ -472,7 +500,7 @@ async fn exercise_gateway(transport: &str, version: AgentVersion) {
                     .unwrap()
                     .is_empty()
             );
-            let mut reconnected = reqwest::get(format!("http://{address}/hive/v1/sessions/events"))
+            let mut reconnected = reqwest::get(format!("http://{address}/v1/sessions/events"))
                 .await
                 .unwrap()
                 .error_for_status()
@@ -922,7 +950,7 @@ async fn explicit_and_default_profiles_share_one_broker_across_client_transports
     );
     assert_ne!(pi, opencode);
     assert_ne!(pi, other_pi);
-    let status: serde_json::Value = reqwest::get(format!("http://{address}/hive/v1/status"))
+    let status: serde_json::Value = reqwest::get(format!("http://{address}/v1/status"))
         .await
         .unwrap()
         .json()
@@ -996,7 +1024,7 @@ async fn a_broken_agent_and_protocol_mismatch_do_not_register_sessions() {
             .contains("agent")
     );
     assert!(session_error(url, Some("mismatch")).await.contains("agent"));
-    let status: serde_json::Value = reqwest::get(format!("http://{address}/hive/v1/status"))
+    let status: serde_json::Value = reqwest::get(format!("http://{address}/v1/status"))
         .await
         .unwrap()
         .json()
@@ -1117,7 +1145,7 @@ async fn disconnecting_one_client_does_not_lose_its_resumable_agent_session() {
     );
     let (address, server) = start_gateway(config).await;
     let id = create_and_prompt(&format!("ws://{address}"), None, "before", "Echo: before").await;
-    let status: serde_json::Value = reqwest::get(format!("http://{address}/hive/v1/status"))
+    let status: serde_json::Value = reqwest::get(format!("http://{address}/v1/status"))
         .await
         .unwrap()
         .json()

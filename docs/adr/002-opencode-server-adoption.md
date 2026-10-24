@@ -44,7 +44,7 @@ pilot routing are the shared code, not a copy.
   persisted, and the native ID is exposed in the catalog so the session can be
   resumed in OpenCode (`opencode attach <url> -s <id>`).
 - **Discovery** is a read-only HTTP route,
-  `GET /hive/v1/providers/{agent}/native-sessions`, that lists candidates and
+  `GET /v1/providers/{agent}/native-sessions`, that lists candidates and
   marks the adopted ones. The catalog is never auto-populated with sessions
   nobody asked Hive to manage.
 - **API flavor** is probed (`/global/health`, `/api/health`, validating the

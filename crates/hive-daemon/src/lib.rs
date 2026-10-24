@@ -1242,7 +1242,7 @@ impl Broker {
             problem(
                 StatusCode::NOT_FOUND,
                 "hive::providers::unknown",
-                format!("unknown agent profile '{agent}'; query GET /hive/v1/providers"),
+                format!("unknown agent profile '{agent}'; query GET /v1/providers"),
             )
         })?;
         if profile.kind != ProfileKind::OpencodeServer {
@@ -1333,16 +1333,17 @@ impl Broker {
                             .filter(|id| !id.is_empty())
                             .map(str::to_owned)
                             .ok_or_else(|| Error::invalid_params().data(
-                                "_meta.hive.adopt must be an object with a nonempty nativeId; list candidates with GET /hive/v1/providers/<agent>/native-sessions",
+                                "_meta.hive.adopt must be an object with a nonempty nativeId; list candidates with GET /v1/providers/<agent>/native-sessions",
                             ))?,
                     );
                 }
-                let id = match hive.remove("agent") {
-                    Some(serde_json::Value::String(id)) if !id.is_empty() => id,
-                    _ => return Err(Error::invalid_params().data(
-                        "_meta.hive.agent must be a nonempty profile ID; see GET /hive/v1/providers",
-                    )),
-                };
+                let id =
+                    match hive.remove("agent") {
+                        Some(serde_json::Value::String(id)) if !id.is_empty() => id,
+                        _ => return Err(Error::invalid_params().data(
+                            "_meta.hive.agent must be a nonempty profile ID; see GET /v1/providers",
+                        )),
+                    };
                 if hive.is_empty() {
                     request
                         .meta
@@ -1362,7 +1363,7 @@ impl Broker {
         let chosen = chosen.ok_or_else(|| Error::invalid_params().data("no default agent configured; set default_agent in Hive config or pass _meta.hive.agent in session/new"))?;
         let provider = self.registry.agents.get(&chosen).cloned().ok_or_else(|| {
             Error::invalid_params().data(format!(
-                "unknown agent profile '{chosen}'; query GET /hive/v1/providers"
+                "unknown agent profile '{chosen}'; query GET /v1/providers"
             ))
         })?;
         let kind = provider.kind;
@@ -2478,15 +2479,15 @@ pub fn router_with_origin(broker: Broker, origin: Option<&str>) -> Router {
     server
         .into_router()
         .route(
-            "/hive/v1/health",
+            "/v1/health",
             get(|| async { Json(serde_json::json!({"status":"ok"})) }),
         )
         .route(
-            "/hive/v1/ready",
+            "/v1/ready",
             get(|| async { Json(serde_json::json!({"ready":true})) }),
         )
         .route(
-            "/hive/v1/status",
+            "/v1/status",
             get({
                 let broker = broker.clone();
                 move || {
@@ -2496,7 +2497,7 @@ pub fn router_with_origin(broker: Broker, origin: Option<&str>) -> Router {
             }),
         )
         .route(
-            "/hive/v1/providers",
+            "/v1/providers",
             get({
                 let broker = broker.clone();
                 move || {
@@ -2506,7 +2507,7 @@ pub fn router_with_origin(broker: Broker, origin: Option<&str>) -> Router {
             }),
         )
         .route(
-            "/hive/v1/providers/{agent}/native-sessions",
+            "/v1/providers/{agent}/native-sessions",
             get({
                 let broker = broker.clone();
                 move |axum::extract::Path(agent): axum::extract::Path<String>,
@@ -2522,7 +2523,7 @@ pub fn router_with_origin(broker: Broker, origin: Option<&str>) -> Router {
             }),
         )
         .route(
-            "/hive/v1/sessions",
+            "/v1/sessions",
             get({
                 let broker = broker.clone();
                 move || {
@@ -2537,7 +2538,7 @@ pub fn router_with_origin(broker: Broker, origin: Option<&str>) -> Router {
             }),
         )
         .route(
-            "/hive/v1/sessions/events",
+            "/v1/sessions/events",
             get({
                 let broker = broker.clone();
                 move || {
@@ -2556,11 +2557,11 @@ pub fn router_with_origin(broker: Broker, origin: Option<&str>) -> Router {
             }),
         )
         .route(
-            "/hive/v1/web",
+            "/ui",
             get(|| async { Html(include_str!("../../../clients/hive-web/index.html")) }),
         )
         .route(
-            "/hive/v1/web/app.js",
+            "/ui/app.js",
             get(|| async {
                 (
                     [(axum::http::header::CONTENT_TYPE, "text/javascript")],

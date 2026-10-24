@@ -69,7 +69,7 @@ do not have a native-session adoption picker or CLI subcommand.
 First list candidates for the actual project directory:
 
 ```sh
-curl --get 'http://127.0.0.1:8765/hive/v1/providers/opencode-server/native-sessions' \
+curl --get 'http://127.0.0.1:8765/v1/providers/opencode-server/native-sessions' \
   --data-urlencode 'directory=/absolute/path/to/project'
 ```
 

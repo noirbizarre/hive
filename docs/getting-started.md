@@ -138,7 +138,7 @@ See the [TUI guide](guides/tui.md) for controls and agent questions.
 hive web
 ```
 
-This opens <http://127.0.0.1:8765/hive/v1/web>. If opening a browser fails, visit
+This opens <http://127.0.0.1:8765/ui>. If opening a browser fails, visit
 that URL manually.
 
 1. Select the same session in the session rail. It opens read-only.

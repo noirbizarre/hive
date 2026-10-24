@@ -8,7 +8,7 @@ pub use agent_client_protocol_http::{AcpHttpServer, HttpClient};
 pub async fn daemon_status(
     base_url: &str,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
-    let url = format!("{}/hive/v1/status", base_url.trim_end_matches('/'));
+    let url = format!("{}/v1/status", base_url.trim_end_matches('/'));
     Ok(reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
         .build()?

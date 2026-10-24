@@ -8,15 +8,15 @@ user. Session conversation/control methods live exclusively on `/acp`.
 
 | Route | Result |
 | --- | --- |
-| `GET /hive/v1/health` | `{ "status": "ok" }` when HTTP responds |
-| `GET /hive/v1/ready` | `{ "ready": true }` when listener is active, without probing agents |
-| `GET /hive/v1/status` | Name, build version, live/persisted session counts, default agent, active sessions by agent |
-| `GET /hive/v1/providers` | Profile IDs, names, declared transports/versions, default indication |
-| `GET /hive/v1/providers/{agent}/native-sessions` | Native sessions an OpenCode server profile can adopt |
-| `GET /hive/v1/sessions` | Live/persisted session summaries and catalog revision |
-| `GET /hive/v1/sessions/events` | SSE catalog revision invalidations |
-| `GET /hive/v1/web` | Embedded browser HTML |
-| `GET /hive/v1/web/app.js` | Embedded browser JavaScript |
+| `GET /v1/health` | `{ "status": "ok" }` when HTTP responds |
+| `GET /v1/ready` | `{ "ready": true }` when listener is active, without probing agents |
+| `GET /v1/status` | Name, build version, live/persisted session counts, default agent, active sessions by agent |
+| `GET /v1/providers` | Profile IDs, names, declared transports/versions, default indication |
+| `GET /v1/providers/{agent}/native-sessions` | Native sessions an OpenCode server profile can adopt |
+| `GET /v1/sessions` | Live/persisted session summaries and catalog revision |
+| `GET /v1/sessions/events` | SSE catalog revision invalidations |
+| `GET /ui` | Embedded browser HTML |
+| `GET /ui/app.js` | Embedded browser JavaScript |
 
 Provider discovery omits commands, endpoints, arguments, environment, and headers.
 It describes configuration rather than successful availability probes.
@@ -34,7 +34,7 @@ and prompts additionally need a stable key. See the
 
 ## Session catalog
 
-`GET /hive/v1/sessions` returns a sorted snapshot independent of the client
+`GET /v1/sessions` returns a sorted snapshot independent of the client
 connection that created each session:
 
 ```json
@@ -141,7 +141,7 @@ profile across sessions. Null values mean unknown, not zero. See
 
 ## Native session discovery
 
-`GET /hive/v1/providers/{agent}/native-sessions?directory=<cwd>&limit=<n>`
+`GET /v1/providers/{agent}/native-sessions?directory=<cwd>&limit=<n>`
 lists candidates from an `opencode-server` profile without attaching them.
 `directory` selects the project lookup; when omitted the server's default project
 is used. `limit` defaults to 50 and is capped at 200.
@@ -181,8 +181,8 @@ working directories. The local trust boundary applies.
 
 ## Catalog revision stream
 
-Open `GET /hive/v1/sessions/events` as an EventSource or SSE client **before**
-fetching `/hive/v1/sessions`. Each event is named `revision`, with its decimal
+Open `GET /v1/sessions/events` as an EventSource or SSE client **before**
+fetching `/v1/sessions`. Each event is named `revision`, with its decimal
 revision in `data` and `id`. The first event reports the current revision.
 
 If an event is newer than the snapshot, fetch another snapshot. Always fetch a

@@ -15,7 +15,7 @@ flowchart TB
 
     subgraph Hive daemon
         ACP["/acp: ACPv2 WebSocket or HTTP/SSE"]
-        HTTP["/hive/v1/*: discovery, status, browser assets"]
+        HTTP["/v1/*: discovery, status; /ui: browser assets"]
         BROKER[Shared session broker]
         CONTROL[Per-session control and volatile replay]
         WORKERS[ACPv2, ACPv1, or OpenCode worker]

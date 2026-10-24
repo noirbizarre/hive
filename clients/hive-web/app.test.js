@@ -372,14 +372,21 @@ test('session UI lists daemon sessions and typing triggers handoff before send',
     <form id="takeover"><input name="session"><button>Open</button></form><button id="skip-history"></button>
     <div id="output"></div><section id="interaction"></section>
     <form id="prompt"><select id="agent"><option value="">Default</option></select><input name="text"><button id="send">Send</button></form>
-    <button id="retry"></button><button id="cancel"></button>`, { url: 'http://localhost/hive/v1/web' });
+    <button id="retry"></button><button id="cancel"></button>`, { url: 'http://localhost/ui' });
   globalThis.document = dom.window.document;
   globalThis.location = dom.window.location;
   globalThis.history = dom.window.history;
   globalThis.FormData = dom.window.FormData;
-  globalThis.fetch = async url => ({ ok: true, json: async () => url.includes('providers')
-    ? { agents: [{ id: 'pi', name: 'Pi' }] } : { revision: 1, sessions: [session] } });
+  const requests = [];
+  globalThis.fetch = async url => {
+    requests.push(url);
+    assert.ok(['/v1/providers', '/v1/sessions'].includes(url));
+    return { ok: true, json: async () => url === '/v1/providers'
+      ? { agents: [{ id: 'pi', name: 'Pi' }] } : { revision: 1, sessions: [session] } };
+  };
+  let eventsUrl;
   globalThis.EventSource = class {
+    constructor(url) { eventsUrl = url; }
     addEventListener() {}
     close() {}
   };
@@ -388,6 +395,8 @@ test('session UI lists daemon sessions and typing triggers handoff before send',
   const client = connect('ws://localhost/acp', state => view?.show(state));
   view = mount(client);
   await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(requests.toSorted(), ['/v1/providers', '/v1/sessions']);
+  assert.equal(eventsUrl, '/v1/sessions/events');
   assert.match(document.querySelector('#sessions').textContent, /pi · idle · controlled by another client/);
   document.querySelector('#sessions button').click();
   await new Promise(resolve => setImmediate(resolve));
@@ -457,7 +466,7 @@ test('agent input UI collects typed form values and prevents stale interaction r
 
 test('the session rail toggles, follows catalog revisions and keeps recent selection', async () => {
   const dom = new JSDOM(readFileSync(new URL('./index.html', import.meta.url), 'utf8'),
-    { url: 'http://localhost/hive/v1/web' });
+    { url: 'http://localhost/ui?session=hive-tui' });
   globalThis.document = dom.window.document;
   globalThis.location = dom.window.location;
   globalThis.history = dom.window.history;
@@ -479,6 +488,7 @@ test('the session rail toggles, follows catalog revisions and keeps recent selec
   view = mount(client);
   await new Promise(resolve => setImmediate(resolve));
   const toggle = document.querySelector('#toggle-sessions');
+  assert.equal(client.state().session.sessionId, 'hive-tui');
   toggle.click();
   assert.equal(toggle.getAttribute('aria-expanded'), 'false');
   assert.equal(document.querySelector('#layout').classList.contains('nav-hidden'), true);
@@ -487,6 +497,8 @@ test('the session rail toggles, follows catalog revisions and keeps recent selec
   document.querySelector('[data-session-id="hive-second"]').click();
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(client.state().session.sessionId, 'hive-second');
+  assert.equal(location.pathname, '/ui');
+  assert.equal(location.search, '?session=hive-second');
   assert.equal(document.querySelector('#sessions button').dataset.sessionId, 'hive-second');
   assert.equal(document.querySelector('#sessions [aria-current="page"]').dataset.sessionId, 'hive-second');
   revision = 2;

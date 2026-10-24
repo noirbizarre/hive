@@ -123,7 +123,7 @@ async fn serve(options: ServeOptions) -> miette::Result<()> {
 }
 
 async fn status(options: StatusOptions) -> miette::Result<()> {
-    let url = format!("{}/hive/v1/status", daemon_url(options.url));
+    let url = format!("{}/v1/status", daemon_url(options.url));
     let response = reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
@@ -170,7 +170,7 @@ fn open_web(url: &str, open: impl FnOnce(&str) -> std::io::Result<()>) -> miette
 }
 
 fn web_url(url: Option<String>) -> String {
-    format!("{}/hive/v1/web", daemon_url(url))
+    format!("{}/ui", daemon_url(url))
 }
 
 #[tokio::main]
@@ -329,7 +329,7 @@ mod tests {
     fn web_address_points_to_the_existing_daemon_route() {
         assert_eq!(
             web_url(Some("http://127.0.0.1:9000/".into())),
-            "http://127.0.0.1:9000/hive/v1/web"
+            "http://127.0.0.1:9000/ui"
         );
     }
 

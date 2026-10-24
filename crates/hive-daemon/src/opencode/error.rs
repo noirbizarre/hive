@@ -73,7 +73,7 @@ pub(crate) enum OpencodeError {
     #[diagnostic(
         code(hive::opencode::session_not_found),
         help(
-            "the session was deleted or lives in another OpenCode project; list sessions with GET /hive/v1/providers/<agent>/native-sessions?directory=<cwd>"
+            "the session was deleted or lives in another OpenCode project; list sessions with GET /v1/providers/<agent>/native-sessions?directory=<cwd>"
         )
     )]
     SessionNotFound { id: String },

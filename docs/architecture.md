@@ -54,8 +54,10 @@ WebSocket JSON-RPC boundary. It lists daemon-owned sessions, attaches as an
 observer using the listed cwd, and takes control when the user starts typing
 a prompt. It renders sequenced replay and live events through the same
 conversation reducer; reconnect observes the original session rather than
-creating another. Pending agent input follows the pilot to whichever client
-currently owns control.
+creating another. Pending session-scoped agent input follows the pilot to
+whichever client currently owns control, with safe cancellation for modes that
+client did not advertise. Request-scoped elicitation follows the original live
+parent RPC instead.
 The browser rail observes catalog revisions via SSE and reconciles full
 snapshots with locally visited sessions; its hide/show state is presentation
 only. Neither client stores a second authoritative session catalog.
@@ -88,7 +90,13 @@ uncertain work are pruned after 90 days without activity. Unavailable sessions
 and records with interrupted work remain until explicitly resolved.
 Storage errors fail the affected operation or fence its session. Each attached observer receives live
 updates but never an ownership token. Pending permission/elicitation requests
-follow the pilot across takeovers and expire if nobody answers.
+follow the pilot across takeovers and expire if nobody answers. Human-response
+waits run outside SDK dispatch, so updates, concurrent questions, and cancellation
+remain responsive. Shared ACP validation lives in `hive-protocol`; host-specific
+forms retain per-request drafts. Zellij's local bridge includes an opaque
+delivery identity in snapshots/answers to prevent a stale action answering the
+next question. URL completion is correlated independently of create responses.
+See [interaction capabilities and fallback](acp-compatibility.md#interaction-capabilities-and-fallback).
 The daemon exclusively locks a private per-user runtime file before binding;
 another `hive daemon` invocation cannot own a different port for the same user.
 Both ACP session access and Hive administration are loopback-only, with no

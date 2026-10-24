@@ -36,6 +36,7 @@ mod activity;
 pub mod compat;
 pub mod config;
 pub mod doctor;
+mod interactions;
 mod opencode;
 mod persistence;
 mod pricing;
@@ -110,6 +111,7 @@ pub struct Broker {
     /// `(profile, native id)` pairs being adopted right now. Without it two simultaneous
     /// adoptions of one native session could both pass the "already attached?" check.
     adopting: Arc<Mutex<std::collections::HashSet<(String, String)>>>,
+    client_capabilities: Arc<Mutex<HashMap<String, v2::ClientCapabilities>>>,
 }
 
 /// Releases an in-flight adoption claim however `create` exits.
@@ -136,6 +138,17 @@ struct Entry {
 }
 
 struct Control {
+    // Only live hop mappings can identify a request-scoped question's original requester.
+    parents: HashMap<v1::RequestId, interactions::Parent>,
+    startup_parent: Option<interactions::Parent>,
+    prompt_parents: HashMap<String, interactions::Parent>,
+    client_capabilities: HashMap<String, v2::ClientCapabilities>,
+    // Unlike pilot generation, this invalidates decisions permanently instead of reoffering them.
+    interaction_epoch: u64,
+    pending_interactions: usize,
+    urls: HashMap<String, interactions::UrlRoute>,
+    // Request publication and notification dispatch can race; records remain worker-local and bounded.
+    early_completions: HashMap<String, (tokio::time::Instant, v2::CompleteElicitationNotification)>,
     generation: u64,
     token: String,
     pilot: Option<String>,
@@ -209,6 +222,14 @@ impl Control {
         }
         Self {
             generation: record.generation,
+            parents: HashMap::new(),
+            startup_parent: None,
+            prompt_parents: HashMap::new(),
+            client_capabilities: HashMap::new(),
+            interaction_epoch: 0,
+            pending_interactions: 0,
+            urls: HashMap::new(),
+            early_completions: HashMap::new(),
             token: uuid::Uuid::new_v4().to_string(),
             pilot: None,
             subscribers: HashMap::new(),
@@ -252,6 +273,14 @@ impl Control {
         }
         Self {
             generation: 1,
+            parents: HashMap::new(),
+            startup_parent: None,
+            prompt_parents: HashMap::new(),
+            client_capabilities: HashMap::new(),
+            interaction_epoch: 0,
+            pending_interactions: 0,
+            urls: HashMap::new(),
+            early_completions: HashMap::new(),
             token: uuid::Uuid::new_v4().to_string(),
             pilot: Some(client_id.clone()),
             subscribers: HashMap::from([(client_id, gateway)]),
@@ -655,6 +684,9 @@ impl Broker {
                 .await;
             }
             let closing = worker_control.lock().is_ok_and(|state| state.closing);
+            if let Ok(mut state) = worker_control.lock() {
+                interactions::invalidate(&mut state);
+            }
             if !closing && let Ok(mut state) = worker_control.lock() {
                 if let Some(record) = &state.record
                     && let Ok(mut record) = record.lock()
@@ -766,6 +798,7 @@ impl Broker {
             store: None,
             offline: Arc::new(Mutex::new(HashMap::new())),
             adopting: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            client_capabilities: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -917,6 +950,7 @@ impl Broker {
         &self,
         client_id: &str,
         mut request: v2::PromptRequest,
+        mut parent: interactions::Parent,
     ) -> agent_client_protocol::Result<oneshot::Receiver<Result<v2::PromptResponse, String>>> {
         let entry = self.entry(&request.session_id)?;
         let mut state = entry.control.lock().map_err(|_| Error::internal_error())?;
@@ -943,6 +977,16 @@ impl Broker {
             } else {
                 record.waiters.push(tx);
             }
+            // A retried logical prompt has multiple RPC waiters, hence no unique parent identity.
+            state.prompt_parents.remove(&key);
+            state.parents.retain(|_, parent| {
+                if parent.prompt_key.as_deref() == Some(&key) {
+                    parent.invalidate();
+                    false
+                } else {
+                    true
+                }
+            });
             return Ok(rx);
         }
         if let Some(store) = &state.store
@@ -1011,6 +1055,8 @@ impl Broker {
             }
         }
         let generation = state.generation;
+        parent.prompt_key = Some(key.clone());
+        state.prompt_parents.insert(key.clone(), parent);
         if let Some(meta) = request.meta.as_mut() {
             meta.remove("hive");
         }
@@ -1042,6 +1088,16 @@ impl Broker {
             return Err(Error::invalid_params().data("session cwd does not match"));
         }
         let mut state = entry.control.lock().map_err(|_| Error::internal_error())?;
+        if let Some(capabilities) = self
+            .client_capabilities
+            .lock()
+            .map_err(|_| Error::internal_error())?
+            .get(client_id)
+        {
+            state
+                .client_capabilities
+                .insert(client_id.to_owned(), capabilities.clone());
+        }
         let action = request
             .meta
             .as_ref()
@@ -1131,6 +1187,7 @@ impl Broker {
             cx.incoming_closed().await;
             if let Ok(mut state) = control.lock() {
                 let removed = state.subscribers.remove(&subscriber).is_some();
+                state.client_capabilities.remove(&subscriber);
                 if state.pilot.as_deref() == Some(&subscriber) {
                     state.pilot = None;
                     state.generation += 1;
@@ -1262,6 +1319,7 @@ impl Broker {
         mut request: v2::NewSessionRequest,
         client_id: String,
         gateway: V2ConnectionTo<Client>,
+        parent: interactions::Parent,
     ) -> agent_client_protocol::Result<v2::NewSessionResponse> {
         let requested = request.meta.as_mut().and_then(|meta| meta.get_mut("hive"));
         let mut adopt: Option<String> = None;
@@ -1333,6 +1391,13 @@ impl Broker {
             chosen.clone(),
             provider.pricing.clone(),
         )));
+        {
+            let mut state = control.lock().map_err(|_| Error::internal_error())?;
+            state
+                .client_capabilities
+                .insert(client_id.clone(), parent.capabilities.clone());
+            state.startup_parent = Some(parent);
+        }
         let cwd = request.cwd.clone();
         let entry_control = control.clone();
         let worker_control = control.clone();
@@ -1410,6 +1475,7 @@ impl Broker {
                 .await;
             }
             if let Ok(mut state) = worker_control.lock() {
+                interactions::invalidate(&mut state);
                 state.activity.session = "ended".into();
                 let _ = publish_activity(
                     &mut state,
@@ -1451,6 +1517,8 @@ impl Broker {
             commands: tx,
             control: entry_control.clone(),
         };
+        // Dropping a not-yet-registered creation must not strand an invisible downstream worker.
+        let mut startup_guard = AbortOnDrop(Some(task.abort_handle()));
         if let Ok(state) = entry_control.lock()
             && let Some(cx) = state.subscribers.get(&client_id).cloned()
         {
@@ -1461,6 +1529,7 @@ impl Broker {
                 cx.incoming_closed().await;
                 if let Ok(mut state) = control.lock() {
                     let removed = state.subscribers.remove(&subscriber).is_some();
+                    state.client_capabilities.remove(&subscriber);
                     if state.pilot.as_deref() == Some(&subscriber) {
                         state.pilot = None;
                         state.generation += 1;
@@ -1474,7 +1543,7 @@ impl Broker {
                 }
             });
         }
-        match tokio::time::timeout(std::time::Duration::from_secs(15), ready_rx).await {
+        match interactions::startup(&entry_control, ready_rx).await {
             Ok(Ok(Ok((mut response, downstream_id)))) => {
                 if let (Some(store), Some(record)) = (&self.store, &stored_record) {
                     let mut record = record.lock().map_err(|_| Error::internal_error())?;
@@ -1509,6 +1578,7 @@ impl Broker {
                     self.catalog.send_modify(|revision| *revision += 1);
                 }
                 let _ = active_tx.send(());
+                startup_guard.0 = None;
                 response.session_id = hive_id;
                 response.meta = Some(
                     entry_control
@@ -1841,91 +1911,14 @@ async fn pilot_permission(
     control: Arc<Mutex<Control>>,
     request: v2::RequestPermissionRequest,
 ) -> v2::RequestPermissionResponse {
-    let mut changes = control
-        .lock()
-        .expect("session state is not poisoned")
-        .changed
-        .subscribe();
-    let answer = async {
-        loop {
-            let (gateway, generation) = {
-                let state = control.lock().expect("session state is not poisoned");
-                (
-                    state
-                        .pilot
-                        .as_ref()
-                        .and_then(|id| state.subscribers.get(id))
-                        .cloned(),
-                    state.generation,
-                )
-            };
-            if let Some(gateway) = gateway {
-                tokio::select! {
-                    result = gateway.send_request(request.clone()).block_task() => {
-                        if control.lock().expect("session state is not poisoned").generation == generation
-                            && let Ok(response) = result { return response; }
-                    }
-                    _ = changes.changed() => continue,
-                }
-            } else if changes.changed().await.is_err() {
-                break;
-            }
-            // A failed pilot request should not spin against the same connection.
-            if *changes.borrow() == generation && changes.changed().await.is_err() {
-                break;
-            }
-        }
-        v2::RequestPermissionResponse::new(v2::RequestPermissionOutcome::Cancelled)
-    };
-    tokio::time::timeout(std::time::Duration::from_secs(120), answer)
-        .await
-        .unwrap_or_else(|_| {
-            v2::RequestPermissionResponse::new(v2::RequestPermissionOutcome::Cancelled)
-        })
+    interactions::permission(control, request).await
 }
 
 async fn pilot_elicitation(
     control: Arc<Mutex<Control>>,
     request: v2::CreateElicitationRequest,
 ) -> v2::CreateElicitationResponse {
-    let mut changes = control
-        .lock()
-        .expect("session state is not poisoned")
-        .changed
-        .subscribe();
-    let answer = async {
-        loop {
-            let (gateway, generation) = {
-                let state = control.lock().expect("session state is not poisoned");
-                (
-                    state
-                        .pilot
-                        .as_ref()
-                        .and_then(|id| state.subscribers.get(id))
-                        .cloned(),
-                    state.generation,
-                )
-            };
-            if let Some(gateway) = gateway {
-                tokio::select! {
-                    result = gateway.send_request(request.clone()).block_task() => {
-                        if control.lock().expect("session state is not poisoned").generation == generation
-                            && let Ok(response) = result { return response; }
-                    }
-                    _ = changes.changed() => continue,
-                }
-            } else if changes.changed().await.is_err() {
-                break;
-            }
-            if *changes.borrow() == generation && changes.changed().await.is_err() {
-                break;
-            }
-        }
-        v2::CreateElicitationResponse::new(v2::ElicitationAction::Cancel)
-    };
-    tokio::time::timeout(std::time::Duration::from_secs(120), answer)
-        .await
-        .unwrap_or_else(|_| v2::CreateElicitationResponse::new(v2::ElicitationAction::Cancel))
+    interactions::elicitation(control, request).await
 }
 
 async fn run_agent(
@@ -1975,12 +1968,19 @@ async fn run_agent(
                 let hive_id = hive_id.clone();
                 async move |mut request: v2::RequestPermissionRequest,
                    responder: Responder<v2::RequestPermissionResponse>,
-                   _cx: V2ConnectionTo<Agent>| {
+                   cx: V2ConnectionTo<Agent>| {
                     if downstream.lock().map_err(|_| Error::internal_error())?.as_ref() != Some(&request.session_id) {
                         return responder.respond(v2::RequestPermissionResponse::new(v2::RequestPermissionOutcome::Cancelled));
                     }
                     request.session_id = hive_id.clone();
-                    responder.respond(pilot_permission(control.clone(), request).await)
+                    let control = control.clone();
+                    let epoch = control.lock().map_err(|_| Error::internal_error())?.interaction_epoch;
+                    let cancellation = responder.cancellation();
+                    cx.spawn(async move {
+                        let result = cancellation.run_until_cancelled(async { Ok(interactions::permission_at(control, request, epoch).await) }).await;
+                        let _ = responder.respond_with_result(result);
+                        Ok(())
+                    })
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -1992,24 +1992,41 @@ async fn run_agent(
                 let hive_id = hive_id.clone();
                 async move |mut request: v2::CreateElicitationRequest,
                     responder: Responder<v2::CreateElicitationResponse>,
-                    _cx: V2ConnectionTo<Agent>| {
+                    cx: V2ConnectionTo<Agent>| {
+                    let epoch = control.lock().map_err(|_| Error::internal_error())?.interaction_epoch;
                     let scope = match &mut request.mode {
                         v2::ElicitationMode::Form(mode) => &mut mode.scope,
                         v2::ElicitationMode::Url(mode) => &mut mode.scope,
                         _ => return responder.respond(v2::CreateElicitationResponse::new(v2::ElicitationAction::Cancel)),
                     };
-                    let v2::ElicitationScope::Session(scope) = scope else {
-                        return responder.respond(v2::CreateElicitationResponse::new(v2::ElicitationAction::Cancel));
-                    };
-                    if downstream.lock().map_err(|_| Error::internal_error())?.as_ref() != Some(&scope.session_id) {
+                    if let v2::ElicitationScope::Session(scope) = scope {
+                        if downstream.lock().map_err(|_| Error::internal_error())?.as_ref() != Some(&scope.session_id) {
+                            return responder.respond(v2::CreateElicitationResponse::new(v2::ElicitationAction::Cancel));
+                        }
+                        scope.session_id = hive_id.clone();
+                    }
+                    // Completion may be the next inbound message, before the spawned waiter runs.
+                    if !interactions::announce_url(&control, &request) {
                         return responder.respond(v2::CreateElicitationResponse::new(v2::ElicitationAction::Cancel));
                     }
-                    scope.session_id = hive_id.clone();
-                    responder.respond(pilot_elicitation(control.clone(), request).await)
+                    let control = control.clone();
+                    let cancellation = responder.cancellation();
+                    cx.spawn(async move {
+                        let result = cancellation.run_until_cancelled(async { Ok(interactions::elicitation_at(control, request, epoch).await) }).await;
+                        let _ = responder.respond_with_result(result);
+                        Ok(())
+                    })
                 }
             },
             agent_client_protocol::on_receive_request!(),
         )
+        .on_receive_notification({
+            let control = control.clone();
+            async move |notification: v2::CompleteElicitationNotification, _: V2ConnectionTo<Agent>| {
+                interactions::complete(&control, notification);
+                Ok(())
+            }
+        }, agent_client_protocol::on_receive_notification!())
         .connect_with(agent, async move |cx| {
             let initialized = cx
                 .send_request(v2::InitializeRequest::new(
@@ -2051,7 +2068,11 @@ async fn run_agent(
                     }
                 }
             } else {
-                match cx.send_request(request).block_task().await {
+                let prepared = cx.prepare_request(request);
+                let parent = control.lock().map_err(|_| Error::internal_error())?.startup_parent.take();
+                let prepared = if let Some(parent) = &parent { prepared.forward_cancellation_from(parent.cancellation.clone()) } else { prepared };
+                let _mapping = interactions::ParentMapping::new(&control, prepared.id().clone(), parent);
+                match prepared.block_task().await {
                     Ok(response) => { let id = response.session_id.clone(); (response, id) }
                     Err(error) => {
                         tracing::warn!(code = ?error.code, "agent session/new failed");
@@ -2073,7 +2094,7 @@ async fn run_agent(
                     Command::Prompt(mut request, generation, key) => {
                         request.session_id = downstream_id.clone();
                         let prompt = {
-                            let state = control.lock().expect("session state is not poisoned");
+                            let mut state = control.lock().expect("session state is not poisoned");
                             if state.generation != generation {
                                 drop(state);
                                 complete(&control, &key, Err("controller was superseded before prompt dispatch; resume with a new key".into()));
@@ -2081,8 +2102,14 @@ async fn run_agent(
                                 continue;
                             }
                             // Publication under the lock defines the dispatch-before-handoff order.
-                            cx.send_request(request).block_task()
+                            let prepared = cx.prepare_request(request);
+                            let parent = state.prompt_parents.remove(&key);
+                            let prepared = if let Some(parent) = &parent { prepared.forward_cancellation_from(parent.cancellation.clone()) } else { prepared };
+                            if let Some(parent) = parent { state.parents.insert(prepared.id().clone(), parent); }
+                            let mapping = interactions::ParentMapping::registered(&control, prepared.id().clone());
+                            (prepared.block_task(), mapping)
                         };
+                        let (prompt, _mapping) = prompt;
                         tokio::pin!(prompt);
                         let result = loop {
                             tokio::select! {
@@ -2207,7 +2234,7 @@ async fn run_v1_agent(
                 let hive_id = hive_id.clone();
                 async move |request: v1::RequestPermissionRequest,
                     responder: Responder<v1::RequestPermissionResponse>,
-                    _cx: ConnectionTo<Agent>| {
+                    cx: ConnectionTo<Agent>| {
                     if route.lock().map_err(|_| Error::internal_error())?.as_ref() != Some(&request.session_id) {
                         return responder.respond(v1::RequestPermissionResponse::new(v1::RequestPermissionOutcome::Cancelled));
                     }
@@ -2216,10 +2243,18 @@ async fn run_v1_agent(
                             .map_err(Error::into_internal_error)
                     }).collect::<agent_client_protocol::Result<Vec<_>>>()?;
                     let title = request.tool_call.fields.title.clone().unwrap_or_else(|| "Agent tool permission".into());
-                    let response = pilot_permission(control.clone(), v2::RequestPermissionRequest::new(hive_id.clone(), title, options)).await;
+                    let subject: v2::RequestPermissionSubject = serde_json::from_value(serde_json::json!({"type":"tool_call","toolCall":request.tool_call})).map_err(Error::into_internal_error)?;
+                    let request = v2::RequestPermissionRequest::new(hive_id.clone(), title, options).subject(subject).meta(request.meta);
+                    let control = control.clone();
+                    let cancellation = responder.cancellation();
+                    cx.spawn(async move {
+                    let response = cancellation.run_until_cancelled(async { Ok(pilot_permission(control, request).await) }).await;
+                    let Ok(response) = response else { let _ = responder.respond_with_error(Error::request_cancelled()); return Ok(()); };
                     let outcome = serde_json::from_value(serde_json::to_value(response.outcome).map_err(Error::into_internal_error)?)
                         .unwrap_or(v1::RequestPermissionOutcome::Cancelled);
-                    responder.respond(v1::RequestPermissionResponse::new(outcome))
+                    let _ = responder.respond(v1::RequestPermissionResponse::new(outcome));
+                    Ok(())
+                    })
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -2231,7 +2266,7 @@ async fn run_v1_agent(
                 let hive_id = hive_id.clone();
                 async move |request: v1::CreateElicitationRequest,
                     responder: Responder<v1::CreateElicitationResponse>,
-                    _cx: ConnectionTo<Agent>| {
+                    cx: ConnectionTo<Agent>| {
                     let mut request: v2::CreateElicitationRequest = serde_json::from_value(
                         serde_json::to_value(request).map_err(Error::into_internal_error)?,
                     ).map_err(Error::into_internal_error)?;
@@ -2247,11 +2282,17 @@ async fn run_v1_agent(
                         return responder.respond(v1::CreateElicitationResponse::new(v1::ElicitationAction::Cancel));
                     }
                     scope.session_id = hive_id.clone();
-                    let response = pilot_elicitation(control.clone(), request).await;
+                    let control = control.clone();
+                    let cancellation = responder.cancellation();
+                    cx.spawn(async move {
+                    let response = cancellation.run_until_cancelled(async { Ok(pilot_elicitation(control, request).await) }).await;
+                    let Ok(response) = response else { let _ = responder.respond_with_error(Error::request_cancelled()); return Ok(()); };
                     let response: v1::CreateElicitationResponse = serde_json::from_value(
                         serde_json::to_value(response).map_err(Error::into_internal_error)?,
                     ).map_err(Error::into_internal_error)?;
-                    responder.respond(response)
+                    let _ = responder.respond(response);
+                    Ok(())
+                    })
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -2535,18 +2576,37 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
         .v2()
         .name("hive")
         .on_receive_request(
-            async |request: v2::InitializeRequest,
-                   responder: Responder<v2::InitializeResponse>,
-                   _cx: V2ConnectionTo<Client>| {
-                responder.respond(
-                    v2::InitializeResponse::new(
-                        request.protocol_version,
-                        v2::Implementation::new("hive", env!("CARGO_PKG_VERSION")),
+            {
+                let capabilities = broker.client_capabilities.clone();
+                let client_id = client_id.clone();
+                async move |request: v2::InitializeRequest,
+                            responder: Responder<v2::InitializeResponse>,
+                            cx: V2ConnectionTo<Client>| {
+                    {
+                        let mut capabilities = capabilities.lock().map_err(|_| Error::internal_error())?;
+                        if capabilities.contains_key(&client_id) { return responder.respond_with_error(Error::invalid_request().data("connection is already initialized; reconnect to change capabilities")); }
+                        capabilities.insert(client_id.clone(), request.capabilities.clone());
+                    }
+                    let capabilities = capabilities.clone();
+                    let client_id = client_id.clone();
+                    let connection = cx.clone();
+                    cx.spawn(async move {
+                        connection.incoming_closed().await;
+                        if let Ok(mut capabilities) = capabilities.lock() {
+                            capabilities.remove(&client_id);
+                        }
+                        Ok(())
+                    })?;
+                    responder.respond(
+                        v2::InitializeResponse::new(
+                            request.protocol_version,
+                            v2::Implementation::new("hive", env!("CARGO_PKG_VERSION")),
+                        )
+                        .capabilities(
+                            v2::AgentCapabilities::new().session(v2::SessionCapabilities::new()),
+                        ),
                     )
-                    .capabilities(
-                        v2::AgentCapabilities::new().session(v2::SessionCapabilities::new()),
-                    ),
-                )
+                }
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -2557,10 +2617,24 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
                 async move |request: v2::NewSessionRequest,
                             responder: Responder<v2::NewSessionResponse>,
                             cx: V2ConnectionTo<Client>| {
-                    match broker.create(request, client_id.clone(), cx).await {
-                        Ok(response) => responder.respond(response),
-                        Err(error) => responder.respond_with_error(error),
-                    }
+                    let broker = broker.clone();
+                    let client_id = client_id.clone();
+                    let connection = cx.clone();
+                    let capabilities = broker
+                        .client_capabilities
+                        .lock()
+                        .map_err(|_| Error::internal_error())?
+                        .get(&client_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    let (parent, end) =
+                        interactions::Parent::new(&responder, connection.clone(), capabilities);
+                    cx.spawn(async move {
+                        let _end = end;
+                        let result = broker.create(request, client_id, connection, parent).await;
+                        let _ = responder.respond_with_result(result);
+                        Ok(())
+                    })
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -2571,17 +2645,31 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
                 let client_id = client_id.clone();
                 async move |request: v2::PromptRequest,
                             responder: Responder<v2::PromptResponse>,
-                            _cx: V2ConnectionTo<Client>| {
-                    let received = broker.prompt(&client_id, request)?;
-                    match received.await {
-                        Ok(Ok(response)) => responder.respond(response),
-                        Ok(Err(error)) => {
-                            responder.respond_with_error(Error::internal_error().data(error))
-                        }
-                        Err(_) => responder.respond_with_error(
-                            Error::internal_error().data("agent disconnected during prompt"),
-                        ),
-                    }
+                            cx: V2ConnectionTo<Client>| {
+                    let capabilities = broker
+                        .client_capabilities
+                        .lock()
+                        .map_err(|_| Error::internal_error())?
+                        .get(&client_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    let (parent, end) =
+                        interactions::Parent::new(&responder, cx.clone(), capabilities);
+                    let received = broker.prompt(&client_id, request, parent)?;
+                    cx.spawn(async move {
+                        let _end = end;
+                        let result = match received.await {
+                            Ok(Ok(response)) => responder.respond(response),
+                            Ok(Err(error)) => {
+                                responder.respond_with_error(Error::internal_error().data(error))
+                            }
+                            Err(_) => responder.respond_with_error(
+                                Error::internal_error().data("agent disconnected during prompt"),
+                            ),
+                        };
+                        let _ = result;
+                        Ok(())
+                    })
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -2636,7 +2724,7 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
                 let client_id = client_id.clone();
                 async move |request: v2::CloseSessionRequest,
                             responder: Responder<v2::CloseSessionResponse>,
-                            _cx: V2ConnectionTo<Client>| {
+                            cx: V2ConnectionTo<Client>| {
                     let entry = broker.entry(&request.session_id)?;
                     let (reply, received) = oneshot::channel();
                     {
@@ -2651,6 +2739,7 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
                         }
                         // Prevent takeover while a close has been admitted but not completed.
                         state.closing = true;
+                        interactions::invalidate(&mut state);
                         if entry
                             .commands
                             .send(Command::Close(state.generation, reply))
@@ -2663,33 +2752,36 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
                         }
                         state.notify();
                     }
-                    match received.await {
-                        Ok(Ok(())) => {
-                            if let Some(store) = &broker.store {
-                                store
-                                    .remove(&request.session_id.to_string())
-                                    .map_err(storage_error)?;
+                    let broker = broker.clone();
+                    cx.spawn(async move {
+                        match received.await {
+                            Ok(Ok(())) => {
+                                if let Some(store) = &broker.store {
+                                    store
+                                        .remove(&request.session_id.to_string())
+                                        .map_err(storage_error)?;
+                                }
+                                let mut sessions = broker
+                                    .sessions
+                                    .lock()
+                                    .map_err(|_| Error::internal_error())?;
+                                if sessions.remove(&request.session_id.to_string()).is_some() {
+                                    broker.catalog.send_modify(|revision| *revision += 1);
+                                }
+                                drop(sessions);
+                                responder.respond(v2::CloseSessionResponse::new())
                             }
-                            let mut sessions = broker
-                                .sessions
-                                .lock()
-                                .map_err(|_| Error::internal_error())?;
-                            if sessions.remove(&request.session_id.to_string()).is_some() {
-                                broker.catalog.send_modify(|revision| *revision += 1);
+                            _ => {
+                                if let Ok(mut state) = entry.control.lock() {
+                                    state.closing = false;
+                                    state.notify();
+                                }
+                                responder.respond_with_error(
+                                    Error::internal_error().data("agent could not close session"),
+                                )
                             }
-                            drop(sessions);
-                            responder.respond(v2::CloseSessionResponse::new())
                         }
-                        _ => {
-                            if let Ok(mut state) = entry.control.lock() {
-                                state.closing = false;
-                                state.notify();
-                            }
-                            responder.respond_with_error(
-                                Error::internal_error().data("agent could not close session"),
-                            )
-                        }
-                    }
+                    })
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -2697,12 +2789,13 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
         .on_receive_notification(
             async move |request: v2::CancelSessionNotification, _cx: V2ConnectionTo<Client>| {
                 let entry = broker.entry(&request.session_id)?;
-                let state = entry.control.lock().map_err(|_| Error::internal_error())?;
+                let mut state = entry.control.lock().map_err(|_| Error::internal_error())?;
                 if state.owner(&client_id, request.meta.as_ref()).is_err() {
                     // JSON-RPC notifications have no response channel; never forward a stale cancel.
                     tracing::debug!("ignored cancel from stale Hive controller");
                     return Ok(());
                 }
+                interactions::invalidate(&mut state);
                 entry
                     .commands
                     .send(Command::Cancel(state.generation))
@@ -2858,11 +2951,73 @@ async fn shutdown_signal() {
 mod control_tests {
     use super::*;
 
+    #[tokio::test(start_paused = true)]
+    async fn startup_waits_for_human_input_but_still_times_out_a_silent_agent() {
+        let control = Arc::new(Mutex::new(detached()));
+        control.lock().unwrap().pending_interactions = 1;
+        let ready = async {
+            tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+            "ready"
+        };
+        assert_eq!(interactions::startup(&control, ready).await, Ok("ready"));
+        control.lock().unwrap().pending_interactions = 0;
+        let started = tokio::time::Instant::now();
+        assert!(
+            interactions::startup(&control, std::future::pending::<()>())
+                .await
+                .is_err()
+        );
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(15));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_permission_expires_without_retaining_a_pending_waiter() {
+        let mut state = detached();
+        state.pilot = None;
+        let control = Arc::new(Mutex::new(state));
+        let started = tokio::time::Instant::now();
+        let response = interactions::permission(
+            control.clone(),
+            v2::RequestPermissionRequest::new(v2::SessionId::new("session"), "Run?", vec![]),
+        )
+        .await;
+        assert!(matches!(
+            response.outcome,
+            v2::RequestPermissionOutcome::Cancelled
+        ));
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(120));
+        assert_eq!(control.lock().unwrap().pending_interactions, 0);
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_a_spawned_waiter_starts_cannot_revive_the_old_interaction() {
+        let control = Arc::new(Mutex::new(detached()));
+        let pending = interactions::permission(
+            control.clone(),
+            v2::RequestPermissionRequest::new(v2::SessionId::new("session"), "Run?", vec![]),
+        );
+        interactions::invalidate(&mut control.lock().unwrap());
+        let response = pending.await;
+        assert!(matches!(
+            response.outcome,
+            v2::RequestPermissionOutcome::Cancelled
+        ));
+        assert_eq!(control.lock().unwrap().pending_interactions, 0);
+    }
+
     fn detached() -> Control {
         let (changed, _) = watch::channel(1);
         let (catalog, _) = watch::channel(0);
         Control {
             generation: 1,
+            parents: HashMap::new(),
+            startup_parent: None,
+            prompt_parents: HashMap::new(),
+            client_capabilities: HashMap::new(),
+            interaction_epoch: 0,
+            pending_interactions: 0,
+            urls: HashMap::new(),
+            early_completions: HashMap::new(),
             token: "first".into(),
             pilot: Some("test".into()),
             subscribers: HashMap::new(),

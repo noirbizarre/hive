@@ -2,10 +2,88 @@ import { afterEach, beforeEach, test } from 'node:test';
 import { strict as assert } from 'node:assert';
 import { JSDOM } from 'jsdom';
 import { readFileSync } from 'node:fs';
-import { connect, conversation, mount } from './app.js';
+import { connect, conversation, mount, validateContent } from './app.js';
 
 const session = { sessionId: 'hive-tui', cwd: '/workspace', agent: 'pi', title: 'Review parser',
   activity: 'idle', controlOwner: 'tui-connection', lastActivityAt: 1791754566280 };
+
+test('browser and native form validation obey the same conformance cases', () => {
+  const cases = JSON.parse(readFileSync(new URL('../../crates/hive-protocol/tests/fixtures/elicitation.json', import.meta.url)));
+  for (const item of cases) {
+    if (item.valid) assert.doesNotThrow(() => validateContent(item.schema, item.content), item.name);
+    else assert.throws(() => validateContent(item.schema, item.content), undefined, item.name);
+  }
+});
+
+test('an inbound request cannot resolve an outbound request with the same id', async () => {
+  const sockets = transport((socket, message) => {
+    if (!message.method || message.method === 'session/prompt') return false;
+  });
+  const client = connect('ws://localhost/acp');
+  await client.open(session);
+  await client.takeControl();
+  let acknowledged = false;
+  const prompt = client.prompt('go').then(() => { acknowledged = true; });
+  await new Promise(resolve => setImmediate(resolve));
+  const sent = sockets[0].sent.find(message => message.method === 'session/prompt');
+  sockets[0].receive({ jsonrpc: '2.0', id: sent.id, method: 'session/request_permission', params: { sessionId: session.sessionId, title: 'Run?', options: [{ optionId: 'allow', name: 'Allow once' }] } });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(acknowledged, false);
+  assert.equal(client.respond({ outcome: { outcome: 'selected', optionId: 'invented' } }, sent.id), false);
+  assert.equal(client.respond({ outcome: { outcome: 'cancelled' } }, sent.id), true);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(acknowledged, false);
+  sockets[0].receive({ jsonrpc: '2.0', id: sent.id, result: { messageId: 'ack' } });
+  await prompt;
+  client.close();
+});
+
+test('queued interactions retain their ids and cancellation withdraws only its target', async () => {
+  const sockets = transport();
+  const client = connect('ws://localhost/acp');
+  await client.open(session);
+  await client.takeControl();
+  for (const id of ['first', 'second', 'third']) sockets[0].receive({ jsonrpc: '2.0', id, method: 'session/request_permission', params: { sessionId: session.sessionId, title: id, options: [] } });
+  assert.equal(client.state().interaction.id, 'first');
+  sockets[0].receive({ jsonrpc: '2.0', method: '$/cancel_request', params: { requestId: 'second' } });
+  assert.equal(client.respond({ outcome: { outcome: 'cancelled' } }, 'first'), true);
+  assert.equal(client.state().interaction.id, 'third');
+  sockets[0].receive({ jsonrpc: '2.0', method: '$/cancel_request', params: { requestId: 'third' } });
+  assert.equal(client.state().interaction, undefined);
+  assert.equal(client.respond({ outcome: { outcome: 'selected', optionId: 'allow' } }, 'third'), false);
+  client.close();
+});
+
+test('URL completion can arrive before create or acceptance and remains visible afterwards', async () => {
+  const sockets = transport();
+  const client = connect('ws://localhost/acp');
+  await client.open(session);
+  await client.takeControl();
+  sockets[0].receive({ jsonrpc: '2.0', method: 'elicitation/complete', params: { elicitationId: 'flow' } });
+  sockets[0].receive({ jsonrpc: '2.0', id: 'url', method: 'elicitation/create', params: { sessionId: session.sessionId, mode: 'url', elicitationId: 'flow', url: 'https://example.com', message: 'Authenticate' } });
+  sockets[0].receive({ jsonrpc: '2.0', method: 'elicitation/complete', params: { elicitationId: 'flow' } });
+  assert.equal(client.respond({ action: 'accept' }, 'url'), true);
+  assert.equal(client.state().urlFlows[0].complete, true);
+  sockets[0].receive({ jsonrpc: '2.0', method: 'elicitation/complete', params: { elicitationId: 'unknown' } });
+  assert.equal(client.state().urlFlows.length, 1);
+  client.close();
+});
+
+test('a live request scoped form can be answered before session creation completes', async () => {
+  let create;
+  const sockets = transport((socket, message, result) => {
+    if (message.method === 'session/new') { create = { id: message.id, result }; return false; }
+  });
+  const client = connect('ws://localhost/acp');
+  const prompting = client.prompt('go');
+  await new Promise(resolve => setImmediate(resolve));
+  sockets[0].receive({ jsonrpc: '2.0', id: 'form', method: 'elicitation/create', params: { mode: 'form', requestId: create.id, message: 'Configure', requestedSchema: { properties: { enabled: { type: 'boolean' } }, required: ['enabled'] } } });
+  assert.equal(client.state().interaction.requestScoped, true);
+  assert.equal(client.respond({ action: 'accept', content: { enabled: false } }, 'form'), true);
+  sockets[0].receive({ jsonrpc: '2.0', id: create.id, result: create.result });
+  await prompting;
+  client.close();
+});
 
 function update(seq, payload, id = session.sessionId) {
   return { jsonrpc: '2.0', method: 'session/update', params: { sessionId: id, update: payload,

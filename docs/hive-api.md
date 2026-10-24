@@ -143,7 +143,7 @@ The WebUI lists these summaries and opens a selected session, including one
 created in the TUI, read-only using its `sessionId` and `cwd`. Typing in its
 prompt explicitly requests control through ACP `session/resume`; Send remains
 unavailable until Hive confirms pilot control and the session is idle. Cancel
-and permission/elicitation responses are available only to the pilot. A
+and session-scoped permission/elicitation responses are available only to the pilot. A
 transferred pilot immediately becomes read-only. Browser reload reconstructs
 history from replay rather than trusting a cursor without rendered messages;
 WebSocket reconnect resumes observing from the last applied event and never
@@ -167,6 +167,15 @@ interaction replies. The local bridge keeps a separate ACP connection per
 plugin instance. Losing or reloading the plugin detaches that connection; the
 daemon-owned agent session continues running. The bridge does not persist
 session history or create sessions on behalf of the plugin.
+
+Interactions themselves use ACP `session/request_permission`, `elicitation/create`,
+`elicitation/complete`, and `$/cancel_request` on `/acp`. There is no operational
+HTTP question/permission protocol. Request-scoped elicitation is answered by
+the connection holding its live parent request. All clients queue concurrent
+questions, withdraw cancelled requests, validate form values, and distinguish
+URL consent from external completion. Optional-mode fallback and client
+requirements are specified in
+[ACP compatibility](acp-compatibility.md#interaction-capabilities-and-fallback).
 
 To observe the catalog, open `GET /hive/v1/sessions/events` as an EventSource
 (or another SSE client), **then** fetch `/hive/v1/sessions`. Each event is named

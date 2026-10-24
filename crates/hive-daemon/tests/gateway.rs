@@ -12,6 +12,9 @@ use tokio::{
     time::timeout,
 };
 
+#[path = "support/interactions.rs"]
+mod interactions;
+
 fn controlled(meta: &Option<v2::Meta>, key: &str) -> v2::Meta {
     let mut value = meta.clone().unwrap();
     value.get_mut("hive").unwrap()["key"] = serde_json::json!(key);
@@ -1963,7 +1966,7 @@ async fn permission_and_form_and_url_elicitation_reach_the_current_pilot() {
             responder.respond(v2::CreateElicitationResponse::new(v2::ElicitationAction::Accept(v2::ElicitationAcceptAction::new())))
         }, agent_client_protocol::on_receive_request!())
         .connect_with(HttpClient::new(format!("ws://{address}")).unwrap(), async move |cx| {
-            cx.send_request(v2::InitializeRequest::new(ProtocolVersion::V2, v2::Implementation::new("pilot", "1"))).block_task().await?;
+            cx.send_request(v2::InitializeRequest::new(ProtocolVersion::V2, v2::Implementation::new("pilot", "1")).capabilities(v2::ClientCapabilities::new().elicitation(v2::ElicitationCapabilities::new().form(v2::ElicitationFormCapabilities::new()).url(v2::ElicitationUrlCapabilities::new())))).block_task().await?;
             let opened = cx.send_request(v2::NewSessionRequest::new(std::env::current_dir().unwrap())).block_task().await?;
             cx.send_request(v2::PromptRequest::new(opened.session_id.clone(), vec!["interact".into()]).meta(controlled(&opened.meta, "requests"))).block_task().await?;
             while let Some(update) = updates.recv().await {

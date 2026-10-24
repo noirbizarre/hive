@@ -71,6 +71,7 @@ clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 miette = { version = "7", features = ["fancy"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

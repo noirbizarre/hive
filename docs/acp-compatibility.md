@@ -14,8 +14,9 @@ ID; its completed prompt response generates a v2 idle update. V1 tool calls
 are preserved as `_hive_v1_tool_call`/`_hive_v1_tool_update` events; permissions
 and supported elicitation are forwarded to the pilot. V2 permissions and
 session-scoped form/URL elicitation are forwarded to the pilot with a 120-second
-unanswered-request timeout. Request-scoped/unknown elicitation modes are
-cancelled. MCP bridge, forks, config options, compaction and other optional
+total decision deadline. Request-scoped elicitation follows a uniquely mapped,
+live parent RPC to its original requester. Unknown modes and unmapped parent
+contexts are cancelled. MCP bridge, forks, config options, compaction and other optional
 capabilities are **not** advertised. Non-text v1 prompts return an error.
 
 ACPv2 `session/new` has no standard agent selector. Hive reserves
@@ -122,9 +123,74 @@ To observe without taking control, send the same resume request with
 `"_meta":{"hive":{"mode":"observe"}}`. The pilot can relinquish without
 disconnecting by sending `"_meta":{"hive":{"mode":"relinquish", "generation":N,
 "token":"opaque"}}` in `session/resume`. Both receive live updates; another
-client sends default `session/resume` to become pilot. Agent permission and
-elicitation requests are addressed to the current pilot only, and are
-re-presented after takeover if still pending.
+client sends default `session/resume` to become pilot. Session-scoped permission
+and elicitation requests are addressed to the current pilot, and are
+re-presented after takeover if still pending and supported by that client.
+
+## Interaction capabilities and fallback
+
+The minimum Hive client contract is ACPv2 session support, permission requests,
+response correlation, and request cancellation. A permission UI must show the
+agent's title, optional description/subject, and supplied options. It returns
+the exact selected option ID or `cancelled`; no missing UI, unknown outcome,
+unsupported payload, error, or timeout authorizes an operation. A proxy retains
+future outcomes without interpreting them as approval.
+
+Elicitation is optional. Advertise `capabilities.elicitation.form: {}` only when
+forms can be presented and valid content returned; advertise `url: {}` only
+when URL consent and `elicitation/complete` notifications can be handled.
+Omitted/null modes are unsupported. Hive's TUI, browser, and Zellij bridge
+advertise both modes. Hive advertises its stable broker-supported modes to
+agents, retaining each upstream client's negotiated support separately.
+Takeover remains available to less capable clients: an interaction in a mode
+the current pilot does not advertise receives `action: "cancel"`, rather than
+being delivered to an absent UI. Observing a session requires no optional mode.
+
+Concurrent interactions retain independent RPC identities and queue without
+overwriting earlier questions. JSON-RPC IDs are connection-local: Hive allocates
+IDs on each hop and correlates responses and `$/cancel_request` notifications;
+it does not copy cancellation IDs between transports. Session cancellation
+withdraws all affected pending decisions. Disconnect permits takeover within
+the original deadline; close or worker termination clears pending waits. Old
+pilot responses cannot authorize a new generation. Queues are bounded at 128;
+overflow cancels safely.
+
+Native v2 `session/new` and dispatched `session/prompt` requests provide live
+parent-ID mappings for request-scoped elicitation. These requests return to
+their originating connection even after pilot transfer. Parent completion or
+cancellation ends child waits. Repeated logical prompts with multiple RPC
+waiters have no unique parent. Downstream initialization, autonomous recovery,
+and unmapped/expired parents are safely cancelled with the diagnostic log code
+`hive::interactions::unmapped_parent`; use session-scoped elicitation or a live
+mapped request instead. The v1 adapter supports session-scoped elicitation.
+
+Forms use ACP primitive schemas, including required fields, choices/titled
+choices, booleans, numeric bounds, string length/pattern constraints, and
+multiselect item counts. Invalid input stays editable; unknown field types are
+not treated as strings. Defaults are suggestions, never automatic submissions.
+Formats are annotations, including unknown/future formats. To keep validation consistent across hosts,
+patterns use the common ASCII Rust/ECMAScript subset without escapes,
+lookaround, character-set algebra, or dot wildcards; patterned values containing line separators are
+rejected. Unsupported patterns cancel the form. The browser rejects integers
+outside JavaScript's safe integer range instead of rounding them.
+
+Terminal forms edit one field at a time: Tab changes fields (Shift-Tab also
+works in the TUI), arrows choose booleans/single-choice values, and arrows/Space
+toggle multiselect choices. Enter submits and Esc declines. Ctrl-Space includes
+an empty optional string/array; `|` or a JSON string array can also enter array
+values. Page Up/Down inspect long context. Permission selection is
+explicit by number. Browser forms provide labelled controls and inline errors.
+
+URL links require explicit user action and HTTP(S). Continue/Enter consents to
+proceed; it does not claim that authentication succeeded. Completion is reported
+only on `elicitation/complete`, including if it arrives before the create
+response. Hive translates worker-local elicitation IDs to avoid collisions on
+a shared upstream connection, preserves completion metadata, and routes to the
+actual recipients. Accepted flows are not restarted on takeover. Completion
+records expire after 120 seconds or session cancellation/termination.
+
+These guarantees are exercised by scripted protocol peers and client tests;
+they do not upgrade the real-agent compatibility matrix above.
 
 Every upstream `session/prompt` and `session/close` request and `session/cancel`
 notification needs `_meta.hive.generation` and `_meta.hive.token` from the

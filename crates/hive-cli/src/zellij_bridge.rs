@@ -49,7 +49,9 @@ struct Request {
     seq: Option<u64>,
     text: Option<String>,
     key: Option<String>,
+    // The local transport envelope carries an ordinary ACP response, not a second answer schema.
     answer: Option<Value>,
+    interaction_id: Option<String>,
 }
 
 enum Interaction {
@@ -63,6 +65,18 @@ enum Interaction {
     ),
 }
 
+impl Interaction {
+    fn request_scoped(&self) -> bool {
+        matches!(self, Self::Elicitation(request, _) if matches!(request.scope(), v2::ElicitationScope::Request(_)))
+    }
+    fn expired(&self) -> bool {
+        match self {
+            Self::Permission(_, tx) => tx.is_closed(),
+            Self::Elicitation(_, tx) => tx.is_closed(),
+        }
+    }
+}
+
 #[derive(Default)]
 struct ClientState {
     id: Option<String>,
@@ -72,7 +86,10 @@ struct ClientState {
     running: bool,
     seq: u64,
     updates: VecDeque<Value>,
-    interaction: Option<Interaction>,
+    interactions: VecDeque<(String, Interaction)>,
+    url_flows: HashMap<String, bool>,
+    url_deadlines: HashMap<String, Instant>,
+    early_completions: HashMap<String, Instant>,
     // A disconnected acknowledgement must never be retried under a new key.
     pending_prompt: Option<(String, String)>,
     // Keep the last acknowledged key for a WebAccess timeout that hid its response.
@@ -84,60 +101,15 @@ fn elicitation_answer(
     raw: Value,
 ) -> Result<v2::CreateElicitationResponse, String> {
     if raw["action"] != "accept" {
+        if raw["action"] != "cancel" && raw["action"] != "decline" {
+            return Err("Choose accept, decline, or cancel".into());
+        }
         return serde_json::from_value(raw).map_err(|e| format!("Invalid input: {e}"));
     }
-    if let v2::ElicitationMode::Form(form) = &request.mode {
-        let values = raw["content"]
-            .as_object()
-            .ok_or("Enter the requested form fields")?;
-        let mut content = std::collections::BTreeMap::new();
-        for (key, value) in values {
-            let schema = form
-                .requested_schema
-                .properties
-                .get(key)
-                .ok_or_else(|| format!("Unknown field: {key}"))?;
-            let type_name = serde_json::to_value(schema).map_err(|e| e.to_string())?["type"]
-                .as_str()
-                .unwrap_or("string")
-                .to_owned();
-            let text = value
-                .as_str()
-                .ok_or_else(|| format!("{key} must be text"))?;
-            let parsed = match type_name.as_str() {
-                "integer" => v2::ElicitationContentValue::Integer(
-                    text.parse()
-                        .map_err(|_| format!("{key} needs an integer"))?,
-                ),
-                "number" => v2::ElicitationContentValue::Number(
-                    text.parse().map_err(|_| format!("{key} needs a number"))?,
-                ),
-                "boolean" => v2::ElicitationContentValue::Boolean(
-                    text.parse()
-                        .map_err(|_| format!("{key} needs true or false"))?,
-                ),
-                "array" => v2::ElicitationContentValue::StringArray(
-                    text.split('|').map(str::to_owned).collect(),
-                ),
-                _ => v2::ElicitationContentValue::String(text.into()),
-            };
-            content.insert(key.clone(), parsed);
-        }
-        for required in form
-            .requested_schema
-            .required
-            .as_deref()
-            .unwrap_or_default()
-        {
-            if !content.contains_key(required) {
-                return Err(format!("Required field: {required}"));
-            }
-        }
-        return Ok(v2::CreateElicitationResponse::new(
-            v2::ElicitationAction::Accept(v2::ElicitationAcceptAction::new().content(content)),
-        ));
-    }
-    serde_json::from_value(raw).map_err(|e| format!("Invalid input: {e}"))
+    let response = serde_json::from_value(raw).map_err(|e| format!("Invalid input: {e}"))?;
+    hive_protocol::interactions::validate_elicitation(request, &response)
+        .map_err(|error| error.to_string())?;
+    Ok(response)
 }
 
 impl ClientState {
@@ -160,18 +132,25 @@ impl ClientState {
         {
             return Err("History expired; attach without history explicitly".into());
         }
-        let interaction = match &self.interaction {
-            Some(Interaction::Permission(req, _)) if self.pilot() => {
-                json!({"type":"permission", "request":req})
+        let interaction = match self
+            .interactions
+            .iter()
+            .find(|(_, interaction)| !interaction.expired())
+        {
+            Some((id, Interaction::Permission(req, _))) if self.pilot() => {
+                json!({"id":id,"type":"permission", "request":req})
             }
-            Some(Interaction::Elicitation(req, _)) if self.pilot() => {
-                json!({"type":"elicitation", "request":req})
+            Some((id, Interaction::Elicitation(req, _)))
+                if self.pilot() || matches!(req.scope(), v2::ElicitationScope::Request(_)) =>
+            {
+                json!({"id":id,"type":"elicitation", "request":req})
             }
             _ => Value::Null,
         };
         Ok(
             json!({"sessionId":self.id, "pilot":self.pilot(), "running":self.running,
             "generation":self.generation, "seq":self.seq, "interaction":interaction,
+            "urlFlows":self.url_flows.iter().map(|(id, complete)| (id.clone(), if !complete && self.url_deadlines.get(id).is_some_and(|expires| *expires <= Instant::now()) { Value::Null } else { json!(complete) })).collect::<serde_json::Map<String,Value>>(),
             "updates":self.updates.iter().filter(|u| u["seq"].as_u64().is_some_and(|n| n >= since)).collect::<Vec<_>>(),
             "pendingPrompt":self.pending_prompt.as_ref().map(|(key,text)| json!({"key":key,"text":text}))}),
         )
@@ -207,8 +186,18 @@ impl ClientState {
                 .unwrap_or(self.generation);
             if !self.pilot() {
                 self.owner = None;
-                self.interaction = None;
+                self.interactions
+                    .retain(|(_, interaction)| interaction.request_scoped());
             }
+        }
+        if let v2::SessionUpdate::Other(other) = &update.update
+            && other.session_update == "_hive_activity"
+            && other.fields.get("kind") == Some(&json!("session"))
+            && other.fields.get("status") == Some(&json!("ended"))
+        {
+            self.interactions.clear();
+            self.url_flows.clear();
+            self.url_deadlines.clear();
         }
         self.seq = seq;
         self.updates
@@ -251,7 +240,9 @@ async fn resume(
             guard.seq = 0;
             guard.updates.clear();
             guard.owner = None;
-            guard.interaction = None;
+            guard.interactions.clear();
+            guard.url_flows.clear();
+            guard.url_deadlines.clear();
         }
         (if previous { guard.seq } else { 0 }, guard.owner.clone())
     };
@@ -371,7 +362,7 @@ async fn command(
             }
         }
         "cancel" => {
-            let guard = state.lock().await;
+            let mut guard = state.lock().await;
             if !guard.pilot() {
                 return Err("Control changed; take control to cancel".into());
             }
@@ -382,39 +373,46 @@ async fn command(
                 .meta(guard.owner.clone().ok_or("Take control first")?),
             )
             .map_err(|e| format!("{e:?}"))?;
+            guard.interactions.clear();
+            guard.url_flows.clear();
+            guard.url_deadlines.clear();
+            guard.early_completions.clear();
             Ok(json!({"sent":true}))
         }
         "answer" => {
             let mut guard = state.lock().await;
-            if !guard.pilot() {
+            let answer = request.answer.ok_or("An answer is required")?;
+            guard
+                .interactions
+                .retain(|(_, interaction)| !interaction.expired());
+            let (id, interaction) = guard
+                .interactions
+                .front()
+                .ok_or("No pending input request")?;
+            if request.interaction_id.as_ref() != Some(id) {
+                return Err("Request expired; refresh before answering".into());
+            }
+            if !guard.pilot() && !interaction.request_scoped() {
                 return Err("Control changed; cannot answer".into());
             }
-            let answer = request.answer.ok_or("An answer is required")?;
-            let interaction = guard
-                .interaction
-                .as_ref()
-                .ok_or("No pending input request")?;
             let validated = match interaction {
                 Interaction::Permission(req, _) => {
-                    let response = if let Some(option) = answer["optionId"].as_str() {
-                        if !req
-                            .options
-                            .iter()
-                            .any(|o| o.option_id.to_string() == option)
-                        {
-                            return Err("Select a listed option".into());
-                        }
-                        v2::RequestPermissionResponse::new(v2::RequestPermissionOutcome::Selected(
-                            v2::SelectedPermissionOutcome::new(option),
-                        ))
-                    } else {
-                        v2::RequestPermissionResponse::new(v2::RequestPermissionOutcome::Cancelled)
-                    };
+                    let response: v2::RequestPermissionResponse = serde_json::from_value(answer)
+                        .map_err(|_| "Return an ACP permission selection or cancellation")?;
+                    if !hive_protocol::interactions::validate_permission(req, &response)
+                        || !matches!(
+                            response.outcome,
+                            v2::RequestPermissionOutcome::Selected(_)
+                                | v2::RequestPermissionOutcome::Cancelled
+                        )
+                    {
+                        return Err("Select a listed option or cancel".into());
+                    }
                     Ok(response)
                 }
                 Interaction::Elicitation(req, _) => Err(elicitation_answer(req, answer)?),
             };
-            let interaction = guard.interaction.take().ok_or("Request expired")?;
+            let (_, interaction) = guard.interactions.pop_front().ok_or("Request expired")?;
             match interaction {
                 Interaction::Permission(_, tx) => {
                     let response = validated.unwrap_or_else(|_| unreachable!());
@@ -474,26 +472,132 @@ async fn connection(url: String, mut commands: mpsc::UnboundedReceiver<Command>)
             .on_receive_request(
                 async move |req: v2::RequestPermissionRequest,
                             responder: Responder<v2::RequestPermissionResponse>,
-                            _: V2ConnectionTo<Agent>| {
+                            cx: V2ConnectionTo<Agent>| {
                     let (tx, rx) = oneshot::channel();
-                    permissions.lock().await.interaction = Some(Interaction::Permission(req, tx));
-                    responder.respond(rx.await.unwrap_or_else(|_| {
-                        v2::RequestPermissionResponse::new(v2::RequestPermissionOutcome::Cancelled)
-                    }))
+                    let mut state = permissions.lock().await;
+                    state
+                        .interactions
+                        .retain(|(_, interaction)| !interaction.expired());
+                    if state.interactions.len() < 128 {
+                        state.interactions.push_back((
+                            uuid::Uuid::new_v4().to_string(),
+                            Interaction::Permission(req, tx),
+                        ));
+                    }
+                    drop(state);
+                    let cancellation = responder.cancellation();
+                    cx.spawn(async move {
+                        let result = cancellation
+                            .run_until_cancelled(async {
+                                Ok(rx.await.unwrap_or_else(|_| {
+                                    v2::RequestPermissionResponse::new(
+                                        v2::RequestPermissionOutcome::Cancelled,
+                                    )
+                                }))
+                            })
+                            .await;
+                        let _ = responder.respond_with_result(result);
+                        Ok(())
+                    })
                 },
                 agent_client_protocol::on_receive_request!(),
             )
             .on_receive_request(
                 async move |req: v2::CreateElicitationRequest,
                             responder: Responder<v2::CreateElicitationResponse>,
-                            _: V2ConnectionTo<Agent>| {
+                            cx: V2ConnectionTo<Agent>| {
+                    let url_id = match &req.mode { v2::ElicitationMode::Url(url) => Some(url.elicitation_id.to_string()), _ => None };
                     let (tx, rx) = oneshot::channel();
-                    elicitations.lock().await.interaction = Some(Interaction::Elicitation(req, tx));
-                    responder.respond(rx.await.unwrap_or_else(|_| {
-                        v2::CreateElicitationResponse::new(v2::ElicitationAction::Cancel)
-                    }))
+                    let mut state = elicitations.lock().await;
+                    state
+                        .interactions
+                        .retain(|(_, interaction)| !interaction.expired());
+                    let supported = match &req.mode {
+                        v2::ElicitationMode::Form(form) => {
+                            hive_protocol::interactions::schema_supported(
+                                &serde_json::to_value(&form.requested_schema)
+                                    .map_err(agent_client_protocol::Error::into_internal_error)?,
+                            )
+                        }
+                        v2::ElicitationMode::Url(url) => {
+                            hive_protocol::interactions::safe_url(&url.url)
+                        }
+                        _ => false,
+                    };
+                    if supported && state.interactions.len() < 128 {
+                        if let v2::ElicitationMode::Url(url) = &req.mode {
+                            if state.url_flows.len() >= 128 {
+                                state.url_flows.clear();
+                                state.url_deadlines.clear();
+                            }
+                            state.url_deadlines.insert(
+                                url.elicitation_id.to_string(),
+                                Instant::now() + Duration::from_secs(120),
+                            );
+                            let complete = state
+                                .early_completions
+                                .remove(&url.elicitation_id.to_string())
+                                .is_some_and(|expires| expires > Instant::now());
+                            state
+                                .url_flows
+                                .insert(url.elicitation_id.to_string(), complete);
+                        }
+                        state.interactions.push_back((
+                            uuid::Uuid::new_v4().to_string(),
+                            Interaction::Elicitation(req, tx),
+                        ));
+                    }
+                    drop(state);
+                    let cancellation = responder.cancellation();
+                    let state = elicitations.clone();
+                    cx.spawn(async move {
+                        let result = cancellation
+                            .run_until_cancelled(async {
+                                Ok(rx.await.unwrap_or_else(|_| {
+                                    v2::CreateElicitationResponse::new(
+                                        v2::ElicitationAction::Cancel,
+                                    )
+                                }))
+                            })
+                            .await;
+                        if !matches!(&result, Ok(response) if matches!(response.action, v2::ElicitationAction::Accept(_)))
+                            && let Some(id) = url_id {
+                            let mut state = state.lock().await;
+                            state.url_flows.remove(&id);
+                            state.url_deadlines.remove(&id);
+                        }
+                        let _ = responder.respond_with_result(result);
+                        Ok(())
+                    })
                 },
                 agent_client_protocol::on_receive_request!(),
+            )
+            .on_receive_notification(
+                {
+                    let state = state.clone();
+                    async move |notification: v2::CompleteElicitationNotification,
+                                _: V2ConnectionTo<Agent>| {
+                        let mut state = state.lock().await;
+                        if let Some(complete) = state
+                            .url_flows
+                            .get_mut(&notification.elicitation_id.to_string())
+                        {
+                            *complete = true;
+                        } else {
+                            state
+                                .early_completions
+                                .retain(|_, expires| *expires > Instant::now());
+                            if state.early_completions.len() < 128 {
+                                state.early_completions.insert(
+                                    notification.elicitation_id.to_string(),
+                                    Instant::now() + Duration::from_secs(120),
+                                );
+                            }
+                        }
+                        Ok(())
+                    }
+                },
+                agent_client_protocol::on_receive_notification!(),
             )
             .connect_with(transport, async |cx| {
                 cx.send_request(
@@ -550,7 +654,14 @@ async fn connection(url: String, mut commands: mpsc::UnboundedReceiver<Command>)
         if commands.is_closed() {
             break;
         }
-        state.lock().await.owner = None;
+        {
+            let mut state = state.lock().await;
+            state.owner = None;
+            state.interactions.clear();
+            state.url_flows.clear();
+            state.url_deadlines.clear();
+            state.early_completions.clear();
+        }
         tracing::warn!("Zellij ACP connection lost ({result:?}); reconnecting");
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
@@ -718,11 +829,9 @@ mod tests {
             )
             .is_err()
         );
-        let answer = elicitation_answer(
-            &req,
-            json!({"action":"accept","content":{"approved":"true"}}),
-        )
-        .unwrap();
+        let answer =
+            elicitation_answer(&req, json!({"action":"accept","content":{"approved":true}}))
+                .unwrap();
         assert_eq!(
             serde_json::to_value(answer).unwrap()["content"]["approved"],
             true
@@ -790,6 +899,7 @@ mod tests {
                                             v2::ElicitationUrlMode::new(v2::ElicitationSessionScope::new(req.session_id.clone()),"auth", "https://example.com"), "Authenticate"))
                                             .block_task().await?;
                                         assert!(matches!(answer.action, v2::ElicitationAction::Accept(_)));
+                                        cx.send_notification(v2::CompleteElicitationNotification::new("auth"))?;
                                         cx.send_notification(v2::UpdateSessionNotification::new(req.session_id,
                                             v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(v2::IdleStateUpdate::new()))))
                                     }.await;
@@ -988,14 +1098,17 @@ mod tests {
             assert!(error["error"].as_str().unwrap_or("").contains("pending"));
         }
         for (kind, answer) in [
-            ("permission", json!({"optionId":"allow"})),
+            (
+                "permission",
+                json!({"outcome":{"outcome":"selected","optionId":"allow"}}),
+            ),
             (
                 "elicitation",
-                json!({"action":"accept","content":{"approved":"true"}}),
+                json!({"action":"accept","content":{"approved":true}}),
             ),
             ("elicitation", json!({"action":"accept"})),
         ] {
-            tokio::time::timeout(Duration::from_secs(10), async {
+            let interaction_id = tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
                     let view: Value = post(json!({"action":"poll","client":client,"seq":1}))
                         .await
@@ -1011,14 +1124,20 @@ mod tests {
                                 && answer["content"].is_null()
                                 && view["interaction"]["request"]["mode"] == "url"))
                     {
-                        break;
+                        break view["interaction"]["id"].clone();
                     }
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
             })
             .await
             .unwrap();
-            let response = post(json!({"action":"answer","client":client,"answer":answer}))
+            let stale = post(
+                json!({"action":"answer","client":client,"interactionId":"stale","answer":answer}),
+            )
+            .await
+            .unwrap();
+            assert!(!stale.status().is_success());
+            let response = post(json!({"action":"answer","client":client,"interactionId":interaction_id,"answer":answer}))
                 .await
                 .unwrap();
             assert!(
@@ -1027,6 +1146,25 @@ mod tests {
                 response.text().await.unwrap()
             );
         }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let view: Value = post(json!({"action":"poll","client":client,"seq":1}))
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+                if view["urlFlows"]
+                    .as_object()
+                    .is_some_and(|flows| flows.values().any(|complete| complete == true))
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the bridge did not expose URL completion");
         if !accepted {
             // Retrying the original key cannot dispatch a second agent prompt.
             let retried = post(json!({"action":"retry","client":client}))

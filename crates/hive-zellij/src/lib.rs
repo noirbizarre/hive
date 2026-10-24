@@ -19,6 +19,11 @@ struct ZjHive {
     seq: u64,
     lines: Vec<String>,
     input: String,
+    form_field: usize,
+    form_choice: usize,
+    form_values: BTreeMap<String, String>,
+    form_error: Option<String>,
+    interaction_scroll: usize,
     status: String,
     stale: bool,
     skip_history: bool,
@@ -77,6 +82,10 @@ impl ZjHive {
         }
         let mut payload = payload;
         payload["action"] = json!(kind);
+        if kind == "answer" {
+            // A delayed WebAccess action must never answer the next queued interaction.
+            payload["interactionId"] = self.view["interaction"]["id"].clone();
+        }
         if let Some(client) = &self.client {
             payload["client"] = json!(client);
         }
@@ -114,6 +123,15 @@ impl ZjHive {
         };
         if self.active.as_deref() != Some(id) {
             return;
+        }
+        if self.view["interaction"]["id"] != view["interaction"]["id"] {
+            // Drafts belong to an interaction, not whichever question happens to be on screen.
+            self.form_field = 0;
+            self.form_choice = 0;
+            self.interaction_scroll = 0;
+            self.form_values.clear();
+            self.form_error = None;
+            self.input.clear();
         }
         if view["seq"].as_u64().is_some_and(|n| n < self.seq) {
             self.status = "Daemon restarted or replay reset; reopen this session".into();
@@ -169,6 +187,9 @@ impl ZjHive {
     }
 
     fn failed(&mut self, kind: &str, message: String) {
+        if kind == "answer" {
+            self.form_error = Some(message.clone());
+        }
         self.status = message;
         if kind == "catalog" || kind == "poll" || kind == "register" {
             self.stale = true;
@@ -282,19 +303,111 @@ impl ZjHive {
         true
     }
 
+    fn choices(field: &Value) -> Vec<String> {
+        if field["type"] == "boolean" {
+            return vec!["true".into(), "false".into()];
+        }
+        let field = if field["type"] == "array" {
+            &field["items"]
+        } else {
+            field
+        };
+        field["enum"]
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .or_else(|| {
+                field
+                    .get("oneOf")
+                    .or_else(|| field.get("anyOf"))
+                    .and_then(Value::as_array)
+                    .map(|values| {
+                        values
+                            .iter()
+                            .filter_map(|value| value["const"].as_str().map(str::to_owned))
+                            .collect()
+                    })
+            })
+            .unwrap_or_default()
+    }
+
+    fn save_form_field(&mut self, request: &serde_json::Map<String, Value>) {
+        if let Some(fields) = request["requestedSchema"]["properties"].as_object()
+            && let Some((name, field)) = fields.iter().nth(self.form_field)
+        {
+            let required = request["requestedSchema"]["required"]
+                .as_array()
+                .is_some_and(|required| required.contains(&json!(name)));
+            if self.input.is_empty()
+                && !(required && matches!(field["type"].as_str(), Some("string" | "array")))
+                && !self.form_values.get(name).is_some_and(String::is_empty)
+            {
+                self.form_values.remove(name);
+            } else {
+                self.form_values.insert(name.clone(), self.input.clone());
+            }
+        }
+    }
+
+    fn field_value(field: &Value, text: &str) -> Result<Value, &'static str> {
+        match field["type"].as_str() {
+            Some("string") => Ok(json!(text)),
+            Some("integer") => text
+                .parse::<i64>()
+                .map(|value| json!(value))
+                .map_err(|_| "enter an integer"),
+            Some("number") => text
+                .parse::<f64>()
+                .ok()
+                .filter(|value| value.is_finite())
+                .map(|value| json!(value))
+                .ok_or("enter a finite number"),
+            Some("boolean") => text
+                .parse::<bool>()
+                .map(|value| json!(value))
+                .map_err(|_| "enter true or false"),
+            Some("array") if text.starts_with('[') => serde_json::from_str::<Vec<String>>(text)
+                .map(|value| json!(value))
+                .map_err(|_| "enter a JSON string array"),
+            Some("array") => Ok(if text.is_empty() {
+                json!([])
+            } else {
+                json!(text.split('|').collect::<Vec<_>>())
+            }),
+            _ => Err("unsupported field type; decline this request"),
+        }
+    }
+
     fn on_key(&mut self, key: KeyWithModifier) -> bool {
+        if key.bare_key != BareKey::Enter {
+            self.form_error = None;
+        }
         let ctrl = key.key_modifiers.contains(&KeyModifier::Ctrl);
         if ctrl && key.bare_key == BareKey::Char('c') && self.view["pilot"] == true && !self.stale {
             self.action("cancel", json!({}));
             return true;
         }
-        if let Some(request) = self.view["interaction"]["request"].as_object()
-            && self.view["pilot"] == true
+        if let Some(request) = self.view["interaction"]["request"].as_object().cloned()
+            && (self.view["pilot"] == true
+                || self.view["interaction"]["request"]["requestId"].is_number()
+                || self.view["interaction"]["request"]["requestId"].is_string())
             && !self.stale
         {
             match key.bare_key {
+                BareKey::PageUp | BareKey::PageDown => {
+                    self.interaction_scroll = if key.bare_key == BareKey::PageUp {
+                        self.interaction_scroll.saturating_sub(4)
+                    } else {
+                        self.interaction_scroll.saturating_add(4)
+                    };
+                    return true;
+                }
                 BareKey::Esc => {
-                    self.action("answer", json!({"answer": if self.view["interaction"]["type"] == "permission" { json!({}) } else { json!({"action":"decline"}) }}));
+                    self.action("answer", json!({"answer": if self.view["interaction"]["type"] == "permission" { json!({"outcome":{"outcome":"cancelled"}}) } else { json!({"action":"decline"}) }}));
                     return true;
                 }
                 BareKey::Enter => {
@@ -313,29 +426,131 @@ impl ZjHive {
                             self.status = "Enter a listed permission number".into();
                             return true;
                         };
-                        json!({"optionId":option["optionId"]})
+                        json!({"outcome":{"outcome":"selected","optionId":option["optionId"]}})
                     } else if request.get("mode").and_then(Value::as_str) == Some("url") {
                         json!({"action":"accept"})
                     } else {
+                        self.save_form_field(&request);
                         let mut content = serde_json::Map::new();
-                        for pair in self.input.split(',').filter(|p| !p.trim().is_empty()) {
-                            let Some((k, v)) = pair.split_once('=') else {
-                                self.status = "Use key=value pairs".into();
-                                return true;
-                            };
-                            content.insert(k.trim().into(), json!(v.trim()));
+                        for (name, text) in &self.form_values {
+                            let field = &request["requestedSchema"]["properties"][name];
+                            match Self::field_value(field, text) {
+                                Ok(value) => {
+                                    content.insert(name.clone(), value);
+                                }
+                                Err(message) => {
+                                    self.status = format!("{name}: {message}");
+                                    self.form_error = Some(self.status.clone());
+                                    return true;
+                                }
+                            }
                         }
                         json!({"action":"accept", "content":content})
                     };
                     self.action("answer", json!({"answer":answer}));
-                    self.input.clear();
+                    return true;
+                }
+                BareKey::Tab | BareKey::Up | BareKey::Down
+                    if request.get("mode").and_then(Value::as_str) == Some("form") =>
+                {
+                    if let Some(fields) = request["requestedSchema"]["properties"].as_object()
+                        && let Some((_name, field)) = fields.iter().nth(self.form_field)
+                    {
+                        if key.bare_key == BareKey::Tab {
+                            self.save_form_field(&request);
+                            self.form_field = (self.form_field + 1) % fields.len();
+                            self.form_choice = 0;
+                            if let Some((name, field)) = fields.iter().nth(self.form_field) {
+                                self.input =
+                                    self.form_values.get(name).cloned().unwrap_or_else(|| {
+                                        field.get("default").map_or_else(String::new, |value| {
+                                            value
+                                                .as_str()
+                                                .map_or_else(|| value.to_string(), str::to_owned)
+                                        })
+                                    });
+                            }
+                        } else {
+                            let choices = Self::choices(field);
+                            if !choices.is_empty() {
+                                if field["type"] == "array" {
+                                    self.form_choice = (self.form_choice
+                                        + if key.bare_key == BareKey::Up {
+                                            choices.len() - 1
+                                        } else {
+                                            1
+                                        })
+                                        % choices.len();
+                                    self.status =
+                                        format!("Space toggles {}", choices[self.form_choice]);
+                                } else {
+                                    let index = choices
+                                        .iter()
+                                        .position(|value| value == &self.input)
+                                        .map_or(0, |index| {
+                                            (index
+                                                + if key.bare_key == BareKey::Up {
+                                                    choices.len() - 1
+                                                } else {
+                                                    1
+                                                })
+                                                % choices.len()
+                                        });
+                                    self.input = choices[index].clone();
+                                }
+                            }
+                        }
+                    }
                     return true;
                 }
                 BareKey::Backspace => {
                     self.input.pop();
                     return true;
                 }
+                BareKey::Char(' ')
+                    if ctrl && request.get("mode").and_then(Value::as_str) == Some("form") =>
+                {
+                    if let Some(fields) = request["requestedSchema"]["properties"].as_object()
+                        && let Some((name, field)) = fields.iter().nth(self.form_field)
+                        && matches!(field["type"].as_str(), Some("string" | "array"))
+                    {
+                        self.form_values.insert(name.clone(), String::new());
+                        self.input.clear();
+                    }
+                    return true;
+                }
                 BareKey::Char(ch) if !ctrl => {
+                    if ch == ' '
+                        && request.get("mode").and_then(Value::as_str) == Some("form")
+                        && let Some(fields) = request["requestedSchema"]["properties"].as_object()
+                        && let Some((_, field)) = fields.iter().nth(self.form_field)
+                        && field["type"] == "array"
+                        && !Self::choices(field).is_empty()
+                    {
+                        let choices = Self::choices(field);
+                        let choice = &choices[self.form_choice];
+                        let mut values = if self.input.starts_with('[') {
+                            match serde_json::from_str::<Vec<String>>(&self.input) {
+                                Ok(values) => values,
+                                Err(_) => {
+                                    self.status =
+                                        "Enter a JSON string array before toggling choices".into();
+                                    return true;
+                                }
+                            }
+                        } else if self.input.is_empty() {
+                            Vec::new()
+                        } else {
+                            self.input.split('|').map(str::to_owned).collect()
+                        };
+                        if values.contains(choice) {
+                            values.retain(|value| value != choice);
+                        } else {
+                            values.push(choice.clone());
+                        }
+                        self.input = serde_json::to_string(&values).expect("strings serialize");
+                        return true;
+                    }
                     self.input.push(ch);
                     return true;
                 }
@@ -571,16 +786,23 @@ impl ZellijPlugin for ZjHive {
                         "Permission: {}",
                         req["title"].as_str().unwrap_or("Agent request")
                     ));
+                    if let Some(description) = req["description"].as_str() {
+                        lines.push(description.into());
+                    }
+                    if let Some(subject) = req.get("subject") {
+                        lines.push(subject.to_string());
+                    }
                     if let Some(options) = req["options"].as_array() {
                         for (i, option) in options.iter().enumerate() {
                             lines.push(format!(
-                                "{}: {}",
+                                "{}: {} ({})",
                                 i + 1,
-                                option["name"].as_str().unwrap_or("?")
+                                option["name"].as_str().unwrap_or("?"),
+                                option["kind"].as_str().unwrap_or("custom")
                             ));
                         }
                     }
-                    lines.push("Enter option number · Esc decline".into());
+                    lines.push("Enter option number · Esc decline · PgUp/PgDn details".into());
                 } else {
                     lines.push(format!(
                         "Input: {}",
@@ -588,35 +810,93 @@ impl ZellijPlugin for ZjHive {
                     ));
                     if req["mode"] == "url" {
                         lines.push(format!(
-                            "Open {} then press Enter",
+                            "Open {} · Enter consents to continue (completion comes from agent)",
                             req["url"].as_str().unwrap_or("?")
                         ));
                     } else {
-                        let fields = req["requestedSchema"]["properties"]
-                            .as_object()
-                            .map(|p| p.keys().cloned().collect::<Vec<_>>().join(", "))
-                            .unwrap_or_default();
-                        lines.push(format!("Fields: {fields} · enter key=value pairs"));
+                        if let Some(fields) = req["requestedSchema"]["properties"].as_object() {
+                            for (index, (name, field)) in fields.iter().enumerate() {
+                                lines.push(format!(
+                                    "{} {} ({}) {}",
+                                    if index == self.form_field { "→" } else { " " },
+                                    field["title"].as_str().unwrap_or(name),
+                                    field["type"].as_str().unwrap_or("unknown"),
+                                    if req["requestedSchema"]["required"]
+                                        .as_array()
+                                        .is_some_and(|required| required.contains(&json!(name)))
+                                    {
+                                        "required"
+                                    } else {
+                                        "optional"
+                                    }
+                                ));
+                                if index == self.form_field {
+                                    if let Some(description) = field["description"].as_str() {
+                                        lines.push(description.into());
+                                    }
+                                    lines.push(format!("Constraints: {field}"));
+                                    if let Some(choices) = field
+                                        .get("enum")
+                                        .or_else(|| field.get("oneOf"))
+                                        .or_else(|| field.get("items"))
+                                    {
+                                        lines.push(format!("Choices: {choices}"));
+                                    }
+                                }
+                            }
+                        }
+                        lines.push(
+                            "Tab: next field · arrows: choices · arrays: separate with |".into(),
+                        );
                     }
                     lines.push("Enter accept · Esc decline".into());
                 }
             }
             lines.push(format!("› {}", self.input));
+            if let Some(flows) = self.view["urlFlows"].as_object() {
+                for complete in flows.values() {
+                    lines.push(
+                        if complete.is_null() {
+                            "Completion not received before timeout"
+                        } else if complete == true {
+                            "External elicitation completed"
+                        } else {
+                            "Waiting for external completion"
+                        }
+                        .into(),
+                    );
+                }
+            }
             lines.push("Ctrl-T takeover · Ctrl-H release · Ctrl-R retry · Esc detach".into());
         }
         lines.push(format!(
             "{}{}",
             if self.stale { "STALE · " } else { "" },
-            self.status
+            self.form_error.as_deref().unwrap_or(&self.status)
         ));
-        for line in lines.into_iter().take(rows) {
-            // Control characters in daemon-provided titles or chunks must not escape the pane.
-            let printable: String = line
-                .chars()
-                .filter(|ch| !ch.is_control())
-                .take(cols)
-                .collect();
-            println!("{printable}");
+        let wrapped: Vec<String> = lines
+            .into_iter()
+            .flat_map(|line| {
+                // Wrapping instead of clipping makes long subjects and choice labels inspectable.
+                let printable: Vec<char> = line.chars().filter(|ch| !ch.is_control()).collect();
+                if printable.is_empty() {
+                    vec![String::new()]
+                } else {
+                    printable
+                        .chunks(cols.max(1))
+                        .map(|chunk| chunk.iter().collect())
+                        .collect()
+                }
+            })
+            .collect();
+        let scroll = if self.view["interaction"].is_object() {
+            self.interaction_scroll
+                .min(wrapped.len().saturating_sub(rows))
+        } else {
+            0
+        };
+        for line in wrapped.into_iter().skip(scroll).take(rows) {
+            println!("{line}");
         }
     }
 }
@@ -836,6 +1116,29 @@ mod tests {
     }
 
     #[test]
+    fn multiselect_controls_preserve_values_containing_separators() {
+        let mut plugin = ZjHive {
+            permitted: true,
+            client: Some("client".into()),
+            active: Some("session".into()),
+            ..ZjHive::default()
+        };
+        plugin.consume_view(json!({"sessionId":"session","seq":0,"updates":[],"pilot":true,"interaction":{"id":"multi","type":"elicitation","request":{"mode":"form","requestedSchema":{"properties":{"tags":{"type":"array","items":{"type":"string","enum":["a|b","c"]}}},"required":["tags"]}}}}));
+        plugin.on_key(key(BareKey::Char(' '), false));
+        plugin.on_key(key(BareKey::Down, false));
+        plugin.on_key(key(BareKey::Char(' '), false));
+        assert_eq!(
+            serde_json::from_str::<Value>(&plugin.input).unwrap(),
+            json!(["a|b", "c"])
+        );
+        plugin.on_key(key(BareKey::Enter, false));
+        assert_eq!(
+            serde_json::from_str::<Value>(&plugin.form_values["tags"]).unwrap(),
+            json!(["a|b", "c"])
+        );
+    }
+
+    #[test]
     fn pilot_input_actions_are_validated_before_the_bridge_receives_them() {
         let mut plugin = ZjHive {
             permitted: true,
@@ -844,7 +1147,7 @@ mod tests {
             ..ZjHive::default()
         };
         plugin.consume_view(json!({"sessionId":"hive-one","seq":0,"updates":[],"pilot":true,
-            "interaction":{"type":"permission","request":{"title":"Run tool","options":[{"optionId":"allow","name":"Allow once"}]}}}));
+            "interaction":{"id":"permission","type":"permission","request":{"title":"Run tool","options":[{"optionId":"allow","name":"Allow once"}]}}}));
         plugin.render(8, 40);
         assert!(plugin.on_key(key(BareKey::Enter, false)));
         assert!(plugin.status.contains("listed permission"));
@@ -853,18 +1156,18 @@ mod tests {
         assert!(plugin.inflight.values().any(|(kind, _)| kind == "answer"));
         deliver(&mut plugin, "answer", 200, json!({"answered":true}));
         plugin.consume_view(json!({"sessionId":"hive-one","seq":0,"updates":[],"pilot":true,
-            "interaction":{"type":"elicitation","request":{"message":"Approve?","mode":"form","requestedSchema":{"properties":{"approved":{"type":"boolean"}}}}}}));
+            "interaction":{"id":"form","type":"elicitation","request":{"message":"Approve?","mode":"form","requestedSchema":{"properties":{"approved":{"type":"boolean"}}}}}}));
         plugin.render(8, 40);
         assert!(plugin.on_key(key(BareKey::Char('x'), false)));
         assert!(plugin.on_key(key(BareKey::Enter, false)));
-        assert!(plugin.status.contains("key=value"));
+        assert!(plugin.status.contains("true or false"));
         assert!(plugin.on_key(key(BareKey::Backspace, false)));
-        for ch in "approved=true".chars() {
+        for ch in "true".chars() {
             assert!(plugin.on_key(key(BareKey::Char(ch), false)));
         }
         assert!(plugin.on_key(key(BareKey::Enter, false)));
         plugin.consume_view(json!({"sessionId":"hive-one","seq":0,"updates":[],"pilot":true,
-            "interaction":{"type":"elicitation","request":{"message":"Authenticate","mode":"url","url":"https://example.com"}}}));
+            "interaction":{"id":"url","type":"elicitation","request":{"message":"Authenticate","mode":"url","url":"https://example.com"}}}));
         assert!(plugin.on_key(key(BareKey::Enter, false)));
         assert!(plugin.on_key(key(BareKey::Esc, false)));
         plugin.render(8, 40);

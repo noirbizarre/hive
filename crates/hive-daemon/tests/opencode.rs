@@ -191,10 +191,18 @@ async fn connect<T>(
             .connect_with(
                 HttpClient::new(format!("ws://{address}")).unwrap(),
                 async move |cx| {
-                    cx.send_request(v2::InitializeRequest::new(
-                        ProtocolVersion::V2,
-                        v2::Implementation::new("opencode-test", "1"),
-                    ))
+                    cx.send_request(
+                        v2::InitializeRequest::new(
+                            ProtocolVersion::V2,
+                            v2::Implementation::new("opencode-test", "1"),
+                        )
+                        .capabilities(
+                            v2::ClientCapabilities::new().elicitation(
+                                v2::ElicitationCapabilities::new()
+                                    .form(v2::ElicitationFormCapabilities::new()),
+                            ),
+                        ),
+                    )
                     .block_task()
                     .await?;
                     body(cx, rx).await

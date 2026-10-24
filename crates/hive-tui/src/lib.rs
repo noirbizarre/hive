@@ -4,6 +4,9 @@ mod state;
 mod theme;
 mod ui;
 
+#[cfg(test)]
+mod interaction_tests;
+
 use std::{
     collections::{BTreeMap, VecDeque},
     time::Duration,

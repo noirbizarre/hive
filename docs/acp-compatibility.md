@@ -7,10 +7,10 @@ the [OpenCode](agents/opencode.md) and [Pi](agents/pi.md) guides.
 ## Protocol boundary
 
 Hive clients always initialize with ACP protocol version 2. The current SDK
-`agent-client-protocol =3.3.0` needs its `unstable_protocol_v2` feature.
-`agent-client-protocol-http =3.3.0` provides both server transport shapes.
+`agent-client-protocol =3.4.0` needs its `unstable_protocol_v2` feature.
+`agent-client-protocol-http =3.4.0` provides both server transport shapes.
 Their crate versions do not denote the ACP wire version. The SDK pins schema
-`=1.11.0`. The Cargo lockfile records the tested dependency set.
+`=1.12.0`. The Cargo lockfile records the resolved dependency set.
 
 Implemented v2 operations are initialize, session/new, list, resume, close,
 prompt, cancel, and session/update. A prompt response acknowledges acceptance.

@@ -14,7 +14,19 @@
 HTTP/SSE uses connection- and session-scoped GET streams for server events;
 requests and cancellation travel by POST. The SDK handles its connection ID,
 session ID and routing. No transport `Last-Event-ID` resumption is claimed.
-Session resume reattaches to an in-process Hive session with retained snapshots;
-it is not a durable or complete event stream.
+
+## Reconnect, recovery, and replay
+
+These are separate guarantees:
+
+- **Live reconnect:** session resume attaches to an existing broker session,
+  with bounded retained replay and current snapshots. The worker keeps running.
+- **Daemon restart:** Hive attempts downstream reattachment using saved IDs,
+  where the agent supports it. Failure remains a visible offline record.
+- **Replay:** the latest 256 updates are in memory only. Restart loses them,
+  and even a live daemon can expire an old cursor. Replay is not a full transcript.
+
 The separate `/hive/v1/sessions/events` SSE feed announces catalog revision
-changes only; clients re-list sessions rather than replaying this feed.
+changes only. Clients re-list sessions rather than replaying this feed.
+
+See [session workflows](guides/sessions.md) and [recovery operations](operations.md#restart-and-recovery).

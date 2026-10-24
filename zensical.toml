@@ -3,7 +3,7 @@
 
 [project]
 
-site_name = "hive"
+site_name = "Hive"
 site_description = "An ACPv2 gateway and session multiplexer for AI coding agents"
 site_url = "https://noirbizarre.github.io/hive/"
 site_author = "noirbizarre"
@@ -21,8 +21,42 @@ Copyright &copy; 2026 Axel H. — MIT licensed
 # meaningfully conflict with additions here.
 nav = [
   { "Home" = "index.md" },
-  { "About" = [
-    { "Architecture Decisions" = "adr/README.md" },
+  { "Getting started" = "getting-started.md" },
+  { "User guide" = [
+    { "Sessions and handoff" = "guides/sessions.md" },
+    { "Terminal client" = "guides/tui.md" },
+    { "Browser client" = "guides/web.md" },
+    { "ZJHive in Zellij" = "guides/zellij.md" },
+  ] },
+  { "Configuration" = "configuration.md" },
+  { "Agent integrations" = [
+    { "OpenCode" = "agents/opencode.md" },
+    { "Pi" = "agents/pi.md" },
+  ] },
+  { "Operations" = [
+    { "Operating Hive" = "operations.md" },
+    { "Troubleshooting" = "troubleshooting.md" },
+  ] },
+  { "Reference" = [
+    { "CLI" = "reference/cli.md" },
+    { "ACP compatibility" = "acp-compatibility.md" },
+    { "Transports" = "transports.md" },
+    { "Operational HTTP API" = "hive-api.md" },
+  ] },
+  { "Architecture" = [
+    { "Overview" = "architecture.md" },
+    { "Architecture decisions" = "adr/README.md" },
+    { "001: Control and replay" = "adr/001-session-control-and-replay.md" },
+    { "002: OpenCode adoption" = "adr/002-opencode-server-adoption.md" },
+    { "003: Durable recovery" = "adr/003-durable-session-catalog-and-conservative-recovery.md" },
+    { "004: Zellij bridge" = "adr/004-zellij-native-acp-bridge.md" },
+    { "005: Protocol compatibility" = "adr/005-explicit-downstream-protocol-compatibility.md" },
+    { "006: Local HTTP boundary" = "adr/006-local-operational-http-and-acp-boundary.md" },
+    { "007: Human interactions" = "adr/007-capability-aware-human-interaction-routing.md" },
+  ] },
+  { "Development" = [
+    { "Development guide" = "development.md" },
+    { "Status and roadmap" = "roadmap.md" },
   ] },
 ]
 
@@ -93,6 +127,10 @@ line_spans = "__span"
 pygments_lang_class = true
 [project.markdown_extensions.pymdownx.inlinehilite]
 [project.markdown_extensions.pymdownx.superfences]
+# Native Mermaid support keeps diagrams aligned with theme and instant navigation.
+custom_fences = [
+  { name = "mermaid", class = "mermaid", format = "pymdownx.superfences.fence_code_format" },
+]
 [project.markdown_extensions.pymdownx.tabbed]
 alternate_style = true
 [project.markdown_extensions.pymdownx.tasklist]

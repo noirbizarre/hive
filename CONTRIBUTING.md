@@ -2,19 +2,19 @@
 
 ## Setup
 
-The toolchain is managed by [mise](https://mise.jdx.dev/); every tool is pinned
-to an exact build in `mise.lock`, so a local run and a CI run use the same
-versions.
+Development tools are managed by [mise](https://mise.jdx.dev/), with resolved
+versions recorded in `mise.lock`. Rust selects the moving `stable` channel,
+and some task-launched tools, including Zensical, are not version-pinned.
 
 ```bash
 mise install          # the tools
 prek install          # the Git hooks
-mise run ci           # everything CI runs
+mise run ci           # aggregate local checks and documentation build
 ```
 
-Rust itself is not managed by mise: `rust-toolchain.toml` pins the channel, and
-rustup installs it. CI uses `dtolnay/rust-toolchain` because it needs per-job
-components and cross-compilation targets.
+Rust itself is not managed by mise. `rust-toolchain.toml` selects the channel,
+and rustup installs it. CI uses `dtolnay/rust-toolchain` for per-job components
+and cross-compilation targets.
 
 ## Tasks
 
@@ -32,10 +32,17 @@ components and cross-compilation targets.
 | `mise run check` | Everything that does not modify the working tree |
 | `mise run ci` | `check` plus the documentation build |
 | `mise run docs` | Serve the documentation locally |
+| `mise run docs:build` | Build the documentation site |
+| `mise run hive:web` | Install browser test dependencies, check syntax, and run tests |
+| `mise run hive:plugin` | Build the Zellij plugin for WASI |
 | `mise run changelog` | Preview the changelog for unreleased commits |
 | `mise run release` | Show the version the next release would take |
 | `mise run tpl:update` | Bring the rendered template ref up to date |
 | `mise run tpl:diff` | Show what merging the template would change |
+
+`mise run ci` covers the aggregate checks and documentation build. Browser/WASM,
+MSRV, and other workflow-specific checks have separate CI jobs. See the
+[development guide](docs/development.md) for focused checks and live smoke tests.
 
 `mise <task>` is a shorthand for `mise run <task>`, but a builtin subcommand of
 the same name wins it silently — which is why the format task is `format` and
@@ -97,9 +104,8 @@ git tpl merge          # take it
 `tpl:update` is safe to run at any time: it only advances the rendered ref.
 Nothing reaches your branch until the merge.
 
-Requires git-tpl on your PATH (`cargo install git-tpl`). It is not declared in
-`mise.toml`'s `[tools]` on purpose — it vendors libgit2, so a global entry
-would make every CI job compile a tool no CI job runs.
+git-tpl is declared in `mise.toml` and installed by `mise install`. Its release
+archives avoid compiling the tool separately in every CI job.
 
 Files carrying template-owned content — `mise.toml`, `prek.toml`, `Cargo.toml` —
 end with a `# --- project-specific ---` marker. Add below it; Git's 3-way merge

@@ -1,103 +1,220 @@
 # Architecture
 
-The daemon (`crates/hive-daemon`) owns the shared session broker and durable catalog. The
-official `AcpHttpServer` mounts ACP at `/acp`: GET with WebSocket upgrade is a
-persistent bidirectional JSON-RPC channel; POST plus per-connection and
-per-session GET SSE streams form the HTTP alternative. Both create the same
-v2 agent handlers against the same broker. `/hive/v1/*` contains operational
-HTTP endpoints and a same-origin browser asset route, not session RPC methods.
+Hive is a local session broker with an ACPv2 gateway. The daemon owns sessions
+and downstream workers. Terminal, browser, and Zellij clients attach to that
+shared authority rather than starting independent copies of a conversation.
 
-The `hive` executable lives in `crates/hive-cli` and depends on the daemon and
-TUI crates; neither library depends on the CLI or on the other.
-`hive-core` defines transport-free Hive session IDs and lifecycle vocabulary.
-`hive-protocol` pins SDK integration and shared native status access. The daemon
-owns a registry of inert agent profiles loaded from one XDG TOML file, and the
-broker maps each Hive session ID to its selected profile, one downstream
-process/connection, and persisted downstream session ID. A downstream worker and session
-outlive any attached upstream client. An atomic per-session control state stores
-the current pilot generation/token, attached observer recipients, active turn,
-prompt-key outcomes, and a bounded log of all emitted updates. Upstream `session/resume`
-validates replay, atomically rotates pilot control and adds an event recipient;
-does not contact the downstream agent for a live session. At daemon startup,
-Hive instead reattaches through the original downstream ID using the agent's
-ACP recovery method; no new downstream session or prompt is sent. Unexpected
-worker exits leave an offline catalog record. Explicit close deletes that
-record, while daemon shutdown preserves it for reattachment.
+## System overview
 
-The downstream version and transport are selected **per session** from its
-profile declaration (v2 preferred over v1). The pinned SDK supports stdio,
-WebSocket and HTTP/SSE. Each session establishes its own connection (and its
-own process for stdio); there is no speculative probing or fallback after
-initialization errors. v1
-text chunks are adapted to v2 agent chunks and the v1 prompt response produces
-a v2 idle state. The transport exposed to clients remains v2 regardless.
+```mermaid
+flowchart TB
+    TUI[Terminal client]
+    WEB[Browser client]
+    ZJ[ZJHive plugin]
+    BR[Native Zellij bridge]
 
-A profile with `kind = "opencode-server"` selects a third worker,
-`crates/hive-daemon/src/opencode/`, that talks to a running OpenCode server
-over REST + SSE rather than ACP. It plugs into the same per-session worker seam
-(`Command` channel, `forward`, `complete`, pilot permission routing), so
-control, fencing, replay and persistence are shared code. It adds adoption of
-sessions that already exist in OpenCode: one native session maps to exactly one
-Hive session, the native ID and pinned API flavor are persisted, and a session
-that disappears is reported `lost` rather than replaced. A native client that
-starts a turn is detected and surfaced as `externalActivity`; Hive refuses its
-own prompts meanwhile because OpenCode cannot arbitrate between clients. See
-[ADR-002](adr/002-opencode-server-adoption.md).
+    subgraph Hive daemon
+        ACP["/acp: ACPv2 WebSocket or HTTP/SSE"]
+        HTTP["/hive/v1/*: discovery, status, browser assets"]
+        BROKER[Shared session broker]
+        CONTROL[Per-session control and volatile replay]
+        WORKERS[ACPv2, ACPv1, or OpenCode worker]
+        DB[(SQLite durable catalog)]
+    end
 
-The full-screen TUI uses the daemon session catalog for discovery and SDK
-`Client.v2()` / `HttpClient` for ACP session creation and interaction. It
-refreshes summaries periodically and preserves session identity across picker
-updates. It can observe without taking control,
-relinquish pilot while observing, or take over by Hive session ID, and leaves
-the session alive on exit. The browser implements the ACPv2
-WebSocket JSON-RPC boundary. It lists daemon-owned sessions, attaches as an
-observer using the listed cwd, and takes control when the user starts typing
-a prompt. It renders sequenced replay and live events through the same
-conversation reducer; reconnect observes the original session rather than
-creating another. Pending session-scoped agent input follows the pilot to
-whichever client currently owns control, with safe cancellation for modes that
-client did not advertise. Request-scoped elicitation follows the original live
-parent RPC instead.
-The browser rail observes catalog revisions via SSE and reconciles full
-snapshots with locally visited sessions; its hide/show state is presentation
-only. Neither client stores a second authoritative session catalog.
-ZJHive polls the same daemon catalog with WebAccess. Its automatically started
-native `hive zellij-bridge` helper holds one SDK WebSocket ACP connection per
-plugin instance, forwarding short requests and bounded update snapshots over a
-separate loopback HTTP port. This is transient client state, not a second session
-manager. Zellij's `web_request` cannot hold an ACP WebSocket or SSE stream;
-plugin detach and helper exit only release upstream connections, not workers.
+    AGENT[ACP agent process or endpoint]
+    OC[Existing OpenCode server]
 
-The current security boundary is one trusted local OS user. Session routing
-checks the exact Hive session ID and downstream ID. Mutating requests also
-require the current control generation and opaque token. A new controller
-fences the old one, including after a network partition; disconnect leaves the
-downstream running until explicit takeover. The event log retains the latest
-256 updates (including token-free control changes) with contiguous sequence
-numbers. A replay cursor outside the
-available range fails without changing control. In-memory retries and retained
-events survive client disconnection; restart retains session IDs and prompt
-reservations but loses replay history and activity snapshots. A SQLite WAL
-database at `$XDG_STATE_HOME/hive/sessions.sqlite3` (or
-`$HOME/.local/state/hive/sessions.sqlite3`) keeps the catalog in per-record
-transactions. Migrations use SQLite `user_version`; a newer schema refuses to
-start rather than overwriting data. Back up the database together with its WAL
-file only while Hive is stopped (or through SQLite's backup API). Crash-safe
-cursor block reservations expose gaps rather than reusing sequence numbers;
-an interrupted prompt requires explicit user acknowledgement before new work.
-Explicit closes remove the record immediately; orphaned/lost records without
-uncertain work are pruned after 90 days without activity. Unavailable sessions
-and records with interrupted work remain until explicitly resolved.
-Storage errors fail the affected operation or fence its session. Each attached observer receives live
-updates but never an ownership token. Pending permission/elicitation requests
-follow the pilot across takeovers and expire if nobody answers. Human-response
-waits run outside SDK dispatch, so updates, concurrent questions, and cancellation
-remain responsive. Shared ACP validation lives in `hive-protocol`; host-specific
-forms retain per-request drafts. Zellij's local bridge includes an opaque
-delivery identity in snapshots/answers to prevent a stale action answering the
-next question. URL completion is correlated independently of create responses.
-See [interaction capabilities and fallback](acp-compatibility.md#interaction-capabilities-and-fallback).
-The daemon exclusively locks a private per-user runtime file before binding;
-another `hive daemon` invocation cannot own a different port for the same user.
-Both ACP session access and Hive administration are loopback-only, with no
-per-client authentication; an untrusted local process can access both.
+    TUI <-->|ACPv2| ACP
+    WEB <-->|ACPv2 WebSocket| ACP
+    TUI --> HTTP
+    WEB -->|Catalog and revision SSE| HTTP
+    ZJ -->|Catalog polling| HTTP
+    ZJ <-->|Short HTTP requests| BR
+    BR <-->|ACPv2 WebSocket| ACP
+    ACP --> BROKER
+    HTTP --> BROKER
+    BROKER --> CONTROL
+    CONTROL --> WORKERS
+    CONTROL <--> DB
+    WORKERS <-->|stdio or network ACP| AGENT
+    WORKERS <-->|REST and SSE| OC
+```
+
+The diagram separates three boundaries:
+
+- **ACP** carries conversation, control, and agent interactions.
+- **Operational HTTP** carries discovery, summaries, readiness, and assets.
+- **Workers** translate the chosen downstream adapter into the shared broker contract.
+
+The Zellij bridge is transient client state. SQLite is durable bookkeeping.
+Neither is a second session manager.
+
+## Components and dependencies
+
+| Component | Responsibility |
+| --- | --- |
+| `crates/hive-cli` | Executable, command dispatch, browser opening, doctor output, native Zellij bridge |
+| `crates/hive-daemon` | HTTP boundary, shared broker, workers, control, persistence, activity and usage |
+| `crates/hive-core` | Transport-free Hive ID generation and declared lifecycle vocabulary |
+| `crates/hive-protocol` | SDK integration, protocol version type, native interaction validation |
+| `crates/hive-tui` | Terminal ACP client and UI |
+| `crates/hive-zellij` | WASI plugin using host HTTP and native bridge |
+| `crates/hive-mock-agent` | Deterministic development/test agent |
+| `clients/hive-web` | Embedded browser assets and JavaScript ACP client |
+
+The CLI depends on daemon and TUI libraries. Those libraries do not depend on
+the CLI or each other. The operative broker lifecycle is implemented in the
+daemon, not derived from the unused lifecycle vocabulary in `hive-core`.
+
+## Session and process ownership
+
+Four identities have different lifetimes:
+
+1. The upstream client connection.
+2. The stable Hive session ID.
+3. The downstream worker/process/connection.
+4. The downstream agent's session ID.
+
+Profiles are inert configuration. Creating a session selects a profile and
+starts one worker. A stdio worker owns its agent subprocess. A network worker
+owns its connection, not the remote server. Each session has its own connection.
+
+Client disconnect leaves the worker and conversation alive. Explicit close
+removes the Hive record when work is idle. Daemon shutdown ends its workers but
+preserves records for a later reattachment attempt.
+
+The broker persists the downstream ID before exposing a newly registered
+session. Recovery uses that saved identity rather than creating a replacement.
+
+## Transports and worker adapters
+
+The official SDK `AcpHttpServer` mounts `/acp`. WebSocket upgrade provides a
+bidirectional JSON-RPC channel. The alternative uses HTTP POST requests and
+connection/session SSE streams. Both reach the same ACPv2 handlers and broker.
+
+ACP profiles explicitly declare versions and transport configuration. Hive
+prefers v2 when declared, otherwise uses its v1 compatibility worker. There is
+no speculative retry after initialization failure. V1 text and tool updates are
+adapted into the v2-facing stream, with a synthetic idle transition on prompt
+completion. This is bounded adaptation, not full feature equivalence.
+
+`kind = "opencode-server"` selects the REST/SSE worker in
+`crates/hive-daemon/src/opencode/`. It shares control, forwarding, replay,
+interaction routing, and persistence with ACP workers. It adds native discovery
+and adoption, persisted API flavor, and external-activity detection.
+
+Duplicate adoption is guarded per profile/native ID. Hive can fence its own
+clients, but cannot stop an independent OpenCode client from acting. It detects
+native work and refuses its own prompts while that work is active.
+
+See [transports](transports.md), [ADR-002](adr/002-opencode-server-adoption.md),
+and [ADR-005](adr/005-explicit-downstream-protocol-compatibility.md).
+
+## Control and handoff
+
+Each session's synchronized control state contains the pilot connection,
+generation/token, observers, active turn, prompt-key outcomes, and replay ring.
+Observers receive updates but never a pilot token.
+
+```mermaid
+sequenceDiagram
+    participant A as Client A (pilot)
+    participant H as Hive broker
+    participant W as Downstream worker
+    participant B as Client B
+    A->>H: Prompt with generation, token, key
+    H->>W: Dispatch admitted prompt
+    B->>H: Resume same session with replay cursor
+    H->>H: Validate replay before changing ownership
+    H->>H: Rotate generation/token atomically
+    H-->>B: Replay, pilot credentials, current snapshot
+    H-->>A: Token-free control change
+    A->>H: Mutation using old credentials
+    H-->>A: Reject stale owner
+    W-->>H: Work continues without restart
+    H-->>B: Live updates after replay
+    H-->>A: Updates as observer
+```
+
+Live `session/resume` is a broker operation, not a downstream reattachment.
+Replay validation, recipient registration, and takeover are serialized together.
+An invalid cursor fails before ownership changes. There is no timed pilot lease.
+Known disconnect releases control without stopping the downstream worker.
+
+Prompt keys deduplicate identical logical retries. Admission is durably reserved
+before dispatch. A reused key with different content fails. Acknowledgement is
+not completion: foreground work ends at idle, and additional distinct prompts
+are refused while busy.
+
+See [ADR-001](adr/001-session-control-and-replay.md) and the
+[exact control contract](acp-compatibility.md#control-and-replay).
+
+## Events, replay, and snapshots
+
+Downstream updates pass through shared forwarding. They receive monotonically
+increasing Hive sequence numbers, enter the latest-256-update ring, and fan out
+to attached clients. Control, normalized activity, and usage updates also occupy
+the ring. It is not 256 messages or turns.
+
+Atomic new/resume responses carry current activity and usage snapshots. A
+snapshot restores current state, not missing conversation text. Clients must
+make history gaps visible before choosing live-only attachment.
+
+The catalog's separate SSE stream only invalidates discovery snapshots. Clients
+re-list on revision changes. It is neither conversation replay nor a durable log.
+
+## Human interactions
+
+Session-scoped permissions and elicitation follow the current pilot.
+Request-scoped elicitation follows a uniquely mapped live parent RPC to its
+original requester, even after pilot transfer.
+
+Human waits run outside SDK dispatch, so updates, other questions, and
+cancellation remain responsive. Decision waits and queues are bounded. Unknown
+or unsupported modes cancel safely instead of implying permission.
+
+Rust hosts share validation helpers through `hive-protocol`. The browser has a
+separate JavaScript implementation checked against shared fixtures. Forms retain
+per-request drafts. Bridge delivery identities prevent stale answers from
+answering a newer question. URL consent and completion are correlated separately.
+
+See [ADR-007](adr/007-capability-aware-human-interaction-routing.md) and
+[interaction capabilities](acp-compatibility.md#interaction-capabilities-and-fallback).
+
+## Persistence and recovery
+
+SQLite WAL stores the catalog at `$XDG_STATE_HOME/hive/sessions.sqlite3`, falling
+back to `$HOME/.local/state/hive/sessions.sqlite3`.
+
+| Durable | Volatile |
+| --- | --- |
+| Hive/downstream IDs, profile and adapter choices | Worker/process and upstream connections |
+| Prompt content, reservations, and confirmed results | Conversation replay payloads |
+| Recovery metadata and sequence reservations | Pilot tokens and activity snapshots |
+| Usage ledger | Process-local pricing cache |
+
+At startup, bounded reconciliation reattaches original downstream sessions where
+supported. Failure leaves an explicit offline state. An interrupted prompt is
+never automatically resent. Reattached uncertain work needs acknowledgement
+before new prompts are admitted.
+
+Sequence blocks are reserved durably before publication to avoid cursor reuse
+after crashes. Restart can introduce gaps and loses replay entirely. Database
+migrations use SQLite `user_version`; future schemas are refused.
+
+See [ADR-003](adr/003-durable-session-catalog-and-conservative-recovery.md) and
+[operations](operations.md) for recovery, pruning, privacy, and backups.
+
+## Trust boundary
+
+Production startup binds only loopback and locks a private per-user runtime
+file. A second daemon cannot use another port in the same runtime namespace.
+These restrictions are enforced at startup, not merely by constructing a router.
+
+The boundary is one trusted local OS user. There is no per-client login.
+Untrusted local processes able to reach the listener can access administration
+and sessions. Pilot credentials fence stale clients, not hostile local users.
+Downstream network endpoints have their own configuration/credential rules.
+
+See [ADR-006](adr/006-local-operational-http-and-acp-boundary.md).

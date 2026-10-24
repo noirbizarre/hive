@@ -23,3 +23,21 @@ by editing the old one. The history is the value.
 
 - [ADR-001](001-session-control-and-replay.md) — In-memory fenced controller and sequenced replay
 - [ADR-002](002-opencode-server-adoption.md) — Adopt OpenCode sessions through the server API, not ACP
+- [ADR-003](003-durable-session-catalog-and-conservative-recovery.md) — Durable catalog and conservative recovery
+- [ADR-004](004-zellij-native-acp-bridge.md) — Native ACP bridge for Zellij
+- [ADR-005](005-explicit-downstream-protocol-compatibility.md) — Explicit downstream protocol compatibility
+- [ADR-006](006-local-operational-http-and-acp-boundary.md) — Local operational HTTP and ACP boundary
+- [ADR-007](007-capability-aware-human-interaction-routing.md) — Capability-aware human interaction routing
+
+## Subsequent decisions and current interpretation
+
+ADR-001 and ADR-002 preserve their historical context. Their central decisions
+remain accepted. Later records describe implemented extensions:
+
+- ADR-003 adds durable catalog recovery without making replay durable.
+- ADR-004 removes ADR-001's former status-only Zellij limitation through a native bridge.
+- ADR-007 specifies session-scoped versus request-scoped human input routing.
+
+For current setup and API details, use the [configuration reference](../configuration.md)
+and [OpenCode guide](../agents/opencode.md). In particular, adoption requires an
+explicit profile selector, and duplicate protection is profile-scoped.

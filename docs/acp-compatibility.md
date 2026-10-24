@@ -1,36 +1,51 @@
 # ACP compatibility and draft maturity
 
-Hive clients always initialize with ACP protocol version 2. The current SDK
-`agent-client-protocol =3.3.0` needs its `unstable_protocol_v2` feature;
-`agent-client-protocol-http =3.3.0` provides both server transport shapes.
-Their crate versions do not denote the ACP wire version. The SDK pins schema
-`=1.11.0`; the Cargo lockfile records the tested dependency set.
+This is the protocol and verification reference. For setup, start with
+[getting started](getting-started.md), [configuration](configuration.md), or
+the [OpenCode](agents/opencode.md) and [Pi](agents/pi.md) guides.
 
-Implemented v2 operations: initialize, session/new, list, resume, close,
-prompt, cancel and session/update. A prompt response acknowledges acceptance;
-observe `running` then `idle` for work completion. Only text prompts are
-adapted to v1. V1 message chunks are forwarded with a synthetic v2 message
-ID; its completed prompt response generates a v2 idle update. V1 tool calls
-are preserved as `_hive_v1_tool_call`/`_hive_v1_tool_update` events; permissions
-and supported elicitation are forwarded to the pilot. V2 permissions and
+## Protocol boundary
+
+Hive clients always initialize with ACP protocol version 2. The current SDK
+`agent-client-protocol =3.4.0` needs its `unstable_protocol_v2` feature.
+`agent-client-protocol-http =3.4.0` provides both server transport shapes.
+Their crate versions do not denote the ACP wire version. The SDK pins schema
+`=1.12.0`. The Cargo lockfile records the resolved dependency set.
+
+Implemented v2 operations are initialize, session/new, list, resume, close,
+prompt, cancel, and session/update. A prompt response acknowledges acceptance.
+Observe `running` then `idle` for work completion.
+
+Only text prompts are adapted to v1. V1 message chunks are forwarded with a
+synthetic v2 message ID. Its completed prompt response generates a v2 idle
+update. V1 tool calls are preserved as `_hive_v1_tool_call`/`_hive_v1_tool_update`
+events. Permissions and supported elicitation are forwarded to the pilot.
+
+V2 permissions and
 session-scoped form/URL elicitation are forwarded to the pilot with a 120-second
 total decision deadline. Request-scoped elicitation follows a uniquely mapped,
 live parent RPC to its original requester. Unknown modes and unmapped parent
-contexts are cancelled. MCP bridge, forks, config options, compaction and other optional
+contexts are cancelled.
+
+MCP bridge, forks, config options, compaction and other optional
 capabilities are **not** advertised. Non-text v1 prompts return an error.
 
 ACPv2 `session/new` has no standard agent selector. Hive reserves
-`_meta.hive.agent` for a profile ID in **client-to-Hive** requests; Hive removes
-the selector before forwarding to downstream agents. Omit it to use
-`default_agent`; if no default exists, creation returns an error. Example:
+`_meta.hive.agent` for a profile ID in **client-to-Hive** requests. Hive removes
+the selector before forwarding to downstream agents. Omit the Hive metadata
+object to use `default_agent`. If `_meta.hive` is present, it must contain
+`agent`, even with a configured default. Without a selector or default, creation
+returns an error. Example:
 
 ```json
 {"cwd":"/workspace","mcpServers":[],"_meta":{"hive":{"agent":"pi"}}}
 ```
 
 The same request works over WebSocket and HTTP/SSE. The SDK supports `_meta`
-on `v2::NewSessionRequest`; this selector is a Hive extension, not an ACP
-standard field. Profile-declared versions and transports select one downstream
+on `v2::NewSessionRequest`. This selector is a Hive extension, not an ACP
+standard field.
+
+Profile-declared versions and transports select one downstream
 connection without speculative retry: v2 first where declared, otherwise the
 explicit v1 compatibility adapter. SDK client transports support stdio,
 WebSocket and HTTP/SSE. No automatic fallback on failed initialization is
@@ -39,10 +54,14 @@ claimed.
 ## Installed-agent capability matrix (2026-10-11)
 
 These rows identify **inspected local binaries**, not validated live model runs.
-`Guaranteed` means demonstrated for the specified installation by a completed
-probe; `best-effort` means observed but dependent on timing/model/configuration;
-`unsupported` means a missing entrypoint or Hive operation; `unverified` means
-no successful live probe. The v1/v2 declaration on a profile does **not** prove
+The evidence labels mean:
+
+- **Guaranteed:** demonstrated for this installation by a completed probe.
+- **Best-effort:** observed but dependent on timing, model, or configuration.
+- **Unsupported:** missing entrypoint or Hive operation.
+- **Unverified:** no successful live probe.
+
+The v1/v2 declaration on a profile does **not** prove
 the downstream agent accepts that wire version. Re-run the opt-in probes after
 upgrading either agent and record results with its product version and transport.
 
@@ -57,30 +76,38 @@ upgrading either agent and record results with its product version and transport
 | OpenCode 1.18.35 | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified | Unverified |
 
 An ad-hoc `opencode acp` run on 1.19.3 advertised `loadSession` and loaded a
-session created through `opencode serve`, so the "ACP load unverified" cell
-above is stale; no retained `NATIVE` probe backs that observation yet, so it
-is not upgraded. The OpenCode ACP command/documented v1 behavior comes from its
+session created through `opencode serve`. That observation concerns a different
+version from the 1.18.35 matrix row and has no retained `NATIVE` probe, so it
+does not upgrade the row. The OpenCode ACP command/documented v1 behavior comes from its
 [ACP CLI reference](https://opencode.ai/docs/acp/); its implementation may
 change between releases. Pi's CLI session flags demonstrate *native* persistence,
-not ACP support. For each successful local run, retain the `PROBE`, `FIRST`,
+not ACP support.
+
+For each successful local run, retain the `PROBE`, `FIRST`,
 `RESUMED` or `NATIVE` summary from `--nocapture`, the run date, and the selected
 wire version before upgrading any cell to guaranteed/best-effort. Failed
 initialization is **not** evidence that session creation, load, or prompts work.
 
 For both agents over **ACP**, Hive's upstream ACPv2 resume is guaranteed by
-deterministic mock tests **only for an existing live Hive session**; native
+deterministic mock tests **only for an existing live Hive session**. Native
 session adoption through an ACP profile remains unsupported. OpenCode sessions
-can be adopted through its server API instead; see
+can be adopted through its server API instead. See
 [the OpenCode server adapter](#opencode-server-adapter). Daemon-restart recovery attempts the saved
 downstream ID through v2 `session/resume` or advertised v1 `session/resume` or
 `session/load`. Capability negotiation does not guarantee downstream persistence:
-failure retains a visible offline record, never a replacement session. Direct native ACP
+failure retains a visible offline record, never a replacement session.
+
+Direct native ACP
 `session/load` (v1) or `session/resume` (v2) probes bypass Hive and must be
-recorded independently. Hive forwards downstream permissions and supported
-elicitation modes to the current pilot; this is covered by scripted agents,
+recorded independently.
+
+Hive forwards downstream permissions and supported
+elicitation modes to the current pilot. This is covered by scripted agents,
 not by either installed product row. A tool-free probe does not establish
 support for those optional features. See
 [the reproducible probes](development.md#real-agent-compatibility-probes).
+
+## Control and replay
 
 The draft [v2 specification](https://github.com/agentclientprotocol/agent-client-protocol/tree/main/docs/protocol/v2)
 and [draft announcement](https://github.com/agentclientprotocol/agent-client-protocol/blob/main/docs/announcements/acp-v2-draft.mdx)
@@ -88,16 +115,20 @@ may change. See the [SDK v2 guide](https://github.com/agentclientprotocol/rust-s
 and [HTTP guide](https://github.com/agentclientprotocol/rust-sdk/blob/main/md/http-transport.md).
 ACPv2 does not specify transferable control, command idempotency, or a
 standard event sequence cursor. Hive extends `_meta.hive` on its upstream
-requests/responses/notifications; it strips that metadata before forwarding
-downstream. A new session returns `generation`, opaque `token`, `nextSeq`,
+requests/responses/notifications. Control credentials are removed before
+forwarding mutations downstream. On creation, recognized selector/adoption
+fields are consumed; do not assume arbitrary additional Hive keys are stripped.
+
+A new session returns `generation`, opaque `token`, `nextSeq`,
 `running`, `pilot: true` and `role: "pilot"` in response `_meta.hive`. Default
-resume takes pilot control. `_meta.hive.mode: "observe"` attaches read-only;
+resume takes pilot control. `_meta.hive.mode: "observe"` attaches read-only.
 `_meta.hive.mode: "relinquish"` requires the pilot's generation/token and makes
 it an observer, leaving no pilot until explicit takeover. Both modes optionally
 replay retained events before returning. Observer responses have no token.
-No implicit new prompt is sent. TUI `--session hive-…` and WebUI's session-ID
-form use this same contract. The WebUI initially requests `mode: "observe"`
-and only attempts pilot resume when the user types a prompt; a pending
+
+No implicit new prompt is sent. TUI `--session hive-…` and browser attachment
+use this same contract. The browser initially requests `mode: "observe"`
+and only attempts pilot resume when the user types a prompt. A pending
 permission or elicitation request then follows the new pilot. Its session
 list supplies the original cwd, including for sessions created in the TUI.
 For example, after `session/new` returns a session ID and
@@ -114,7 +145,7 @@ On another connection, take over that ID (with the original `cwd`):
 {"sessionId":"hive-…","cwd":"/workspace","replayFrom":{"type":"_hive_seq","seq":8}}
 ```
 
-The pilot resume response returns a new generation/token; use those for subsequent
+The pilot resume response returns a new generation/token. Use those for subsequent
 commands. `session/cancel` and `session/close` carry the same ownership fields
 without a prompt key. Tokens are local control credentials: do not forward
 them to downstream agents or print them in client logs.
@@ -132,118 +163,147 @@ re-presented after takeover if still pending and supported by that client.
 The minimum Hive client contract is ACPv2 session support, permission requests,
 response correlation, and request cancellation. A permission UI must show the
 agent's title, optional description/subject, and supplied options. It returns
-the exact selected option ID or `cancelled`; no missing UI, unknown outcome,
+the exact selected option ID or `cancelled`. No missing UI, unknown outcome,
 unsupported payload, error, or timeout authorizes an operation. A proxy retains
 future outcomes without interpreting them as approval.
 
 Elicitation is optional. Advertise `capabilities.elicitation.form: {}` only when
-forms can be presented and valid content returned; advertise `url: {}` only
+forms can be presented and valid content returned. Advertise `url: {}` only
 when URL consent and `elicitation/complete` notifications can be handled.
 Omitted/null modes are unsupported. Hive's TUI, browser, and Zellij bridge
 advertise both modes. Hive advertises its stable broker-supported modes to
 agents, retaining each upstream client's negotiated support separately.
+
 Takeover remains available to less capable clients: an interaction in a mode
 the current pilot does not advertise receives `action: "cancel"`, rather than
 being delivered to an absent UI. Observing a session requires no optional mode.
 
 Concurrent interactions retain independent RPC identities and queue without
 overwriting earlier questions. JSON-RPC IDs are connection-local: Hive allocates
-IDs on each hop and correlates responses and `$/cancel_request` notifications;
-it does not copy cancellation IDs between transports. Session cancellation
+IDs on each hop and correlates responses and `$/cancel_request` notifications.
+It does not copy cancellation IDs between transports.
+
+Session cancellation
 withdraws all affected pending decisions. Disconnect permits takeover within
-the original deadline; close or worker termination clears pending waits. Old
-pilot responses cannot authorize a new generation. Queues are bounded at 128;
-overflow cancels safely.
+the original deadline. Close or worker termination clears pending waits. Old
+pilot responses cannot authorize a new generation. Queues are bounded at 128.
+Overflow cancels safely.
 
 Native v2 `session/new` and dispatched `session/prompt` requests provide live
 parent-ID mappings for request-scoped elicitation. These requests return to
 their originating connection even after pilot transfer. Parent completion or
 cancellation ends child waits. Repeated logical prompts with multiple RPC
-waiters have no unique parent. Downstream initialization, autonomous recovery,
+waiters have no unique parent.
+
+Downstream initialization, autonomous recovery,
 and unmapped/expired parents are safely cancelled with the diagnostic log code
-`hive::interactions::unmapped_parent`; use session-scoped elicitation or a live
+`hive::interactions::unmapped_parent`. Use session-scoped elicitation or a live
 mapped request instead. The v1 adapter supports session-scoped elicitation.
+
+### Form validation
 
 Forms use ACP primitive schemas, including required fields, choices/titled
 choices, booleans, numeric bounds, string length/pattern constraints, and
-multiselect item counts. Invalid input stays editable; unknown field types are
+multiselect item counts. Invalid input stays editable. Unknown field types are
 not treated as strings. Defaults are suggestions, never automatic submissions.
-Formats are annotations, including unknown/future formats. To keep validation consistent across hosts,
+Formats are annotations, including unknown/future formats.
+
+To keep validation consistent across hosts,
 patterns use the common ASCII Rust/ECMAScript subset without escapes,
-lookaround, character-set algebra, or dot wildcards; patterned values containing line separators are
+lookaround, character-set algebra, or dot wildcards. Patterned values containing line separators are
 rejected. Unsupported patterns cancel the form. The browser rejects integers
 outside JavaScript's safe integer range instead of rounding them.
 
-Terminal forms edit one field at a time: Tab changes fields (Shift-Tab also
-works in the TUI), arrows choose booleans/single-choice values, and arrows/Space
-toggle multiselect choices. Enter submits and Esc declines. Ctrl-Space includes
-an empty optional string/array; `|` or a JSON string array can also enter array
-values. Page Up/Down inspect long context. Permission selection is
-explicit by number. Browser forms provide labelled controls and inline errors.
+Client controls are documented in the [TUI](guides/tui.md#answer-agent-questions),
+[browser](guides/web.md), and [ZJHive](guides/zellij.md) guides. Forms must remain
+editable after validation errors rather than implicitly submitting defaults.
+
+### URL completion
 
 URL links require explicit user action and HTTP(S). Continue/Enter consents to
-proceed; it does not claim that authentication succeeded. Completion is reported
+proceed. It does not claim that authentication succeeded.
+
+Completion is reported
 only on `elicitation/complete`, including if it arrives before the create
 response. Hive translates worker-local elicitation IDs to avoid collisions on
 a shared upstream connection, preserves completion metadata, and routes to the
-actual recipients. Accepted flows are not restarted on takeover. Completion
+actual recipients.
+
+Accepted flows are not restarted on takeover. Completion
 records expire after 120 seconds or session cancellation/termination.
 
-These guarantees are exercised by scripted protocol peers and client tests;
-they do not upgrade the real-agent compatibility matrix above.
+These guarantees are exercised by scripted protocol peers and client tests.
+They do not upgrade the real-agent compatibility matrix above.
+
+## Mutation ownership and idempotency
 
 Every upstream `session/prompt` and `session/close` request and `session/cancel`
 notification needs `_meta.hive.generation` and `_meta.hive.token` from the
 latest successful new/resume response. Missing or stale owners receive an
-actionable error for requests; cancel is a JSON-RPC notification, so a stale
+actionable error for requests. Cancel is a JSON-RPC notification, so a stale
 cancel is discarded and cannot carry an error response. A subsequent resume
 rotates ownership even when the old connection is still alive. A disconnected
-pilot relinquishes control; another client must explicitly take over. All
+pilot relinquishes control. Another client must explicitly take over.
+
+All
 attached clients receive live updates, including a sequenced `_hive_control`
 event with `generation` and pilot presence but no token. `session/list` includes
 profile, running, generation, pilot presence and observer count in each entry's
 `_meta.hive`, along with the shared `title`, `lifecycle`, `activity`,
 `lastActivityAt` and `controlOwner` summary fields. The owner is an ephemeral
-connection ID, **never** the token. An absent title/timestamp/owner is `null`;
+connection ID, **never** the token. An absent title/timestamp/owner is `null`.
 `activity: "unknown"` means no trustworthy foreground status is available.
 The HTTP catalog and its SSE invalidation feed are documented in
-[Hive's operational API](hive-api.md#session-catalog); ACP `session/list` and
-HTTP snapshots derive their fields from the same broker. A close is explicit and cannot be issued while work is active;
+[Hive's operational API](hive-api.md#session-catalog). ACP `session/list` and
+HTTP snapshots derive their fields from the same broker.
+
+A close is explicit and cannot be issued while work is active.
 client detach does not close the session or cancel the agent. A second distinct prompt
 is rejected until the agent sends `idle` (not merely until its prompt response).
 
 Prompts additionally require `_meta.hive.key`, a nonempty client-generated
 idempotency key scoped to the Hive session. Retrying the *same key and content*
 after an uncertain acknowledgement returns or waits for the original result,
-including after takeover. The same key with changed content fails. A rejected
-prompt that was never dispatched retains its error under that key; use a new
-key for a newly intended prompt. Do not blindly send a new key after losing an
-acknowledgement; reconnect and retry the existing key while this daemon is
-alive. Reservations and confirmed responses survive restart. An interrupted
+including after takeover. The same key with changed content fails.
+
+A rejected prompt that was never dispatched retains its error under that key.
+Use a new key for a newly intended prompt. Do not blindly send a new key after
+losing an acknowledgement. Reconnect and retry the existing key while this daemon
+is alive.
+
+Reservations and confirmed responses survive restart. An interrupted
 key remains reserved and is never redispatched. After inspecting the agent's
 state, explicitly take control with `_meta.hive.recoveryAction: "acknowledge"`
-on `session/resume`; this permits *new* keys, but does not establish that
+on `session/resume`. This permits *new* keys, but does not establish that
 previous work completed or allow the interrupted key to be reused. Observe
 mode remains available without acknowledgement.
 
+## Replay cursors
+
 Every `session/update` carries `_meta.hive.seq`, an increasing per-session
 integer, unchanged on replay. On `session/resume`, omit `replayFrom` to attach
-without history; `{ "type": "start" }` requests the full history if retained.
+without history. `{ "type": "start" }` requests the full history if retained.
 `{ "type": "_hive_seq", "seq": N }` requests updates **at or after** N,
 inclusive. Send `lastProcessedSeq + 1` to avoid duplicates. `nextSeq` in the
 resume response identifies the first event not yet produced at the atomic
-takeover boundary. The most recent 256 updates (including chunks and state
+takeover boundary.
+
+The most recent 256 updates (including chunks and state
 transitions) are available. An expired or future cursor fails with the current
 available range and leaves the old controller in place. Live updates are
-ordered after replay; a partially delivered replay must be retried using the
-last actually processed sequence. The WebUI rebuilds from `start` on reload
+ordered after replay. A partially delivered replay must be retried using the
+last actually processed sequence.
+
+The WebUI rebuilds from `start` on reload
 and retains the cursor alongside rendered history only while the page is
-alive; an expired cursor requires a visible attach-without-history choice.
-Replay does not survive a daemon restart; prompt deduplication records do.
+alive. An expired cursor requires a visible attach-without-history choice.
+
+Replay does not survive a daemon restart. Prompt deduplication records do.
 Cursor blocks are reserved on disk before publishing updates: a restart can
 skip numbers, and an expired cursor fails rather than silently replaying an
-incomplete history. Updates
-can arrive before prompt responses; `idle` ends foreground work, not a
+incomplete history.
+
+Updates can arrive before prompt responses. `idle` ends foreground work, not a
 unique turn-ID boundary.
 
 ## Token usage and costs
@@ -260,37 +320,41 @@ Each accepted turn ends with one sequenced `session/update` extension
 `source: "acp"`, `turn: { id, agent, timestamp, tokens, estimate }` and
 `session: { turns, reportedTurns, tokens, estimatedCost, actualSessionCost,
 contextUsed, contextSize }`. For an ACP `usage_update` or cost change, `turn`
-is null; the session snapshot replaces the previous one. `turn.id` is Hive's
+is null. The session snapshot replaces the previous one. `turn.id` is Hive's
 idempotency key, not a provider request ID. A later price lookup can publish
-a replacement event for the same turn ID; clients replace rather than sum it.
+a replacement event for the same turn ID. Clients replace rather than sum it.
+
 Unreported/partially reported fields are null, including aggregate categories
 when any contributing turn lacks that field. `totalTokens` is the agent's
-reported total, not a sum inferred from other categories. Cost numbers are
-USD unless the agent supplies a different currency in `actualSessionCost`;
-actual cumulative cost takes precedence over estimates. An estimate includes
+reported total, not a sum inferred from other categories.
+
+Cost numbers are USD unless the agent supplies a different currency in `actualSessionCost`.
+Actual cumulative cost takes precedence over estimates. An estimate includes
 `input`, `output`, `cacheRead`, `cacheWrite`, `total`, `currency`, `provider`,
 `model`, `retrievedAt` (Unix milliseconds) and `source` (models.dev URL).
 Partial estimates have a null total. No price identity or pricing lookup means
 null estimated cost, while tokens remain available.
 
 `_meta.hive.usageSnapshot` contains the latest session aggregate atomically on
-new/resume; `_meta.hive.usageSeq` marks its event cursor. Summaries from
-`session/list` and the HTTP catalog also include `usage`; the HTTP catalog
+new/resume. `_meta.hive.usageSeq` marks its event cursor. Summaries from
+`session/list` and the HTTP catalog also include `usage`. The HTTP catalog
 includes `usageByAgent`, grouped by configured Hive profile across sessions.
 An aggregate cost is null if any contributing price is missing or currencies
-disagree. Accounting survives
-daemon restarts, but the bounded event replay remains in-memory. A prompt
-interrupted before idle has no recorded turn; do not infer usage from it.
+disagree.
+
+Accounting survives daemon restarts, but the bounded event replay remains
+in-memory. A prompt interrupted before idle has no recorded turn. Do not infer
+usage from it.
 
 ## Pi
 
-**Pi has no native ACP mode.** Pi 1.3.0 offers `--mode text|json|rpc`; `rpc` is
+**Pi has no native ACP mode.** Pi 1.3.0 offers `--mode text|json|rpc`. `rpc` is
 Pi's own JSON protocol, not ACP, and neither its documentation nor its changelog
 mentions ACP. Do not assume any Pi version exposes ACP by default.
 
-Hive's supported path is the external adapter
+The setup guide is [Pi integration](agents/pi.md). Hive's supported path is the external adapter
 [`pi-acp`](https://github.com/svkozak/pi-acp), which speaks ACP over stdio and
-launches `pi --mode rpc` itself. It is a **prerequisite you install**; Hive does
+launches `pi --mode rpc` itself. It is a **prerequisite you install**. Hive does
 not ship or maintain it. Pin the version you tested:
 
 ```toml
@@ -324,14 +388,15 @@ Only `initialize` is verified. Prompt turns, streaming, cancellation, tool calls
 and reconnect stay **Unverified** in the matrix until someone records a completed
 `pi_creates_prompts_and_reattaches_to_a_live_hive_session` run with its versions.
 `pi-acp` stores a map of ACP to Pi session IDs, so it can load a session created in
-Pi; whether Hive can adopt such a session is tracked separately in
+Pi. Whether Hive can adopt such a session is tracked separately in
 [#6](https://github.com/noirbizarre/hive/issues/6) and is **not** part of basic
 ACP operation.
 
 ### Diagnostics
 
-`hive_daemon::compat` rejects broken launch settings and reports an actionable
-diagnostic. Codes are public identifiers and never renamed.
+`hive_daemon::compat` checks launch settings for probes and reports actionable
+diagnostics. Session startup follows a separate worker path and can report
+different errors/timeouts. Codes are public identifiers and never renamed.
 
 | Code | Meaning and fix |
 | --- | --- |
@@ -361,11 +426,12 @@ named) and prints the diagnostics above with their help text:
   the lock (and answers there), and the permissions of the state directory.
   Doctor never creates the lock or state files.
 
-It exits with status 1 when any check fails; warnings alone exit 0. `--json`
+It exits with status 1 when any check fails. Warnings alone exit 0. `--json`
 prints the same report as one JSON object (`ok`, `config`, `profiles`,
-`daemon`), each finding having `status`, `code`, `message` and `help`. Nothing
-sends a prompt. Reports never contain endpoint URLs, headers, environment
-values, arguments or agent output; agent names and versions are reduced to
+`daemon`), each finding having `status`, `code`, `message` and `help`.
+
+Nothing sends a prompt. Reports never contain endpoint URLs, headers, environment
+values, arguments or agent output. Agent names and versions are reduced to
 printable characters. A missing-binary message does name the configured
 `command`, so review a pasted report before sharing it.
 
@@ -378,7 +444,7 @@ printable characters. A missing-binary message does name the configured
 | `hive::config::pricing` | The `pricing` table is incomplete. |
 | `hive::config::versions` | The profile declares no protocol version. |
 | `hive::config::profile` | The profile needs a stdio `command` or an `endpoint`, not both or neither. |
-| `hive::config::endpoint` | The endpoint is missing, malformed, embeds credentials or uses plain HTTP off loopback. |
+| `hive::config::endpoint` | Endpoint is missing/malformed. OpenCode server profiles also reject URL credentials and remote plain HTTP. |
 | `hive::config::header` | A header name or value is invalid (neither is printed). |
 | `hive::config::credentials` | `password_env` is not a variable name, or credentials fields are set on an ACP profile. |
 | `hive::doctor::unknown_agent` | A named profile is not configured. |
@@ -391,7 +457,7 @@ printable characters. A missing-binary message does name the configured
 | `hive::doctor::no_state_dir` | Neither `XDG_STATE_HOME` nor `HOME` is set, so the state directory cannot be located (warning). |
 | `hive::doctor::probe_panicked` | A probe stopped unexpectedly; re-run with `RUST_BACKTRACE=1` and report a bug. |
 | `hive::doctor::unsafe_runtime_dir` | The runtime directory or lock is not private; the daemon would refuse to start. |
-| `hive::doctor::unsafe_state_dir` | The state directory or database is not private; the daemon would refuse to start. |
+| `hive::doctor::unsafe_state_dir` | State directory/database failed doctor's privacy or ownership checks; inspect actual startup separately. |
 
 Run the free, opt-in probe against a real Pi (it sends no prompt) with:
 
@@ -419,47 +485,60 @@ selected by `kind`:
 
 `source` is `acp-v1`, `acp-v2`, `acp` (v1/v2 tool patches), or `extension`.
 `_meta.hive.seq` is the ordinary per-session event cursor, including normalized
-updates. Tool patch fields absent from an update retain their previous value;
-explicit null clears a field; arrays replace previous arrays. Content chunks
-append until a full content update replaces them. Top-level provider `_meta` is
-excluded from tool/plan/task projections. IDs are scoped to the Hive session;
-turn IDs, parent task IDs, and other relationships are present only when the
+updates.
+
+Tool patches follow these rules:
+
+- Absent fields retain their previous value.
+- Explicit null clears a field.
+- Arrays replace previous arrays.
+- Content chunks append until a full content update replaces them.
+- Top-level provider `_meta` is excluded from tool/plan/task projections.
+
+IDs are scoped to the Hive session.
+Turn IDs, parent task IDs, and other relationships are present only when the
 downstream event provides them. A tool or task update after idle never reopens
 the foreground turn or closes the session.
 
 `_meta.hive.activitySnapshot` in new/resume responses contains `{version:1,
 seq,session,foreground,tools,plans,tasks,support}` at the atomic replay/live attachment
-boundary. `seq` is the last normalized activity event; `nextSeq` remains the
-first not-yet-produced *session update*. The support values for tools, plans,
+boundary. `seq` is the last normalized activity event. `nextSeq` remains the
+first not-yet-produced *session update*.
+
+The support values for tools, plans,
 and tasks are `observed`, `unknown`, or `unsupported`. V1 task identities are
-unsupported by Hive's stable v1 adapter; otherwise an absent todo update cannot
-justify an invented plan or an unsupported claim.
-Unrecognized provider statuses are preserved. Finished tools are retained up
-to 128 per session; streaming chunk snapshots retain the latest 64 chunks and
+unsupported by Hive's stable v1 adapter. Otherwise an absent todo update cannot
+justify an invented plan or an unsupported claim. Unrecognized provider statuses
+are preserved.
+
+Finished tools are retained up to 128 per session. Streaming chunk snapshots
+retain the latest 64 chunks and
 flag `chunksTruncated` when earlier chunks have been evicted. Raw event history
 remains bounded at 256 updates (now including normalized activity), so a full
 replay can expire sooner than before.
 
-Apply replay in sequence order; ignore repeated sequence numbers. Identical
+Apply replay in sequence order and ignore repeated sequence numbers. Identical
 downstream content chunks without provider event IDs cannot be distinguished
-from legitimate repeated chunks; entity upserts still replace the same call or
-plan. On a gap,
-replay from the last applied sequence plus one. If that cursor has expired,
+from legitimate repeated chunks. Entity upserts still replace the same call or plan.
+
+On a gap, replay from the last applied sequence plus one. If that cursor has expired,
 attach live-only after an explicit history-gap decision, restore
 `activitySnapshot`, and continue from `nextSeq`. A snapshot restores *current
-activity*, not missed conversation text. Buffer updates that arrive before the
+activity*, not missed conversation text.
+
+Buffer updates that arrive before the
 resume response and reduce them after the snapshot so later activity cannot be
-overwritten. A daemon restart loses both history and this in-memory snapshot;
-activity resumes as unknown rather than assuming the interrupted turn was idle.
-V1 tool calls and plans are adapted; ACPv2 provides tool, plan, and foreground
-updates natively. Background tasks require explicit provider extension events;
-neither wire version guarantees them.
+overwritten. A daemon restart loses both history and this in-memory snapshot.
+Activity resumes as unknown rather than assuming the interrupted turn was idle.
+V1 tool calls and plans are adapted. ACPv2 provides tool, plan, and foreground
+updates natively. Background tasks require explicit provider extension events.
+Neither wire version guarantees them.
 
 ## OpenCode server adapter
 
 A profile with `kind = "opencode-server"` talks to a running OpenCode server
 (`opencode serve`, or the TUI started with `--port`) over its REST + SSE API
-instead of spawning an ACP process. Clients still speak ACPv2; the decision and
+instead of spawning an ACP process. Clients still speak ACPv2. The decision and
 its trade-offs are recorded in [ADR-002](adr/002-opencode-server-adoption.md).
 
 ```toml
@@ -483,12 +562,18 @@ curl 'http://127.0.0.1:PORT/hive/v1/providers/opencode-server/native-sessions?di
 ```
 
 Adoption attaches to the existing session and never creates one. The response
-and catalog carry a stable Hive session ID; the catalog also exposes
+and catalog carry a stable Hive session ID. The catalog also exposes
 `origin` (`adopted`, or `hive` for sessions Hive created), `nativeId` and
-`externalActivity`. A session Hive creates on this profile is a real OpenCode
+`externalActivity`.
+
+A session Hive creates on this profile is a real OpenCode
 session: resume it there with `opencode attach <url> -s <nativeId>`. Closing a
-Hive session only detaches; it never deletes the OpenCode session, and the same
+Hive session only detaches. It never deletes the OpenCode session, and the same
 native session can be adopted again afterwards.
+
+Both `agent` and `adopt` are required in this request. Duplicate protection is
+scoped to the profile/native ID, not globally across profiles pointing to the
+same server. See the [OpenCode guide](agents/opencode.md) for the user workflow.
 
 Up to the 50 most recent native messages are replayed into the session's
 256-update ring (not pushed live to the adopting client): resume with
@@ -522,8 +607,8 @@ recalled_context=true`, `RESUMED duplicate_session=false native_messages=4`.
 Versions below 1.19.0, and servers answering neither `/global/health` nor
 `/api/health` with a valid JSON body (an HTML catch-all is not mistaken for an
 API), fail with an actionable diagnostic rather than creating a session. The
-minimum is the oldest release the adapter was tested against, not a proven
-floor; older ones may work and are simply untested.
+minimum is a compatibility policy, not proof that every older server is
+incapable. Reported versions below it are rejected rather than tried.
 
 ### API flavors
 
@@ -531,10 +616,14 @@ OpenCode 1.19.3 serves two session APIs with **separate message stores**. Hive
 prefers the documented v1 routes, which the TUI uses, and falls back to the
 `/api/*` preview only when v1 is unavailable or does not know the session. The
 choice is made once per session and saved: recovery uses the same flavor or
-fails with `hive::opencode::api_unavailable`; it never switches. The v1 event
+fails with `hive::opencode::api_unavailable`. It never switches.
+
+The v1 event
 stream has no replay cursor, so after a dropped stream Hive re-reads status and
 recent history and de-duplicates by part, whereas the v2 stream resumes from its
-durable sequence number. The v2 preview does not support questions, and its
+durable sequence number.
+
+The v2 preview does not support questions, and its
 permission requests are polled rather than pushed.
 
 ### Single controller
@@ -585,7 +674,12 @@ endpoint, headers, credentials or server response bodies.
 - Anyone who can reach Hive's own (loopback) gateway can act through its
   OpenCode credentials, and the native-sessions route reveals session titles and
   directories. The existing single-user loopback policy applies.
-- Not supported: simultaneous control from the OpenCode TUI and Hive (detected,
-  not prevented); deleting or forking sessions from Hive; unifying the v1 and v2
-  stores; history older than the 50-message backfill; MCP server declarations in
-  `session/new`; non-text prompt content; questions over the v2 preview.
+
+Unsupported workflows:
+
+- Simultaneous control from OpenCode and Hive (detected, not prevented).
+- Deleting or forking native sessions through Hive.
+- Unifying v1 and preview message stores.
+- Backfill older than the 50-message window.
+- MCP declarations in `session/new` or non-text prompts.
+- Questions over the preview API.

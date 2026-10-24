@@ -186,6 +186,6 @@ hive tui --address 127.0.0.1:9000
 hive web --url http://127.0.0.1:9000
 ```
 
-The daemon/doctor use `HIVE_LISTEN`. Web, status, and bridge support `HIVE_URL`
+The daemon/doctor use `HIVE_LISTEN`. Web and status support `HIVE_URL`
 and fall back to `HIVE_LISTEN`. The TUI uses its own `--address` and does not
 read either variable. See the [CLI reference](reference/cli.md) for precedence.

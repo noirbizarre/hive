@@ -170,7 +170,7 @@ future outcomes without interpreting them as approval.
 Elicitation is optional. Advertise `capabilities.elicitation.form: {}` only when
 forms can be presented and valid content returned. Advertise `url: {}` only
 when URL consent and `elicitation/complete` notifications can be handled.
-Omitted/null modes are unsupported. Hive's TUI, browser, and Zellij bridge
+Omitted/null modes are unsupported. Hive's TUI and Web UI
 advertise both modes. Hive advertises its stable broker-supported modes to
 agents, retaining each upstream client's negotiated support separately.
 
@@ -214,8 +214,8 @@ lookaround, character-set algebra, or dot wildcards. Patterned values containing
 rejected. Unsupported patterns cancel the form. The browser rejects integers
 outside JavaScript's safe integer range instead of rounding them.
 
-Client controls are documented in the [TUI](guides/tui.md#answer-agent-questions),
-[browser](guides/web.md), and [ZJHive](guides/zellij.md) guides. Forms must remain
+Client controls are documented in the [TUI](guides/tui.md#answer-agent-questions)
+and [Web UI](guides/web.md) guides. Forms must remain
 editable after validation errors rather than implicitly submitting defaults.
 
 ### URL completion

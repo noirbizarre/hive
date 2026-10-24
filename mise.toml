@@ -225,10 +225,6 @@ git tpl diff --exit-code --stat
 description = "Check and test the zero-dependency browser client"
 run = "npm ci --prefix clients/hive-web && npm run build --prefix clients/hive-web && npm run test --prefix clients/hive-web"
 
-[tasks."hive:plugin"]
-description = "Build ZJHive for the Zellij WASI host"
-run = "cargo build -p hive-zellij --target wasm32-wasip1"
-
 [tasks."hive:tui"]
 description = "Run the Hive TUI"
 run = "cargo run -p hive-cli -- tui"

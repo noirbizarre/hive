@@ -84,8 +84,7 @@ work: use the separate TUI `Ctrl-Y` or browser recovery action after inspecting
 what the agent actually did.
 
 Acknowledgement permits new prompt keys. It neither resends the interrupted key
-nor proves its effects completed. ZJHive currently requires another client for
-this acknowledgement step.
+nor proves its effects completed.
 
 ## Usage and costs
 

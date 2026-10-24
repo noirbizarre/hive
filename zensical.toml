@@ -26,7 +26,7 @@ nav = [
     { "Sessions and handoff" = "guides/sessions.md" },
     { "Terminal client" = "guides/tui.md" },
     { "Browser client" = "guides/web.md" },
-    { "ZJHive in Zellij" = "guides/zellij.md" },
+    { "External clients" = "guides/zellij.md" },
   ] },
   { "Configuration" = "configuration.md" },
   { "Agent integrations" = [
@@ -49,7 +49,6 @@ nav = [
     { "001: Control and replay" = "adr/001-session-control-and-replay.md" },
     { "002: OpenCode adoption" = "adr/002-opencode-server-adoption.md" },
     { "003: Durable recovery" = "adr/003-durable-session-catalog-and-conservative-recovery.md" },
-    { "004: Zellij bridge" = "adr/004-zellij-native-acp-bridge.md" },
     { "005: Protocol compatibility" = "adr/005-explicit-downstream-protocol-compatibility.md" },
     { "006: Local HTTP boundary" = "adr/006-local-operational-http-and-acp-boundary.md" },
     { "007: Human interactions" = "adr/007-capability-aware-human-interaction-routing.md" },

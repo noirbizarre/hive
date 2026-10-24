@@ -195,5 +195,4 @@ not install this separate development executable.
 
 - [Configure additional agents](configuration.md).
 - [Understand pilot control and handoff](guides/sessions.md).
-- [Use ZJHive inside Zellij](guides/zellij.md).
 - [Continue native OpenCode sessions](agents/opencode.md).

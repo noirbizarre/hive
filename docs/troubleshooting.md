@@ -65,7 +65,7 @@ daemon error as well. See [storage and backups](operations.md#storage-and-backup
 
 ## Prompting is disabled or control was lost
 
-Select the original session and take control (`Ctrl-T` in the TUI/ZJHive, or
+Select the original session and take control (`Ctrl-T` in the TUI, or
 type in the browser composer). Wait until the daemon confirms pilot ownership.
 An observer cannot mutate the session, and another client's takeover fences
 the previous pilot.
@@ -98,12 +98,6 @@ recovery acknowledgement action before sending anything new. See
 
 Native adoption needs both `agent` and `adopt` metadata. An OpenCode REST server
 is not an ACP endpoint. See [OpenCode integration](agents/opencode.md).
-
-## ZJHive does not connect
-
-Confirm `hive` is on Zellij's `PATH`, grant WebAccess and RunCommands, and check
-the plugin's `url` and `bridge` settings. Create a session in another client first.
-For interrupted-work acknowledgement, use the TUI or browser.
 
 ## The TUI leaves its screen but does not return to the shell
 

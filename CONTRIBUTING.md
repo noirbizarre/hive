@@ -34,13 +34,12 @@ and cross-compilation targets.
 | `mise run docs` | Serve the documentation locally |
 | `mise run docs:build` | Build the documentation site |
 | `mise run hive:web` | Install browser test dependencies, check syntax, and run tests |
-| `mise run hive:plugin` | Build the Zellij plugin for WASI |
 | `mise run changelog` | Preview the changelog for unreleased commits |
 | `mise run release` | Show the version the next release would take |
 | `mise run tpl:update` | Bring the rendered template ref up to date |
 | `mise run tpl:diff` | Show what merging the template would change |
 
-`mise run ci` covers the aggregate checks and documentation build. Browser/WASM,
+`mise run ci` covers the aggregate checks and documentation build. Browser,
 MSRV, and other workflow-specific checks have separate CI jobs. See the
 [development guide](docs/development.md) for focused checks and live smoke tests.
 

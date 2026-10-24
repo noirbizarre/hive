@@ -14,7 +14,7 @@ session, use `hive tui --session hive-…`.
 
 The TUI opens with the session overview visible. It lists all directories by
 default and hides after you open a session. Summaries refresh from the daemon,
-so the same sessions appear in the browser and Zellij.
+so the same sessions are available in the Web UI and other ACP clients.
 
 | Key | Action |
 | --- | --- |

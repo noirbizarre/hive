@@ -1,8 +1,8 @@
 # Hive
 
 Hive is a local gateway and session multiplexer for AI coding agents. One daemon
-owns the conversations. You can start in the terminal, observe in a browser,
-and take control from Zellij without starting another copy of the agent session.
+owns the conversations. You can start in the TUI, observe in the Web UI,
+and transfer control between ACP clients without starting another copy of the agent session.
 
 ## Start here
 
@@ -16,7 +16,6 @@ lets you try the workflow without a model account.
 | Move a conversation between clients | [Sessions and handoff](guides/sessions.md) |
 | Learn terminal controls | [TUI guide](guides/tui.md) |
 | Continue in a browser | [Browser guide](guides/web.md) |
-| Use a Zellij plugin | [ZJHive guide](guides/zellij.md) |
 | Continue a native OpenCode conversation | [OpenCode integration](agents/opencode.md) |
 | Diagnose setup or recovery | [Troubleshooting](troubleshooting.md) |
 | Understand the system | [Architecture and diagrams](architecture.md) |
@@ -27,7 +26,7 @@ lets you try the workflow without a model account.
 - One pilot per session, with read-only observers and transferable control.
 - ACPv2 clients over WebSocket or HTTP/SSE, with explicit downstream adapters.
 - Bounded replay for client reconnect, durable recovery bookkeeping, and usage reporting.
-- Built-in terminal/browser clients and external [ZJHive](https://github.com/noirbizarre/zjhive)
+- Built-in TUI and Web UI, with generic ACP clients
   using the same daemon-owned sessions.
 
 Agent capabilities and real-world verification vary. Check the

@@ -27,11 +27,6 @@ The browser has no third-party runtime dependency. Its DOM tests use `jsdom`.
 Run `mise run hive:web` to install test dependencies, check JavaScript syntax,
 and execute the tests.
 
-The Zellij integration is developed, built and tested independently in
-[ZJHive](https://github.com/noirbizarre/zjhive). Its repository owns the plugin,
-native transport companion, packaging and live-host smoke tests. Hive's workspace
-and install workflow do not build or launch any Zellij-specific helper.
-
 ## Local runtime
 
 Follow [getting started](getting-started.md) for a real-agent or mock session.

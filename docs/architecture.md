@@ -1,7 +1,7 @@
 # Architecture
 
 Hive is a local session broker with an ACPv2 gateway. The daemon owns sessions
-and downstream workers. Terminal, browser, and Zellij clients attach to that
+and downstream workers. The TUI, Web UI, and other ACP clients attach to that
 shared authority rather than starting independent copies of a conversation.
 
 ## System overview
@@ -10,10 +10,7 @@ shared authority rather than starting independent copies of a conversation.
 flowchart TB
     TUI[Terminal client]
     WEB[Browser client]
-    subgraph External ZJHive repository
-        ZJ[ZJHive plugin]
-        BR[ZJHive transport companion]
-    end
+    CLIENT[ACP client]
 
     subgraph Hive daemon
         ACP["/acp: ACPv2 WebSocket or HTTP/SSE"]
@@ -31,9 +28,8 @@ flowchart TB
     WEB <-->|ACPv2 WebSocket| ACP
     TUI --> HTTP
     WEB -->|Catalog and revision SSE| HTTP
-    ZJ -->|Catalog polling| HTTP
-    ZJ <-->|Short HTTP requests| BR
-    BR <-->|ACPv2 WebSocket| ACP
+    CLIENT <-->|ACPv2| ACP
+    CLIENT -->|Catalog discovery| HTTP
     ACP --> BROKER
     HTTP --> BROKER
     BROKER --> CONTROL
@@ -49,8 +45,8 @@ The diagram separates three boundaries:
 - **Operational HTTP** carries discovery, summaries, readiness, and assets.
 - **Workers** translate the chosen downstream adapter into the shared broker contract.
 
-The external ZJHive companion owns transient client state. Hive neither builds
-nor launches it. SQLite is durable bookkeeping; neither is a second session manager.
+Clients do not own Hive sessions. SQLite provides durable bookkeeping; the daemon
+remains the session authority.
 
 ## Components and dependencies
 

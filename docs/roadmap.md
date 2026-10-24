@@ -12,7 +12,6 @@ coverage from retained real-agent evidence.
 | Shared sessions and transferable control | One pilot, observers, stale-owner fencing, bounded replay | [#3](https://github.com/noirbizarre/hive/issues/3) |
 | Agent compatibility probes | Explicit ACP versions, initialize-only doctor, opt-in model turns | [#4](https://github.com/noirbizarre/hive/issues/4) |
 | TUI and browser handoff | Same Hive session and downstream conversation | [#7](https://github.com/noirbizarre/hive/issues/7), [#8](https://github.com/noirbizarre/hive/issues/8) |
-| Independent ZJHive integration | Plugin and companion owned by [ZJHive](https://github.com/noirbizarre/zjhive) | [#37](https://github.com/noirbizarre/hive/issues/37) |
 | Durable catalog and restart recovery | Saved-ID reattachment, explicit uncertainty, volatile replay | [#10](https://github.com/noirbizarre/hive/issues/10) |
 | Live execution activity | Tools, plans, foreground state, explicit task events and snapshots | [#17](https://github.com/noirbizarre/hive/issues/17) |
 | Token usage and cost estimates | Reported turn totals and exact optional pricing mappings | [#18](https://github.com/noirbizarre/hive/issues/18) |
@@ -31,14 +30,11 @@ restart recovery, permissions, or native adoption.
   interaction, disconnect, and recovery results before promoting matrix cells.
 - **OpenCode preview API:** keep it experimental and distinct from v1 stores.
   Its questions are unsupported, and coverage is primarily fake-server based.
-- **External client compatibility:** ZJHive maintains its own build, distribution
-  and real-host evidence against Hive's ACP interfaces.
 
 ## Current client limits
 
 The browser creates new sessions with cwd `/`, without a project picker.
-Use the TUI for project-session creation. ZJHive opens existing sessions and
-does not provide interrupted-work acknowledgement. Native adoption currently
+Use the TUI for project-session creation. Native adoption currently
 requires an ACP integration client rather than a supplied UI or CLI action.
 
 These limits describe current behavior rather than committed release dates.

@@ -18,7 +18,7 @@
 </p>
 
 Hive runs one local daemon that owns shared agent sessions. Start a conversation
-in the TUI, observe it in a browser, and take control from Zellij without
+in the TUI, observe it in the Web UI, and transfer control between ACP clients without
 duplicating the downstream conversation. Sessions outlive client disconnects.
 
 Clients speak ACPv2 over WebSocket or HTTP/SSE. Configured agents use explicit
@@ -82,7 +82,7 @@ Full site: <https://noirbizarre.github.io/hive/>
 
 - [Configuration](docs/configuration.md) and [CLI reference](docs/reference/cli.md)
 - [Sessions and handoff](docs/guides/sessions.md)
-- [TUI](docs/guides/tui.md), [browser](docs/guides/web.md), and external [ZJHive](https://github.com/noirbizarre/zjhive)
+- [TUI](docs/guides/tui.md) and [Web UI](docs/guides/web.md)
 - [OpenCode](docs/agents/opencode.md) and [Pi](docs/agents/pi.md) integrations
 - [Operations](docs/operations.md) and [troubleshooting](docs/troubleshooting.md)
 - [Architecture and diagrams](docs/architecture.md), [decisions](docs/adr/README.md), and [roadmap](docs/roadmap.md)

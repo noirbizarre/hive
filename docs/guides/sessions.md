@@ -1,7 +1,7 @@
 # Sessions and handoff
 
 A Hive session has a stable `hive-…` ID and a selected agent profile. Its lifetime
-is independent of any terminal tab, browser page, or Zellij plugin.
+is independent of any terminal tab, browser page, or ACP client connection.
 
 ## Create a session
 
@@ -35,8 +35,7 @@ against other processes running as the same local user.
 5. Press `Ctrl-T` in the TUI to take control back when needed.
 
 In the TUI overview, Enter attaches as pilot and `o` observes. `Ctrl-H`
-relinquishes control while continuing to observe. In [ZJHive](zellij.md), select
-an existing session to observe it, then use `Ctrl-T` for takeover.
+relinquishes control while continuing to observe.
 
 ## Prompt, cancel, detach, and close
 
@@ -73,7 +72,7 @@ A lost prompt acknowledgement does not prove the agent did nothing. Hive clients
 use stable prompt keys so an identical retry does not dispatch the same work
 twice. Do not submit a new prompt just to compensate for a lost acknowledgement.
 
-The browser and ZJHive offer explicit uncertain-prompt retry actions. After a
+The Web UI offers an explicit uncertain-prompt retry action. After a
 daemon restart, an interrupted key remains reserved and is never resent.
 Inspect the agent's state first. If the recovered session requires acknowledgement,
 use `Ctrl-Y` in the TUI or the browser's recovery button to allow **new** work.

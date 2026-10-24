@@ -194,10 +194,8 @@ discovery snapshots; ACP remains the source of conversation/control events.
 
 ## Client navigation
 
-The [TUI](guides/tui.md), [browser](guides/web.md), and external
-[ZJHive](https://github.com/noirbizarre/zjhive) use the same catalog and ACP session
-identities. ZJHive owns its complete Zellij integration and transport companion;
-Hive exposes the same ACP interface to it as to other clients.
+The [TUI](guides/tui.md), [Web UI](guides/web.md), and other ACP clients use the
+same catalog and ACP session identities.
 
 Client guides describe controls. [Sessions and handoff](guides/sessions.md)
 explains roles, retry, and history semantics. A client-local attention marker

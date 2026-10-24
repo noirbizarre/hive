@@ -26,7 +26,7 @@ These are separate guarantees:
 - **Replay:** the latest 256 updates are in memory only. Restart loses them,
   and even a live daemon can expire an old cursor. Replay is not a full transcript.
 
-The separate `/hive/v1/sessions/events` SSE feed announces catalog revision
+The separate `/v1/sessions/events` SSE feed announces catalog revision
 changes only. Clients re-list sessions rather than replaying this feed.
 
 See [session workflows](guides/sessions.md) and [recovery operations](operations.md#restart-and-recovery).

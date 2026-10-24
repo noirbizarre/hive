@@ -58,7 +58,7 @@ hive daemon status --url http://127.0.0.1:9000
 ```
 
 The parent daemon `--listen` option does not set the status URL. Web appends
-`/hive/v1/web` to its base URL. Bridge `--listen` independently defaults to
+`/ui` to its base URL. Bridge `--listen` independently defaults to
 `127.0.0.1:8766` and controls its own loopback listener.
 
 ## Environment variables

@@ -289,7 +289,7 @@ async fn run(installation: Installation) -> Result<(), String> {
 
 async fn lifecycle(address: SocketAddr, id: &str) -> Result<(), String> {
     let cwd = workspace(id)?;
-    let providers: serde_json::Value = reqwest::get(format!("http://{address}/hive/v1/providers"))
+    let providers: serde_json::Value = reqwest::get(format!("http://{address}/v1/providers"))
         .await
         .map_err(|_| "Hive providers request failed")?
         .json()
@@ -321,7 +321,7 @@ async fn lifecycle(address: SocketAddr, id: &str) -> Result<(), String> {
         eprintln!("FIRST running={} chunks={} snapshots={} tools={} idle=true text=true", observed.running, observed.chunks, observed.snapshots, observed.tools);
         Ok((session, cwd))
     }).await.map_err(stage)?;
-    let status: serde_json::Value = reqwest::get(format!("http://{address}/hive/v1/status"))
+    let status: serde_json::Value = reqwest::get(format!("http://{address}/v1/status"))
         .await
         .map_err(|_| "Hive status request failed")?
         .json()
@@ -392,7 +392,7 @@ async fn lifecycle(address: SocketAddr, id: &str) -> Result<(), String> {
         )
         .await
         .map_err(stage)?;
-    let status: serde_json::Value = reqwest::get(format!("http://{address}/hive/v1/status"))
+    let status: serde_json::Value = reqwest::get(format!("http://{address}/v1/status"))
         .await
         .map_err(|_| "Hive final status request failed")?
         .json()

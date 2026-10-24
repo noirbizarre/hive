@@ -728,7 +728,7 @@ async fn running_daemon(listen: SocketAddr) -> Option<String> {
         .timeout(DAEMON_TIMEOUT)
         .build()
         .ok()?
-        .get(format!("http://{listen}/hive/v1/status"))
+        .get(format!("http://{listen}/v1/status"))
         .send()
         .await
         .ok()?

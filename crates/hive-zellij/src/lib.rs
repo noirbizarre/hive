@@ -69,7 +69,7 @@ impl ZjHive {
         if self.permitted && !self.inflight.values().any(|(k, _)| k == "catalog") {
             self.request(
                 "catalog",
-                format!("{}/hive/v1/sessions", self.url.trim_end_matches('/')),
+                format!("{}/v1/sessions", self.url.trim_end_matches('/')),
                 HttpVerb::Get,
                 Value::Null,
             );

@@ -146,7 +146,7 @@ async fn a_running_daemon_is_recognised_instead_of_reported_as_a_conflict() {
     .kill_on_drop(true)
     .spawn()
     .unwrap();
-    let status_url = format!("http://{address}/hive/v1/status");
+    let status_url = format!("http://{address}/v1/status");
     timeout(Duration::from_secs(5), async {
         loop {
             if reqwest::get(&status_url).await.is_ok() {

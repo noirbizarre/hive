@@ -331,7 +331,7 @@ async fn resume(
 }
 
 async fn refresh(address: &str, app: &mut App) -> Result<(), String> {
-    let response = reqwest::get(format!("http://{address}/hive/v1/sessions"))
+    let response = reqwest::get(format!("http://{address}/v1/sessions"))
         .await
         .map_err(|error| error.to_string())?
         .error_for_status()
@@ -910,7 +910,7 @@ pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error + Sen
         ..App::default()
     };
     let providers: serde_json::Value =
-        reqwest::get(format!("http://{}/hive/v1/providers", options.address))
+        reqwest::get(format!("http://{}/v1/providers", options.address))
             .await?
             .json()
             .await?;

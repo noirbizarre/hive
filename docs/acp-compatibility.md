@@ -554,7 +554,7 @@ OpenCode's project lookup and should be the session's working directory), then
 send `session/new` with the native ID:
 
 ```sh
-curl 'http://127.0.0.1:PORT/hive/v1/providers/opencode-server/native-sessions?directory=/work/app'
+curl 'http://127.0.0.1:PORT/v1/providers/opencode-server/native-sessions?directory=/work/app'
 ```
 
 ```json

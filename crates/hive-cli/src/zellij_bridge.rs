@@ -1011,7 +1011,7 @@ mod tests {
         });
         let (id, _) = opened_rx.await.unwrap();
         let catalog: Value = http
-            .get(format!("http://{gateway_addr}/hive/v1/sessions"))
+            .get(format!("http://{gateway_addr}/v1/sessions"))
             .send()
             .await
             .unwrap()
@@ -1184,7 +1184,7 @@ mod tests {
             .unwrap();
         assert_eq!(detached["detached"], true);
         let catalog: Value = http
-            .get(format!("http://{gateway_addr}/hive/v1/sessions"))
+            .get(format!("http://{gateway_addr}/v1/sessions"))
             .send()
             .await
             .unwrap()

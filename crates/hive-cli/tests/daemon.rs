@@ -29,7 +29,7 @@ async fn a_second_daemon_cannot_start_on_another_port_for_the_same_user() {
         .spawn()
         .unwrap();
     let mut first = first;
-    let status_url = format!("http://{address}/hive/v1/status");
+    let status_url = format!("http://{address}/v1/status");
     timeout(Duration::from_secs(5), async {
         loop {
             if reqwest::get(&status_url).await.is_ok() {

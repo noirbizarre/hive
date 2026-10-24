@@ -16,8 +16,9 @@ deployment would require authentication and authorization beyond pilot fencing.
 
 ## Decision
 
-Use `/acp` for conversation and session control. Use `/hive/v1/*` for operational
-status, discovery, catalog snapshots, revision invalidation, and browser assets.
+Use `/acp` for conversation and session control. Use `/v1/*` for operational
+status, discovery, catalog snapshots, and revision invalidation. Serve the browser
+UI at `/ui` and its assets under `/ui/`.
 Both surfaces derive session summaries from the same broker.
 
 Catalog SSE means “fetch a new snapshot,” not replay of conversation events.

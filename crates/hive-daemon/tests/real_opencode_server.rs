@@ -307,7 +307,7 @@ async fn a_session_started_natively_in_opencode_is_continued_through_hive_withou
     tokio::spawn(axum::serve(listener, hive_daemon::router(broker.clone())).into_future());
 
     let discovery: Value = reqwest::get(format!(
-        "http://{address}/hive/v1/providers/oc/native-sessions?directory={}",
+        "http://{address}/v1/providers/oc/native-sessions?directory={}",
         encode(&directory)
     ))
     .await

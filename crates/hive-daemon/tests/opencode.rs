@@ -72,7 +72,7 @@ async fn start(config: Config) -> (hive_daemon::Broker, SocketAddr) {
 }
 
 async fn catalog(address: SocketAddr) -> Value {
-    reqwest::get(format!("http://{address}/hive/v1/sessions"))
+    reqwest::get(format!("http://{address}/v1/sessions"))
         .await
         .unwrap()
         .json()
@@ -97,7 +97,7 @@ async fn wait_for(address: SocketAddr, done: impl Fn(&Value) -> bool) -> Value {
 
 async fn discover(address: SocketAddr, agent: &str, directory: Option<&str>) -> (u16, Value) {
     let mut url = reqwest::Url::parse(&format!(
-        "http://{address}/hive/v1/providers/{agent}/native-sessions"
+        "http://{address}/v1/providers/{agent}/native-sessions"
     ))
     .unwrap();
     if let Some(directory) = directory {
@@ -933,7 +933,7 @@ async fn credentials_are_sent_when_configured_and_never_echoed_back() {
     let (status, body) = discover(address, "oc", Some(&cwd())).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["sessions"][0]["nativeId"], "ses_a");
-    let providers = reqwest::get(format!("http://{address}/hive/v1/providers"))
+    let providers = reqwest::get(format!("http://{address}/v1/providers"))
         .await
         .unwrap()
         .text()

@@ -6,7 +6,7 @@ Start the daemon, then run:
 hive web
 ```
 
-The browser opens <http://127.0.0.1:8765/hive/v1/web>. Assets are embedded in
+The browser opens <http://127.0.0.1:8765/ui>. Assets are embedded in
 Hive and served by the daemon. No separate frontend process is needed.
 
 For another loopback port, use `hive web --url http://127.0.0.1:9000`.

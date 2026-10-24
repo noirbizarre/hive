@@ -530,11 +530,11 @@ export function catalog(onChange, onError = () => {}) {
   let revision = -1;
   let stopped = false;
   let requestId = 0;
-  const events = new EventSource('/hive/v1/sessions/events');
+  const events = new EventSource('/v1/sessions/events');
   async function refresh() {
     const id = ++requestId;
     try {
-      const response = await fetch('/hive/v1/sessions');
+      const response = await fetch('/v1/sessions');
       if (!response.ok) throw new Error(`Session list failed (${response.status})`);
       const snapshot = await response.json();
       if (stopped || id !== requestId) return;
@@ -784,7 +784,7 @@ export function mount(client, root = document) {
     toggle.textContent = navigationVisible ? 'Hide sessions' : 'Show sessions';
     if (navigationVisible) list.querySelector('[aria-current="page"]')?.focus();
   };
-  fetch('/hive/v1/providers').then(response => response.json()).then(({ agents }) => {
+  fetch('/v1/providers').then(response => response.json()).then(({ agents }) => {
     for (const agent of agents) add(agentSelect, 'option', agent.name, { value: agent.id });
     if (client.state().session?.agent) agentSelect.value = client.state().session.agent;
   }).catch(() => { status.textContent = 'Agent inventory unavailable'; });

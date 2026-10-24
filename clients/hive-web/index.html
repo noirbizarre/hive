@@ -29,6 +29,11 @@
   #prompt label { display: flex; gap: .5rem; align-items: center; }
   #prompt label:last-of-type { flex: 1; }
   #prompt input { flex: 1; min-width: 10rem; }
+  #interaction { border: 1px solid #73d9e7; border-radius: .4rem; padding: 1rem; }
+  #interaction pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+  #interaction label { display: flex; flex-direction: column; gap: .3rem; margin-bottom: .8rem; }
+  #interaction button { margin: .3rem; }
+  #interaction [role="alert"] { color: #ffd782; }
   @media (max-width: 700px) {
     #layout { grid-template-columns: minmax(0, 1fr); }
     #navigation { max-height: 40vh; border-right: 0; border-bottom: 1px solid #566174; }

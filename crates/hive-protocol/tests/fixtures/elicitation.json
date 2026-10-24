@@ -1,0 +1,18 @@
+[
+  {"name":"integral JSON numbers remain integers","schema":{"properties":{"count":{"type":"integer"}}},"content":{"count":1.0},"valid":true},
+  {"name":"fractional JSON numbers are not integers","schema":{"properties":{"count":{"type":"integer"}}},"content":{"count":1.5},"valid":false},
+  {"name":"native regex set algebra is not portable","schema":{"properties":{"text":{"type":"string","pattern":"[a&&b]"}}},"content":{"text":"a"},"valid":false},
+  {"name":"false and zero are present","schema":{"properties":{"flag":{"type":"boolean"},"count":{"type":"integer","minimum":0}},"required":["flag","count"]},"content":{"flag":false,"count":0},"valid":true},
+  {"name":"required values cannot be omitted","schema":{"properties":{"flag":{"type":"boolean"}},"required":["flag"]},"content":{},"valid":false},
+  {"name":"empty strings remain strings","schema":{"properties":{"name":{"type":"string"}},"required":["name"]},"content":{"name":""},"valid":true},
+  {"name":"length counts Unicode code points","schema":{"properties":{"name":{"type":"string","maxLength":1}}},"content":{"name":"🌊"},"valid":true},
+  {"name":"string constraints are checked","schema":{"properties":{"name":{"type":"string","minLength":2,"pattern":"^[a-z]+$"}}},"content":{"name":"A"},"valid":false},
+  {"name":"titled choice values are returned","schema":{"properties":{"choice":{"type":"string","oneOf":[{"const":"a","title":"First"}]}}},"content":{"choice":"a"},"valid":true},
+  {"name":"choice labels are not values","schema":{"properties":{"choice":{"type":"string","enum":["a"]}}},"content":{"choice":"First"},"valid":false},
+  {"name":"multiselect constraints are checked","schema":{"properties":{"items":{"type":"array","minItems":1,"maxItems":2,"items":{"type":"string","enum":["a","b"]}}}},"content":{"items":["c"]},"valid":false},
+  {"name":"titled multiselect choices are supported","schema":{"properties":{"items":{"type":"array","items":{"anyOf":[{"const":"a","title":"First"}]}}}},"content":{"items":["a"]},"valid":true},
+  {"name":"unknown fields cannot bypass validation","schema":{"properties":{}},"content":{"unknown":"a"},"valid":false},
+  {"name":"future property types are unsupported","schema":{"properties":{"future":{"type":"future"}}},"content":{"future":"a"},"valid":false},
+  {"name":"patterns with different engine semantics are unsupported","schema":{"properties":{"text":{"type":"string","pattern":"\\d+"}}},"content":{"text":"12"},"valid":false},
+  {"name":"number bounds are checked","schema":{"properties":{"count":{"type":"number","maximum":2}}},"content":{"count":2.5},"valid":false}
+]

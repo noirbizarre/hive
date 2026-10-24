@@ -92,6 +92,43 @@ export function conversation() {
   };
 }
 
+// Only the common pattern subset is advertised as renderable by all Hive clients.
+export function schemaSupported(schema) {
+  const choicesSupported = field => (field.enum == null || (Array.isArray(field.enum) && field.enum.every(value => typeof value === 'string'))) &&
+    ['oneOf', 'anyOf'].every(kind => field[kind] == null || (Array.isArray(field[kind]) && field[kind].every(option => typeof option?.const === 'string')));
+  return Boolean(schema?.properties && typeof schema.properties === 'object' && !Array.isArray(schema.properties) &&
+    (schema.type == null || schema.type === 'object') &&
+    (schema.required == null || Array.isArray(schema.required)) && Object.entries(schema.properties).every(([, field]) => field && typeof field === 'object' &&
+    ['string', 'integer', 'number', 'boolean', 'array'].includes(field.type) &&
+    choicesSupported(field) &&
+    ['minLength', 'maxLength', 'minItems', 'maxItems'].every(key => field[key] == null || (Number.isSafeInteger(field[key]) && field[key] >= 0)) &&
+    ['minimum', 'maximum'].every(key => field[key] == null || (typeof field[key] === 'number' && Number.isFinite(field[key]))) &&
+    (field.pattern == null || (typeof field.pattern === 'string' && /^[\x00-\x7f]*$/.test(field.pattern) && !['\\', '.', '(?', '&&', '--', '~~', '[[', '[:'].some(syntax => field.pattern.includes(syntax)) && (() => { try { new RegExp(field.pattern, 'u'); return true; } catch { return false; } })())) &&
+    (field.type !== 'array' || (field.items && choicesSupported(field.items) && (field.items.type === 'string' || (field.items.type == null && Array.isArray(field.items.anyOf)))))) &&
+    (schema.required || []).every(key => typeof key === 'string' && Object.hasOwn(schema.properties, key)));
+}
+
+export function validateContent(schema, content) {
+  if (!schemaSupported(schema)) throw new Error('Unsupported form schema; decline this request');
+  for (const key of schema.required || []) if (!Object.hasOwn(content, key)) throw new Error(`Required field: ${key}`);
+  const choices = (field, value) => (!field.enum || field.enum.includes(value)) &&
+    ['oneOf', 'anyOf'].every(kind => !field[kind] || field[kind].some(option => option.const === value));
+  for (const [key, value] of Object.entries(content)) {
+    const field = schema.properties[key];
+    if (!field || !(field.type === 'array' ? Array.isArray(value) && value.every(item => typeof item === 'string')
+      : field.type === 'integer' ? Number.isSafeInteger(value)
+      : field.type === 'number' ? typeof value === 'number' && Number.isFinite(value)
+      : typeof value === field.type)) throw new Error(`${key}: value has the wrong type`);
+    if (!choices(field, value)) throw new Error(`${key}: select a listed choice`);
+    if (typeof value === 'number' && ((field.minimum != null && value < field.minimum) || (field.maximum != null && value > field.maximum))) throw new Error(`${key}: value is outside the requested bounds`);
+    if (typeof value === 'string' && ((field.minLength != null && [...value].length < field.minLength) ||
+      (field.maxLength != null && [...value].length > field.maxLength) || (field.pattern != null && (/[\r\n\u2028\u2029]/u.test(value) || !new RegExp(field.pattern, 'u').test(value))))) throw new Error(`${key}: text does not satisfy the requested constraints`);
+    if (Array.isArray(value) && ((field.minItems != null && value.length < field.minItems) ||
+      (field.maxItems != null && value.length > field.maxItems) || value.some(item => !choices(field.items, item)))) throw new Error(`${key}: select the requested items`);
+  }
+  return content;
+}
+
 export function connect(url, onChange = () => {}) {
   const store = typeof localStorage === 'undefined' ? null : localStorage;
   let socket;
@@ -104,7 +141,12 @@ export function connect(url, onChange = () => {}) {
   let history = conversation();
   let owner;
   let interaction;
-  let earlyInteraction;
+  let interactionQueue = [];
+  let earlyInteractions = [];
+  const urlFlows = new Map();
+  const earlyCompletions = new Map();
+  const flowTimers = new Map();
+  let connectionEpoch = 0;
   let takingControl;
   let gap = false;
   let attaching = false;
@@ -121,7 +163,7 @@ export function connect(url, onChange = () => {}) {
   const snapshot = () => ({ connected, status, session: selected && { ...selected }, role: owner?.role || 'observer',
     generation: owner?.generation,
     running: history.runningNow, lines: history.lines, activity: history.activity, usage: history.usage, seq: history.seq, gap, interaction,
-    uncertain: uncertain && { ...uncertain }, recoveryRequired, takingControl: Boolean(takingControl) });
+    urlFlows: [...urlFlows.values()], uncertain: uncertain && { ...uncertain }, recoveryRequired, takingControl: Boolean(takingControl) });
   const publish = () => onChange(snapshot());
   const errorText = error => error?.data || error?.message || String(error);
   function request(method, params) {
@@ -132,11 +174,19 @@ export function connect(url, onChange = () => {}) {
       socket.send(JSON.stringify({ jsonrpc: '2.0', id, method, params }));
     });
   }
-  function clearInteraction() { interaction = undefined; publish(); }
+  function clearInteraction() { interaction = interactionQueue.shift(); publish(); }
+  function clearInteractions() {
+    if (connected) for (const item of [interaction, ...interactionQueue, ...earlyInteractions].filter(Boolean)) socket.send(JSON.stringify({ jsonrpc: '2.0', id: item.id,
+      result: item.method === 'elicitation/create' ? { action: 'cancel' } : { outcome: { outcome: 'cancelled' } } }));
+    interaction = undefined; interactionQueue = []; earlyInteractions = [];
+  }
   function relinquished() {
     owner = undefined;
-    interaction = undefined;
-    earlyInteraction = undefined;
+    // A request-scoped question belongs to its live parent RPC, independent of pilot ownership.
+    const held = [interaction, ...interactionQueue].filter(item => item?.requestScoped);
+    interaction = held.shift();
+    interactionQueue = held;
+    earlyInteractions = [];
     status = `Read-only ${selected?.sessionId || ''} — control transferred`;
     publish();
   }
@@ -151,24 +201,75 @@ export function connect(url, onChange = () => {}) {
       return;
     }
     if (!applied) return;
+    if (message.params.update?.sessionUpdate === '_hive_activity' && message.params.update.kind === 'session' && message.params.update.status === 'ended') { urlFlows.clear(); clearInteractions(); }
     if (owner?.role === 'pilot' && history.generation > owner.generation) relinquished();
     else publish();
   }
   function inbound(message) {
-    if (message.method !== 'session/request_permission' && message.method !== 'elicitation/create') return;
-    if (!selected || !connected || message.params?.sessionId !== selected.sessionId) return;
-    if (takingControl && owner?.role !== 'pilot') { earlyInteraction = message; return; }
-    if (owner?.role !== 'pilot') return;
+    if (message.method !== 'session/request_permission' && message.method !== 'elicitation/create') {
+      socket.send(JSON.stringify({ jsonrpc: '2.0', id: message.id, error: { code: -32601, message: 'Unsupported ACP interaction' } }));
+      return;
+    }
+    const cancel = () => socket.send(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: message.method === 'elicitation/create' ? { action: 'cancel' } : { outcome: { outcome: 'cancelled' } } }));
+    const requestScoped = message.method === 'elicitation/create' && message.params?.requestId != null && pending.has(message.params.requestId);
+    if (!connected || (!requestScoped && (!selected || message.params?.sessionId !== selected.sessionId))) { cancel(); return; }
+    if (!requestScoped && takingControl && owner?.role !== 'pilot') { earlyInteractions.push(message); return; }
+    if (!requestScoped && owner?.role !== 'pilot') { cancel(); return; }
+    if (message.method === 'elicitation/create' && (message.params.mode === 'form' ? !schemaSupported(message.params.requestedSchema) : message.params.mode !== 'url')) { cancel(); return; }
+    if ([interaction, ...interactionQueue].some(item => item?.id === message.id)) return;
+    if (interactionQueue.length >= 128) { cancel(); return; }
+    if (message.params?.mode === 'url') {
+      try {
+        if (!['http:', 'https:'].includes(new URL(message.params.url).protocol)) { cancel(); return; }
+      } catch { cancel(); return; }
+      if (urlFlows.size >= 128) {
+        const oldest = urlFlows.keys().next().value;
+        urlFlows.delete(oldest);
+        clearTimeout(flowTimers.get(oldest));
+        flowTimers.delete(oldest);
+      }
+      const complete = earlyCompletions.get(message.params.elicitationId) > Date.now();
+      earlyCompletions.delete(message.params.elicitationId);
+      urlFlows.set(message.params.elicitationId, { id: message.params.elicitationId, message: message.params.message, complete, expires: Date.now() + 120000 });
+      const timer = setTimeout(() => { flowTimers.delete(message.params.elicitationId); publish(); }, 120000);
+      timer.unref?.();
+      flowTimers.set(message.params.elicitationId, timer);
+    }
     // A new pilot receives unanswered requests again; only the current generation may respond.
-    interaction = { id: message.id, method: message.method, params: message.params, generation: owner.generation };
+    const next = { id: message.id, method: message.method, params: message.params, generation: owner?.generation, requestScoped, epoch: connectionEpoch };
+    if (interaction) interactionQueue.push(next); else interaction = next;
     publish();
   }
   function handle(message) {
-    if (message.method === 'session/update') update(message);
-    else if (message.method && message.id != null) inbound(message);
-    if (message.id != null && pending.has(message.id)) {
+    // Request IDs are independent in each direction; a request is never a response.
+    if (message.method) {
+      if (message.id != null) inbound(message);
+      else if (message.method === 'session/update') update(message);
+      else if (message.method === '$/cancel_request') {
+        const id = message.params?.requestId;
+        if ([interaction, ...interactionQueue, ...earlyInteractions].some(item => item?.id === id)) socket.send(JSON.stringify({ jsonrpc: '2.0', id, error: { code: -32800, message: 'Request cancelled' } }));
+        interactionQueue = interactionQueue.filter(item => item.id !== id);
+        earlyInteractions = earlyInteractions.filter(item => item.id !== id);
+        if (interaction?.id === id) clearInteraction(); else publish();
+      } else if (message.method === 'elicitation/complete') {
+        const flow = urlFlows.get(message.params?.elicitationId);
+        if (flow) { flow.complete = true; clearTimeout(flowTimers.get(flow.id)); flowTimers.delete(flow.id); publish(); }
+        else if (typeof message.params?.elicitationId === 'string') {
+          if (earlyCompletions.size >= 128) earlyCompletions.delete(earlyCompletions.keys().next().value);
+          earlyCompletions.set(message.params.elicitationId, Date.now() + 120000);
+        }
+      }
+      return;
+    }
+    if (message.id != null && ('result' in message || 'error' in message) && pending.has(message.id)) {
       const task = pending.get(message.id);
       pending.delete(message.id);
+      const abandoned = [interaction, ...interactionQueue].filter(item => item?.requestScoped && item.params.requestId === message.id);
+      for (const item of abandoned) {
+        socket.send(JSON.stringify({ jsonrpc: '2.0', id: item.id, result: { action: 'cancel' } }));
+        interactionQueue = interactionQueue.filter(queued => queued.id !== item.id);
+        if (interaction?.id === item.id) clearInteraction();
+      }
       if (message.error) task.reject(new Error(errorText(message.error))); else task.resolve(message.result);
     }
   }
@@ -181,8 +282,9 @@ export function connect(url, onChange = () => {}) {
     gap = false;
     status = `${owner.role === 'pilot' ? 'Controlling' : 'Read-only'} ${selected.sessionId}${hive.running ? ' (running)' : ''}`;
     publish();
-    if (owner.role === 'pilot' && earlyInteraction) inbound(earlyInteraction);
-    earlyInteraction = undefined;
+    const early = earlyInteractions;
+    earlyInteractions = [];
+    if (owner.role === 'pilot') for (const message of early) inbound(message);
     return hive;
   }
   async function resume(mode = 'observe', replay = true, acknowledge = false) {
@@ -239,6 +341,11 @@ export function connect(url, onChange = () => {}) {
     if (closed) return;
     const ws = new WebSocket(url);
     socket = ws;
+    connectionEpoch++;
+    urlFlows.clear();
+    earlyCompletions.clear();
+    for (const timer of flowTimers.values()) clearTimeout(timer);
+    flowTimers.clear();
     pending = new Map();
     nextId = 0;
     ws.onmessage = event => { if (socket === ws) handle(JSON.parse(event.data)); };
@@ -269,8 +376,9 @@ export function connect(url, onChange = () => {}) {
       attaching = false;
       queuedUpdates = [];
       owner = undefined;
-      interaction = undefined;
-      earlyInteraction = undefined;
+      clearInteractions();
+      for (const timer of flowTimers.values()) clearTimeout(timer);
+      flowTimers.clear();
       takingControl = undefined;
       for (const task of pending.values()) task.reject(new Error('Hive disconnected'));
       pending.clear();
@@ -305,8 +413,7 @@ export function connect(url, onChange = () => {}) {
         store?.removeItem('hive.creating');
         history = conversation();
         owner = undefined;
-        interaction = undefined;
-        earlyInteraction = undefined;
+        clearInteractions();
         uncertain = JSON.parse(store?.getItem(`hive.pending.${selected.sessionId}`) || 'null');
         publish();
         return resume('observe');
@@ -384,13 +491,32 @@ export function connect(url, onChange = () => {}) {
       if (!connected || owner?.role !== 'pilot') return false;
       socket.send(JSON.stringify({ jsonrpc: '2.0', method: 'session/cancel', params: { sessionId: selected.sessionId,
         _meta: { hive: { generation: owner.generation, token: owner.token } } } }));
-      if (interaction) this.respond(interaction.method === 'elicitation/create'
+      urlFlows.clear();
+      while (interaction) this.respond(interaction.method === 'elicitation/create'
         ? { action: 'cancel' } : { outcome: { outcome: 'cancelled' } }, interaction.id);
       return true;
     },
     respond(result, id) {
-      if (!connected || owner?.role !== 'pilot' || !interaction || interaction.id !== id ||
-          interaction.generation !== owner.generation) return false;
+      if (!connected || !interaction || interaction.id !== id || interaction.epoch !== connectionEpoch ||
+          (!interaction.requestScoped && (owner?.role !== 'pilot' || interaction.generation !== owner.generation))) return false;
+      if (interaction.method === 'session/request_permission' && result.outcome?.outcome === 'selected' &&
+          !interaction.params.options?.some(option => option.optionId === result.outcome.optionId)) return false;
+      if (interaction.method === 'session/request_permission' && !['selected', 'cancelled'].includes(result.outcome?.outcome)) return false;
+      if (interaction.method === 'elicitation/create' && !['accept', 'decline', 'cancel'].includes(result.action)) return false;
+      if (interaction.params.mode === 'url' && result.action !== 'accept') {
+        urlFlows.delete(interaction.params.elicitationId);
+        clearTimeout(flowTimers.get(interaction.params.elicitationId));
+        flowTimers.delete(interaction.params.elicitationId);
+      }
+      if (interaction.method === 'elicitation/create' && result.action === 'accept') {
+        if (interaction.params.mode === 'form') validateContent(interaction.params.requestedSchema, result.content);
+        else if (interaction.params.mode === 'url') {
+          const url = new URL(interaction.params.url);
+          if (!['http:', 'https:'].includes(url.protocol)) return false;
+          const previous = urlFlows.get(interaction.params.elicitationId);
+          urlFlows.set(interaction.params.elicitationId, { id: interaction.params.elicitationId, message: interaction.params.message, complete: previous?.complete || false, expires: previous?.expires || Date.now() + 120000 });
+        } else return false;
+      }
       socket.send(JSON.stringify({ jsonrpc: '2.0', id, result }));
       clearInteraction();
       return true;
@@ -436,24 +562,25 @@ function add(parent, tag, text, attributes = {}) {
 }
 
 function formValues(schema, form) {
-  const content = {};
+  // Agent-provided property names such as __proto__ must remain ordinary form keys.
+  const content = Object.create(null);
   for (const [name, field] of Object.entries(schema?.properties || {})) {
     const input = form.elements.namedItem(name);
-    if (field.type === 'boolean') {
+    if (field.type === 'array' && input.multiple) {
+      const values = Array.from(input.selectedOptions, option => option.value);
+      if (values.length || schema.required?.includes(name)) content[name] = values;
+    } else if (field.type === 'boolean') {
       if (input.value !== '') content[name] = input.value === 'true';
-    } else if (input.value !== '') {
+    } else if (input.value !== '' || input.dataset.includeEmpty === 'true' || (field.type === 'string' && schema.required?.includes(name))) {
       if (field.type === 'integer' || field.type === 'number') {
         const number = Number(input.value);
-        if (!Number.isFinite(number) || (field.type === 'integer' && !Number.isInteger(number))) throw new Error(`${name} needs a ${field.type}`);
+        if (!Number.isFinite(number) || (field.type === 'integer' && !Number.isSafeInteger(number))) throw new Error(`${name} needs a ${field.type}`);
         content[name] = number;
-      } else if (field.type === 'array') content[name] = input.value.split(',').map(part => part.trim());
+      } else if (field.type === 'array') content[name] = input.value.startsWith('[') ? JSON.parse(input.value) : input.value.split(',').map(part => part.trim());
       else content[name] = input.value;
     }
   }
-  for (const name of schema?.required || []) {
-    if (!(name in content)) throw new Error(`Required field: ${name}`);
-  }
-  return content;
+  return validateContent(schema, content);
 }
 
 export function mount(client, root = document) {
@@ -530,47 +657,79 @@ export function mount(client, root = document) {
         }
       }
     }
-    if (currentInteraction?.id === state.interaction?.id) return;
+    for (const flow of state.urlFlows || []) add(output, 'p', `${flow.message}: ${flow.complete ? 'Completed' : flow.expires <= Date.now() ? 'Completion not received before timeout' : 'Waiting for external completion'}`);
+    if (currentInteraction?.id === state.interaction?.id && currentInteraction?.epoch === state.interaction?.epoch && currentInteraction?.generation === state.interaction?.generation) return;
     currentInteraction = state.interaction;
     dialog.replaceChildren();
-    dialog.hidden = !state.interaction || !pilot;
+    dialog.hidden = !state.interaction || (!pilot && !state.interaction.requestScoped);
     if (dialog.hidden) return;
     const interaction = state.interaction;
     const params = interaction.params;
     add(dialog, 'p', params.title || params.message || 'Agent needs input');
     if (params.description) add(dialog, 'p', params.description);
+    if (params.subject) add(dialog, 'pre', JSON.stringify(params.subject, null, 2));
     const form = add(dialog, 'form', '');
     if (interaction.method === 'session/request_permission') {
       for (const option of params.options || []) {
-        const button = add(form, 'button', option.name, { type: 'button' });
+        const button = add(form, 'button', `${option.name}${option.kind ? ` (${option.kind})` : ''}`, { type: 'button' });
         button.onclick = () => client.respond({ outcome: { outcome: 'selected', optionId: option.optionId } }, interaction.id);
       }
     } else if (params.mode === 'form') {
+      if (params.requestedSchema.title) add(form, 'h3', params.requestedSchema.title);
+      if (params.requestedSchema.description) add(form, 'p', params.requestedSchema.description);
       for (const [name, field] of Object.entries(params.requestedSchema?.properties || {})) {
-        const label = add(form, 'label', name);
-        const control = add(label, 'input', '', { name, type: field.type === 'integer' || field.type === 'number' ? 'number' : 'text' });
+        const label = add(form, 'label', `${field.title || name}${params.requestedSchema.required?.includes(name) ? ' (required)' : ''}`);
+        const options = field.enum?.map(value => ({ const: value, title: value })) || field.oneOf || field.items?.enum?.map(value => ({ const: value, title: value })) || field.items?.anyOf;
+        let control;
+        if (options) {
+          control = add(label, 'select', '', { name });
+          if (field.type === 'array') control.multiple = true;
+          else add(control, 'option', 'Choose…', { value: '' });
+          for (const option of options) add(control, 'option', option.title || option.const, { value: option.const });
+        } else control = add(label, 'input', '', { name, type: field.type === 'integer' || field.type === 'number' ? 'number' : 'text' });
         if (field.type === 'boolean') {
           const select = add(label, 'select', '', { name });
           control.remove();
           for (const value of ['', 'true', 'false']) add(select, 'option', value || 'Choose…', { value });
+          control = select;
         }
+        if (field.description) add(label, 'small', field.description);
+        const constraints = add(form, 'details', '');
+        add(constraints, 'summary', `Constraints for ${field.title || name}`);
+        add(constraints, 'pre', JSON.stringify(field, null, 2));
+        if (field.type === 'string' && !params.requestedSchema.required?.includes(name)) {
+          const empty = add(label, 'button', 'Include empty value', { type: 'button' });
+          empty.onclick = () => { control.dataset.includeEmpty = control.dataset.includeEmpty === 'true' ? 'false' : 'true'; empty.textContent = control.dataset.includeEmpty === 'true' ? 'Omit empty value' : 'Include empty value'; };
+        }
+        if (field.default != null) {
+          if (control.multiple) for (const option of control.options) option.selected = field.default.includes(option.value);
+          else control.value = String(field.default);
+        }
+        if (field.type === 'number') control.step = 'any';
+        control.setAttribute('aria-required', String(Boolean(params.requestedSchema.required?.includes(name))));
+        if (field.type === 'integer') control.step = '1';
+        if (field.minimum != null) control.min = field.minimum;
+        if (field.maximum != null) control.max = field.maximum;
       }
+      const errors = add(form, 'p', '', { role: 'alert' });
       const accept = add(form, 'button', 'Submit', { type: 'submit' });
       accept.disabled = false;
       form.onsubmit = event => {
         event.preventDefault();
         try { client.respond({ action: 'accept', content: formValues(params.requestedSchema, form) }, interaction.id); }
-        catch (error) { status.textContent = error.message; }
+        catch (error) { errors.textContent = error.message; }
       };
     } else if (params.mode === 'url') {
       try {
         const url = new URL(params.url);
         if (url.protocol === 'http:' || url.protocol === 'https:') add(form, 'a', url.href, { href: url.href, target: '_blank', rel: 'noopener noreferrer' });
       } catch { /* An invalid agent URL must not become an unsafe browser link. */ }
-      add(form, 'button', 'Done', { type: 'button' }).onclick = () => client.respond({ action: 'accept' }, interaction.id);
+      add(form, 'p', 'Continue to allow the external flow; Hive will report completion when the agent notifies it.');
+      add(form, 'button', 'Continue', { type: 'button' }).onclick = () => client.respond({ action: 'accept' }, interaction.id);
     }
     add(form, 'button', 'Decline', { type: 'button' }).onclick = () => client.respond(
       interaction.method === 'session/request_permission' ? { outcome: { outcome: 'cancelled' } } : { action: 'decline' }, interaction.id);
+    form.querySelector('input, select, button, a')?.focus();
   }
 
   async function open(id) {

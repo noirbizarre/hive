@@ -1596,6 +1596,7 @@ dependencies = [
  "agent-client-protocol",
  "agent-client-protocol-http",
  "hive-core",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

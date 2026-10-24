@@ -61,6 +61,7 @@ pub struct App {
     pub pending: HashMap<String, (String, String)>,
     pub drafts: HashMap<String, String>,
     pub dialog: Option<String>,
+    pub dialog_scroll: u16,
     pub skip_replay: bool,
 }
 
@@ -155,7 +156,7 @@ impl App {
                 Constraint::Length(if compact {
                     2
                 } else if self.dialog.is_some() {
-                    8
+                    (main.height / 2).max(8).min(main.height.saturating_sub(4))
                 } else {
                     4
                 }),
@@ -340,6 +341,30 @@ impl App {
     }
 
     fn render_composer(&self, frame: &mut Frame, area: Rect, theme: Theme) {
+        if let Some(dialog) = &self.dialog {
+            let block = Block::default()
+                .title(" Agent request · PgUp/PgDn details")
+                .borders(Borders::LEFT)
+                .border_style(theme.accent())
+                .padding(Padding::horizontal(2));
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            let sections =
+                Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).split(inner);
+            frame.render_widget(
+                Paragraph::new(dialog.as_str())
+                    .style(theme.text())
+                    .wrap(Wrap { trim: false })
+                    .scroll((self.dialog_scroll, 0)),
+                sections[0],
+            );
+            // Keep the editable value visible even when the subject/schema needs scrolling.
+            frame.render_widget(
+                Paragraph::new(format!("> {}", self.input)).style(theme.text()),
+                sections[1],
+            );
+            return;
+        }
         let label = if self.dialog.is_some() {
             " Agent request"
         } else if self.page == Page::Chat {

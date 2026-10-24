@@ -17,6 +17,7 @@ axum = { workspace = true }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 hive-daemon = { path = "../hive-daemon" }
+hive-protocol = { path = "../hive-protocol" }
 hive-tui = { path = "../hive-tui" }
 miette = { workspace = true }
 reqwest = { workspace = true }
@@ -29,5 +30,4 @@ uuid = { workspace = true }
 webbrowser = { workspace = true }
 
 [dev-dependencies]
-hive-protocol = { path = "../hive-protocol" }
 uuid = { workspace = true }

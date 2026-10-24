@@ -198,6 +198,26 @@ impl App {
     }
 
     fn render_sessions(&self, frame: &mut Frame, area: Rect, theme: Theme) {
+        if self.sessions.is_empty() {
+            let (title, help) = if self.all {
+                ("No sessions yet", "Ctrl-N  create a session")
+            } else {
+                (
+                    "No sessions in this directory",
+                    "a  show all directories · Ctrl-N  create a session",
+                )
+            };
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::styled(title, theme.text()),
+                    Line::styled(help, theme.muted()),
+                ])
+                .wrap(Wrap { trim: false })
+                .block(Block::default().padding(Padding::horizontal(3))),
+                area,
+            );
+            return;
+        }
         let entries = self.sessions.iter().map(|info| {
             let owner = if info.control_owner.is_none() {
                 "unclaimed"
@@ -271,6 +291,22 @@ impl App {
     }
 
     fn render_profiles(&self, frame: &mut Frame, area: Rect, theme: Theme) {
+        if self.profiles.is_empty() {
+            // Profiles are loaded at startup, so restarting only the daemon leaves this picker empty.
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::styled("No agents configured", theme.text()),
+                    Line::styled(
+                        "Add an [agents.<id>] profile to the daemon configuration, then restart the daemon and TUI.",
+                        theme.muted(),
+                    ),
+                ])
+                .wrap(Wrap { trim: false })
+                .block(Block::default().padding(Padding::horizontal(3))),
+                area,
+            );
+            return;
+        }
         let list = List::new(
             self.profiles
                 .iter()
@@ -380,6 +416,14 @@ impl App {
             } else {
                 self.input.clone()
             }
+        } else if self.page == Page::Sessions && self.sessions.is_empty() {
+            if self.all {
+                "Ctrl-N to create a session".to_owned()
+            } else {
+                "a to show all directories · Ctrl-N to create a session".to_owned()
+            }
+        } else if self.page == Page::Profiles && self.profiles.is_empty() {
+            "Configure an agent, then restart the daemon and TUI".to_owned()
         } else {
             "Select an item with ↑/↓ and Enter".to_owned()
         };
@@ -405,9 +449,17 @@ impl App {
 
     fn render_footer(&self, frame: &mut Frame, area: Rect, theme: Theme, compact: bool) {
         let hint = match self.page {
+            Page::Sessions if self.sessions.is_empty() => {
+                if self.active.is_some() {
+                    "Tab chat  a all  Ctrl-N new  Esc quit"
+                } else {
+                    "a all  Ctrl-N new  Esc quit"
+                }
+            }
             Page::Sessions => {
                 "↑↓ select  Enter pilot  o observe  Tab chat  a all  Ctrl-N new  Esc quit"
             }
+            Page::Profiles if self.profiles.is_empty() => "Tab sessions  Esc quit",
             Page::Profiles => "↑↓ select  Enter create  Tab sessions  Esc quit",
             Page::Chat if self.dialog.is_some() => "Enter confirm  Esc decline",
             Page::Chat => {
@@ -593,6 +645,135 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn an_empty_session_overview_explains_how_to_create_a_session() {
+        let app = App {
+            all: true,
+            ..App::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(100, 14)).unwrap();
+        terminal.draw(|frame| app.show(frame)).unwrap();
+        let rendered = screen(&terminal);
+        assert!(rendered.contains("No sessions yet"));
+        assert!(rendered.contains("Ctrl-N  create a session"));
+        assert!(!rendered.contains("Select an item"));
+        assert!(!rendered.contains("Enter pilot"));
+        assert!(!rendered.contains("o observe"));
+    }
+
+    #[test]
+    fn an_empty_directory_overview_explains_how_to_broaden_the_scope() {
+        let mut app = App::default();
+        let mut terminal = Terminal::new(TestBackend::new(100, 14)).unwrap();
+        terminal.draw(|frame| app.show(frame)).unwrap();
+        let rendered = screen(&terminal);
+        assert!(rendered.contains("No sessions in this directory"));
+        assert!(rendered.contains("a  show all directories"));
+        app.all = true;
+        terminal.draw(|frame| app.show(frame)).unwrap();
+        let rendered = screen(&terminal);
+        assert!(rendered.contains("No sessions yet"));
+        assert!(!rendered.contains("No sessions in this directory"));
+    }
+
+    #[test]
+    fn an_empty_agent_picker_explains_configuration_and_restart_requirements() {
+        let mut app = App {
+            page: Page::Profiles,
+            ..App::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(120, 14)).unwrap();
+        terminal.draw(|frame| app.show(frame)).unwrap();
+        let rendered = screen(&terminal);
+        assert!(rendered.contains("No agents configured"));
+        assert!(rendered.contains("[agents.<id>]"));
+        assert!(rendered.contains("restart the daemon and TUI"));
+        assert!(!rendered.contains("Select an item"));
+        assert!(!rendered.contains("Enter create"));
+
+        app.status = "Connection lost".into();
+        terminal.draw(|frame| app.show(frame)).unwrap();
+        assert!(screen(&terminal).contains("Connection lost"));
+        assert!(screen(&terminal).contains("No agents configured"));
+    }
+
+    #[test]
+    fn empty_state_guidance_tracks_catalog_changes() {
+        let mut app = App {
+            page: Page::Profiles,
+            all: true,
+            ..App::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(100, 14)).unwrap();
+        terminal.draw(|frame| app.show(frame)).unwrap();
+        assert!(screen(&terminal).contains("No agents configured"));
+        app.profiles.push("pi".into());
+        terminal.draw(|frame| app.show(frame)).unwrap();
+        let rendered = screen(&terminal);
+        assert!(rendered.contains("▸ pi"));
+        assert!(rendered.contains("Select an item"));
+        assert!(rendered.contains("Enter create"));
+        assert!(!rendered.contains("No agents configured"));
+        app.profiles.clear();
+        terminal.draw(|frame| app.show(frame)).unwrap();
+        assert!(screen(&terminal).contains("No agents configured"));
+
+        app.page = Page::Sessions;
+        app.update_sessions(vec![SessionSummary {
+            session_id: "hive-one".into(),
+            cwd: "/tmp".into(),
+            agent: "pi".into(),
+            title: None,
+            lifecycle: "active".into(),
+            recovery: None,
+            recovery_reason: None,
+            activity: "idle".into(),
+            last_activity_at: None,
+            control_owner: None,
+            generation: 1,
+        }]);
+        terminal.draw(|frame| app.show(frame)).unwrap();
+        let rendered = screen(&terminal);
+        assert!(rendered.contains("hive-one"));
+        assert!(rendered.contains("Enter pilot"));
+        assert!(!rendered.contains("No sessions yet"));
+        app.update_sessions(vec![]);
+        terminal.draw(|frame| app.show(frame)).unwrap();
+        assert!(screen(&terminal).contains("No sessions yet"));
+    }
+
+    #[test]
+    fn narrow_terminals_wrap_empty_state_guidance_and_tiny_terminals_do_not_panic() {
+        for (page, all, title, help) in [
+            (Page::Sessions, true, "No sessions yet", "create a session"),
+            (
+                Page::Sessions,
+                false,
+                "No sessions in this directory",
+                "create a session",
+            ),
+            (
+                Page::Profiles,
+                false,
+                "No agents configured",
+                "daemon and TUI.",
+            ),
+        ] {
+            let app = App {
+                page,
+                all,
+                ..App::default()
+            };
+            let mut narrow = Terminal::new(TestBackend::new(44, 18)).unwrap();
+            narrow.draw(|frame| app.show(frame)).unwrap();
+            let rendered = screen(&narrow);
+            assert!(rendered.contains(title));
+            assert!(rendered.contains(help));
+            let mut tiny = Terminal::new(TestBackend::new(18, 5)).unwrap();
+            tiny.draw(|frame| app.show(frame)).unwrap();
+        }
     }
 
     #[test]

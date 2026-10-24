@@ -2,38 +2,34 @@
 
 ## Status
 
-Accepted. Retrospective record written on 2026-10-24 for implemented behavior.
-Replaces the status-only Zellij limitation described in
-[ADR-001](001-session-control-and-replay.md), while retaining its session contract.
+Superseded in ownership by the independent
+[ZJHive repository](https://github.com/noirbizarre/zjhive), implementing
+[Hive #37](https://github.com/noirbizarre/hive/issues/37).
+This page retains the historical architectural boundary, not installation instructions.
 
 ## Context
 
-Zellij's WebAccess host API completes individual HTTP requests. It cannot hold
-the ACP WebSocket or SSE streams needed for a full conversation client.
-
-Keeping ZJHive status-only would prevent handoff. Implementing persistent ACP
-inside the plugin would exceed its host interface. Adding separate daemon
-mutation routes for Zellij would create another session-control protocol.
+The original integration used a Hive-owned native adapter because Zellij's
+completion-based WebAccess API could not supply persistent ACP conversations.
+This replaced [ADR-001](001-session-control-and-replay.md)'s status-only limitation
+without adding another daemon mutation API.
 
 ## Decision
 
-Use native `hive zellij-bridge` as an ordinary ACP client. Each plugin
-registration gets its own upstream connection. The plugin uses short local HTTP
-requests to exchange actions and bounded snapshots, and polls daemon discovery.
+Hive must not contain, build, launch or maintain a Zellij-specific native bridge.
+ZJHive owns its complete integration, including any required transport companion.
+The companion is an ordinary client of Hive's public ACP and operational interfaces.
+Session ownership, control fencing and downstream workers remain in Hive.
 
-The bridge owns transient client state, not sessions. Detach, helper exit, or
-handle expiry drops connectivity without closing the daemon-owned conversation.
-Interaction deliveries carry identities so stale responses cannot approve a
-later question.
+ZJHive's transport investigation and real Zellij 0.45.1 smoke tests establish its
+selected adapter's host compatibility. That evidence and repeatable probes belong
+to ZJHive alongside its build/test/release configuration.
 
 ## Consequences
 
-- The native executable must be installed in Zellij's environment.
-- WebAccess and RunCommands permissions are required.
-- Another loopback listener, polling latency, and helper lifecycle need handling.
-- Bounded snapshots are not independent durable history.
-- Ownership, fencing, and downstream lifetime stay in the shared broker.
-
-Implementation: [bridge](https://github.com/noirbizarre/hive/blob/main/crates/hive-cli/src/zellij_bridge.rs)
-and [plugin](https://github.com/noirbizarre/hive/blob/main/crates/hive-zellij/src/lib.rs).
-See the [user guide](../guides/zellij.md).
+- Hive installation and CI require no Zellij SDK, WASM target or helper.
+- Plugin and companion distribution/version compatibility belong to ZJHive.
+- A transport adapter may retain bounded client snapshots and retry identity,
+  but detach, helper exit and registration expiry must never close Hive sessions.
+- The shared ACP contract remains authoritative; no parallel session mutation API
+  is introduced for an individual client.

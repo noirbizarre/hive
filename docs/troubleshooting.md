@@ -101,9 +101,9 @@ is not an ACP endpoint. See [OpenCode integration](agents/opencode.md).
 
 ## ZJHive does not connect
 
-Confirm `hive` is on Zellij's `PATH`, grant WebAccess and RunCommands, and check
-the plugin's `url` and `bridge` settings. Create a session in another client first.
-For interrupted-work acknowledgement, use the TUI or browser.
+Follow the independent [ZJHive installation and troubleshooting documentation](https://github.com/noirbizarre/zjhive).
+Hive no longer supplies a plugin or Zellij helper command. Verify Hive's health
+and session catalog separately; use the TUI or browser for recovery acknowledgement.
 
 ## The TUI leaves its screen but does not return to the shell
 

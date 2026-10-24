@@ -27,7 +27,8 @@ lets you try the workflow without a model account.
 - One pilot per session, with read-only observers and transferable control.
 - ACPv2 clients over WebSocket or HTTP/SSE, with explicit downstream adapters.
 - Bounded replay for client reconnect, durable recovery bookkeeping, and usage reporting.
-- Terminal, browser, and Zellij clients using the same daemon-owned sessions.
+- Built-in terminal/browser clients and external [ZJHive](https://github.com/noirbizarre/zjhive)
+  using the same daemon-owned sessions.
 
 Agent capabilities and real-world verification vary. Check the
 [compatibility evidence](acp-compatibility.md) rather than assuming every profile

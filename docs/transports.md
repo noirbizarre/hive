@@ -9,7 +9,7 @@
 | Hive to agent | v2/v1 | WebSocket, HTTP/SSE | SDK client transport; v2 HTTP/SSE and WS integration-tested with mock |
 | Hive to OpenCode server | REST + SSE (not ACP) | HTTP `/session`, `/event` or the `/api/*` preview | `kind = "opencode-server"`; integration-tested with a scripted fake and probed against OpenCode 1.19.3 (v1 routes). See [the adapter](acp-compatibility.md#opencode-server-adapter) |
 | Client to Hive | v1 | Any | Rejected by v2 gateway |
-| ZJHive to Hive | v2 | Native bridge client to WebSocket `/acp`; plugin polls HTTP catalog and local bridge | Integration-tested against mock agent |
+| External [ZJHive](https://github.com/noirbizarre/zjhive) to Hive | v2 | ZJHive-owned companion to WebSocket `/acp` | Contract tests and live-host evidence maintained in ZJHive |
 
 HTTP/SSE uses connection- and session-scoped GET streams for server events;
 requests and cancellation travel by POST. The SDK handles its connection ID,

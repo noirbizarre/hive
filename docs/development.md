@@ -19,7 +19,7 @@ for hooks, commit conventions, and releases.
 
 `mise run ci` includes formatting checks, Clippy, workflow/Markdown lint,
 spelling, tests, and the documentation build. It does not include every separate
-CI job, including browser/WASM checks and MSRV testing.
+CI job, including browser checks and MSRV testing.
 
 ## Client checks
 
@@ -27,30 +27,10 @@ The browser has no third-party runtime dependency. Its DOM tests use `jsdom`.
 Run `mise run hive:web` to install test dependencies, check JavaScript syntax,
 and execute the tests.
 
-For the plugin:
-
-```sh
-rustup target add wasm32-wasip1
-mise run hive:plugin
-```
-
-Native plugin tests and WASM compilation do not replace a live Zellij host run.
-See [ZJHive setup](guides/zellij.md) for loading and permissions.
-
-### Live Zellij smoke test
-
-1. Create a project session in the TUI and load the floating plugin.
-2. Grant WebAccess and RunCommands. Verify the same session ID/activity appears.
-3. Observe, take over, and prompt. Verify the old pilot is fenced.
-4. Exercise cancellation and permission/form/URL replies.
-5. Transfer control back and check that the plugin becomes read-only.
-6. Reload the plugin while the agent runs and verify the session survives.
-7. Interrupt connectivity and inspect stale-state handling and replay recovery.
-
-The native bridge uses a separate ACP connection per registration. Plugin
-catalog polling is every four seconds, conversation polling every two seconds,
-and failures back off up to sixteen seconds. Inactive handles expire after
-thirty seconds without calling `session/close`.
+The Zellij integration is developed, built and tested independently in
+[ZJHive](https://github.com/noirbizarre/zjhive). Its repository owns the plugin,
+native transport companion, packaging and live-host smoke tests. Hive's workspace
+and install workflow do not build or launch any Zellij-specific helper.
 
 ## Local runtime
 

@@ -82,7 +82,7 @@ Full site: <https://noirbizarre.github.io/hive/>
 
 - [Configuration](docs/configuration.md) and [CLI reference](docs/reference/cli.md)
 - [Sessions and handoff](docs/guides/sessions.md)
-- [TUI](docs/guides/tui.md), [browser](docs/guides/web.md), and [Zellij](docs/guides/zellij.md)
+- [TUI](docs/guides/tui.md), [browser](docs/guides/web.md), and external [ZJHive](https://github.com/noirbizarre/zjhive)
 - [OpenCode](docs/agents/opencode.md) and [Pi](docs/agents/pi.md) integrations
 - [Operations](docs/operations.md) and [troubleshooting](docs/troubleshooting.md)
 - [Architecture and diagrams](docs/architecture.md), [decisions](docs/adr/README.md), and [roadmap](docs/roadmap.md)
@@ -94,8 +94,8 @@ downstream agent and never silently resends interrupted prompts.
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) and the [development guide](docs/development.md).
-Run `mise run ci` for the repository-wide local checks. Browser and WASM checks
-have separate tasks documented in the development guide.
+Run `mise run ci` for the repository-wide local checks. Browser checks
+have a separate task documented in the development guide.
 
 ## License
 

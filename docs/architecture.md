@@ -10,8 +10,10 @@ shared authority rather than starting independent copies of a conversation.
 flowchart TB
     TUI[Terminal client]
     WEB[Browser client]
-    ZJ[ZJHive plugin]
-    BR[Native Zellij bridge]
+    subgraph External ZJHive repository
+        ZJ[ZJHive plugin]
+        BR[ZJHive transport companion]
+    end
 
     subgraph Hive daemon
         ACP["/acp: ACPv2 WebSocket or HTTP/SSE"]
@@ -47,19 +49,18 @@ The diagram separates three boundaries:
 - **Operational HTTP** carries discovery, summaries, readiness, and assets.
 - **Workers** translate the chosen downstream adapter into the shared broker contract.
 
-The Zellij bridge is transient client state. SQLite is durable bookkeeping.
-Neither is a second session manager.
+The external ZJHive companion owns transient client state. Hive neither builds
+nor launches it. SQLite is durable bookkeeping; neither is a second session manager.
 
 ## Components and dependencies
 
 | Component | Responsibility |
 | --- | --- |
-| `crates/hive-cli` | Executable, command dispatch, browser opening, doctor output, native Zellij bridge |
+| `crates/hive-cli` | Executable, command dispatch, browser opening, doctor output |
 | `crates/hive-daemon` | HTTP boundary, shared broker, workers, control, persistence, activity and usage |
 | `crates/hive-core` | Transport-free Hive ID generation and declared lifecycle vocabulary |
 | `crates/hive-protocol` | SDK integration, protocol version type, native interaction validation |
 | `crates/hive-tui` | Terminal ACP client and UI |
-| `crates/hive-zellij` | WASI plugin using host HTTP and native bridge |
 | `crates/hive-mock-agent` | Deterministic development/test agent |
 | `clients/hive-web` | Embedded browser assets and JavaScript ACP client |
 
@@ -176,7 +177,7 @@ or unsupported modes cancel safely instead of implying permission.
 
 Rust hosts share validation helpers through `hive-protocol`. The browser has a
 separate JavaScript implementation checked against shared fixtures. Forms retain
-per-request drafts. Bridge delivery identities prevent stale answers from
+per-request drafts. Client delivery identities prevent stale answers from
 answering a newer question. URL consent and completion are correlated separately.
 
 See [ADR-007](adr/007-capability-aware-human-interaction-routing.md) and

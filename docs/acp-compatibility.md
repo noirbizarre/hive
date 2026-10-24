@@ -170,7 +170,7 @@ future outcomes without interpreting them as approval.
 Elicitation is optional. Advertise `capabilities.elicitation.form: {}` only when
 forms can be presented and valid content returned. Advertise `url: {}` only
 when URL consent and `elicitation/complete` notifications can be handled.
-Omitted/null modes are unsupported. Hive's TUI, browser, and Zellij bridge
+Omitted/null modes are unsupported. Hive's TUI, browser, and external ZJHive client
 advertise both modes. Hive advertises its stable broker-supported modes to
 agents, retaining each upstream client's negotiated support separately.
 

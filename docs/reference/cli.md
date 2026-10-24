@@ -13,7 +13,6 @@ Use `hive <command> --help` for the installed executable's exact help.
 | `hive web` | Open embedded browser client | `--url` |
 | `hive doctor [AGENT]...` | Diagnose all or selected profiles and daemon setup | `--config`, `--listen`, `--json` |
 | `hive completions <shell>` | Write shell completion script to stdout | Shell argument |
-| `hive zellij-bridge` | Native helper for ZJHive | `--listen`, `--url` |
 | `hive serve` | Legacy alias for daemon startup | `--listen`, `--config` |
 | `hive status` | Legacy alias for daemon status | `--url` |
 
@@ -42,7 +41,7 @@ Doctor checks every profile unless IDs are supplied. `--json` prints one report
 object. Errors exit 1; warnings alone exit 0. It probes initialization without
 prompting and does not create daemon lock/state files.
 
-## Web, status, and bridge URLs
+## Web and status URLs
 
 Their daemon base URL is selected in this order:
 
@@ -58,8 +57,7 @@ hive daemon status --url http://127.0.0.1:9000
 ```
 
 The parent daemon `--listen` option does not set the status URL. Web appends
-`/ui` to its base URL. Bridge `--listen` independently defaults to
-`127.0.0.1:8766` and controls its own loopback listener.
+`/ui` to its base URL.
 
 ## Environment variables
 
@@ -67,8 +65,8 @@ The parent daemon `--listen` option does not set the status URL. Web appends
 | --- | --- | --- |
 | `HIVE_CONFIG` | Daemon, doctor, serve | Configuration file |
 | `HIVE_DEFAULT_AGENT` | Configuration loading | Override default profile ID |
-| `HIVE_LISTEN` | Daemon, doctor, serve | Listen address; URL fallback for status/web/bridge |
-| `HIVE_URL` | Status, web, bridge | Daemon base URL |
+| `HIVE_LISTEN` | Daemon, doctor, serve | Listen address; URL fallback for status/web |
+| `HIVE_URL` | Status, web | Daemon base URL |
 | `RUST_LOG` | Daemon tracing | Log filter |
 | `XDG_CONFIG_HOME` | Configuration lookup | Configuration base directory |
 | `XDG_RUNTIME_DIR` | Instance lock | Runtime base directory |

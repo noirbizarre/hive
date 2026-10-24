@@ -34,5 +34,6 @@ stale-owner error to the sender. Running work and prompt outcomes survive
 upstream disconnects. Issue #10 subsequently added durable session metadata
 and downstream ACP reattachment; replay still does not survive daemon restart.
 The bounded log requires clients to handle an expired cursor explicitly.
-ZJHive remains status-only until its host interface can drive a suitable
-client transport; no separate session manager is created for it.
+The original status-only ZJHive limitation was subsequently addressed by
+[ADR-004](004-zellij-native-acp-bridge.md). ZJHive now owns its complete integration
+in an independent repository; no separate session manager is created for it.

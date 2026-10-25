@@ -61,6 +61,9 @@ pub struct Record {
     /// `hive` when Hive created the downstream session, `adopted` when it was found natively.
     #[serde(default = "default_origin")]
     pub origin: String,
+    /// Opaque connection identity prevents saved native IDs from moving to another server.
+    #[serde(default)]
+    pub identity: Option<String>,
 }
 
 fn default_kind() -> String {
@@ -386,6 +389,7 @@ mod tests {
             kind: "acp".into(),
             api: None,
             origin: "hive".into(),
+            identity: None,
         }
     }
 

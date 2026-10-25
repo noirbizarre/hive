@@ -353,7 +353,38 @@ async fn refresh(address: &str, app: &mut App) -> Result<(), String> {
         .filter(|s| app.all || s.cwd == app.cwd)
         .collect();
     app.update_sessions(sessions);
+    let providers: serde_json::Value = reqwest::get(format!("http://{address}/v1/providers"))
+        .await
+        .map_err(|error| error.to_string())?
+        .error_for_status()
+        .map_err(|error| error.to_string())?
+        .json()
+        .await
+        .map_err(|error| error.to_string())?;
+    update_profiles(app, &providers);
     Ok(())
+}
+
+fn update_profiles(app: &mut App, providers: &serde_json::Value) {
+    // `selected` also indexes the session list on other pages; only remap it for profiles.
+    let selected = (app.page == Page::Profiles)
+        .then(|| app.profiles.get(app.selected).cloned())
+        .flatten();
+    app.profiles = providers["agents"]
+        .as_array()
+        .map(|agents| {
+            agents
+                .iter()
+                .filter_map(|agent| agent["id"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    if app.page == Page::Profiles {
+        app.selected = selected
+            .as_ref()
+            .and_then(|id| app.profiles.iter().position(|profile| profile == id))
+            .unwrap_or(0);
+    }
 }
 
 fn resume_failure(error: &agent_client_protocol::Error) -> String {
@@ -1128,15 +1159,7 @@ pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error + Sen
             .await?
             .json()
             .await?;
-    app.profiles = providers["agents"]
-        .as_array()
-        .map(|agents| {
-            agents
-                .iter()
-                .filter_map(|agent| agent["id"].as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default();
+    update_profiles(&mut app, &providers);
     if let Some(agent) = &options.agent {
         if options.session.is_none() {
             app.page = Page::Profiles;
@@ -1343,6 +1366,31 @@ mod tests {
         let result = done.recv_timeout(Duration::from_millis(500));
         worker.join().unwrap();
         result.expect("an idle keyboard reader must observe receiver closure");
+    }
+
+    #[test]
+    fn provider_refresh_preserves_selection_by_id_and_leaves_the_active_session_and_draft_intact() {
+        let mut app = App {
+            page: Page::Profiles,
+            profiles: vec!["a".into(), "b".into()],
+            selected: 1,
+            active: Some("existing".into()),
+            input: "unsent draft".into(),
+            ..App::default()
+        };
+        app.update_sessions(vec![]);
+        update_profiles(
+            &mut app,
+            &serde_json::json!({"agents":[{"id":"b"},{"id":"c"}]}),
+        );
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.profiles[app.selected], "b");
+        update_profiles(&mut app, &serde_json::json!({"agents":[{"id":"c"}]}));
+        assert_eq!(app.profiles[app.selected], "c");
+        update_profiles(&mut app, &serde_json::json!({"agents":[]}));
+        assert_eq!(app.selected, 0);
+        assert_eq!(app.active.as_deref(), Some("existing"));
+        assert_eq!(app.input, "unsent draft");
     }
 
     #[tokio::test]

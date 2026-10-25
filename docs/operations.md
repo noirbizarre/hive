@@ -4,7 +4,7 @@
 
 Run `hive daemon` in a terminal and leave it running. Use `hive daemon status`
 from another terminal to query its JSON status. Hive does not provide background
-start, stop, restart, or reload subcommands.
+start, stop, or restart subcommands.
 
 Interrupt the foreground process with `Ctrl-C` to stop it. Client exit is
 different: it leaves downstream work running while the daemon remains alive.
@@ -12,6 +12,26 @@ different: it leaves downstream work running while the daemon remains alive.
 Only one daemon can hold the per-user runtime lock. Changing its port does not
 allow a second daemon in the same runtime namespace. The lock is released on
 process exit. See [configuration paths](configuration.md#runtime-locations).
+
+## Reloading configuration
+
+```sh
+hive daemon reload
+hive daemon reload --url http://127.0.0.1:9000
+# Unix: substitute the PID of the running Hive daemon.
+kill -HUP "$HIVE_PID"
+```
+
+Both triggers reread the daemon's original configuration file. A command prints
+the accepted catalog revision or exits unsuccessfully with a diagnostic. SIGHUP
+logs the outcome and keeps listening after a failed reload. A timed-out command
+may still have applied its candidate; check status or safely retry.
+
+Configuration is published only after complete validation. Existing sessions
+continue unchanged; new sessions use updated profiles and defaults. Open clients
+refresh provider choices. Invalid, missing, or unreadable files leave the previous
+configuration active. Reload does not launch probes or retry offline recovery.
+See [reload semantics and identity conflicts](configuration.md#reloading-changes).
 
 ## Health and diagnosis
 

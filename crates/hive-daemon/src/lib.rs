@@ -23,7 +23,7 @@ use axum::{
         Html,
         sse::{Event, Sse},
     },
-    routing::get,
+    routing::{get, post},
 };
 use fs2::FileExt;
 use hive_core::SessionId;
@@ -40,6 +40,7 @@ mod interactions;
 mod opencode;
 mod persistence;
 mod pricing;
+pub mod reload;
 mod session_config;
 mod usage;
 use activity::Activity;
@@ -104,7 +105,8 @@ fn transport(profile: &Profile) -> Result<Downstream, String> {
 
 #[derive(Clone)]
 pub struct Broker {
-    registry: Arc<Config>,
+    registry: Arc<Mutex<reload::Registry>>,
+    reloading: Arc<tokio::sync::Mutex<()>>,
     sessions: Arc<Mutex<HashMap<String, Entry>>>,
     catalog: watch::Sender<u64>,
     store: Option<Arc<Store>>,
@@ -597,7 +599,7 @@ impl Broker {
         let Some(store) = self.store.clone() else {
             return;
         };
-        let Some(provider) = self.registry.agents.get(&record.profile).cloned() else {
+        let Some(provider) = self.config().agents.get(&record.profile).cloned() else {
             record.outcome = Outcome::Unavailable;
             record.reason =
                 Some("agent profile is missing; restore its configuration and restart Hive".into());
@@ -612,6 +614,14 @@ impl Broker {
                 "agent profile no longer uses adapter kind '{}'; restore it and restart Hive",
                 record.kind
             ));
+            self.update_offline(record);
+            return;
+        }
+        if provider.kind == ProfileKind::OpencodeServer
+            && (record.identity.is_none() || record.identity != reload::identity(&provider))
+        {
+            record.outcome = Outcome::Unavailable;
+            record.reason = Some("agent server identity changed; restore the original connection configuration and restart Hive, or use a new profile ID".into());
             self.update_offline(record);
             return;
         }
@@ -801,7 +811,13 @@ impl Broker {
     pub fn new(registry: Config) -> Self {
         let (catalog, _) = watch::channel(0);
         Self {
-            registry: Arc::new(registry),
+            registry: Arc::new(Mutex::new(reload::Registry {
+                current: Arc::new(registry),
+                source: None,
+                bindings: HashMap::new(),
+                stopping: false,
+            })),
+            reloading: Arc::new(tokio::sync::Mutex::new(())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             catalog,
             store: None,
@@ -828,6 +844,34 @@ impl Broker {
                 })
                 .collect(),
         ));
+        {
+            let mut registry = broker.registry.lock().expect("configuration lock poisoned");
+            let mut offline = broker.offline.lock().expect("offline lock poisoned");
+            for record in offline.values_mut() {
+                let kind = if record.kind == ProfileKind::OpencodeServer.as_str() {
+                    ProfileKind::OpencodeServer
+                } else {
+                    ProfileKind::Acp
+                };
+                // Legacy records did not carry identity: preserve the startup recovery baseline.
+                if kind == ProfileKind::OpencodeServer
+                    && record.identity.is_none()
+                    && let Some(profile) = registry.current.agents.get(&record.profile)
+                    && profile.kind == kind
+                {
+                    record.identity = reload::identity(profile);
+                    store.save(record)?;
+                }
+                registry.bindings.insert(
+                    record.id.clone(),
+                    reload::Binding {
+                        profile: record.profile.clone(),
+                        kind,
+                        identity: record.identity.clone(),
+                    },
+                );
+            }
+        }
         broker.store = Some(store);
         Ok(broker)
     }
@@ -1231,7 +1275,7 @@ impl Broker {
             name: "hive",
             version: env!("CARGO_PKG_VERSION"),
             sessions: sessions.map_or(0, |sessions| sessions.len()) + offline,
-            default_agent: self.registry.default_agent.clone(),
+            default_agent: self.config().default_agent.clone(),
             active_by_agent,
         }
     }
@@ -1249,7 +1293,8 @@ impl Broker {
                 Json(serde_json::json!({ "code": code, "message": message })),
             )
         };
-        let profile = self.registry.agents.get(agent).ok_or_else(|| {
+        let registry = self.config();
+        let profile = registry.agents.get(agent).ok_or_else(|| {
             problem(
                 StatusCode::NOT_FOUND,
                 "hive::providers::unknown",
@@ -1303,11 +1348,15 @@ impl Broker {
     }
 
     fn provider_info(&self) -> serde_json::Value {
-        serde_json::json!({ "defaultAgent": self.registry.default_agent, "agents": self.registry.public_profiles() })
+        let registry = self.config();
+        serde_json::json!({ "defaultAgent": registry.default_agent, "agents": registry.public_profiles() })
     }
 
     /// Close every downstream worker when an embedded gateway stops serving requests.
     pub async fn shutdown(&self) {
+        if let Ok(mut registry) = self.registry.lock() {
+            registry.stopping = true;
+        }
         let entries = self
             .sessions
             .lock()
@@ -1369,14 +1418,48 @@ impl Broker {
                     Error::invalid_params().data("_meta.hive must be an object containing agent")
                 );
             }
-            None => self.registry.default_agent.clone(),
+            None => None,
         };
-        let chosen = chosen.ok_or_else(|| Error::invalid_params().data("no default agent configured; set default_agent in Hive config or pass _meta.hive.agent in session/new"))?;
-        let provider = self.registry.agents.get(&chosen).cloned().ok_or_else(|| {
-            Error::invalid_params().data(format!(
-                "unknown agent profile '{chosen}'; query GET /v1/providers"
-            ))
-        })?;
+        let hive_id = v2::SessionId::new(SessionId::new().as_str());
+        let (chosen, provider, mut reservation) = {
+            // Selection and binding publication are one admission boundary with reload.
+            let mut registry = self.registry.lock().map_err(|_| Error::internal_error())?;
+            if registry.stopping {
+                return Err(Error::invalid_request().data("Hive is shutting down"));
+            }
+            let chosen = chosen.or_else(|| registry.current.default_agent.clone());
+            let chosen = chosen.ok_or_else(|| Error::invalid_params().data("no default agent configured; set default_agent in Hive config or pass _meta.hive.agent in session/new"))?;
+            let provider = registry
+                .current
+                .agents
+                .get(&chosen)
+                .cloned()
+                .ok_or_else(|| {
+                    Error::invalid_params().data(format!(
+                        "unknown agent profile '{chosen}'; query GET /v1/providers"
+                    ))
+                })?;
+            registry
+                .check(&chosen, &provider)
+                .map_err(|error| Error::invalid_request().data(error.to_string()))?;
+            registry.bindings.insert(
+                hive_id.to_string(),
+                reload::Binding {
+                    profile: chosen.clone(),
+                    kind: provider.kind,
+                    identity: reload::identity(&provider),
+                },
+            );
+            (
+                chosen,
+                provider,
+                reload::Reservation {
+                    registry: self.registry.clone(),
+                    id: hive_id.to_string(),
+                    retained: false,
+                },
+            )
+        };
         let kind = provider.kind;
         if adopt.is_some() && kind != ProfileKind::OpencodeServer {
             return Err(Error::invalid_params().data(format!(
@@ -1391,7 +1474,6 @@ impl Broker {
             ),
             None => None,
         };
-        let hive_id = v2::SessionId::new(SessionId::new().as_str());
         let (tx, rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = oneshot::channel();
         let (active_tx, active_rx) = oneshot::channel();
@@ -1443,10 +1525,12 @@ impl Broker {
                 usage: Ledger::default(),
                 kind: kind.as_str().into(),
                 api: None,
+                identity: reload::identity(&provider),
                 origin: if adopt.is_some() { "adopted" } else { "hive" }.into(),
             }))
         });
         let worker_record = stored_record.clone();
+        let worker_registry = self.registry.clone();
         // Each session owns its subprocess: no guessed transport support or duplicate probing.
         let task = tokio::spawn(async move {
             if kind == ProfileKind::OpencodeServer {
@@ -1521,6 +1605,12 @@ impl Broker {
             {
                 catalog.send_modify(|revision| *revision += 1);
             }
+            if store.is_none()
+                && let Ok(mut registry) = worker_registry.lock()
+            {
+                // Keep the identity reserved until native-ID discovery can no longer find it.
+                registry.bindings.remove(&id.to_string());
+            }
         });
         let entry = Entry {
             cwd,
@@ -1580,6 +1670,8 @@ impl Broker {
                         task.abort();
                         return Err(storage_error(error));
                     }
+                    // Once durable, cancellation must not forget the native identity.
+                    reservation.retained = true;
                     let mut state = entry_control.lock().map_err(|_| Error::internal_error())?;
                     state.store = Some(store.clone());
                     state.record = stored_record.clone();
@@ -1589,6 +1681,7 @@ impl Broker {
                     sessions.insert(hive_id.to_string(), entry);
                     self.catalog.send_modify(|revision| *revision += 1);
                 }
+                reservation.retained = true;
                 let _ = active_tx.send(());
                 startup_guard.0 = None;
                 response.session_id = hive_id;
@@ -2529,6 +2622,7 @@ pub fn router(broker: Broker) -> Router {
 
 /// Only the specified browser origin and its listener-local aliases may initiate an upgrade.
 pub fn router_with_origin(broker: Broker, origin: Option<&str>) -> Router {
+    let reload_origin = origin.map(str::to_owned);
     let state = broker.clone();
     let agent = move || gateway_agent(state.clone());
     let mut server = AcpHttpServer::new(agent);
@@ -2549,6 +2643,26 @@ pub fn router_with_origin(broker: Broker, origin: Option<&str>) -> Router {
     }
     server
         .into_router()
+        .route(
+            "/v1/config/reload",
+            post({
+                let broker = broker.clone();
+                move |headers: axum::http::HeaderMap| {
+                    let broker = broker.clone();
+                    let origin = reload_origin.clone();
+                    async move {
+                        if !reload::allowed_origin(&headers, origin.as_deref()) {
+                            return Err((axum::http::StatusCode::FORBIDDEN, Json(serde_json::json!({
+                                "code": "hive::reload::origin", "message": "reload origin is not allowed; use the local CLI or listener origin",
+                            }))));
+                        }
+                        broker.reload_config().await
+                            .map(|revision| Json(serde_json::json!({"reloaded": true, "revision": revision})))
+                            .map_err(reload::ReloadError::response)
+                    }
+                }
+            }),
+        )
         .route(
             "/v1/health",
             get(|| async { Json(serde_json::json!({"status":"ok"})) }),
@@ -2884,6 +2998,8 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
                                     broker.catalog.send_modify(|revision| *revision += 1);
                                 }
                                 drop(sessions);
+                                broker.registry.lock().map_err(|_| Error::internal_error())?
+                                    .bindings.remove(&request.session_id.to_string());
                                 responder.respond(v2::CloseSessionResponse::new())
                             }
                             _ => {
@@ -2924,6 +3040,23 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
 
 /// Reject remote binds: this initial gateway has no authentication or TLS.
 pub async fn serve(addr: SocketAddr, registry: Config) -> std::io::Result<()> {
+    serve_inner(addr, registry, None).await
+}
+
+/// Source-backed startup keeps reload metadata out of the public configuration schema.
+pub async fn serve_configured(
+    addr: SocketAddr,
+    source: config::ConfigSource,
+) -> std::io::Result<()> {
+    let registry = source.load().map_err(std::io::Error::other)?;
+    serve_inner(addr, registry, Some(source)).await
+}
+
+async fn serve_inner(
+    addr: SocketAddr,
+    registry: Config,
+    source: Option<config::ConfigSource>,
+) -> std::io::Result<()> {
     if !addr.ip().is_loopback() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -2939,27 +3072,60 @@ pub async fn serve(addr: SocketAddr, registry: Config) -> std::io::Result<()> {
         persistence::default_path().map_err(std::io::Error::other)?,
     )
     .map_err(std::io::Error::other)?;
+    let broker = if let Some(source) = source {
+        broker.with_config_source(source)
+    } else {
+        broker
+    };
+    // Register before serving readiness: an immediate HUP must never terminate the process.
+    #[cfg(unix)]
+    let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+    #[cfg(unix)]
+    let hangups = tokio::spawn({
+        let broker = broker.clone();
+        async move {
+            while hangup.recv().await.is_some() {
+                match broker.reload_config().await {
+                    Ok(revision) => tracing::info!(revision, "Hive configuration reloaded"),
+                    Err(error) => {
+                        tracing::warn!(code = ?miette::Diagnostic::code(&error).map(|code| code.to_string()), %error, "Hive configuration reload rejected")
+                    }
+                }
+            }
+        }
+    });
+    #[cfg(unix)]
+    let _hangup_guard = AbortOnDrop(Some(hangups.abort_handle()));
     // Discovery stays responsive while slow or unavailable agents are reconciled.
     let recovery = tokio::spawn({
         let broker = broker.clone();
         async move { broker.reconcile().await }
     });
+    let _recovery_guard = AbortOnDrop(Some(recovery.abort_handle()));
     let (shutdown_done, shut_down) = oneshot::channel();
+    let shutdown_broker = broker.clone();
     let server = axum::serve(listener, router_with_origin(broker.clone(), Some(&origin)))
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
             recovery.abort();
             let _ = recovery.await;
-            broker.shutdown().await;
+            shutdown_broker.shutdown().await;
             let _ = shutdown_done.send(());
         })
         .into_future();
     tokio::pin!(server);
-    tokio::select! {
+    let result = tokio::select! {
         result = &mut server => result,
         _ = shut_down => tokio::time::timeout(std::time::Duration::from_secs(8), &mut server).await
             .unwrap_or_else(|_| Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Hive HTTP shutdown timed out; active clients may need to reconnect"))),
+    };
+    broker.shutdown().await;
+    #[cfg(unix)]
+    {
+        hangups.abort();
+        let _ = hangups.await;
     }
+    result
 }
 
 /// Parent of the Hive runtime directory. Shared with `hive doctor` so that the two can never

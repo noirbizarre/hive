@@ -12,6 +12,7 @@ user. Session conversation/control methods live exclusively on `/acp`.
 | `GET /v1/ready` | `{ "ready": true }` when listener is active, without probing agents |
 | `GET /v1/status` | Name, build version, live/persisted session counts, default agent, active sessions by agent |
 | `GET /v1/providers` | Profile IDs, names, declared transports/versions, default indication |
+| `POST /v1/config/reload` | Validate and publish the original configuration for new sessions |
 | `GET /v1/providers/{agent}/native-sessions` | Native sessions an OpenCode server profile can adopt |
 | `GET /v1/sessions` | Live/persisted session summaries and catalog revision |
 | `GET /v1/sessions/events` | SSE catalog revision invalidations |
@@ -20,6 +21,34 @@ user. Session conversation/control methods live exclusively on `/acp`.
 
 Provider discovery omits commands, endpoints, arguments, environment, and headers.
 It describes configuration rather than successful availability probes.
+
+## Configuration reload
+
+`POST /v1/config/reload` takes no body or source-path parameter. It reloads the
+daemon's original file and returns `{ "reloaded": true, "revision": 8 }` on
+success. Existing workers, pricing, ownership, and replay remain unchanged.
+An accepted reload invalidates the catalog even if no session changed or the
+file was unchanged; clients should refresh both sessions and provider inventory.
+
+Failure bodies carry `code`, `message`, and optional `help`, without connection
+secrets. Failed reloads preserve configuration and do not emit an invalidation:
+
+| Status | Meaning |
+| --- | --- |
+| `422` | Read, TOML, or validation failure (`hive::config::*`) |
+| `409` | Existing session identity conflict (`hive::reload::profile_identity`) or an embedded broker without a file (`hive::reload::no_source`) |
+| `403` | Browser origin rejected (`hive::reload::origin`) |
+| `503` | Daemon shutting down (`hive::reload::stopping`) |
+| `500` | Internal reload failure (`hive::reload::internal`) |
+
+No-Origin local CLI requests are accepted. Browser mutations must originate from
+the exact listener origin or its `http://localhost:<same-port>` alias; foreign,
+null, duplicate origins and cross-site fetches are rejected. This preserves the
+trusted-local-user boundary, without introducing a separate login.
+
+Unix SIGHUP and `hive daemon reload` call the same reload implementation.
+See [configuration](configuration.md#reloading-changes) for identity and environment
+rules and [operations](operations.md#reloading-configuration) for examples.
 
 ## ACP boundary
 
@@ -182,10 +211,10 @@ working directories. The local trust boundary applies.
 ## Catalog revision stream
 
 Open `GET /v1/sessions/events` as an EventSource or SSE client **before**
-fetching `/v1/sessions`. Each event is named `revision`, with its decimal
+fetching `/v1/sessions` and `/v1/providers`. Each event is named `revision`, with its decimal
 revision in `data` and `id`. The first event reports the current revision.
 
-If an event is newer than the snapshot, fetch another snapshot. Always fetch a
+If an event is newer than the snapshot, refresh both inventories. Always fetch a
 fresh snapshot on reconnection. Revisions are monotonic only within this daemon
 process and changes may coalesce.
 

@@ -620,13 +620,33 @@ export function connect(url, onChange = () => {}) {
 }
 
 // Catalog revisions are invalidations, never conversation updates or browser ownership state.
-export function catalog(onChange, onError = () => {}) {
+export function catalog(onChange, onError = () => {}, onProviders) {
   let revision = -1;
   let stopped = false;
   let requestId = 0;
+  let providerRequest = 0;
+  let providerRetry;
   const events = new EventSource('/v1/sessions/events');
+  async function refreshProviders() {
+    if (!onProviders || stopped) return;
+    const id = ++providerRequest;
+    clearTimeout(providerRetry);
+    try {
+      const response = await fetch('/v1/providers');
+      if (!response.ok) throw new Error(`Agent inventory unavailable (${response.status})`);
+      const inventory = await response.json();
+      if (!stopped && id === providerRequest) onProviders(inventory);
+    } catch (error) {
+      if (!stopped && id === providerRequest) {
+        onError(error.message);
+        // The last invalidation may be the final one; retry even without another session event.
+        providerRetry = setTimeout(refreshProviders, 2000);
+      }
+    }
+  }
   async function refresh() {
     const id = ++requestId;
+    void refreshProviders();
     try {
       const response = await fetch('/v1/sessions');
       if (!response.ok) throw new Error(`Session list failed (${response.status})`);
@@ -644,7 +664,7 @@ export function catalog(onChange, onError = () => {}) {
   });
   events.onopen = () => refresh();
   refresh();
-  return { refresh, close() { stopped = true; events.close(); } };
+  return { refresh, close() { stopped = true; clearTimeout(providerRetry); events.close(); } };
 }
 
 function add(parent, tag, text, attributes = {}) {
@@ -904,7 +924,12 @@ export function mount(client, root = document) {
     renderRows(client.state());
     if (selectedId && !opening) { opening = true; open(selectedId); }
   }
-  const feed = catalog(renderList, message => { if (listStatus) listStatus.textContent = message; else status.textContent = message; });
+  const feed = catalog(renderList, message => { if (listStatus) listStatus.textContent = message; else status.textContent = message; }, ({ agents, defaultAgent }) => {
+    const selected = agentSelect.value || client.state().session?.agent;
+    agentSelect.replaceChildren();
+    for (const agent of agents) add(agentSelect, 'option', agent.name, { value: agent.id });
+    agentSelect.value = agents.some(agent => agent.id === selected) ? selected : defaultAgent || agents[0]?.id || '';
+  });
   if (toggle) toggle.onclick = () => {
     navigationVisible = !navigationVisible;
     layout.classList.toggle('nav-hidden', !navigationVisible);
@@ -912,10 +937,6 @@ export function mount(client, root = document) {
     toggle.textContent = navigationVisible ? 'Hide sessions' : 'Show sessions';
     if (navigationVisible) list.querySelector('[aria-current="page"]')?.focus();
   };
-  fetch('/v1/providers').then(response => response.json()).then(({ agents }) => {
-    for (const agent of agents) add(agentSelect, 'option', agent.name, { value: agent.id });
-    if (client.state().session?.agent) agentSelect.value = client.state().session.agent;
-  }).catch(() => { status.textContent = 'Agent inventory unavailable'; });
   root.querySelector('#takeover').onsubmit = event => {
     event.preventDefault();
     open(new FormData(event.target).get('session').trim());

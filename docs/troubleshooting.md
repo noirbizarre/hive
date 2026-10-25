@@ -31,8 +31,15 @@ to start another. A different port does not bypass the singleton lock.
 | `hive::doctor::no_agents` | Create the configuration or select the intended file |
 
 An absent implicit default file is allowed and yields no agents. An explicit
-missing file fails. Restart the daemon after edits: configuration is not hot-reloaded.
+missing file fails. Run `hive daemon reload` after edits, or send Unix SIGHUP.
+Reload failures leave the previous configuration active. New sessions use the
+updated profiles; existing sessions retain their original settings.
 See [configuration](configuration.md).
+
+`hive::reload::profile_identity` means an OpenCode profile is still associated
+with existing or saved sessions. Use a new profile ID for a different server,
+adapter, or routing/authentication configuration. Removing and re-adding the ID
+does not release its association. Reload does not retry offline session recovery.
 
 ## Agent initialization fails
 

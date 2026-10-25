@@ -3,6 +3,7 @@
 mod picker;
 mod state;
 mod theme;
+mod transcript;
 mod ui;
 
 #[cfg(test)]
@@ -19,7 +20,10 @@ use agent_client_protocol::{
 };
 use clap::Args;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+        MouseEvent, MouseEventKind,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -206,9 +210,10 @@ impl Interaction {
 impl TerminalGuard {
     fn enter() -> std::io::Result<Self> {
         enable_raw_mode()?;
-        if let Err(error) = execute!(std::io::stdout(), EnterAlternateScreen) {
+        if let Err(error) = execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture) {
             // An alternate-screen failure must not leave the user's shell in raw mode.
             let _ = disable_raw_mode();
+            let _ = execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
             return Err(error);
         }
         Ok(Self)
@@ -216,7 +221,7 @@ impl TerminalGuard {
 }
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = execute!(std::io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
         let _ = disable_raw_mode();
     }
 }
@@ -652,6 +657,26 @@ async fn handle_key(
         return false;
     }
     match (key.code, ctrl) {
+        (KeyCode::PageUp, _) | (KeyCode::PageDown, _) if app.page == Page::Chat => {
+            if let Some(view) = app.transcript() {
+                view.page(key.code == KeyCode::PageDown);
+            }
+        }
+        (KeyCode::Home, _) | (KeyCode::End, _) if app.page == Page::Chat => {
+            if let Some(view) = app.transcript() {
+                view.boundary(key.code == KeyCode::End);
+            }
+        }
+        (KeyCode::Up, true) | (KeyCode::Down, true) if app.page == Page::Chat => {
+            if let Some(view) = app.transcript() {
+                view.select_tool(key.code == KeyCode::Down);
+            }
+        }
+        (KeyCode::Char('o'), true) if app.page == Page::Chat => {
+            if let Some(view) = app.transcript() {
+                view.toggle_selected();
+            }
+        }
         // Ctrl-M aliases Enter in terminals; Ctrl-P remains distinguishable for the model picker.
         (KeyCode::Char('p'), true) => {
             if let Some(id) = app.active.clone() {
@@ -923,6 +948,27 @@ fn apply_configuration(cx: &V2ConnectionTo<Agent>, app: &mut App) {
         picker.pending = false;
         picker.message = error.to_string();
         app.status.clone_from(&picker.message);
+    }
+}
+
+fn handle_mouse(app: &mut App, event: MouseEvent) {
+    // Overlays own input: wheel/click events must never reach the history behind them.
+    if let Some(picker) = app.picker.as_mut() {
+        match event.kind {
+            MouseEventKind::ScrollUp => picker.navigate(-3),
+            MouseEventKind::ScrollDown => picker.navigate(3),
+            _ => {}
+        }
+    } else if app.dialog.is_some() {
+        match event.kind {
+            MouseEventKind::ScrollUp => app.dialog_scroll = app.dialog_scroll.saturating_sub(3),
+            MouseEventKind::ScrollDown => app.dialog_scroll = app.dialog_scroll.saturating_add(3),
+            _ => {}
+        }
+    } else if app.page == Page::Chat
+        && let Some(view) = app.transcript()
+    {
+        view.mouse(event);
     }
 }
 
@@ -1234,7 +1280,13 @@ pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error + Sen
                                  if error.contains("stale") && app.active.as_deref() == Some(&id) { app.owner = None; }
                              }}
                          }
-                         Some(Event::Key(key)) = keys.recv() => {
+                          Some(event) = keys.recv() => {
+                             let key = match event {
+                                 Event::Key(key) => key,
+                                 Event::Mouse(mouse) => { handle_mouse(&mut app, mouse); continue; }
+                                 // The next draw recalculates wrapping and click targets after a resize.
+                                 _ => continue,
+                             };
                              let before = app.active.clone();
                              let declined_url = if key.code == KeyCode::Esc { interaction.as_ref().and_then(Interaction::url_id) } else { None };
                              if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) { url_flows.clear(); }

@@ -9,11 +9,7 @@ use ratatui::{
 };
 use serde::Deserialize;
 
-use crate::{
-    picker::Picker,
-    state::{Conversation, LineKind},
-    theme::Theme,
-};
+use crate::{picker::Picker, state::Conversation, theme::Theme, transcript::Transcript};
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -61,6 +57,7 @@ pub struct App {
     pub recent: Vec<String>,
     pub cwd: std::path::PathBuf,
     pub conversations: HashMap<String, Conversation>,
+    pub transcripts: HashMap<String, Transcript>,
     pub owner: Option<v2::Meta>,
     pub input: String,
     pub status: String,
@@ -184,6 +181,12 @@ impl App {
         self.active
             .as_ref()
             .and_then(|id| self.conversations.get(id))
+    }
+
+    pub fn transcript(&mut self) -> Option<&mut Transcript> {
+        self.active
+            .clone()
+            .map(|id| self.transcripts.entry(id).or_default())
     }
 
     pub fn pilot(&self) -> bool {
@@ -476,7 +479,7 @@ impl App {
         frame.render_stateful_widget(list, area, &mut self.profile_list);
     }
 
-    fn render_conversation(&self, frame: &mut Frame, area: Rect, theme: Theme) {
+    fn render_conversation(&mut self, frame: &mut Frame, area: Rect, theme: Theme) {
         if self.active.is_none() {
             frame.render_widget(
                 Paragraph::new(Text::from(vec![
@@ -488,48 +491,16 @@ impl App {
             );
             return;
         }
-        let lines = self
-            .conversation()
-            .into_iter()
-            .flat_map(|conversation| conversation.lines.iter())
-            .enumerate()
-            .flat_map(|(position, entry)| {
-                let style = match entry.kind {
-                    LineKind::User => theme.accent(),
-                    LineKind::Tool | LineKind::Notice => theme.muted(),
-                    LineKind::Agent => theme.text(),
-                };
-                // Spacing separates turns without the heavy borders of the old conversation pane.
-                let gap = (position > 0).then(Line::default);
-                // Split embedded newlines so wrapping and bottom anchoring count every row.
-                gap.into_iter()
-                    .chain(entry.text.lines().enumerate().map(move |(index, line)| {
-                        if entry.kind == LineKind::User {
-                            Line::styled(
-                                format!("{} {line}", if index == 0 { "▏" } else { " " }),
-                                style,
-                            )
-                        } else {
-                            Line::styled(line.to_owned(), style)
-                        }
-                    }))
-            })
-            .collect::<Vec<_>>();
         let body = Block::default().padding(Padding::horizontal(3));
-        let width = area.width.saturating_sub(6).max(1) as usize;
-        // Account for wrapped rows so the latest response remains in view while it grows.
-        let rows: usize = lines
-            .iter()
-            .map(|line| line.width().max(1).div_ceil(width))
-            .sum();
-        let paragraph = Paragraph::new(Text::from(lines))
-            .style(theme.text())
-            .wrap(Wrap { trim: false })
-            .block(body);
-        let scroll = rows
-            .saturating_sub(area.height as usize)
-            .min(u16::MAX as usize) as u16;
-        frame.render_widget(paragraph.scroll((scroll, 0)), area);
+        if let Some(id) = self.active.as_ref()
+            && let Some(conversation) = self.conversations.get(id)
+        {
+            self.transcripts.entry(id.clone()).or_default().render(
+                conversation,
+                frame,
+                body.inner(area),
+            );
+        }
     }
 
     fn render_composer(&self, frame: &mut Frame, area: Rect, theme: Theme) {
@@ -604,6 +575,13 @@ impl App {
     }
 
     fn render_footer(&self, frame: &mut Frame, area: Rect, theme: Theme, compact: bool) {
+        let history = self.page == Page::Chat
+            && self.dialog.is_none()
+            && self
+                .active
+                .as_ref()
+                .and_then(|id| self.transcripts.get(id))
+                .is_some_and(|view| view.top.is_some());
         let hint = match self.page {
             Page::Sessions if self.sessions.is_empty() => {
                 if self.active.is_some() {
@@ -618,14 +596,21 @@ impl App {
             Page::Profiles if self.profiles.is_empty() => "Tab sessions  Esc quit",
             Page::Profiles => "↑↓ select  Enter create  Tab sessions  Esc quit",
             Page::Chat if self.dialog.is_some() => "Enter confirm  Esc decline",
+            Page::Chat if history => {
+                "History · PgUp/PgDn or wheel scroll · End live · Ctrl-↑↓ tool · Ctrl-O details"
+            }
             Page::Chat => {
-                "Enter send  Ctrl-P model  Tab sessions  Ctrl-B recent  Ctrl-N new  Ctrl-T pilot  Ctrl-H handoff  Ctrl-R live  Ctrl-Y acknowledge recovery  Ctrl-C cancel  Esc quit"
+                "Enter send  Tab sessions  PgUp/PgDn scroll  End live  Ctrl-↑↓ tool  Ctrl-O details  Ctrl-P model  Ctrl-N new  Ctrl-C cancel  Esc quit"
             }
         };
+        // Browsing older messages must not hide a new connection or submission error.
+        let history_status = format!("History · End live · {}", self.status);
         let mut lines = vec![Line::from(vec![
             Span::styled("  ▪ ", theme.accent()),
             Span::styled(
-                if self.status.is_empty() {
+                if history && !self.status.is_empty() {
+                    &history_status
+                } else if self.status.is_empty() || history {
                     hint
                 } else {
                     &self.status
@@ -1111,7 +1096,8 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 18)).unwrap();
         terminal.draw(|frame| app.show(frame)).unwrap();
         let rendered = screen(&terminal);
-        assert!(rendered.contains("▏ You: hello"));
+        assert!(rendered.contains("▏ You"));
+        assert!(rendered.contains("hello"));
         assert!(rendered.contains("Session"));
         assert!(rendered.contains("Connected"));
         assert!(rendered.contains("next step"));

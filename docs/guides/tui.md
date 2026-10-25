@@ -29,6 +29,12 @@ so the same sessions are available in the Web UI and other ACP clients.
 | `Ctrl-P` | Open/close the provider/model configuration picker |
 | `Ctrl-H` | Relinquish control while observing |
 | Enter in composer | Send the typed prompt |
+| Page Up / Page Down | Scroll conversation history |
+| Home / End | Jump to the oldest message / resume following live output |
+| Mouse wheel over conversation | Scroll history |
+| Click a tool summary | Expand/collapse formatted tool details |
+| `Ctrl-Up` / `Ctrl-Down` | Select the previous/next tool call |
+| `Ctrl-O` | Expand/collapse the selected tool (latest visible tool by default) |
 | `Ctrl-C` | Cancel foreground work |
 | `Ctrl-R` | Accept live-only attachment after a history gap |
 | `Ctrl-Y` | Acknowledge interrupted work and take control |
@@ -87,3 +93,19 @@ the TUI. See [CLI reference](../reference/cli.md).
 The transcript follows your terminal's foreground/background and ANSI colors.
 Session details collapse in narrow terminals. Unknown activity remains unknown,
 and an attention marker reflects only questions visible to this client.
+
+Messages render Markdown headings, emphasis, lists, links, tables, and code
+blocks. Tool calls start collapsed as a single line with the tool name (or
+category), status, and a short action summary. Click that line to inspect input,
+output, and file changes; text output is decoded and formatted instead of showing
+the serialized protocol event. You can also select tools with `Ctrl-Up` /
+`Ctrl-Down` and toggle details with `Ctrl-O`.
+
+Page Up/Down and the mouse wheel browse the retained conversation history. Home
+jumps to the beginning; End returns to the latest output and resumes automatic
+following. New output does not pull you away while reading older messages, and
+each session retains its own scroll position and expanded tools. The footer
+shows **History** while automatic following is paused. With an agent question or
+model picker open, scrolling controls that dialog instead of the conversation.
+Hold Shift when selecting terminal text if your terminal reserves mouse input
+for the application.

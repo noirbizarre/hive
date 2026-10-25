@@ -253,6 +253,68 @@ async fn dismissing_search_preserves_the_draft_and_no_matches_cannot_submit() {
     .await;
 }
 
+#[tokio::test]
+async fn history_keys_and_mouse_scroll_without_editing_the_draft_or_leaking_through_a_modal() {
+    connected(async |cx| {
+        let mut app = App::default();
+        app.select_session("one".into());
+        app.input = "unfinished prompt".into();
+        for number in 0..40 {
+            app.conversations
+                .entry("one".into())
+                .or_default()
+                .push_notice(format!("Message {number}"));
+        }
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|frame| app.show(frame)).unwrap();
+        press(&cx, &mut app, &mut None, KeyCode::PageUp).await;
+        let top = app.transcript().unwrap().top.unwrap();
+        let area = app.transcript().unwrap().area;
+        handle_mouse(
+            &mut app,
+            event::MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: area.x + 2,
+                row: area.y + 2,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(app.transcript().unwrap().top, Some(top - 3));
+        key(
+            &cx,
+            &mut app,
+            &mut None,
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL,
+        )
+        .await;
+        press(&cx, &mut app, &mut None, KeyCode::PageDown).await;
+        handle_mouse(
+            &mut app,
+            event::MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: area.x + 2,
+                row: area.y + 2,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(app.transcript().unwrap().top, Some(top - 3));
+        press(&cx, &mut app, &mut None, KeyCode::Esc).await;
+        app.select_session("two".into());
+        assert!(app.transcript().unwrap().top.is_none());
+        app.select_session("one".into());
+        assert_eq!(app.transcript().unwrap().top, Some(top - 3));
+        assert_eq!(app.input, "unfinished prompt");
+        press(&cx, &mut app, &mut None, KeyCode::End).await;
+        assert!(app.transcript().unwrap().top.is_none());
+        press(&cx, &mut app, &mut None, KeyCode::Home).await;
+        assert_eq!(app.transcript().unwrap().top, Some(0));
+        Ok(())
+    })
+    .await;
+}
+
 #[test]
 fn rejected_changes_keep_search_and_old_successes_do_not_close_a_reopened_picker() {
     let mut app = App::default();

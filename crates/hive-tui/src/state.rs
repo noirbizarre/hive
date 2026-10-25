@@ -14,6 +14,8 @@ pub enum LineKind {
 pub struct ConversationLine {
     pub kind: LineKind,
     pub text: String,
+    pub tool: Option<serde_json::Value>,
+    pub revision: u64,
 }
 
 #[derive(Default)]
@@ -55,6 +57,8 @@ impl Conversation {
         self.lines.push(ConversationLine {
             kind: LineKind::User,
             text: format!("You: {text}"),
+            tool: None,
+            revision: 0,
         });
     }
 
@@ -62,6 +66,8 @@ impl Conversation {
         self.lines.push(ConversationLine {
             kind: LineKind::Notice,
             text,
+            tool: None,
+            revision: 0,
         });
     }
 
@@ -89,6 +95,8 @@ impl Conversation {
             self.lines.push(ConversationLine {
                 kind,
                 text: format!("{label}: "),
+                tool: None,
+                revision: 0,
             });
             self.lines.len() - 1
         });
@@ -97,6 +105,53 @@ impl Conversation {
         } else {
             self.lines[index].text.push_str(text);
         }
+        self.lines[index].revision += 1;
+    }
+
+    fn tool(&mut self, value: serde_json::Value, chunk: bool) {
+        let Some(id) = value["toolCallId"].as_str() else {
+            return;
+        };
+        let index = *self.tools.entry(id.to_owned()).or_insert_with(|| {
+            self.lines.push(ConversationLine {
+                kind: LineKind::Tool,
+                text: String::new(),
+                tool: Some(serde_json::json!({"toolCallId": id})),
+                revision: 0,
+            });
+            self.lines.len() - 1
+        });
+        let line = &mut self.lines[index];
+        let stored = line.tool.as_mut().unwrap();
+        if chunk {
+            // Chunk content appends; a concrete content array in a later patch replaces it.
+            if !stored["content"].is_array() {
+                stored["content"] = serde_json::json!([]);
+            }
+            stored["content"]
+                .as_array_mut()
+                .unwrap()
+                .push(value["content"].clone());
+        } else if let Some(fields) = value.as_object() {
+            // Keep omitted fields across both native v2 and translated v1 patches.
+            for (key, value) in fields {
+                if key == "_meta" && value.is_object() {
+                    if !stored[key].is_object() {
+                        stored[key] = serde_json::json!({});
+                    }
+                    for (name, value) in value.as_object().unwrap() {
+                        if value.is_null() {
+                            stored[key].as_object_mut().unwrap().remove(name);
+                        } else {
+                            stored[key][name] = value.clone();
+                        }
+                    }
+                } else {
+                    stored[key] = value.clone();
+                }
+            }
+        }
+        line.revision += 1;
     }
 
     pub fn apply(&mut self, notification: v2::UpdateSessionNotification) -> bool {
@@ -154,25 +209,10 @@ impl Conversation {
                 }
             }
             v2::SessionUpdate::ToolCallUpdate(tool) => {
-                let value = serde_json::to_value(&tool).unwrap_or_default();
-                let id = value["toolCallId"].as_str().unwrap_or("tool");
-                let title = value["title"].as_str().unwrap_or("Tool");
-                let status = value["status"].as_str().unwrap_or("working");
-                self.upsert(
-                    id.to_string(),
-                    LineKind::Tool,
-                    &format!("{title} — {status} {}", value["content"]),
-                    true,
-                );
+                self.tool(serde_json::to_value(tool).unwrap_or_default(), false);
             }
             v2::SessionUpdate::ToolCallContentChunk(chunk) => {
-                let value = serde_json::to_value(&chunk).unwrap_or_default();
-                self.upsert(
-                    value["toolCallId"].to_string(),
-                    LineKind::Tool,
-                    &value.to_string(),
-                    false,
-                );
+                self.tool(serde_json::to_value(chunk).unwrap_or_default(), true);
             }
             v2::SessionUpdate::StateUpdate(v2::StateUpdate::Running(_)) => self.running = true,
             v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(idle)) => {
@@ -243,9 +283,7 @@ impl Conversation {
             v2::SessionUpdate::Other(other)
                 if other.session_update.starts_with("_hive_v1_tool") =>
             {
-                let value = &other.fields["tool"];
-                let id = value["toolCallId"].as_str().unwrap_or("tool");
-                self.upsert(id.to_string(), LineKind::Tool, &value.to_string(), true);
+                self.tool(other.fields["tool"].clone(), false);
             }
             _ => {}
         }
@@ -285,6 +323,69 @@ mod tests {
         let mut meta = v2::Meta::new();
         meta.insert("hive".into(), serde_json::json!({"seq": seq}));
         v2::UpdateSessionNotification::new(v2::SessionId::new("hive-test"), update).meta(meta)
+    }
+
+    #[test]
+    fn tool_patches_and_chunks_keep_one_structured_call_without_losing_earlier_fields() {
+        let mut conversation = Conversation::default();
+        conversation.apply(event(
+            1,
+            v2::SessionUpdate::ToolCallUpdate(
+                v2::ToolCallUpdate::new("read-one")
+                    .name("read")
+                    .title("Read the configuration")
+                    .raw_input(serde_json::json!({"path":"config.toml"}))
+                    .status(v2::ToolCallStatus::InProgress),
+            ),
+        ));
+        conversation.apply(event(
+            2,
+            v2::SessionUpdate::ToolCallContentChunk(v2::ToolCallContentChunk::new(
+                "read-one",
+                "first output",
+            )),
+        ));
+        conversation.apply(event(
+            3,
+            v2::SessionUpdate::ToolCallUpdate(
+                v2::ToolCallUpdate::new("read-one").status(v2::ToolCallStatus::Completed),
+            ),
+        ));
+        assert_eq!(conversation.lines.len(), 1);
+        let tool = conversation.lines[0].tool.as_ref().unwrap();
+        assert_eq!(tool["name"], "read");
+        assert_eq!(tool["rawInput"]["path"], "config.toml");
+        assert_eq!(tool["content"][0]["content"]["text"], "first output");
+        assert_eq!(tool["status"], "completed");
+        conversation.apply(event(
+            4,
+            v2::SessionUpdate::ToolCallUpdate(v2::ToolCallUpdate::new("read-one").content(vec![])),
+        ));
+        assert_eq!(
+            conversation.lines[0].tool.as_ref().unwrap()["content"],
+            serde_json::json!([])
+        );
+        assert_eq!(conversation.lines[0].revision, 4);
+    }
+
+    #[test]
+    fn translated_v1_tool_patches_preserve_titles_inputs_and_unescaped_output() {
+        let mut conversation = Conversation::default();
+        for (index, tool) in [
+            serde_json::json!({"toolCallId":"call", "title":"Read README.md", "kind":"read", "rawInput":{"path":"README.md"}}),
+            serde_json::json!({"toolCallId":"call", "status":"completed", "content":[{"type":"content", "content":{"type":"text", "text":"# Heading\n\n**answer**"}}]}),
+        ].into_iter().enumerate() {
+            conversation.apply(event(index as u64 + 1, v2::SessionUpdate::Other(v2::OtherSessionUpdate::new(
+                "_hive_v1_tool_update", BTreeMap::from([("tool".into(), tool)]),
+            ))));
+        }
+        assert_eq!(conversation.lines.len(), 1);
+        let tool = conversation.lines[0].tool.as_ref().unwrap();
+        assert_eq!(tool["title"], "Read README.md");
+        assert_eq!(
+            tool["content"][0]["content"]["text"],
+            "# Heading\n\n**answer**"
+        );
     }
 
     #[test]

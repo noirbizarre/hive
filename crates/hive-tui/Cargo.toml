@@ -18,3 +18,4 @@ ratatui = { workspace = true }
 crossterm = { workspace = true }
 reqwest = { workspace = true }
 nucleo-matcher = { workspace = true }
+tui-markdown = { workspace = true }

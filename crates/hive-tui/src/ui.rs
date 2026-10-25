@@ -1323,8 +1323,11 @@ mod tests {
         );
         assert!(rendered.contains("pending · low · V1"));
         assert!(rendered.contains("Plans · supported"));
+        // The narrow sidebar wraps this label between words; layout must not decide observation.
         assert!(
-            rendered.contains("not yet observed"),
+            ["not", "yet", "observed"]
+                .iter()
+                .all(|word| rendered.contains(word)),
             "adapted v1 plans do not establish native v2 observation"
         );
     }

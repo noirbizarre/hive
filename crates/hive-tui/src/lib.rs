@@ -308,6 +308,10 @@ async fn resume(
     conversation.generation = hive["generation"].as_u64().unwrap_or(0);
     conversation.running = hive["running"].as_bool().unwrap_or(false);
     conversation.pilot_present = hive["pilot"].as_bool().unwrap_or(false);
+    conversation.config_snapshot(
+        response.config_options,
+        hive["configSeq"].as_u64().unwrap_or(0),
+    );
     conversation.snapshot(&hive["activitySnapshot"]);
     conversation.usage_snapshot(
         &hive["usageSnapshot"],
@@ -620,6 +624,15 @@ async fn handle_key(
     }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match (key.code, ctrl) {
+        // Ctrl-M aliases Enter in terminals; Ctrl-P remains distinguishable for the model picker.
+        (KeyCode::Char('p'), true) => {
+            app.page = if app.page == Page::Configuration {
+                Page::Chat
+            } else {
+                Page::Configuration
+            };
+            app.selected = 0;
+        }
         (KeyCode::Esc, _) | (KeyCode::Char('q'), true) => return true,
         (KeyCode::Tab, _) => {
             if app.toggle_sessions()
@@ -728,6 +741,7 @@ async fn handle_key(
                 match app.page {
                     Page::Sessions => app.sessions.len(),
                     Page::Profiles => app.profiles.len(),
+                    Page::Configuration => app.config_choices().len(),
                     Page::Chat => 0,
                 }
                 .saturating_sub(1),
@@ -747,6 +761,53 @@ async fn handle_key(
             }
         }
         (KeyCode::Enter, _) => match app.page {
+            Page::Configuration => {
+                if !app.connected
+                    || !app.pilot()
+                    || app.conversation().is_some_and(|state| state.running)
+                    || app.configuration.is_some()
+                    || app
+                        .active
+                        .as_ref()
+                        .is_some_and(|id| app.pending.contains_key(id))
+                {
+                    app.status = "Take control of an idle session before changing its model".into();
+                } else if let (Some(id), Some((config_id, value, _)), Some(owner)) = (
+                    app.active.clone(),
+                    app.config_choices().get(app.selected).cloned(),
+                    app.owner.clone(),
+                ) {
+                    let request = v2::SetSessionConfigOptionRequest::new(
+                        v2::SessionId::new(id.clone()),
+                        v2::SessionConfigId::new(config_id),
+                        v2::SessionConfigOptionValue::Id {
+                            value: v2::SessionConfigValueId::new(value),
+                        },
+                    )
+                    .meta(owner);
+                    let request = cx.send_request(request).block_task();
+                    let (sent, received) = tokio::sync::oneshot::channel();
+                    app.configuration = Some(received);
+                    app.status = "Updating session configuration…".into();
+                    if let Err(error) = cx.spawn(async move {
+                        let _ = sent.send((
+                            id,
+                            request.await.map_err(|error| {
+                                error
+                                    .data
+                                    .as_ref()
+                                    .and_then(serde_json::Value::as_str)
+                                    .unwrap_or("Agent configuration failed; check the agent logs")
+                                    .to_owned()
+                            }),
+                        ));
+                        Ok(())
+                    }) {
+                        app.configuration = None;
+                        app.status = error.to_string();
+                    }
+                }
+            }
             Page::Sessions => {
                 if let Some(info) = app.sessions.get(app.selected).cloned()
                     && let Err(error) = resume(cx, app, info.session_id, info.cwd, "pilot").await
@@ -777,6 +838,7 @@ async fn handle_key(
             Page::Chat => {
                 if !app.input.trim().is_empty()
                     && app.pilot()
+                    && app.configuration.is_none()
                     && !app.conversation().is_some_and(|c| c.running)
                     && app
                         .active
@@ -786,10 +848,7 @@ async fn handle_key(
                     let content = std::mem::take(&mut app.input);
                     let key = uuid::Uuid::new_v4().to_string();
                     let id = app.active.clone().unwrap_or_default();
-                    app.conversations
-                        .entry(id.clone())
-                        .or_default()
-                        .push_user(content.clone());
+                    // Only sequenced daemon messages enter history; the admission echo would duplicate this draft.
                     app.pending.insert(id, (key, content));
                     send_prompt(cx, app, acks);
                 } else {
@@ -976,6 +1035,23 @@ pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error + Sen
                   let mut interaction_tick = tokio::time::interval(Duration::from_millis(50));
                  let mut catalog_tick = tokio::time::interval(Duration::from_secs(2));
                  loop {
+                    if let Some(receiver) = app.configuration.as_mut() {
+                        match receiver.try_recv() {
+                            Ok((id, result)) => {
+                                app.configuration = None;
+                                match result {
+                                    Ok(response) => {
+                                        let seq = response.meta.as_ref().and_then(|meta| meta.get("hive")).and_then(|hive| hive["configSeq"].as_u64()).unwrap_or(0);
+                                        app.conversations.entry(id).or_default().config_snapshot(response.config_options, seq);
+                                        app.status = "Session configuration updated".into();
+                                    }
+                                    Err(error) => app.status = error,
+                                }
+                            }
+                            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => { app.configuration = None; app.status = "Configuration interrupted; reopen the session to inspect its current model".into(); }
+                            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+                        }
+                    }
                     terminal.draw(|frame| app.show(frame)).map_err(Error::into_internal_error)?;
                      tokio::select! {
                          _ = interaction_tick.tick() => {
@@ -1003,7 +1079,9 @@ pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error + Sen
                                  let id = created.session_id.to_string();
                                  let state = app.conversations.entry(id.clone()).or_default();
                                  state.generation = 1;
-                                 state.pilot_present = true;
+                                  state.pilot_present = true;
+                                  let seq = created.meta.as_ref().and_then(|meta| meta.get("hive")).and_then(|hive| hive["configSeq"].as_u64()).unwrap_or(0);
+                                  state.config_snapshot(created.config_options, seq);
                                  app.owner = created.meta;
                                  app.select_session(id);
                                  app.status = "Session created".into();

@@ -11,6 +11,8 @@ export function conversation() {
     support: { tools: 'unknown', plans: 'unknown', tasks: 'unknown' } };
   let usage = {};
   let usageSeq = 0;
+  let configOptions = [];
+  let configSeq = 0;
   let gap = false;
 
   function reconcile(snapshot) {
@@ -34,6 +36,13 @@ export function conversation() {
     line.text = replace ? text : line.text + text;
   }
 
+  function reconcileConfig(options, number) {
+    if (Array.isArray(options) && number >= configSeq) {
+      configOptions = structuredClone(options);
+      configSeq = number;
+    }
+  }
+
   function apply(event) {
     const number = event._meta?.hive?.seq;
     if (!Number.isSafeInteger(number) || number <= seq) return false;
@@ -52,6 +61,10 @@ export function conversation() {
       upsert(tools, tool.toolCallId || 'tool', 'tool',
         kind === 'tool_call_content_chunk' ? JSON.stringify(tool) : `${tool.title || 'Tool'} — ${tool.status || ''} ${JSON.stringify(tool.content || '')}`,
         kind !== 'tool_call_content_chunk');
+    } else if (kind === 'config_option_update') {
+      reconcileConfig(update.configOptions, number);
+    } else if (kind === '_hive_error' || kind === '_hive_opencode_error') {
+      lines.push({ kind: 'notice', text: `${update.message || 'Agent failed'} — ${update.help || 'Check the agent provider credentials, model configuration and logs'}` });
     } else if (kind === 'state_update') {
       if (update.state === 'running') running = true;
       if (update.state === 'idle') running = false;
@@ -80,6 +93,8 @@ export function conversation() {
     skip(nextSeq) { seq = Math.max(seq, nextSeq - 1); gap = false; },
     reconcile,
     reconcileUsage,
+    reconcileConfig,
+    get configOptions() { return structuredClone(configOptions); },
     running(value) { running = value; },
     get seq() { return seq; },
     get runningNow() { return running; },
@@ -157,15 +172,33 @@ export function connect(url, onChange = () => {}) {
   let creationUncertain = store?.getItem('hive.creating') === 'true';
   let openQueue = Promise.resolve();
   let openVersion = 0;
+  let desired;
+  let readyNow = false;
+  const readiness = new Set();
+  let configuring = false;
+  let creating = false;
   let firstResolve;
   const initialized = new Promise(resolve => { firstResolve = resolve; });
 
   const snapshot = () => ({ connected, status, session: selected && { ...selected }, role: owner?.role || 'observer',
     generation: owner?.generation,
-    running: history.runningNow, lines: history.lines, activity: history.activity, usage: history.usage, seq: history.seq, gap, interaction,
+    running: history.runningNow, lines: history.lines, activity: history.activity, usage: history.usage, configOptions: history.configOptions,
+    configuring, creating, opening: Boolean(desired && desired.sessionId !== selected?.sessionId), pendingSession: desired?.sessionId, seq: history.seq, gap, interaction,
     urlFlows: [...urlFlows.values()], uncertain: uncertain && { ...uncertain }, recoveryRequired, takingControl: Boolean(takingControl) });
   const publish = () => onChange(snapshot());
-  const errorText = error => error?.data || error?.message || String(error);
+  const errorText = error => typeof error?.data === 'string' ? error.data
+    : error?.data?.message ? [error.data.message, error.data.help].filter(Boolean).join(' — ')
+    : error?.message || String(error);
+  function ready() {
+    if (readyNow) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const waiter = { resolve() { clearTimeout(timer); readiness.delete(waiter); resolve(); },
+        reject(error) { clearTimeout(timer); readiness.delete(waiter); reject(error); } };
+      // A rejected handshake must not leave clicks queued forever; a reconnect may retry the latest selection.
+      const timer = setTimeout(() => waiter.reject(new Error('ACP connection unavailable; check the daemon URL and connection status')), 10000);
+      readiness.add(waiter);
+    });
+  }
   function request(method, params) {
     if (!connected || socket.readyState !== WebSocket.OPEN) return Promise.reject(new Error('Hive disconnected'));
     const id = ++nextId;
@@ -315,6 +348,7 @@ export function connect(url, onChange = () => {}) {
       const hive = ownership(response);
       history.reconcile(hive.activitySnapshot);
       history.reconcileUsage(hive.usageSnapshot, hive.usageSeq);
+      history.reconcileConfig(response.configOptions || [], hive.configSeq || 0);
       if (!replay) {
         // With no retained events, move the cursor to the daemon's atomic attachment boundary.
         history.skip(hive.nextSeq);
@@ -357,22 +391,29 @@ export function connect(url, onChange = () => {}) {
           info: { name: 'hive-web', version: '0.1.0' },
           capabilities: { elicitation: { form: {}, url: {} } } });
         if (response.protocolVersion !== 2 || !response.capabilities?.session) throw new Error('ACPv2 sessions unavailable');
+        readyNow = true;
+        const waiting = readiness.size > 0;
+        for (const waiter of [...readiness]) waiter.resolve();
         firstResolve(response);
-        if (selected) await resume('observe');
+        if (desired && desired.sessionId !== selected?.sessionId && !waiting) await client.open(desired);
+        else if (selected && !waiting) await resume('observe');
         else {
-          status = creationUncertain ? 'Session creation interrupted — select the original session from the list' : 'Connected to ACPv2';
+          status = creationUncertain ? 'Session creation interrupted — select the original session from the list'
+            : desired ? `Opening ${desired.sessionId}…` : 'Connected to ACPv2';
           publish();
         }
       } catch (error) {
         status = error.message;
         publish();
         // An expired replay needs an explicit choice, but the transport is usable.
-        if (!selected && ws.readyState === WebSocket.OPEN) ws.close();
+        if (!readyNow && ws.readyState === WebSocket.OPEN) ws.close();
       }
     };
     ws.onclose = () => {
       if (socket !== ws) return;
       connected = false;
+      readyNow = false;
+      for (const waiter of [...readiness]) waiter.reject(new Error('ACP connection failed; check the daemon URL. Reconnecting…'));
       attaching = false;
       queuedUpdates = [];
       owner = undefined;
@@ -391,16 +432,23 @@ export function connect(url, onChange = () => {}) {
   openSocket();
   publish();
 
-  return {
+  const client = {
     initialized,
     state: snapshot,
     open(session) {
       if (!session?.sessionId || !session.cwd) throw new Error('Select a listed Hive session with a cwd');
+      desired = { ...session };
+      status = `Opening ${session.sessionId}${readyNow ? '' : ' — waiting for ACP connection'}…`;
+      publish();
       const version = ++openVersion;
       const operation = openQueue.then(async () => {
-        await initialized;
+        await ready();
         if (version !== openVersion) return;
-        if (selected?.sessionId === session.sessionId && owner) return;
+        if (selected?.sessionId === session.sessionId && owner) {
+          status = `${owner.role === 'pilot' ? 'Controlling' : 'Read-only'} ${session.sessionId}`;
+          publish();
+          return;
+        }
         if (selected && owner?.role === 'pilot' && selected.sessionId !== session.sessionId) {
           // Leaving an owned conversation must release its pilot token without ending the agent session.
           await request('session/resume', { sessionId: selected.sessionId, cwd: selected.cwd,
@@ -440,13 +488,17 @@ export function connect(url, onChange = () => {}) {
       }
       return takingControl;
     },
-    async prompt(text, agent = '') {
-      await initialized;
-      if (!text?.trim()) throw new Error('Enter a prompt');
-      if (!selected) {
-        if (creationUncertain) throw new Error('Session creation was interrupted; choose the original session from the list before prompting');
+    async create(agent = '') {
+      await ready();
+      if (creating || configuring) throw new Error('Wait for session configuration to finish');
+      if (selected) throw new Error('A session is already selected');
+      if (creationUncertain) throw new Error('Session creation was interrupted; choose the original session from the list before prompting');
+      creating = true;
+      const version = openVersion;
+      try {
         creationUncertain = true;
         store?.setItem('hive.creating', 'true');
+        publish();
         let created;
         try {
           created = await request('session/new', { cwd: '/', mcpServers: [],
@@ -455,13 +507,54 @@ export function connect(url, onChange = () => {}) {
           if (connected) { creationUncertain = false; store?.removeItem('hive.creating'); }
           throw error;
         }
+        if (version !== openVersion) {
+          // Selection may change while creation asks a question; don't leave an invisible pilot behind.
+          const hive = created._meta?.hive;
+          if (hive?.role === 'pilot') await request('session/resume', { sessionId: created.sessionId, cwd: '/',
+            _meta: { hive: { mode: 'relinquish', generation: hive.generation, token: hive.token } } });
+          creationUncertain = false;
+          store?.removeItem('hive.creating');
+          throw new Error('Session created; select it from the session list');
+        }
         selected = { sessionId: created.sessionId, cwd: '/', agent };
+        desired = { ...selected };
         creationUncertain = false;
         store?.removeItem('hive.creating');
         history = conversation();
         const hive = ownership(created);
         history.reconcileUsage(hive.usageSnapshot, hive.usageSeq);
+        history.reconcileConfig(created.configOptions || [], hive.configSeq || 0);
+        return created;
+      } finally { creating = false; publish(); }
+    },
+    async configure(configId, value) {
+      await ready();
+      if (!selected || (desired && desired.sessionId !== selected.sessionId) || owner?.role !== 'pilot' || history.runningNow || configuring || creating || recoveryRequired || uncertain) throw new Error('Take control of an idle session before changing its model');
+      const target = selected.sessionId;
+      const version = openVersion;
+      const epoch = connectionEpoch;
+      configuring = true;
+      publish();
+      try {
+        const response = await request('session/set_config_option', { sessionId: target, configId, type: 'id', value,
+          _meta: { hive: { generation: owner.generation, token: owner.token } } });
+        if (selected?.sessionId === target && version === openVersion && epoch === connectionEpoch) {
+          history.reconcileConfig(response.configOptions || [], response._meta?.hive?.configSeq ?? history.seq);
+          status = 'Session configuration updated';
+        }
+        return response;
+      } catch (error) {
+        if (selected?.sessionId === target && version === openVersion && epoch === connectionEpoch) status = error.message;
+        throw error;
       }
+      finally { configuring = false; publish(); }
+    },
+    async prompt(text, agent = '') {
+      await ready();
+      if (!text?.trim()) throw new Error('Enter a prompt');
+      if (!selected) await client.create(agent);
+      if (configuring || creating) throw new Error('Wait for session configuration to finish');
+      if (desired && desired.sessionId !== selected.sessionId) throw new Error('Wait for the selected session to open');
       if (owner?.role !== 'pilot') throw new Error('Start typing to take control first');
       if (uncertain && uncertain.text !== text) throw new Error('Retry the uncertain prompt with its original text first');
       if (history.runningNow && !uncertain) throw new Error('Wait for the active generation to become idle');
@@ -523,6 +616,7 @@ export function connect(url, onChange = () => {}) {
     },
     close() { closed = true; clearTimeout(retryTimer); socket?.close(); },
   };
+  return client;
 }
 
 // Catalog revisions are invalidations, never conversation updates or browser ownership state.
@@ -618,9 +712,43 @@ export function mount(client, root = document) {
     }
     renderRows(state);
     const pilot = state.role === 'pilot' && state.connected && !state.gap;
-    input.disabled = !state.connected || state.gap;
+    const create = root.querySelector('#create');
+    if (create) {
+      create.hidden = Boolean(state.session);
+      create.disabled = !state.connected || state.creating || state.opening;
+      create.onclick = () => client.create(agentSelect.value).catch(error => { status.textContent = error.message; });
+    }
+    const control = root.querySelector('#control');
+    if (control) {
+      control.hidden = !state.session || pilot;
+      control.disabled = !state.connected || state.recoveryRequired || state.takingControl;
+      control.onclick = () => client.takeControl().catch(error => { status.textContent = error.message; });
+    }
+    const configuration = root.querySelector('#configuration');
+    if (configuration) {
+      const focused = root.activeElement?.dataset?.configId;
+      configuration.replaceChildren();
+      const options = (state.configOptions || []).filter(option => option.type === 'select');
+      if (!options.length) add(configuration, 'p', state.session ? 'This backend does not expose model selection' : 'Create a session to choose its provider / model before sending a prompt');
+      for (const option of options) {
+        const label = add(configuration, 'label', option.category === 'model' ? 'Provider / Model ' : `${option.name} `);
+        const select = add(label, 'select', '', { 'aria-label': option.category === 'model' ? 'Provider / Model' : option.name });
+        select.dataset.configId = option.configId;
+        for (const choice of option.options || []) {
+          if (Array.isArray(choice.options)) {
+            const group = add(select, 'optgroup', '', { label: choice.name || choice.group });
+            for (const item of choice.options) add(group, 'option', item.name, { value: item.value });
+          } else add(select, 'option', choice.name, { value: choice.value });
+        }
+        select.value = option.currentValue;
+        select.disabled = !pilot || state.opening || state.running || state.configuring || state.creating || state.recoveryRequired || Boolean(state.uncertain);
+        select.onchange = () => client.configure(option.configId, select.value).catch(error => { status.textContent = error.message; });
+        if (focused === option.configId) select.focus();
+      }
+    }
+    input.disabled = !state.connected || state.gap || state.opening;
     send.disabled = !state.connected || state.gap || sending || state.takingControl || state.running || state.recoveryRequired ||
-      (Boolean(state.session) && !pilot) || Boolean(state.uncertain);
+      state.opening || state.configuring || state.creating || (!state.session && Boolean(create)) || (Boolean(state.session) && !pilot) || Boolean(state.uncertain);
     cancel.disabled = !pilot || !state.running;
     retry.hidden = !state.uncertain || state.recoveryRequired;
     retry.disabled = !pilot || !state.connected || sending;

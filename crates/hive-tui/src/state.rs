@@ -30,6 +30,8 @@ pub struct Conversation {
     pub usage: serde_json::Value,
     pub usage_seq: u64,
     pub gap: bool,
+    pub config_options: Vec<v2::SessionConfigOption>,
+    pub config_seq: u64,
 }
 
 impl Conversation {
@@ -48,6 +50,7 @@ impl Conversation {
         }
     }
 
+    #[cfg(test)]
     pub fn push_user(&mut self, text: String) {
         self.lines.push(ConversationLine {
             kind: LineKind::User,
@@ -60,6 +63,14 @@ impl Conversation {
             kind: LineKind::Notice,
             text,
         });
+    }
+
+    pub fn config_snapshot(&mut self, options: Vec<v2::SessionConfigOption>, seq: u64) {
+        // Replay predating the attachment snapshot must not undo the active model selection.
+        if seq >= self.config_seq {
+            self.config_options = options;
+            self.config_seq = seq;
+        }
     }
 
     fn upsert(&mut self, key: String, kind: LineKind, text: &str, replace: bool) {
@@ -107,6 +118,9 @@ impl Conversation {
         }
         // Replay and live events share sequence numbers; only advance after reducing the event.
         match notification.update {
+            v2::SessionUpdate::ConfigOptionUpdate(update) => {
+                self.config_snapshot(update.config_options, seq)
+            }
             v2::SessionUpdate::AgentMessageChunk(chunk) => self.upsert(
                 format!("agent:{}", chunk.message_id),
                 LineKind::Agent,
@@ -163,7 +177,21 @@ impl Conversation {
             v2::SessionUpdate::StateUpdate(v2::StateUpdate::Running(_)) => self.running = true,
             v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(idle)) => {
                 self.running = false;
-                self.push_notice(format!("Turn ended: {:?}", idle.stop_reason));
+                if matches!(idle.stop_reason, Some(v2::StopReason::Cancelled)) {
+                    self.push_notice("Turn cancelled".into());
+                }
+            }
+            v2::SessionUpdate::Other(other)
+                if other.session_update == "_hive_error"
+                    || other.session_update == "_hive_opencode_error" =>
+            {
+                self.push_notice(format!(
+                    "{} — {}",
+                    other.fields["message"].as_str().unwrap_or("Agent failed"),
+                    other.fields["help"]
+                        .as_str()
+                        .unwrap_or("Check the agent logs")
+                ));
             }
             v2::SessionUpdate::Other(other) if other.session_update == "_hive_control" => {
                 self.generation = other.fields["generation"]
@@ -304,6 +332,43 @@ mod tests {
         assert_eq!(conversation.lines[0].text, "Agent: hello");
         assert_eq!(conversation.lines[0].kind, LineKind::Agent);
         assert_eq!(conversation.seq, 1);
+    }
+
+    #[test]
+    fn configuration_snapshots_ignore_older_replay_and_errors_remain_readable_after_idle() {
+        let mut conversation = Conversation::default();
+        let options = |value| {
+            vec![v2::SessionConfigOption::select(
+                v2::SessionConfigId::new("model"),
+                "Model",
+                v2::SessionConfigValueId::new(value),
+                vec![v2::SessionConfigSelectOption::new(
+                    v2::SessionConfigValueId::new(value),
+                    "Model",
+                )],
+            )]
+        };
+        conversation.config_snapshot(options("new"), 5);
+        conversation.apply(event(
+            1,
+            v2::SessionUpdate::ConfigOptionUpdate(v2::ConfigOptionUpdate::new(options("old"))),
+        ));
+        assert_eq!(conversation.config_seq, 5);
+        assert_eq!(
+            serde_json::to_value(&conversation.config_options).unwrap()[0]["currentValue"],
+            "new"
+        );
+        let failure =
+            hive_protocol::AgentFailure::classify("This API key has expired. sk-do-not-echo");
+        conversation.apply(event(2, failure.update("acp-v1")));
+        conversation.apply(event(
+            3,
+            v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(v2::IdleStateUpdate::new())),
+        ));
+        assert_eq!(conversation.lines.len(), 1);
+        assert!(conversation.lines[0].text.contains("Create a new API key"));
+        assert!(!conversation.lines[0].text.contains("sk-do-not-echo"));
+        assert!(!conversation.running);
     }
 
     #[test]

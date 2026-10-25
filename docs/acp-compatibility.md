@@ -13,7 +13,7 @@ Their crate versions do not denote the ACP wire version. The SDK pins schema
 `=1.12.0`. The Cargo lockfile records the resolved dependency set.
 
 Implemented v2 operations are initialize, session/new, list, resume, close,
-prompt, cancel, and session/update. A prompt response acknowledges acceptance.
+prompt, cancel, session/set_config_option, and session/update. A prompt response acknowledges acceptance.
 Observe `running` then `idle` for work completion.
 
 Only text prompts are adapted to v1. V1 message chunks are forwarded with a
@@ -27,8 +27,22 @@ total decision deadline. Request-scoped elicitation follows a uniquely mapped,
 live parent RPC to its original requester. Unknown modes and unmapped parent
 contexts are cancelled.
 
-MCP bridge, forks, config options, compaction and other optional
+MCP bridge, forks, compaction and other optional
 capabilities are **not** advertised. Non-text v1 prompts return an error.
+
+Agents can expose session configuration through `configOptions` on new/resume
+responses and `config_option_update` notifications. Hive retains the current
+snapshot independently of replay and forwards `session/set_config_option` for
+idle sessions owned by the caller. ACPv1 option/group identities and setter
+values are translated to ACPv2. Response `_meta.hive.configSeq` marks the
+snapshot boundary so older replay cannot undo current selections. Support is
+covered by v1/v2 mocks; actual choices depend on the downstream agent.
+The native OpenCode server adapter does not expose model configuration.
+
+Post-admission ACPv1 prompt failures produce a sequenced `_hive_error` update
+before idle. Its version, source, operation, stable diagnostic code, message
+and help contain controlled diagnostics rather than arbitrary provider data.
+Both clients render these failures, including on replay.
 
 ACPv2 `session/new` has no standard agent selector. Hive reserves
 `_meta.hive.agent` for a profile ID in **client-to-Hive** requests. Hive removes

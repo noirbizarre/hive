@@ -7,6 +7,109 @@ import { connect, conversation, mount, validateContent } from './app.js';
 const session = { sessionId: 'hive-tui', cwd: '/workspace', agent: 'pi', title: 'Review parser',
   activity: 'idle', controlOwner: 'tui-connection', lastActivityAt: 1791754566280 };
 
+const modelOptions = currentValue => [{ configId: 'model', name: 'Model', category: 'model', type: 'select', currentValue,
+  options: [{ groupId: 'provider', name: 'Provider', options: [{ value: 'fast', name: 'Fast' }, { value: 'careful', name: 'Careful' }] }] }];
+
+test('failed initialization rejects pending clicks and reconnect opens only the latest desired session', async () => {
+  const sockets = transport((socket, message) => {
+    if (socket === sockets[0] && message.method === 'initialize') return false;
+  });
+  const client = connect('ws://localhost/acp');
+  const first = client.open(session).catch(error => error);
+  const latest = { ...session, sessionId: 'hive-latest' };
+  const second = client.open(latest).catch(error => error);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(client.state().pendingSession, latest.sessionId);
+  assert.match(client.state().status, /Opening/);
+  sockets[0].close();
+  assert.match((await first).message, /connection failed/);
+  await second;
+  await new Promise(resolve => setTimeout(resolve, 800));
+  assert.equal(client.state().session.sessionId, latest.sessionId);
+  assert.equal(client.state().role, 'observer');
+  assert.deepEqual(sockets[1].sent.map(message => message.method), ['initialize', 'session/resume']);
+  client.close();
+});
+
+test('an explicit session can select its model before the first inference and blocks prompts during the change', async () => {
+  let setter;
+  const sockets = transport((socket, message, result) => {
+    if (message.method === 'session/new') return { ...result, configOptions: modelOptions('fast') };
+    if (message.method === 'session/set_config_option') { setter = message; return false; }
+  });
+  const client = connect('ws://localhost/acp');
+  await client.create('opencode');
+  assert.equal(client.state().configOptions[0].currentValue, 'fast');
+  assert.equal(sockets[0].sent.some(message => message.method === 'session/prompt'), false);
+  const changing = client.configure('model', 'careful');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(client.state().configuring, true);
+  await assert.rejects(client.prompt('go'), /configuration to finish/);
+  assert.deepEqual(setter.params, { sessionId: 'hive-new', configId: 'model', type: 'id', value: 'careful', _meta: { hive: { generation: 1, token: 'new-token' } } });
+  sockets[0].receive({ jsonrpc: '2.0', id: setter.id, result: { configOptions: modelOptions('careful'), _meta: { hive: { configSeq: 3 } } } });
+  await changing;
+  assert.equal(client.state().configOptions[0].currentValue, 'careful');
+  await client.prompt('go');
+  assert.deepEqual(sockets[0].sent.map(message => message.method), ['initialize', 'session/new', 'session/set_config_option', 'session/prompt']);
+  client.close();
+});
+
+test('configuration snapshots cannot be regressed by older replay and failures render once', () => {
+  const state = conversation();
+  state.reconcileConfig(modelOptions('careful'), 5);
+  state.apply(update(1, { sessionUpdate: 'config_option_update', configOptions: modelOptions('fast') }).params);
+  assert.equal(state.configOptions[0].currentValue, 'careful');
+  const failure = update(2, { sessionUpdate: '_hive_error', message: 'API key expired', help: 'Replace the key' }).params;
+  assert.equal(state.apply(failure), true);
+  assert.equal(state.apply(failure), false);
+  state.apply(update(3, { sessionUpdate: 'state_update', state: 'idle', stopReason: '_v1_error' }).params);
+  assert.deepEqual(state.lines, [{ kind: 'notice', text: 'API key expired — Replace the key' }]);
+});
+
+test('the web shell uses the canonical embedded icon for its header and favicon', () => {
+  const dom = new JSDOM(readFileSync(new URL('./index.html', import.meta.url), 'utf8'));
+  const root = dom.window.document;
+  assert.equal(root.querySelector('link[rel="icon"]').getAttribute('href'), '/ui/icon.svg');
+  assert.equal(root.querySelector('header h1 img').getAttribute('src'), '/ui/icon.svg');
+  assert.equal(root.querySelector('header h1 img').getAttribute('alt'), '');
+  assert.equal(root.querySelector('#create').type, 'button');
+  dom.window.close();
+});
+
+test('the web controls discover grouped providers and configure before enabling inference', async () => {
+  const dom = new JSDOM(readFileSync(new URL('./index.html', import.meta.url), 'utf8'), { url: 'http://localhost/ui' });
+  globalThis.document = dom.window.document;
+  globalThis.location = dom.window.location;
+  globalThis.history = dom.window.history;
+  globalThis.FormData = dom.window.FormData;
+  globalThis.fetch = async url => ({ ok: true, json: async () => url.includes('providers') ? { agents: [{ id: 'opencode', name: 'OpenCode' }] } : { revision: 1, sessions: [] } });
+  globalThis.EventSource = class { addEventListener() {} close() {} };
+  const sockets = transport((_, message, result) => {
+    if (message.method === 'session/new') return { ...result, configOptions: modelOptions('fast') };
+    if (message.method === 'session/set_config_option') return { configOptions: modelOptions(message.params.value) };
+  });
+  let view;
+  const client = connect('ws://localhost/acp', state => view?.show(state));
+  view = mount(client);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(document.querySelector('#send').disabled, true);
+  document.querySelector('#agent').value = 'opencode';
+  document.querySelector('#create').click();
+  await new Promise(resolve => setImmediate(resolve));
+  const select = document.querySelector('#configuration select');
+  assert.equal(select.value, 'fast');
+  assert.equal(select.querySelector('optgroup').label, 'Provider');
+  assert.equal(select.disabled, false);
+  select.value = 'careful';
+  select.dispatchEvent(new dom.window.Event('change'));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(document.querySelector('#configuration select').value, 'careful');
+  assert.equal(document.querySelector('#send').disabled, false);
+  assert.deepEqual(sockets[0].sent.map(message => message.method), ['initialize', 'session/new', 'session/set_config_option']);
+  view.close();
+  dom.window.close();
+});
+
 test('browser and native form validation obey the same conformance cases', () => {
   const cases = JSON.parse(readFileSync(new URL('../../crates/hive-protocol/tests/fixtures/elicitation.json', import.meta.url)));
   for (const item of cases) {

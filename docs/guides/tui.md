@@ -26,6 +26,7 @@ so the same sessions are available in the Web UI and other ACP clients.
 | `o` in overview | Attach as observer |
 | `Ctrl-B` | Return to the previously visited session |
 | `Ctrl-T` | Take pilot control |
+| `Ctrl-P` | Open/close the provider/model configuration picker |
 | `Ctrl-H` | Relinquish control while observing |
 | Enter in composer | Send the typed prompt |
 | `Ctrl-C` | Cancel foreground work |
@@ -38,6 +39,20 @@ Recovery acknowledgement requires checking the downstream state first. See
 
 If quitting restores the screen but leaves the process waiting, press Enter
 once. See the [terminal-reader workaround](../troubleshooting.md#the-tui-leaves-its-screen-but-does-not-return-to-the-shell).
+
+## Choose a provider and model
+
+Create a session with `Ctrl-N`, then press `Ctrl-P` before sending a prompt.
+The picker lists the agent's advertised configuration choices, grouped by
+provider when available; `*` marks current values. Use arrows and Enter to
+apply a choice, and `Ctrl-P` to return to chat. Current choices also appear
+under the conversation heading when space permits.
+
+The backend profile chooses the agent process or server; provider/model
+selection configures that agent. Take control with `Ctrl-T` before editing an
+observed session, and wait for foreground work to finish. Unsupported backends
+display an explanation. Model configuration for the OpenCode server adapter
+currently stays in OpenCode itself.
 
 ## Answer agent questions
 

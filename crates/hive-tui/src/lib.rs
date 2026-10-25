@@ -295,8 +295,12 @@ async fn resume(
     }
     let response = match cx.send_request(request).block_task().await {
         Ok(response) => response,
-        Err(error) if format!("{error:?}").contains("replay cursor unavailable") => {
-            app.status = "History expired: press Ctrl-R to attach without earlier events".into();
+        Err(error)
+            if format!("{error:?}").contains("replay cursor unavailable")
+                || format!("{error:?}").contains("hive::transcript::unsupported")
+                || format!("{error:?}").contains("hive::transcript::history_missing") =>
+        {
+            app.status = resume_failure(&error);
             if app.active.as_deref() != Some(&id) {
                 app.owner = None;
                 app.select_session(id);
@@ -311,6 +315,10 @@ async fn resume(
         .and_then(|m| m.get("hive"))
         .ok_or_else(Error::internal_error)?;
     let conversation = app.conversations.entry(id.clone()).or_default();
+    if let Some(through) = hive["snapshotThroughSeq"].as_u64() {
+        // Notifications are drained after this request; marked snapshot entries bypass cursor checks.
+        conversation.begin_transcript(through);
+    }
     conversation.generation = hive["generation"].as_u64().unwrap_or(0);
     conversation.running = hive["running"].as_bool().unwrap_or(false);
     conversation.pilot_present = hive["pilot"].as_bool().unwrap_or(false);
@@ -359,6 +367,10 @@ async fn refresh(address: &str, app: &mut App) -> Result<(), String> {
 fn resume_failure(error: &agent_client_protocol::Error) -> String {
     if format!("{error:?}").contains("replay cursor unavailable") {
         "History expired: press Ctrl-R to attach without earlier events".into()
+    } else if format!("{error:?}").contains("hive::transcript::unsupported") {
+        "Agent cannot replay history: press Ctrl-R to attach without earlier events".into()
+    } else if format!("{error:?}").contains("hive::transcript::history_missing") {
+        "Agent retained no messages: press Ctrl-R to attach without earlier events".into()
     } else {
         format!("Could not attach: {error}")
     }

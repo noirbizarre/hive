@@ -1,4 +1,4 @@
-// The daemon owns session lifecycle and control; this adapter only keeps a view of its event log.
+// The daemon owns lifecycle and control; this adapter projects transcript snapshots and live events.
 export function conversation() {
   const lines = [];
   const messages = new Map();
@@ -43,10 +43,10 @@ export function conversation() {
     }
   }
 
-  function apply(event) {
+  function apply(event, snapshot = false) {
     const number = event._meta?.hive?.seq;
-    if (!Number.isSafeInteger(number) || number <= seq) return false;
-    if (seq && number !== seq + 1) { gap = true; return false; }
+    if (!snapshot && (!Number.isSafeInteger(number) || number <= seq)) return false;
+    if (!snapshot && seq && number !== seq + 1) { gap = true; return false; }
     const update = event.update;
     const kind = update.sessionUpdate;
     if (kind === 'agent_message_chunk' || kind === 'user_message_chunk') {
@@ -83,12 +83,18 @@ export function conversation() {
       usage = structuredClone(update.session);
       usageSeq = number;
     }
-    seq = number;
+    if (!snapshot) seq = number;
     return true;
   }
 
   return {
     apply,
+    restore(events, through) {
+      // Snapshot entries are full upserts, not a contiguous subset of the live event log.
+      lines.length = 0; messages.clear(); tools.clear();
+      for (const event of events) apply(event, true);
+      seq = through; gap = false;
+    },
     notice(text) { lines.push({ kind: 'notice', text }); },
     skip(nextSeq) { seq = Math.max(seq, nextSeq - 1); gap = false; },
     reconcile,
@@ -226,6 +232,8 @@ export function connect(url, onChange = () => {}) {
   function update(message) {
     if (message.params?.sessionId !== selected?.sessionId) return;
     if (attaching) { queuedUpdates.push(message); return; }
+    // Only a successful resume may commit its staged transcript snapshot.
+    if (message.params._meta?.hive?.snapshot) return;
     const applied = history.apply({ ...message.params, _meta: message.params._meta });
     if (history.gap && !gap) {
       status = 'Activity gap detected — reconciling…';
@@ -346,6 +354,10 @@ export function connect(url, onChange = () => {}) {
         return response;
       }
       const hive = ownership(response);
+      if (Number.isSafeInteger(hive.snapshotThroughSeq)) {
+        history.restore(queuedUpdates.filter(message => message.params._meta?.hive?.snapshot).map(message => message.params), hive.snapshotThroughSeq);
+        queuedUpdates = queuedUpdates.filter(message => !message.params._meta?.hive?.snapshot);
+      }
       history.reconcile(hive.activitySnapshot);
       history.reconcileUsage(hive.usageSnapshot, hive.usageSeq);
       history.reconcileConfig(response.configOptions || [], hive.configSeq || 0);
@@ -366,6 +378,9 @@ export function connect(url, onChange = () => {}) {
       if (error.message.includes('replay cursor unavailable')) {
         gap = true;
         status = 'History expired — attach without earlier events to continue';
+      } else if (error.message.includes('hive::transcript::unsupported') || error.message.includes('hive::transcript::history_missing')) {
+        gap = true;
+        status = error.message;
       } else status = error.message;
       publish();
       throw error;

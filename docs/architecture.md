@@ -149,14 +149,21 @@ See [ADR-001](adr/001-session-control-and-replay.md) and the
 
 ## Events, replay, and snapshots
 
-Downstream updates pass through shared forwarding. They receive monotonically
+Live downstream updates pass through shared forwarding. They receive monotonically
 increasing Hive sequence numbers, enter the latest-256-update ring, and fan out
 to attached clients. Control, normalized activity, and usage updates also occupy
 the ring. It is not 256 messages or turns.
 
-Atomic new/resume responses carry current activity and usage snapshots. A
-snapshot restores current state, not missing conversation text. Clients must
-make history gaps visible before choosing live-only attachment.
+Conversation updates also feed a separate in-memory materialized transcript,
+compacting chunks into messages while retaining first-appearance order.
+`replayFrom: start` sends this projection as marked snapshot entries with an
+atomic high-watermark; incremental cursors still use the bounded ring.
+Recovery hydrates the transcript through ACPv1 load or ACPv2 resume replay,
+without repeating accounting, interactions or live broadcasts.
+
+Atomic new/resume responses carry current activity and usage snapshots,
+independently of conversation history. Clients must make unavailable history
+visible before choosing live-only attachment. No durable transcript archive is maintained.
 
 The catalog's separate SSE stream only invalidates discovery snapshots. Clients
 re-list on revision changes. It is neither conversation replay nor a durable log.
@@ -197,7 +204,8 @@ never automatically resent. Reattached uncertain work needs acknowledgement
 before new prompts are admitted.
 
 Sequence blocks are reserved durably before publication to avoid cursor reuse
-after crashes. Restart can introduce gaps and loses replay entirely. Database
+after crashes. Restart can introduce gaps and loses incremental replay; transcript
+snapshots are rebuilt from the downstream agent's retained history. Database
 migrations use SQLite `user_version`; future schemas are refused.
 
 See [ADR-003](adr/003-durable-session-catalog-and-conservative-recovery.md) and

@@ -187,16 +187,14 @@ pub(crate) async fn run_opencode_agent(
         }
     };
     let started_busy = native.busy().await.unwrap_or(false);
-    // Backfill reaches the replay ring but not live subscribers: the client that is adopting
-    // has not yet received the new session ID, and fetches history with replayFrom = start.
+    // History is display data, not new work: importing it must not repeat accounting effects.
     if let Ok(mut state) = control.lock() {
-        let subscribers = std::mem::take(&mut state.subscribers);
         for item in backlog {
             if let Mapped::Update(update) = item {
-                let _ = crate::forward_locked(&mut state, &hive_id, Some(update));
+                let _ = state.transcript.ingest(&update);
             }
         }
-        state.subscribers = subscribers;
+        state.finish_history();
     }
     let _ = ready.send(Ok((
         v2::NewSessionResponse::new(hive_id.clone()),

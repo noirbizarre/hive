@@ -24,6 +24,7 @@ pub struct Conversation {
     messages: HashMap<String, usize>,
     tools: HashMap<String, usize>,
     pub seq: u64,
+    snapshot_through: Option<u64>,
     pub running: bool,
     pub generation: u64,
     pub pilot_present: bool,
@@ -37,6 +38,15 @@ pub struct Conversation {
 }
 
 impl Conversation {
+    pub fn begin_transcript(&mut self, through: u64) {
+        // The request must succeed before queued snapshot notifications can replace this view.
+        *self = Self {
+            seq: through,
+            snapshot_through: Some(through),
+            ..Self::default()
+        };
+    }
+
     pub fn snapshot(&mut self, value: &serde_json::Value) {
         let seq = value["seq"].as_u64().unwrap_or(0);
         if seq >= self.activity_seq && value["version"] == 1 {
@@ -155,6 +165,11 @@ impl Conversation {
     }
 
     pub fn apply(&mut self, notification: v2::UpdateSessionNotification) -> bool {
+        let snapshot = notification
+            .meta
+            .as_ref()
+            .and_then(|m| m.get("hive"))
+            .is_some_and(|h| h["snapshot"] == true);
         let seq = notification
             .meta
             .as_ref()
@@ -164,10 +179,13 @@ impl Conversation {
         let Some(seq) = seq else {
             return false;
         };
-        if seq <= self.seq {
+        if snapshot && self.snapshot_through != Some(seq) {
             return false;
         }
-        if self.seq != 0 && seq != self.seq + 1 {
+        if !snapshot && seq <= self.seq {
+            return false;
+        }
+        if !snapshot && self.seq != 0 && seq != self.seq + 1 {
             self.gap = true;
             return false;
         }
@@ -287,7 +305,10 @@ impl Conversation {
             }
             _ => {}
         }
-        self.seq = seq;
+        if !snapshot {
+            self.seq = seq;
+            self.snapshot_through = None;
+        }
         true
     }
 }
@@ -416,6 +437,48 @@ mod tests {
             )),
         ));
         assert_eq!(conversation.usage["actualSessionCost"]["amount"], 0.04);
+    }
+
+    #[test]
+    fn full_transcript_entries_share_a_boundary_without_consuming_live_sequences() {
+        let mut conversation = Conversation::default();
+        conversation.begin_transcript(2048);
+        for (id, text) in [("first", "one"), ("second", "two")] {
+            let mut notification = event(
+                2048,
+                v2::SessionUpdate::AgentMessage(
+                    v2::AgentMessage::new(v2::MessageId::new(id)).content(vec![text.into()]),
+                ),
+            );
+            notification.meta.as_mut().unwrap().get_mut("hive").unwrap()["snapshot"] = true.into();
+            assert!(conversation.apply(notification));
+        }
+        assert_eq!(conversation.seq, 2048);
+        assert!(conversation.apply(event(
+            2049,
+            v2::SessionUpdate::AgentMessageChunk(v2::ContentChunk::new(
+                "!".into(),
+                v2::MessageId::new("second")
+            ))
+        )));
+        assert_eq!(conversation.lines.len(), 2);
+        assert_eq!(conversation.lines[1].text, "Agent: two!");
+        assert!(!conversation.gap);
+    }
+
+    #[test]
+    fn a_snapshot_from_an_unacknowledged_attachment_is_discarded() {
+        let mut conversation = Conversation::default();
+        let mut notification = event(
+            2048,
+            v2::SessionUpdate::AgentMessage(
+                v2::AgentMessage::new(v2::MessageId::new("stale")).content(vec!["discard".into()]),
+            ),
+        );
+        notification.meta.as_mut().unwrap().get_mut("hive").unwrap()["snapshot"] = true.into();
+        assert!(!conversation.apply(notification));
+        assert!(conversation.lines.is_empty());
+        assert_eq!(conversation.seq, 0);
     }
 
     #[test]

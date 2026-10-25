@@ -421,9 +421,16 @@ async fn native_session(installation: Installation) -> Result<(), String> {
     }
     let cwd = workspace(installation.id)?;
     let agent = AcpAgent::new(AcpAgentConfig::new(&installation.command).args(installation.args));
+    let replayed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let received = replayed.clone();
     let result = if installation.wire == AgentVersion::V1 {
         Client.builder().on_receive_notification(
-            async |_update: v1::SessionNotification, _: ConnectionTo<Agent>| Ok(()),
+            async move |update: v1::SessionNotification, _: ConnectionTo<Agent>| {
+                if matches!(update.update, v1::SessionUpdate::UserMessageChunk(_) | v1::SessionUpdate::AgentMessageChunk(_)) {
+                    received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(())
+            },
             agent_client_protocol::on_receive_notification!(),
         ).connect_with(agent, async move |cx| {
             let initialized = cx.send_request(v1::InitializeRequest::new(ProtocolVersion::V1))
@@ -431,13 +438,21 @@ async fn native_session(installation: Installation) -> Result<(), String> {
             if initialized.protocol_version != ProtocolVersion::V1 {
                 return Err(diagnostic("native agent did not negotiate ACPv1"));
             }
+            if !initialized.agent_capabilities.load_session {
+                return Err(diagnostic("native agent does not advertise history restoration via session/load"));
+            }
             cx.send_request(v1::LoadSessionRequest::new(native_id, cwd))
                 .block_task().await.map_err(|_| diagnostic("session/load rejected native ID; check cwd and native ACP load capability"))?;
             Ok(())
         }).await.map_err(stage)
     } else {
         Client.v2().on_receive_notification(
-            async |_update: v2::UpdateSessionNotification, _: V2ConnectionTo<Agent>| Ok(()),
+            async move |update: v2::UpdateSessionNotification, _: V2ConnectionTo<Agent>| {
+                if matches!(update.update, v2::SessionUpdate::UserMessage(_) | v2::SessionUpdate::AgentMessage(_) | v2::SessionUpdate::UserMessageChunk(_) | v2::SessionUpdate::AgentMessageChunk(_)) {
+                    received.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                Ok(())
+            },
             agent_client_protocol::on_receive_notification!(),
         ).connect_with(agent, async move |cx| {
             let initialized = cx.send_request(v2::InitializeRequest::new(
@@ -446,15 +461,19 @@ async fn native_session(installation: Installation) -> Result<(), String> {
             if initialized.protocol_version != ProtocolVersion::V2 {
                 return Err(diagnostic("native agent did not negotiate ACPv2"));
             }
-            cx.send_request(v2::ResumeSessionRequest::new(v2::SessionId::new(native_id), cwd))
+            cx.send_request(v2::ResumeSessionRequest::new(v2::SessionId::new(native_id), cwd).replay_from(v2::ReplayFrom::Start(v2::ReplayFromStart::new())))
                 .block_task().await.map_err(|_| diagnostic("session/resume rejected native ID; check cwd and native ACP resume capability"))?;
             Ok(())
         }).await.map_err(stage)
     };
     result?;
+    let replayed = replayed.load(std::sync::atomic::Ordering::Relaxed);
+    if replayed == 0 {
+        return Err("native attachment replayed no messages; select a retained session with a nonempty conversation".into());
+    }
     eprintln!(
-        "NATIVE agent={} version={} wire={:?} stdio attachment=true (direct ACP; Hive adoption unimplemented)",
-        installation.id, installation.version, installation.wire
+        "NATIVE agent={} version={} wire={:?} stdio attachment=true replayed_messages={} (direct ACP; Hive adoption unimplemented)",
+        installation.id, installation.version, installation.wire, replayed
     );
     Ok(())
 }

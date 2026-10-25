@@ -35,6 +35,11 @@ pub struct Record {
     pub id: String,
     pub downstream_id: String,
     pub cwd: String,
+    // Resume must reactivate the same workspace scope and MCP connections, not just its cwd.
+    #[serde(default)]
+    pub additional_directories: Vec<agent_client_protocol::schema::v2::AbsolutePath>,
+    #[serde(default)]
+    pub mcp_servers: Vec<agent_client_protocol::schema::v2::McpServer>,
     pub profile: String,
     pub version: String,
     pub created_at: u64,
@@ -370,6 +375,8 @@ mod tests {
             id: id.into(),
             downstream_id: "agent-session".into(),
             cwd: "/tmp".into(),
+            additional_directories: Vec::new(),
+            mcp_servers: Vec::new(),
             profile: "mock".into(),
             version: "v2".into(),
             created_at: 1,
@@ -415,6 +422,36 @@ mod tests {
     }
 
     #[test]
+    fn recovery_keeps_workspace_roots_and_mcp_connections_alongside_the_original_identity() {
+        let path = temporary();
+        let store = Store::open(path.clone()).unwrap();
+        let mut session = record("one");
+        session
+            .additional_directories
+            .push(PathBuf::from("/workspace/other").into());
+        session.mcp_servers = vec![agent_client_protocol::schema::v2::McpServer::Stdio(
+            agent_client_protocol::schema::v2::McpServerStdio::new(
+                "fixture",
+                PathBuf::from("/fixture-mcp"),
+            ),
+        )];
+        store.save(&session).unwrap();
+        drop(store);
+        let store = Store::open(path.clone()).unwrap();
+        let recovered = store.records().unwrap().pop().unwrap();
+        assert_eq!(recovered.id, session.id);
+        assert_eq!(recovered.downstream_id, session.downstream_id);
+        assert_eq!(recovered.cwd, session.cwd);
+        assert_eq!(
+            recovered.additional_directories,
+            session.additional_directories
+        );
+        assert_eq!(recovered.mcp_servers, session.mcp_servers);
+        drop(store);
+        std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
+    }
+
+    #[test]
     fn a_record_written_before_native_adoption_decodes_as_an_acp_hive_session() {
         // The exact shape earlier builds stored: no kind, api or origin.
         let legacy = r#"{"id":"hive-1","downstream_id":"d","cwd":"/tmp","profile":"p",
@@ -424,6 +461,8 @@ mod tests {
         assert_eq!(record.kind, "acp");
         assert_eq!(record.origin, "hive");
         assert_eq!(record.api, None);
+        assert!(record.additional_directories.is_empty());
+        assert!(record.mcp_servers.is_empty());
     }
 
     #[test]

@@ -19,11 +19,13 @@ session ID and routing. No transport `Last-Event-ID` resumption is claimed.
 These are separate guarantees:
 
 - **Live reconnect:** session resume attaches to an existing broker session,
-  with bounded retained replay and current snapshots. The worker keeps running.
+  with bounded incremental replay or a full in-memory transcript snapshot. The worker keeps running.
 - **Daemon restart:** Hive attempts downstream reattachment using saved IDs,
   where the agent supports it. Failure remains a visible offline record.
-- **Replay:** the latest 256 updates are in memory only. Restart loses them,
-  and even a live daemon can expire an old cursor. Replay is not a full transcript.
+- **Incremental replay:** the latest 256 updates are in memory only. Restart loses
+  them, and even a live daemon can expire an old cursor. Fresh `start` attachments
+  use a separate transcript snapshot, rebuilt from agent-retained history after
+  restart. Hive does not durably archive conversation payloads.
 
 The separate `/v1/sessions/events` SSE feed announces catalog revision
 changes only. Clients re-list sessions rather than replaying this feed.

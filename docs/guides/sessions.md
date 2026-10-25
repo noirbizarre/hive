@@ -53,9 +53,11 @@ active. Hive's CLI does not provide a session-close subcommand.
 
 ## Reconnect and missing history
 
-Hive retains the latest **256 updates** per live session. Text chunks, control
+Hive retains the latest **256 updates** for incremental reconnects. Text chunks, control
 changes, activity, and usage all consume this window. It is not a transcript
-archive and does not represent 256 messages or turns.
+archive and does not represent 256 messages or turns. Fresh selection/page reload
+uses a separate in-memory transcript snapshot, so wrapping this window does not
+discard conversation prefixes from the view.
 
 If retained history is available, reconnect replays it and then continues live.
 If the cursor expired, the client reports a gap instead of pretending history is
@@ -63,7 +65,12 @@ complete. Choose live-only attachment explicitly (`Ctrl-R` in the TUI, or the
 browser's attach-without-history action).
 
 Live-only attachment restores current activity, not missing conversation text.
-A daemon restart loses this replay window entirely. See
+Reload the browser page or restart the TUI to rebuild the view from a fresh
+transcript snapshot instead. Reselecting a TUI session retains its existing cursor.
+A daemon restart loses the incremental window and rebuilds the transcript via
+ACPv1 `session/load` or ACPv2 `session/resume` with replay from the start.
+An agent that cannot replay history or no longer retains the session returns
+an actionable diagnostic. Hive keeps the original session identity. See
 [restart and recovery](../operations.md#restart-and-recovery).
 
 ## Uncertain prompts and interrupted work

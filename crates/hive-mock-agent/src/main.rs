@@ -15,6 +15,17 @@ struct State {
     sessions: HashMap<v2::SessionId, (v2::AbsolutePath, Vec<v2::SessionUpdate>)>,
     #[serde(default)]
     models: HashMap<String, String>,
+    #[serde(default)]
+    v1_sessions: HashMap<String, (std::path::PathBuf, Vec<v1::SessionUpdate>)>,
+    #[serde(default)]
+    restores: Vec<String>,
+}
+
+fn load() -> State {
+    std::env::var_os("HIVE_MOCK_STATE")
+        .and_then(|path| std::fs::read(path).ok())
+        .and_then(|data| serde_json::from_slice(&data).ok())
+        .unwrap_or_default()
 }
 
 fn model_options(current: &str) -> Vec<v2::SessionConfigOption> {
@@ -70,12 +81,7 @@ async fn main() -> agent_client_protocol::Result<()> {
     if std::env::args().nth(1).as_deref() == Some("v1") {
         return serve_v1().await;
     }
-    let state = Arc::new(Mutex::new(
-        std::env::var_os("HIVE_MOCK_STATE")
-            .and_then(|path| std::fs::read(path).ok())
-            .and_then(|data| serde_json::from_slice::<State>(&data).ok())
-            .unwrap_or_default(),
-    ));
+    let state = Arc::new(Mutex::new(load()));
     Agent
         .v2()
         .name("hive-mock-agent")
@@ -147,21 +153,60 @@ async fn main() -> agent_client_protocol::Result<()> {
                 async move |request: v2::ResumeSessionRequest,
                             responder: Responder<v2::ResumeSessionResponse>,
                             cx: V2ConnectionTo<Client>| {
+                    match std::env::var("HIVE_MOCK_RESTORE").as_deref() {
+                        Ok("reject") => {
+                            return responder
+                                .respond_with_error(invalid("history replay unavailable"));
+                        }
+                        Ok("missing") => {
+                            return responder
+                                .respond_with_error(invalid("saved session not found"));
+                        }
+                        _ => {}
+                    }
                     let updates = {
-                        let state = state.lock().map_err(|_| Error::internal_error())?;
-                        let (_, history) = state
+                        let mut state = state.lock().map_err(|_| Error::internal_error())?;
+                        let (cwd, history) = state
                             .sessions
                             .get(&request.session_id)
                             .ok_or_else(|| invalid("unknown session"))?;
-                        if request.replay_from.is_some() {
-                            history.clone()
+                        if cwd != &request.cwd {
+                            return responder.respond_with_error(invalid("cwd mismatch"));
+                        }
+                        let updates = if request.replay_from.is_some() {
+                            if !matches!(request.replay_from, Some(v2::ReplayFrom::Start(_))) {
+                                return responder.respond_with_error(invalid("unsupported cursor"));
+                            }
+                            if std::env::var("HIVE_MOCK_RESTORE").as_deref() == Ok("empty") {
+                                Vec::new()
+                            } else {
+                                history.clone()
+                            }
                         } else {
                             Vec::new()
-                        }
+                        };
+                        state.restores.push(
+                            if request.replay_from.is_some() {
+                                "v2:start"
+                            } else {
+                                "v2:none"
+                            }
+                            .into(),
+                        );
+                        save(&state)?;
+                        updates
                     };
                     for update in updates {
                         notify(&cx, &request.session_id, update)?;
                     }
+                    // ACPv2 requires current state after replay and before the resume response.
+                    notify(
+                        &cx,
+                        &request.session_id,
+                        v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(
+                            v2::IdleStateUpdate::new(),
+                        )),
+                    )?;
                     let model = state
                         .lock()
                         .map_err(|_| Error::internal_error())?
@@ -171,7 +216,29 @@ async fn main() -> agent_client_protocol::Result<()> {
                         .unwrap_or_else(|| "fast".into());
                     responder.respond(
                         v2::ResumeSessionResponse::new().config_options(model_options(&model)),
-                    )
+                    )?;
+                    if std::env::var("HIVE_MOCK_RESTORE").as_deref() == Ok("live") {
+                        // No sleeps: these messages must follow the response even if its waiter has not run.
+                        notify(
+                            &cx,
+                            &request.session_id,
+                            v2::SessionUpdate::UsageUpdate(v2::UsageUpdate::new(321, 200_000)),
+                        )?;
+                        notify(
+                            &cx,
+                            &request.session_id,
+                            v2::SessionUpdate::ConfigOptionUpdate(v2::ConfigOptionUpdate::new(
+                                model_options("careful"),
+                            )),
+                        )?;
+                        cx.prepare_request(v2::RequestPermissionRequest::new(
+                            request.session_id,
+                            "Post-resume permission",
+                            vec![],
+                        ))
+                        .detach()?;
+                    }
+                    Ok(())
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -340,6 +407,14 @@ async fn main() -> agent_client_protocol::Result<()> {
                         v2::AgentMessage::new(agent_id).content(vec![reply.into()]),
                     );
                     notify(&cx, &request.session_id, snapshot.clone())?;
+                    {
+                        // Persist before idle so restart tests cannot race the agent's last write.
+                        let mut state = state.lock().map_err(|_| Error::internal_error())?;
+                        if let Some((_, history)) = state.sessions.get_mut(&request.session_id) {
+                            history.extend([user, snapshot]);
+                        }
+                        save(&state)?;
+                    }
                     let mut idle = v2::IdleStateUpdate::new().stop_reason(v2::StopReason::EndTurn);
                     if text.contains("usage-fixture") {
                         idle = idle.usage(v2::Usage::new(120, 80, 40).cached_read_tokens(Some(20)));
@@ -375,14 +450,6 @@ async fn main() -> agent_client_protocol::Result<()> {
                             );
                         });
                     }
-                    if let Some((_, history)) = state
-                        .lock()
-                        .map_err(|_| Error::internal_error())?
-                        .sessions
-                        .get_mut(&request.session_id)
-                    {
-                        history.extend([user, snapshot]);
-                    }
                     Ok(())
                 }
             },
@@ -405,7 +472,7 @@ async fn main() -> agent_client_protocol::Result<()> {
 }
 
 async fn serve_v1() -> agent_client_protocol::Result<()> {
-    let sessions = Arc::new(Mutex::new(0u64));
+    let state = Arc::new(Mutex::new(load()));
     let models = Arc::new(Mutex::new(HashMap::<String, String>::new()));
     Agent
         .builder()
@@ -414,24 +481,114 @@ async fn serve_v1() -> agent_client_protocol::Result<()> {
                    responder: Responder<v1::InitializeResponse>,
                    _cx| {
                 responder.respond(
-                    v1::InitializeResponse::new(request.protocol_version)
-                        .agent_capabilities(v1::AgentCapabilities::new()),
+                    v1::InitializeResponse::new(request.protocol_version).agent_capabilities(
+                        v1::AgentCapabilities::new()
+                            .load_session(
+                                std::env::var("HIVE_MOCK_RESTORE").as_deref() != Ok("resume-only")
+                                    && std::env::var("HIVE_MOCK_RESTORE").as_deref() != Ok("none"),
+                            )
+                            .session_capabilities(
+                                v1::SessionCapabilities::new().resume(
+                                    (std::env::var("HIVE_MOCK_RESTORE").as_deref()
+                                        != Ok("load-only")
+                                        && std::env::var("HIVE_MOCK_RESTORE").as_deref()
+                                            != Ok("none"))
+                                    .then(v1::SessionResumeCapabilities::new),
+                                ),
+                            ),
+                    ),
                 )
             },
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
             {
-                let sessions = sessions.clone();
-                async move |_request: v1::NewSessionRequest,
+                let state = state.clone();
+                async move |request: v1::NewSessionRequest,
                             responder: Responder<v1::NewSessionResponse>,
                             _cx| {
-                    let mut sessions = sessions.lock().map_err(|_| Error::internal_error())?;
-                    *sessions += 1;
+                    let mut state = state.lock().map_err(|_| Error::internal_error())?;
+                    state.next += 1;
+                    let id = format!("mock-v1-{}", state.next);
+                    state
+                        .v1_sessions
+                        .insert(id.clone(), (request.cwd, Vec::new()));
+                    save(&state)?;
                     responder.respond(
-                        v1::NewSessionResponse::new(format!("mock-v1-{sessions}"))
-                            .config_options(v1_model_options("fast")),
+                        v1::NewSessionResponse::new(id).config_options(v1_model_options("fast")),
                     )
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = state.clone();
+                async move |request: v1::LoadSessionRequest,
+                            responder: Responder<v1::LoadSessionResponse>,
+                            cx: agent_client_protocol::ConnectionTo<Client>| {
+                    let mut state = state.lock().map_err(|_| Error::internal_error())?;
+                    let (cwd, history) = state
+                        .v1_sessions
+                        .get(&request.session_id.to_string())
+                        .ok_or_else(|| invalid("unknown session"))?;
+                    if cwd != &request.cwd {
+                        return responder.respond_with_error(invalid("cwd mismatch"));
+                    }
+                    for update in history {
+                        if std::env::var("HIVE_MOCK_RESTORE").as_deref() != Ok("empty") {
+                            cx.send_notification(v1::SessionNotification::new(
+                                request.session_id.clone(),
+                                update.clone(),
+                            ))?;
+                        }
+                    }
+                    state.restores.push("v1:load".into());
+                    save(&state)?;
+                    responder.respond(v1::LoadSessionResponse::new())?;
+                    if std::env::var("HIVE_MOCK_RESTORE").as_deref() == Ok("live") {
+                        cx.send_notification(v1::SessionNotification::new(
+                            request.session_id.clone(),
+                            v1::SessionUpdate::UsageUpdate(v1::UsageUpdate::new(321, 200_000)),
+                        ))?;
+                        cx.send_notification(v1::SessionNotification::new(
+                            request.session_id.clone(),
+                            v1::SessionUpdate::ConfigOptionUpdate(v1::ConfigOptionUpdate::new(
+                                v1_model_options("careful"),
+                            )),
+                        ))?;
+                        cx.prepare_request(v1::RequestPermissionRequest::new(
+                            request.session_id,
+                            v1::ToolCallUpdate::new(
+                                "post-resume",
+                                v1::ToolCallUpdateFields::new().title("Post-resume permission"),
+                            ),
+                            vec![],
+                        ))
+                        .detach()?;
+                    }
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = state.clone();
+                async move |request: v1::ResumeSessionRequest,
+                            responder: Responder<v1::ResumeSessionResponse>,
+                            _cx: agent_client_protocol::ConnectionTo<Client>| {
+                    let mut state = state.lock().map_err(|_| Error::internal_error())?;
+                    let (cwd, _) = state
+                        .v1_sessions
+                        .get(&request.session_id.to_string())
+                        .ok_or_else(|| invalid("unknown session"))?;
+                    if cwd != &request.cwd {
+                        return responder.respond_with_error(invalid("cwd mismatch"));
+                    }
+                    state.restores.push("v1:resume".into());
+                    save(&state)?;
+                    responder.respond(v1::ResumeSessionResponse::new())
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -484,57 +641,73 @@ async fn serve_v1() -> agent_client_protocol::Result<()> {
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
-            async |request: v1::PromptRequest,
-                   responder: Responder<v1::PromptResponse>,
-                   cx: agent_client_protocol::ConnectionTo<Client>| {
-                let text = request
-                    .prompt
-                    .iter()
-                    .filter_map(|block| match block {
-                        v1::ContentBlock::Text(text) => Some(text.text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                if text.contains("activity-sequence") {
-                    cx.send_notification(v1::SessionNotification::new(
-                        request.session_id.clone(),
-                        v1::SessionUpdate::ToolCall(v1::ToolCall::new("v1-tool", "Check files")),
-                    ))?;
-                    cx.send_notification(v1::SessionNotification::new(
-                        request.session_id.clone(),
-                        v1::SessionUpdate::Plan(v1::Plan::new(vec![v1::PlanEntry::new(
-                            "Check files",
-                            v1::PlanEntryPriority::High,
-                            v1::PlanEntryStatus::InProgress,
-                        )])),
-                    ))?;
-                    cx.send_notification(v1::SessionNotification::new(
-                        request.session_id.clone(),
-                        v1::SessionUpdate::ToolCallUpdate(v1::ToolCallUpdate::new(
-                            "v1-tool",
-                            v1::ToolCallUpdateFields::new().status(v1::ToolCallStatus::Failed),
-                        )),
-                    ))?;
-                }
-                if text.contains("fail-prompt") {
-                    return responder.respond_with_error(
-                        Error::internal_error()
-                            .data("synthetic failure with secret sk-must-not-leak"),
-                    );
-                }
-                cx.send_notification(v1::SessionNotification::new(
-                    request.session_id,
-                    v1::SessionUpdate::AgentMessageChunk(v1::ContentChunk::new(
+            {
+                let state = state.clone();
+                async move |request: v1::PromptRequest,
+                            responder: Responder<v1::PromptResponse>,
+                            cx: agent_client_protocol::ConnectionTo<Client>| {
+                    let text = request
+                        .prompt
+                        .iter()
+                        .filter_map(|block| match block {
+                            v1::ContentBlock::Text(text) => Some(text.text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if text.contains("activity-sequence") {
+                        cx.send_notification(v1::SessionNotification::new(
+                            request.session_id.clone(),
+                            v1::SessionUpdate::ToolCall(v1::ToolCall::new(
+                                "v1-tool",
+                                "Check files",
+                            )),
+                        ))?;
+                        cx.send_notification(v1::SessionNotification::new(
+                            request.session_id.clone(),
+                            v1::SessionUpdate::Plan(v1::Plan::new(vec![v1::PlanEntry::new(
+                                "Check files",
+                                v1::PlanEntryPriority::High,
+                                v1::PlanEntryStatus::InProgress,
+                            )])),
+                        ))?;
+                        cx.send_notification(v1::SessionNotification::new(
+                            request.session_id.clone(),
+                            v1::SessionUpdate::ToolCallUpdate(v1::ToolCallUpdate::new(
+                                "v1-tool",
+                                v1::ToolCallUpdateFields::new().status(v1::ToolCallStatus::Failed),
+                            )),
+                        ))?;
+                    }
+                    if text.contains("fail-prompt") {
+                        return responder.respond_with_error(
+                            Error::internal_error()
+                                .data("synthetic failure with secret sk-must-not-leak"),
+                        );
+                    }
+                    let reply = v1::SessionUpdate::AgentMessageChunk(v1::ContentChunk::new(
                         format!("Echo: {text}").into(),
-                    )),
-                ))?;
-                let mut response = v1::PromptResponse::new(v1::StopReason::EndTurn);
-                if text.contains("usage-fixture") {
-                    response =
-                        response.usage(v1::Usage::new(120, 80, 40).cached_read_tokens(Some(20)));
+                    ));
+                    {
+                        let mut state = state.lock().map_err(|_| Error::internal_error())?;
+                        let (_, history) = state
+                            .v1_sessions
+                            .get_mut(&request.session_id.to_string())
+                            .ok_or_else(|| invalid("unknown session"))?;
+                        history.push(v1::SessionUpdate::UserMessageChunk(v1::ContentChunk::new(
+                            text.clone().into(),
+                        )));
+                        history.push(reply.clone());
+                        save(&state)?;
+                    }
+                    cx.send_notification(v1::SessionNotification::new(request.session_id, reply))?;
+                    let mut response = v1::PromptResponse::new(v1::StopReason::EndTurn);
+                    if text.contains("usage-fixture") {
+                        response = response
+                            .usage(v1::Usage::new(120, 80, 40).cached_read_tokens(Some(20)));
+                    }
+                    responder.respond(response)
                 }
-                responder.respond(response)
             },
             agent_client_protocol::on_receive_request!(),
         )

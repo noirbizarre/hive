@@ -29,24 +29,31 @@ so the same sessions are available in the Web UI and other ACP clients.
 | `Ctrl-P` | Open/close the provider/model configuration picker |
 | `Ctrl-H` | Relinquish control while observing |
 | Enter in composer | Send the typed prompt |
+| Page Up / Page Down | Scroll conversation history |
+| Home / End | Jump to the oldest message / resume following live output |
+| Mouse wheel over conversation | Scroll history |
+| Click a tool summary | Expand/collapse formatted tool details |
+| `Ctrl-Up` / `Ctrl-Down` | Select the previous/next tool call |
+| `Ctrl-O` | Expand/collapse the selected tool (latest visible tool by default) |
 | `Ctrl-C` | Cancel foreground work |
 | `Ctrl-R` | Accept live-only attachment after a history gap |
 | `Ctrl-Y` | Acknowledge interrupted work and take control |
-| Esc / `Ctrl-Q` | Quit without closing the session |
+| Esc | Close the model picker, or quit outside dialogs |
+| `Ctrl-Q` | Quit without closing the session (outside agent questions) |
 
 Recovery acknowledgement requires checking the downstream state first. See
 [sessions and handoff](sessions.md) for what these operations guarantee.
 
-If quitting restores the screen but leaves the process waiting, press Enter
-once. See the [terminal-reader workaround](../troubleshooting.md#the-tui-leaves-its-screen-but-does-not-return-to-the-shell).
-
 ## Choose a provider and model
 
 Create a session with `Ctrl-N`, then press `Ctrl-P` before sending a prompt.
-The picker lists the agent's advertised configuration choices, grouped by
-provider when available; `*` marks current values. Use arrows and Enter to
-apply a choice, and `Ctrl-P` to return to chat. Current choices also appear
-under the conversation heading when space permits.
+The modal lists the agent's advertised configuration choices, grouped by
+provider when available; `*` marks current values. Type to fuzzy-search provider
+and model names. Use arrows or Page Up/Down to navigate and Enter to apply a
+choice. Successful changes close the modal; errors keep the search open for
+retry. Esc or `Ctrl-P` closes it without changing your chat draft. Selection and
+scroll position stay stable while the session catalog refreshes. Current choices
+also appear under the conversation heading when space permits.
 
 The backend profile chooses the agent process or server; provider/model
 selection configures that agent. Take control with `Ctrl-T` before editing an
@@ -86,3 +93,19 @@ the TUI. See [CLI reference](../reference/cli.md).
 The transcript follows your terminal's foreground/background and ANSI colors.
 Session details collapse in narrow terminals. Unknown activity remains unknown,
 and an attention marker reflects only questions visible to this client.
+
+Messages render Markdown headings, emphasis, lists, links, tables, and code
+blocks. Tool calls start collapsed as a single line with the tool name (or
+category), status, and a short action summary. Click that line to inspect input,
+output, and file changes; text output is decoded and formatted instead of showing
+the serialized protocol event. You can also select tools with `Ctrl-Up` /
+`Ctrl-Down` and toggle details with `Ctrl-O`.
+
+Page Up/Down and the mouse wheel browse the retained conversation history. Home
+jumps to the beginning; End returns to the latest output and resumes automatic
+following. New output does not pull you away while reading older messages, and
+each session retains its own scroll position and expanded tools. The footer
+shows **History** while automatic following is paused. With an agent question or
+model picker open, scrolling controls that dialog instead of the conversation.
+Hold Shift when selecting terminal text if your terminal reserves mouse input
+for the application.

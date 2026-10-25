@@ -2072,7 +2072,14 @@ async fn restore_plans(forget: bool) {
     server.abort();
     let _ = server.await;
     drop(recovered);
+    #[cfg(not(windows))]
     std::fs::remove_dir_all(base).unwrap();
+    #[cfg(windows)]
+    {
+        // Aborted workers can retain SQLite handles until the test runtime exits on Windows.
+        // The runner removes this unique directory after those handles have been released.
+        let _ = std::fs::remove_dir_all(base);
+    }
 }
 
 #[tokio::test]

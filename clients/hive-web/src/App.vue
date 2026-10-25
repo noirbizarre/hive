@@ -109,6 +109,11 @@ onBeforeUnmount(() => { feed?.close(); props.client.close(); });
         <Button v-if="state.session && !pilot" id="control" label="Take control" severity="secondary" outlined :loading="state.takingControl" :disabled="!state.connected || state.recoveryRequired || busy || state.gap" @click="action(() => client.takeControl())" />
       </section>
       <div class="notices">
+        <!-- Coverage survives transient transport messages and never blocks available content. -->
+        <Message v-if="state.session" id="history-status" severity="warn" :closable="false" role="status">
+          {{ state.transcript?.completeness === 'partial' ? 'History: partial' : 'History: retention coverage unknown' }}
+          <span v-for="warning in state.transcript?.warnings || []" :key="warning.code"> · {{ warning.message }}</span>
+        </Message>
         <Message v-if="providerError" severity="error" :closable="false">{{ providerError }} <Button label="Retry backends" size="small" @click="feed.refresh()" /></Message>
         <Message v-if="error" severity="error" :closable="false" role="alert">{{ error }}</Message>
         <Message v-if="state.gap" severity="warn" :closable="false">Earlier history is unavailable. <Button label="Attach without earlier history" :disabled="!state.connected || busy" @click="action(() => client.attachWithoutHistory())" /></Message>

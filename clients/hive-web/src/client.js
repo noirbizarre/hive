@@ -13,6 +13,8 @@ export function conversation() {
   let usageSeq = 0;
   let configOptions = [];
   let configSeq = 0;
+  let transcript;
+  let transcriptSeq = 0;
   let gap = false;
 
   function reconcile(snapshot) {
@@ -44,17 +46,25 @@ export function conversation() {
     }
   }
 
+  function reconcileTranscript(value, number) {
+    // An old replayed control update must not undo the successful attachment's status.
+    if (value && Number.isSafeInteger(number) && number >= transcriptSeq) {
+      transcript = structuredClone(value);
+      transcriptSeq = number;
+    }
+  }
+
   function apply(event, snapshot = false) {
     const number = event._meta?.hive?.seq;
     if (!snapshot && (!Number.isSafeInteger(number) || number <= seq)) return false;
     if (!snapshot && seq && number !== seq + 1) { gap = true; return false; }
     const update = event.update;
     const kind = update.sessionUpdate;
-    if (kind === 'agent_message_chunk' || kind === 'user_message_chunk') {
-      const speaker = kind.startsWith('agent') ? 'agent' : 'user';
+    if (kind === 'agent_message_chunk' || kind === 'user_message_chunk' || kind === 'agent_thought_chunk') {
+      const speaker = kind.startsWith('agent_thought') ? 'thought' : kind.startsWith('agent') ? 'agent' : 'user';
       upsert(messages, `${speaker}:${update.messageId}`, speaker, update.content?.text || '');
-    } else if (kind === 'agent_message' || kind === 'user_message') {
-      const speaker = kind.startsWith('agent') ? 'agent' : 'user';
+    } else if (kind === 'agent_message' || kind === 'user_message' || kind === 'agent_thought') {
+      const speaker = kind === 'agent_thought' ? 'thought' : kind.startsWith('agent') ? 'agent' : 'user';
       upsert(messages, `${speaker}:${update.messageId}`, speaker,
         (update.content || []).map(block => block.text || `[${block.type || 'content'}]`).join('\n'), true);
     } else if (kind === 'tool_call_update' || kind === 'tool_call_content_chunk' || kind.startsWith('_hive_v1_tool')) {
@@ -80,6 +90,7 @@ export function conversation() {
     } else if (kind === '_hive_control') {
       generation = update.generation;
       pilot = update.pilot;
+      reconcileTranscript(update.transcript, number);
     } else if (kind === '_hive_activity' && number > activity.seq) {
       if (update.kind === 'foreground') activity.foreground = update.state?.state || 'unknown';
       if (update.kind === 'session') activity.session = update.status;
@@ -109,6 +120,8 @@ export function conversation() {
     reconcile,
     reconcileUsage,
     reconcileConfig,
+    reconcileTranscript,
+    get transcript() { return transcript && structuredClone(transcript); },
     get configOptions() { return structuredClone(configOptions); },
     running(value) { running = value; },
     get seq() { return seq; },
@@ -197,7 +210,7 @@ export function connect(url, onChange = () => {}) {
 
   const snapshot = () => ({ connected, status, session: selected && { ...selected }, role: owner?.role || 'observer',
     generation: owner?.generation,
-    running: history.runningNow, lines: history.lines, activity: history.activity, usage: history.usage, configOptions: history.configOptions,
+    running: history.runningNow, lines: history.lines, activity: history.activity, usage: history.usage, configOptions: history.configOptions, transcript: history.transcript,
     configuring, creating, opening: Boolean(desired && desired.sessionId !== selected?.sessionId), pendingSession: desired?.sessionId, seq: history.seq, gap, interaction,
     urlFlows: [...urlFlows.values()], uncertain: uncertain && { ...uncertain }, recoveryRequired, takingControl: Boolean(takingControl) });
   const publish = () => onChange(snapshot());
@@ -328,6 +341,7 @@ export function connect(url, onChange = () => {}) {
     if (!hive || !Number.isSafeInteger(hive.generation) || !hive.role) throw new Error('Hive did not return control metadata');
     owner = hive.role === 'pilot' ? hive : { generation: hive.generation, role: 'observer' };
     recoveryRequired = Boolean(hive.recoveryRequired);
+    history.reconcileTranscript(hive.transcript, hive.transcriptSeq ?? 0);
     history.running(hive.running);
     gap = false;
     status = `${owner.role === 'pilot' ? 'Controlling' : 'Read-only'} ${selected.sessionId}${hive.running ? ' (running)' : ''}`;

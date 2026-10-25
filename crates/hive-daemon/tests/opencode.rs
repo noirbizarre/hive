@@ -488,10 +488,46 @@ async fn adopting_a_native_session_never_creates_a_new_one_and_replays_its_histo
     assert_eq!(summary["nativeId"], "ses_a");
     assert_eq!(summary["title"], "Fix the bug");
     assert_eq!(summary["agent"], "oc");
+    assert_eq!(summary["transcript"]["source"], "agent_history");
+    assert_eq!(summary["transcript"]["completeness"], "unknown");
 
     let history = replay(address, &id).await;
     assert_eq!(user_texts(&history), ["why does it crash?"]);
     assert_eq!(agent_text(&history), "a null pointer");
+}
+
+#[tokio::test]
+async fn bounded_native_imports_and_exhausted_pagination_report_partial_history() {
+    for (v2, exchanges) in [(false, 30), (true, 130), (true, 2600)] {
+        let (fake, url) = fake_opencode::start(Options {
+            v1: !v2,
+            v2,
+            ..Options::default()
+        })
+        .await;
+        fake.add_session("ses_tail", "Retained history", &cwd());
+        for index in 0..exchanges {
+            if v2 {
+                fake.add_v2_exchange("ses_tail", &format!("question {index}"), "answer");
+            } else {
+                fake.add_exchange("ses_tail", &format!("question {index}"), "answer");
+            }
+        }
+        let (broker, address) = start(config(&url)).await;
+        let id = adopt(address, "ses_tail").await;
+        let status = catalog(address).await["sessions"][0]["transcript"].clone();
+        assert_eq!(status["owner"], "agent");
+        assert_eq!(status["availability"], "available");
+        assert_eq!(status["completeness"], "partial");
+        assert_eq!(status["warnings"][0]["code"], "hive::transcript::truncated");
+        if exchanges == 2600 {
+            assert_eq!(fake.exact("GET /api/session/ses_tail/history"), 25);
+        }
+        let history = replay(address, &id).await;
+        assert!(!user_texts(&history).is_empty());
+        assert_ne!(user_texts(&history)[0], "question 0");
+        broker.shutdown().await;
+    }
 }
 
 #[tokio::test]

@@ -28,6 +28,7 @@ by editing the old one. The history is the value.
 - [ADR-006](006-local-operational-http-and-acp-boundary.md) — Local operational HTTP and ACP boundary
 - [ADR-007](007-capability-aware-human-interaction-routing.md) — Capability-aware human interaction routing
 - [ADR-008](008-embedded-vue-interface.md) — Embedded Vue and OpenVue interface
+- [ADR-009](009-agent-owned-history-and-session-registry.md) — Agent-owned history and the Hive session registry
 
 ## Subsequent decisions and current interpretation
 
@@ -36,6 +37,9 @@ remain accepted. Later records describe implemented extensions:
 
 - ADR-003 adds durable catalog recovery without making replay durable.
 - ADR-007 specifies session-scoped versus request-scoped human input routing.
+- ADR-009 separates transcript ownership and coverage from registry and recovery.
+  It supersedes ADR-003's full prompt-content/result storage with schema-2
+  fingerprints, minimal acknowledgements and failure markers, retaining reservations.
 
 For current setup and API details, use the [configuration reference](../configuration.md)
 and [OpenCode guide](../agents/opencode.md). In particular, adoption requires an

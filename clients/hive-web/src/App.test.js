@@ -62,6 +62,22 @@ test('session selection observes the original session and typing requests contro
   expect(wrapper.get('#composer').element.value).toBe('');
 });
 
+test('partial history warnings persist through transport updates without blocking available content', async () => {
+  const { publish } = application({ session, role: 'pilot', lines: [{ kind: 'agent', text: 'Retained answer' }],
+    transcript: { completeness: 'partial', warnings: [{ code: 'hive::transcript::truncated', message: 'Earlier content remains with the agent' }] } });
+  await flushPromises();
+  expect(wrapper.get('#history-status').text()).toContain('History: partial');
+  expect(wrapper.get('#history-status').text()).toContain('Earlier content remains with the agent');
+  expect(wrapper.get('#output').text()).toContain('Retained answer');
+  await wrapper.get('#composer').setValue('follow up');
+  expect(wrapper.get('#send').element.disabled).toBe(false);
+  publish({ status: 'Prompt sent' }); await nextTick();
+  expect(wrapper.get('#history-status').text()).toContain('Earlier content remains with the agent');
+  publish({ session: { ...session, sessionId: 'other' }, transcript: undefined }); await nextTick();
+  expect(wrapper.get('#history-status').text()).toContain('retention coverage unknown');
+  expect(wrapper.get('#history-status').text()).not.toContain('Earlier content');
+});
+
 test('a fresh session configures grouped models before its first prompt and gates busy controls', async () => {
   const { client, publish } = application();
   await flushPromises();

@@ -907,6 +907,9 @@ fn earlier_conversations_restore_once_under_the_original_identity_for_both_acp_v
         (AgentVersion::V2, "missing"),
         (AgentVersion::V2, "empty"),
         (AgentVersion::V2, "live"),
+        (AgentVersion::V2, "partial"),
+        (AgentVersion::V2, "no-state"),
+        (AgentVersion::V2, "unimplemented"),
     ] {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1065,6 +1068,7 @@ async fn restore_conversation(version: AgentVersion, mode: &str) -> std::path::P
         .env
         .insert("HIVE_MOCK_STATE".into(), agent_state.display().to_string());
     profile.env.insert("HIVE_MOCK_RESTORE".into(), mode.into());
+    profile.env.insert("HIVE_MOCK_ACK_META".into(), "1".into());
     if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
         profile.env.insert(
             "LLVM_PROFILE_FILE".into(),
@@ -1077,7 +1081,7 @@ async fn restore_conversation(version: AgentVersion, mode: &str) -> std::path::P
     let router = hive_daemon::router(broker.clone());
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let id = Client
+    let (id, acknowledgements) = Client
         .v2()
         .on_receive_notification(
             async move |update: v2::UpdateSessionNotification, _: V2ConnectionTo<Agent>| {
@@ -1098,13 +1102,25 @@ async fn restore_conversation(version: AgentVersion, mode: &str) -> std::path::P
                     .send_request(v2::NewSessionRequest::new(std::env::current_dir().unwrap()))
                     .block_task()
                     .await?;
+                let mut acknowledgements = Vec::new();
                 for text in ["first", "second"] {
-                    cx.send_request(
-                        v2::PromptRequest::new(opened.session_id.clone(), vec![text.into()])
-                            .meta(controlled(&opened.meta, text)),
-                    )
-                    .block_task()
-                    .await?;
+                    let acknowledgement = cx
+                        .send_request(
+                            v2::PromptRequest::new(opened.session_id.clone(), vec![text.into()])
+                                .meta(controlled(&opened.meta, text)),
+                        )
+                        .block_task()
+                        .await?;
+                    let retried = cx
+                        .send_request(
+                            v2::PromptRequest::new(opened.session_id.clone(), vec![text.into()])
+                                .meta(controlled(&opened.meta, text)),
+                        )
+                        .block_task()
+                        .await?;
+                    assert_eq!(retried.message_id, acknowledgement.message_id);
+                    assert_eq!(retried.meta, acknowledgement.meta);
+                    acknowledgements.push(acknowledgement.message_id);
                     loop {
                         let update = timeout(Duration::from_secs(5), rx.recv())
                             .await
@@ -1118,7 +1134,7 @@ async fn restore_conversation(version: AgentVersion, mode: &str) -> std::path::P
                         }
                     }
                 }
-                Ok(opened.session_id)
+                Ok((opened.session_id, acknowledgements))
             },
         )
         .await
@@ -1126,6 +1142,20 @@ async fn restore_conversation(version: AgentVersion, mode: &str) -> std::path::P
     let expected = vec!["first", "Echo: first", "second", "Echo: second"];
     let (texts, old_seq) = transcript_snapshot(address, id.clone()).await.unwrap();
     assert_eq!(texts, expected);
+    let fresh = summaries(address).await;
+    assert_eq!(fresh["sessions"][0]["transcript"]["owner"], "agent");
+    assert_eq!(fresh["sessions"][0]["transcript"]["source"], "live");
+    assert_eq!(
+        fresh["sessions"][0]["transcript"]["availability"],
+        "available"
+    );
+    if version == AgentVersion::V1 && matches!(mode, "resume-only" | "none") {
+        // Unsupported future restoration does not invalidate content observed from creation.
+        assert_eq!(
+            fresh["sessions"][0]["transcript"]["restoration"],
+            "unsupported"
+        );
+    }
     assert_eq!(
         transcript_snapshot(address, id.clone()).await.unwrap().0,
         expected
@@ -1145,11 +1175,72 @@ async fn restore_conversation(version: AgentVersion, mode: &str) -> std::path::P
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     let catalog = summaries(address).await;
     assert_eq!(catalog["sessions"][0]["sessionId"], id.to_string());
+    if mode == "both" {
+        Client
+            .v2()
+            .connect_with(
+                HttpClient::new(format!("ws://{address}")).unwrap(),
+                async |cx| {
+                    cx.send_request(v2::InitializeRequest::new(
+                        ProtocolVersion::V2,
+                        v2::Implementation::new("retry-test", "1"),
+                    ))
+                    .block_task()
+                    .await?;
+                    let mut request =
+                        v2::ResumeSessionRequest::new(id.clone(), std::env::current_dir().unwrap());
+                    if catalog["sessions"][0]["recovery"] == "recovery_required" {
+                        request = request.meta(v2::Meta::from_iter([(
+                            "hive".into(),
+                            serde_json::json!({"recoveryAction":"acknowledge"}),
+                        )]));
+                    }
+                    let attached = cx.send_request(request).block_task().await?;
+                    for (text, message_id) in ["first", "second"].into_iter().zip(&acknowledgements)
+                    {
+                        let retried = cx
+                            .send_request(
+                                v2::PromptRequest::new(id.clone(), vec![text.into()])
+                                    .meta(controlled(&attached.meta, text)),
+                            )
+                            .block_task()
+                            .await?;
+                        assert_eq!(&retried.message_id, message_id);
+                        assert!(
+                            retried.meta.is_none(),
+                            "durable acknowledgements exclude arbitrary metadata"
+                        );
+                        let changed = cx
+                            .send_request(
+                                v2::PromptRequest::new(id.clone(), vec!["different".into()])
+                                    .meta(controlled(&attached.meta, text)),
+                            )
+                            .block_task()
+                            .await
+                            .unwrap_err();
+                        assert!(
+                            changed
+                                .data
+                                .unwrap()
+                                .to_string()
+                                .contains("different content")
+                        );
+                    }
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+    }
     if mode == "live" {
         post_recovery_updates_and_permissions_are_live(address, id.clone()).await;
     }
     match mode {
-        "none" | "reject" | "missing" => {
+        "none" | "reject" | "missing" | "unimplemented" => {
+            assert_eq!(
+                catalog["sessions"][0]["transcript"]["availability"],
+                "unavailable"
+            );
             let reason = catalog["sessions"][0]["recoveryReason"]
                 .as_str()
                 .unwrap_or_else(|| catalog["sessions"][0]["reason"].as_str().unwrap_or(""));
@@ -1158,24 +1249,53 @@ async fn restore_conversation(version: AgentVersion, mode: &str) -> std::path::P
                     "hive::transcript::unsupported"
                 } else if mode == "missing" {
                     "hive::transcript::session_missing"
+                } else if mode == "unimplemented" {
+                    "hive::transcript::operation_rejected"
                 } else {
                     "hive::transcript::replay_failed"
                 }),
                 "{catalog}"
             );
         }
-        "resume-only" | "empty" => {
+        "resume-only" => {
             let error = transcript_snapshot(address, id.clone()).await.unwrap_err();
             assert!(
                 error
                     .data
                     .unwrap()
                     .to_string()
-                    .contains(if mode == "empty" {
-                        "hive::transcript::history_missing"
-                    } else {
-                        "hive::transcript::unsupported"
-                    })
+                    .contains("hive::transcript::unsupported")
+            );
+            assert_eq!(
+                catalog["sessions"][0]["transcript"]["restoration"],
+                "unsupported"
+            );
+        }
+        "empty" => {
+            assert!(
+                transcript_snapshot(address, id.clone())
+                    .await
+                    .unwrap()
+                    .0
+                    .is_empty()
+            );
+            let status = &catalog["sessions"][0]["transcript"];
+            assert_eq!(status["availability"], "available");
+            assert_eq!(status["completeness"], "unknown");
+            assert_eq!(
+                status["warnings"][0]["code"],
+                "hive::transcript::history_missing"
+            );
+        }
+        "partial" => {
+            assert_eq!(
+                transcript_snapshot(address, id.clone()).await.unwrap().0,
+                ["second", "Echo: second"]
+            );
+            // The protocol exposes no retention watermark: a shorter replay is not proof of violation.
+            assert_eq!(
+                catalog["sessions"][0]["transcript"]["completeness"],
+                "unknown"
             );
         }
         _ => {
@@ -1183,6 +1303,16 @@ async fn restore_conversation(version: AgentVersion, mode: &str) -> std::path::P
             assert_eq!(texts, expected, "{version:?} {mode}");
             assert!(seq > old_seq, "restart must not reuse old live cursors");
             assert_eq!(transcript_snapshot(address, id).await.unwrap().0, expected);
+            let status = &catalog["sessions"][0]["transcript"];
+            assert_eq!(status["source"], "agent_history");
+            assert_eq!(status["restoration"], "supported");
+            assert_eq!(status["completeness"], "unknown");
+            if mode == "no-state" {
+                assert_eq!(
+                    status["warnings"][0]["code"],
+                    "hive::transcript::state_missing"
+                );
+            }
         }
     }
     let after: serde_json::Value =
@@ -1226,6 +1356,37 @@ async fn restore_conversation(version: AgentVersion, mode: &str) -> std::path::P
             "recovery publication must not overwrite live accounting"
         );
     }
+    // History policy must not remove the separate journal that prevents duplicate execution.
+    let db = rusqlite::Connection::open(base.join("hive/sessions.sqlite3")).unwrap();
+    let prompts: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM prompts WHERE result IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(prompts, 2);
+    let mut statement = db
+        .prepare("SELECT content,content_fingerprint,result FROM prompts")
+        .unwrap();
+    for row in statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .unwrap()
+    {
+        let (content, fingerprint, result) = row.unwrap();
+        assert!(content.is_empty());
+        assert!(fingerprint.starts_with("sha256-v1:"));
+        assert!(!result.contains("sentinel"));
+        assert!(!result.contains("_meta"));
+    }
+    drop(statement);
+    drop(db);
     base
 }
 
@@ -1360,10 +1521,14 @@ async fn a_restart_reattaches_the_original_downstream_session_without_creating_a
     )
     .unwrap();
     db.execute(
-        "INSERT INTO prompts (session_id,key,content) VALUES (?1,'interrupted','[]')",
+        "INSERT INTO prompts (session_id,key,content,content_fingerprint) VALUES (?1,'interrupted','','sha256-v1:f8edd0d31cc3b2dc29f713081a548677cae8f62da13aae23dfbe9576680b4738')",
         [id.to_string()],
     )
     .unwrap();
+    db.execute(
+        "INSERT INTO prompts (session_id,key,content,content_fingerprint,result) VALUES (?1,'failed','','sha256-v1:f8edd0d31cc3b2dc29f713081a548677cae8f62da13aae23dfbe9576680b4738','{\"status\":\"failed\"}')",
+        [id.to_string()],
+    ).unwrap();
     drop(db);
     let recovered = hive_daemon::Broker::persistent(config.clone(), database.clone()).unwrap();
     recovered.reconcile().await;
@@ -1414,12 +1579,31 @@ async fn a_restart_reattaches_the_original_downstream_session_without_creating_a
                 let mut meta = owner.meta.unwrap();
                 meta.get_mut("hive").unwrap()["key"] = "interrupted".into();
                 let result = cx
-                    .send_request(
-                        v2::PromptRequest::new(id.clone(), vec!["hello".into()]).meta(meta),
-                    )
+                    .send_request(v2::PromptRequest::new(id.clone(), vec![]).meta(meta.clone()))
                     .block_task()
                     .await;
-                assert!(result.is_err(), "an interrupted key must never be resent");
+                assert!(
+                    result
+                        .unwrap_err()
+                        .data
+                        .unwrap()
+                        .to_string()
+                        .contains("prompt outcome is uncertain after restart"),
+                    "a matching interrupted key must never be resent"
+                );
+                meta.get_mut("hive").unwrap()["key"] = "failed".into();
+                let failed = cx
+                    .send_request(v2::PromptRequest::new(id.clone(), vec![]).meta(meta))
+                    .block_task()
+                    .await
+                    .unwrap_err();
+                assert!(
+                    failed
+                        .data
+                        .unwrap()
+                        .to_string()
+                        .contains("prompt previously failed")
+                );
                 Ok(())
             },
         )

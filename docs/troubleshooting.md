@@ -88,8 +88,14 @@ restart. Reload the browser page or restart the TUI to rebuild the conversation 
 in-memory transcript snapshot; after restart this depends on agent-retained
 history. `hive::transcript::unsupported` means the agent cannot replay history;
 `hive::transcript::session_missing` means its saved session was not found.
-`hive::transcript::history_missing` means a known completed conversation resumed
-without any retained messages.
+`hive::transcript::history_missing` warns that completed work was recorded but
+replay returned no messages. This does not prove a protocol violation and does
+not block successful attachment. Partial/unknown coverage stays visible while
+available history renders. `hive::transcript::truncated` means Hive imported a
+bounded portion; consult the agent for older content.
+`hive::transcript::state_missing` or `hive::transcript::operation_rejected`
+warns of missing required state or an unimplemented advertised operation; check
+the agent's protocol implementation. No agent-name overrides are applied.
 Check the original agent, cwd and retained sessions, then restart Hive to retry.
 Accept live-only attachment explicitly to continue without earlier messages.
 

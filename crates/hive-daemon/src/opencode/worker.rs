@@ -151,6 +151,7 @@ pub(crate) async fn run_opencode_agent(
 
     let mut mapper = Mapper::new(native.flavor, &native.id);
     let mut backlog = Vec::new();
+    let mut truncated = false;
     let mut cursor = None;
     let first = match native.flavor {
         // v1 has no replay cursor: open the live stream first so nothing is lost between the
@@ -162,7 +163,10 @@ pub(crate) async fn run_opencode_agent(
             };
             if !matches!(attach, Attach::New) {
                 match native.history(&mut mapper).await {
-                    Ok(history) => backlog = history,
+                    Ok(history) => {
+                        backlog = history.updates;
+                        truncated = history.truncated;
+                    }
                     Err(error) => fail!(error),
                 }
             }
@@ -172,7 +176,10 @@ pub(crate) async fn run_opencode_agent(
         Flavor::V2 => {
             if !matches!(attach, Attach::New) {
                 match native.history(&mut mapper).await {
-                    Ok(history) => backlog = history,
+                    Ok(history) => {
+                        backlog = history.updates;
+                        truncated = history.truncated;
+                    }
                     Err(error) => fail!(error),
                 }
                 cursor = backlog.iter().rev().find_map(|item| match item {
@@ -189,10 +196,26 @@ pub(crate) async fn run_opencode_agent(
     let started_busy = native.busy().await.unwrap_or(false);
     // History is display data, not new work: importing it must not repeat accounting effects.
     if let Ok(mut state) = control.lock() {
+        state.history_status.restoration = crate::Restoration::Supported;
+        if !matches!(attach, Attach::New) {
+            state.history_status.source = crate::Source::AgentHistory;
+            state.history_status.availability = crate::Availability::Available;
+        }
+        if truncated {
+            state.history_status.partial(crate::WarningCode::Truncated);
+        }
         for item in backlog {
-            if let Mapped::Update(update) = item {
-                let _ = state.transcript.ingest(&update);
+            if let Mapped::Update(update) = item
+                && let Err(error) = state.transcript.ingest(&update)
+            {
+                let _ = ready.send(Err(format!("history projection failed: {error}; check the adapter protocol and restart Hive")));
+                return;
             }
+        }
+        if state.transcript.limited() {
+            state
+                .history_status
+                .partial(crate::WarningCode::ProjectionLimited);
         }
         state.finish_history();
     }
@@ -522,7 +545,13 @@ impl Worker {
         if self.native.flavor == Flavor::V1
             && let Ok(history) = self.native.history(&mut self.mapper).await
         {
-            for item in history {
+            if history.truncated
+                && let Ok(mut state) = self.control.lock()
+            {
+                state.history_status.partial(crate::WarningCode::Truncated);
+                let _ = crate::forward_locked(&mut state, &self.hive_id, None);
+            }
+            for item in history.updates {
                 self.apply(item);
             }
         }

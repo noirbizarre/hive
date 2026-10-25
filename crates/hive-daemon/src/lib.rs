@@ -27,6 +27,9 @@ use axum::{
 };
 use fs2::FileExt;
 use hive_core::SessionId;
+use hive_protocol::history::{
+    Availability, Completeness, Restoration, Source, TranscriptStatus, WarningCode,
+};
 use hive_protocol::{AcpHttpServer, AgentVersion};
 use serde::Serialize;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -40,6 +43,7 @@ mod interactions;
 mod opencode;
 mod persistence;
 mod pricing;
+mod prompt_journal;
 pub mod reload;
 mod session_config;
 mod transcript;
@@ -164,6 +168,8 @@ struct Control {
     // Recovery replay must not run accounting or dispatch historical interactions.
     hydrating: bool,
     history_error: Option<transcript::RestoreError>,
+    history_status: TranscriptStatus,
+    require_history_state: bool,
     expected_history: bool,
     running: bool,
     activity_known: bool,
@@ -201,7 +207,7 @@ struct NativeMeta {
 }
 
 struct PromptRecord {
-    content: Vec<v2::ContentBlock>,
+    fingerprint: prompt_journal::Fingerprint,
     result: Option<Result<v2::PromptResponse, String>>,
     waiters: Vec<oneshot::Sender<Result<v2::PromptResponse, String>>>,
 }
@@ -251,6 +257,11 @@ impl Control {
             transcript: transcript::Transcript::default(),
             hydrating: true,
             history_error: None,
+            history_status: TranscriptStatus {
+                availability: Availability::Loading,
+                ..TranscriptStatus::default()
+            },
+            require_history_state: false,
             expected_history: !record.usage.turns.is_empty(),
             running: false,
             activity_known: false,
@@ -308,6 +319,12 @@ impl Control {
             transcript: transcript::Transcript::default(),
             hydrating: false,
             history_error: None,
+            history_status: TranscriptStatus {
+                source: Source::Live,
+                availability: Availability::Available,
+                ..TranscriptStatus::default()
+            },
+            require_history_state: false,
             expected_history: false,
             running: false,
             activity_known: false,
@@ -342,6 +359,8 @@ impl Control {
             "usageSnapshot": self.usage.summary(),
             "usageSeq": self.next_seq.saturating_sub(1),
             "configSeq": self.next_seq.saturating_sub(1),
+            "transcript": self.history_status,
+            "transcriptSeq": self.next_seq.saturating_sub(1),
             "recoveryRequired": self.recovery_required,
             "role": if self.pilot.as_deref() == Some(client_id) { "pilot" } else { "observer" },
         });
@@ -354,15 +373,27 @@ impl Control {
     }
 
     fn finish_history(&mut self) {
-        // A known completed turn distinguishes erased history from a legitimately empty session.
+        if self.hydrating && self.history_status.restoration == Restoration::Supported {
+            self.history_status.source = Source::AgentHistory;
+            self.history_status.availability = Availability::Available;
+        }
+        // Completed work is evidence for a warning, not proof that the agent must retain it.
         if self.expected_history && !self.transcript.has_messages() && self.history_error.is_none()
         {
-            self.history_error = Some(transcript::RestoreError::HistoryMissing);
+            self.history_status.warn(WarningCode::HistoryMissing);
             tracing::warn!(
                 diagnostic_code = "hive::transcript::history_missing",
                 "agent resumed without retained conversation messages"
             );
         }
+        if self.require_history_state && !self.activity_known {
+            self.history_status.warn(WarningCode::StateMissing);
+            tracing::warn!(
+                diagnostic_code = "hive::transcript::state_missing",
+                "resume response omitted current state"
+            );
+        }
+        self.require_history_state = false;
         self.hydrating = false;
     }
 
@@ -372,6 +403,7 @@ impl Control {
             BTreeMap::from([
                 ("generation".into(), serde_json::json!(self.generation)),
                 ("pilot".into(), serde_json::json!(self.pilot.is_some())),
+                ("transcript".into(), serde_json::json!(self.history_status)),
             ]),
         ))
     }
@@ -452,6 +484,7 @@ pub struct SessionSummary {
     native_id: Option<String>,
     /// A native client is driving the session; Hive prompts are refused until it is idle.
     external_activity: bool,
+    transcript: TranscriptStatus,
 }
 
 impl SessionSummary {
@@ -488,10 +521,29 @@ impl SessionSummary {
                 .to_owned(),
             native_id: state.native.as_ref().map(|native| native.id.clone()),
             external_activity: state.external_activity,
+            transcript: state.history_status.clone(),
         }
     }
 
     fn from_record(record: &Record) -> Self {
+        let mut transcript = TranscriptStatus::default();
+        if matches!(record.outcome, Outcome::Recovering) {
+            transcript.availability = Availability::Loading;
+        }
+        if record
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("hive::transcript::operation_rejected:"))
+        {
+            transcript.warn(WarningCode::OperationRejected);
+        }
+        if record
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("hive::transcript::unsupported:"))
+        {
+            transcript.warn(WarningCode::Unsupported);
+        }
         Self {
             session_id: record.id.clone(),
             cwd: v2::AbsolutePath::from(PathBuf::from(&record.cwd)),
@@ -510,6 +562,7 @@ impl SessionSummary {
             native_id: (record.kind == ProfileKind::OpencodeServer.as_str())
                 .then(|| record.downstream_id.clone()),
             external_activity: false,
+            transcript,
         }
     }
 }
@@ -1053,8 +1106,11 @@ impl Broker {
             })?
             .to_owned();
         let (tx, rx) = oneshot::channel();
+        // Compute before reserving admission so encoding failure cannot leave the session busy.
+        let fingerprint = prompt_journal::Fingerprint::content(&request.prompt)
+            .map_err(Error::into_internal_error)?;
         if let Some(record) = state.prompts.get_mut(&key) {
-            if record.content != request.prompt {
+            if record.fingerprint != fingerprint {
                 return Err(Error::invalid_params()
                     .data("prompt key was used with different content; choose a new key"));
             }
@@ -1076,20 +1132,16 @@ impl Broker {
             return Ok(rx);
         }
         if let Some(store) = &state.store
-            && let Some((content, result)) = store
+            && let Some((stored_fingerprint, result)) = store
                 .prompt(&request.session_id.to_string(), &key)
                 .map_err(storage_error)?
         {
-            if content
-                != serde_json::to_string(&request.prompt).map_err(Error::into_internal_error)?
-            {
+            if stored_fingerprint != fingerprint {
                 return Err(Error::invalid_params()
                     .data("prompt key was used with different content; choose a new key"));
             }
             if let Some(result) = result {
-                let outcome: Result<v2::PromptResponse, String> =
-                    serde_json::from_str(&result).map_err(Error::into_internal_error)?;
-                let _ = tx.send(outcome);
+                let _ = tx.send(result.into_response());
                 return Ok(rx);
             }
             return Err(Error::invalid_request().data("prompt outcome is uncertain after restart; never retry this key; inspect agent state and explicitly acknowledge recovery"));
@@ -1119,7 +1171,7 @@ impl Broker {
         state.prompts.insert(
             key.clone(),
             PromptRecord {
-                content: request.prompt.clone(),
+                fingerprint: fingerprint.clone(),
                 result: None,
                 waiters: vec![tx],
             },
@@ -1130,9 +1182,7 @@ impl Broker {
             record.uncertain = true;
             record.last_activity_at = state.last_activity_at;
             record.title = title.clone();
-            let content =
-                serde_json::to_string(&request.prompt).map_err(Error::into_internal_error)?;
-            if let Err(error) = store.reserve_prompt(&record, &key, &content) {
+            if let Err(error) = store.reserve_prompt(&record, &key, &fingerprint) {
                 state.prompts.remove(&key);
                 state.active_turn = None;
                 state.running = false;
@@ -1205,7 +1255,10 @@ impl Broker {
         }
         let from = replay_start(&state, request.replay_from.as_ref())?;
         let snapshot = matches!(request.replay_from, Some(v2::ReplayFrom::Start(_)));
-        if snapshot && let Some(error) = &state.history_error {
+        if snapshot
+            && state.history_status.availability != Availability::Available
+            && let Some(error) = &state.history_error
+        {
             return Err(Error::invalid_request().data(error.to_string()));
         }
         let hive = request.meta.as_ref().and_then(|meta| meta.get("hive"));
@@ -1899,7 +1952,17 @@ fn forward_locked(
 ) -> agent_client_protocol::Result<()> {
     let is_agent_update = update.is_some();
     let update = update.unwrap_or_else(|| state.status_update());
+    // Token streaming must not clone warning strings on every chunk.
+    let previous_history = (
+        state.history_status.source,
+        state.history_status.availability,
+        state.history_status.completeness,
+        state.history_status.warnings.len(),
+    );
     state.transcript.ingest(&update)?;
+    if state.transcript.limited() {
+        state.history_status.partial(WarningCode::ProjectionLimited);
+    }
     if state.hydrating {
         // Resume's final state describes current execution; historical usage never enters the ledger.
         match &update {
@@ -1914,6 +1977,14 @@ fn forward_locked(
             _ => {}
         }
         return Ok(());
+    }
+    if state.history_status.availability != Availability::Available
+        && state.transcript.has_messages()
+    {
+        // Context-only resume can accumulate a useful view without recovering the missing prefix.
+        state.history_status.source = Source::Live;
+        state.history_status.availability = Availability::Available;
+        state.history_status.completeness = Completeness::Partial;
     }
     if let v2::SessionUpdate::UsageUpdate(usage) = &update {
         let cost = usage
@@ -2008,6 +2079,16 @@ fn forward_locked(
     } else if matches!(update, v2::SessionUpdate::UsageUpdate(_)) {
         publish_usage(state, id, None)?;
     }
+    if previous_history
+        != (
+            state.history_status.source,
+            state.history_status.availability,
+            state.history_status.completeness,
+            state.history_status.warnings.len(),
+        )
+    {
+        forward_locked(state, id, None)?;
+    }
     Ok(())
 }
 
@@ -2090,13 +2171,8 @@ fn complete(control: &Mutex<Control>, key: &str, result: Result<v2::PromptRespon
         if let (Some(store), Some(record)) = (state.store.clone(), state.record.clone())
             && let Ok(record) = record.lock()
         {
-            let persisted = serde_json::to_string(&result)
-                .map_err(|error| error.to_string())
-                .and_then(|encoded| {
-                    store
-                        .finish_prompt(&record.id, key, &encoded)
-                        .map_err(|error| error.to_string())
-                });
+            let persisted =
+                store.finish_prompt(&record.id, key, &prompt_journal::Outcome::recorded(&result));
             if let Err(error) = persisted {
                 tracing::error!(%error, "cannot persist prompt result");
                 state.recovery_required = true;
@@ -2250,6 +2326,7 @@ async fn run_agent(
             match initialized {
                 Ok(response) if response.protocol_version == ProtocolVersion::V2 && response.capabilities.session.is_some() => {
                     tracing::info!(protocol = "v2", session = true, "agent capabilities negotiated");
+                    if let Ok(mut state) = control.lock() { state.history_status.restoration = Restoration::Supported; }
                 }
                 Ok(_) => {
                     let _ =
@@ -2264,6 +2341,11 @@ async fn run_agent(
             }
             let restoring = recovering.is_some();
             let (opened, downstream_id) = if let Some(id) = recovering {
+                if let Ok(mut state) = control.lock() {
+                    // Only this resume's state update can satisfy its response barrier.
+                    state.activity_known = false;
+                    state.require_history_state = true;
+                }
                 let id = v2::SessionId::new(id);
                 // Route updates sent during session/resume, before its response is available.
                 if let Ok(mut route) = downstream.lock() { *route = Some(id.clone()); }
@@ -2575,6 +2657,10 @@ async fn run_v1_agent(
                     return Ok(());
                 }
             };
+            if let Ok(mut state) = control.lock() {
+                state.history_status.restoration = if capabilities.load_session { Restoration::Supported } else { Restoration::Unsupported };
+                if !capabilities.load_session { state.history_status.warn(WarningCode::Unsupported); }
+            }
             if !request.mcp_servers.is_empty() || !request.additional_directories.is_empty() {
                 let _ = ready.send(Err(
                     "v1 adapter cannot translate v2 MCP server declarations or additional workspace roots; use a v2 profile for this session".into(),
@@ -2591,7 +2677,11 @@ async fn run_v1_agent(
                         .map(|response| session_config::from_v1(response.config_options.unwrap_or_default()));
                     restore_history(prepared, control.clone()).await
                 } else if capabilities.session_capabilities.resume.is_some() {
-                    if let Ok(mut state) = control.lock() { state.history_error = Some(transcript::RestoreError::Unsupported); }
+                    if let Ok(mut state) = control.lock() {
+                        state.history_error = Some(transcript::RestoreError::Unsupported);
+                        state.history_status.availability = Availability::Unavailable;
+                        state.history_status.completeness = Completeness::Partial;
+                    }
                     tracing::warn!(protocol = "v1", method = "session/resume", diagnostic_code = "hive::transcript::unsupported", "agent can resume context but cannot restore history");
                     let prepared = cx.prepare_request(v1::ResumeSessionRequest::new(id.clone(), request.cwd.0))
                         .map(|response| session_config::from_v1(response.config_options.unwrap_or_default()));
@@ -3394,6 +3484,40 @@ async fn shutdown_signal() {
 mod control_tests {
     use super::*;
 
+    #[test]
+    fn context_only_recovery_can_offer_new_live_content_without_hiding_the_missing_prefix() {
+        let mut state = detached();
+        state.history_error = Some(transcript::RestoreError::Unsupported);
+        state.history_status.restoration = Restoration::Unsupported;
+        state.history_status.warn(WarningCode::Unsupported);
+        let id = v2::SessionId::new("context-only");
+        forward_locked(
+            &mut state,
+            &id,
+            Some(v2::SessionUpdate::AgentMessageChunk(v2::ContentChunk::new(
+                "new answer".into(),
+                "new",
+            ))),
+        )
+        .unwrap();
+        assert_eq!(state.history_status.availability, Availability::Available);
+        assert_eq!(state.history_status.source, Source::Live);
+        assert_eq!(state.history_status.completeness, Completeness::Partial);
+        let status = state.history_status.clone();
+        forward_locked(
+            &mut state,
+            &id,
+            Some(v2::SessionUpdate::AgentMessageChunk(v2::ContentChunk::new(
+                " continues".into(),
+                "new",
+            ))),
+        )
+        .unwrap();
+        assert_eq!(state.history_status, status);
+        let control = serde_json::to_value(&state.events[1].1).unwrap();
+        assert_eq!(control["transcript"]["completeness"], "partial");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn startup_waits_for_human_input_but_still_times_out_a_silent_agent() {
         let control = Arc::new(Mutex::new(detached()));
@@ -3470,6 +3594,8 @@ mod control_tests {
             transcript: transcript::Transcript::default(),
             hydrating: false,
             history_error: None,
+            history_status: TranscriptStatus::default(),
+            require_history_state: false,
             expected_history: false,
             running: false,
             activity_known: false,

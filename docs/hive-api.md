@@ -120,7 +120,15 @@ connection that created each session:
       },
       "origin": "hive",
       "nativeId": null,
-      "externalActivity": false
+      "externalActivity": false,
+      "transcript": {
+        "owner": "agent",
+        "source": "live",
+        "restoration": "supported",
+        "availability": "available",
+        "completeness": "unknown",
+        "warnings": []
+      }
     }
   ]
 }
@@ -158,6 +166,32 @@ lifecycle. `recoveryReason` explains the required action.
 Offline records cannot accept ACP commands. Reattached uncertain sessions can
 be observed but not controlled until acknowledged. See
 [recovery operations](operations.md#restart-and-recovery).
+
+### Transcript ownership and status
+
+Every session summary includes `transcript`, also exposed through ACP list
+metadata, new/resume `_meta.hive`, and sequenced `_hive_control` updates:
+
+| Field | Values and meaning |
+| --- | --- |
+| `owner` | `agent`: retained conversation authority |
+| `source` | `unknown`, `live`, `agent_history`: how the current projection was seeded |
+| `restoration` | `unknown`, `supported`, `unsupported`: negotiated reconstruction support |
+| `availability` | `loading`, `available`, `unavailable`: current display projection, not execution readiness |
+| `completeness` | `unknown` or `partial`: original retention cannot be certified by successful replay |
+| `warnings` | Controlled `{code, message}` diagnostics; repeated reasons are deduplicated |
+
+An available projection can be empty. Offline records remain listable without
+transcript payloads, with unknown support and unavailable projection. Legacy
+clients may ignore this additive object; new clients treat absent fields as
+unknown rather than unsupported. Warnings do not grant control or acknowledge
+uncertain work. Genuine restoration failures remain failures.
+
+Attachment metadata includes `transcriptSeq`, an atomic status watermark. Ignore
+older replayed control status; apply successful response status before queued
+newer updates. Keep existing transcript snapshot boundaries unchanged. For
+ownership, retention and migration policy, see
+[ADR-009](adr/009-agent-owned-history-and-session-registry.md).
 
 ### Ownership and usage fields
 

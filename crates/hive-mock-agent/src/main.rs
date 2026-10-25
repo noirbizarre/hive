@@ -154,6 +154,9 @@ async fn main() -> agent_client_protocol::Result<()> {
                             responder: Responder<v2::ResumeSessionResponse>,
                             cx: V2ConnectionTo<Client>| {
                     match std::env::var("HIVE_MOCK_RESTORE").as_deref() {
+                        Ok("unimplemented") => {
+                            return responder.respond_with_error(Error::method_not_found());
+                        }
                         Ok("reject") => {
                             return responder
                                 .respond_with_error(invalid("history replay unavailable"));
@@ -180,7 +183,12 @@ async fn main() -> agent_client_protocol::Result<()> {
                             if std::env::var("HIVE_MOCK_RESTORE").as_deref() == Ok("empty") {
                                 Vec::new()
                             } else {
-                                history.clone()
+                                let mut updates = history.clone();
+                                if std::env::var("HIVE_MOCK_RESTORE").as_deref() == Ok("partial") {
+                                    // Retention may legally discard a prefix without advertising its extent.
+                                    updates = updates.into_iter().skip(2).collect();
+                                }
+                                updates
                             }
                         } else {
                             Vec::new()
@@ -200,13 +208,15 @@ async fn main() -> agent_client_protocol::Result<()> {
                         notify(&cx, &request.session_id, update)?;
                     }
                     // ACPv2 requires current state after replay and before the resume response.
-                    notify(
-                        &cx,
-                        &request.session_id,
-                        v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(
-                            v2::IdleStateUpdate::new(),
-                        )),
-                    )?;
+                    if std::env::var("HIVE_MOCK_RESTORE").as_deref() != Ok("no-state") {
+                        notify(
+                            &cx,
+                            &request.session_id,
+                            v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(
+                                v2::IdleStateUpdate::new(),
+                            )),
+                        )?;
+                    }
                     let model = state
                         .lock()
                         .map_err(|_| Error::internal_error())?
@@ -345,7 +355,14 @@ async fn main() -> agent_client_protocol::Result<()> {
                             v2::MessageId::new(format!("agent-{seq}")),
                         )
                     };
-                    responder.respond(v2::PromptResponse::new(user_id.clone()))?;
+                    let mut acknowledgement = v2::PromptResponse::new(user_id.clone());
+                    if std::env::var_os("HIVE_MOCK_ACK_META").is_some() {
+                        acknowledgement = acknowledgement.meta(v2::Meta::from_iter([(
+                            "private".into(),
+                            serde_json::json!("acknowledgement metadata sentinel"),
+                        )]));
+                    }
+                    responder.respond(acknowledgement)?;
                     let user = v2::SessionUpdate::UserMessage(
                         v2::UserMessage::new(user_id).content(request.prompt),
                     );

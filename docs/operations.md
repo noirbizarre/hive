@@ -63,9 +63,26 @@ Hive stores its catalog in `$XDG_STATE_HOME/hive/sessions.sqlite3`, falling back
 to `$HOME/.local/state/hive/sessions.sqlite3`. It uses SQLite WAL.
 
 Persisted data includes session identities, downstream IDs, profile/adapter
-choices, prompt **content**, reservations/results, and usage bookkeeping.
-Treat the database and backups as conversation data, not just a list of IDs.
+choices, titles, usage bookkeeping, and a minimal request journal. The journal
+holds request keys, versioned SHA-256 content fingerprints, and acknowledgements
+(message IDs) or failure markers. It does not hold prompt bodies, arbitrary
+acknowledgement metadata, downstream error text, or assistant transcripts.
+Titles and other registry metadata can still contain user-derived text;
+fingerprints are not encryption. Keep the database and backups private.
 Control tokens, conversation replay payloads, and activity snapshots are volatile.
+
+The registry can list sessions without a local transcript or an available agent.
+The prompt journal is required for idempotency and interrupted-work protection;
+it is not a reconstructable assistant transcript. Hive maintains no durable
+transcript archive. A future optional archive requires an explicit purpose and
+retention/fallback policy; see [ADR-009](adr/009-agent-owned-history-and-session-registry.md).
+Schema version 2 upgrades earlier journals transactionally: it fingerprints each
+legacy prompt, blanks its body, and reduces results to message IDs or failure
+markers without releasing pending reservations. Invalid legacy rows abort the
+upgrade rather than dropping requests. Older Hive binaries refuse schema 2.
+This removes bodies and arbitrary result payloads from logical journal columns;
+old pages/WAL files and backups may still contain previous data. Migration does
+not compact the database or delete backups.
 
 On Unix, runtime/state directories and files must be private. Hive creates
 private locations but can refuse existing unsafe ones rather than repair them.
@@ -102,6 +119,13 @@ Replay and activity snapshots do not survive restart. A client may need to
 accept live-only attachment. That acceptance does not acknowledge interrupted
 work: use the separate TUI `Ctrl-Y` or browser recovery action after inspecting
 what the agent actually did.
+
+The catalog's `transcript` object reports history independently of recovery.
+ACP restoration uses negotiated protocol support, never agent identity. Available
+retained history may be partial or have unknown coverage; both clients keep that
+status visible while rendering it. An empty successful replay is accepted with a
+warning when earlier completed work is recorded. An agent outage does not produce
+an offline transcript: fix availability and restart Hive to retry restoration.
 
 Acknowledgement permits new prompt keys. It neither resends the interrupted key
 nor proves its effects completed.

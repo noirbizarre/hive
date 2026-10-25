@@ -12,9 +12,12 @@ pub enum RestoreError {
     )]
     Unsupported,
     #[error(
-        "hive::transcript::history_missing: the agent resumed a previously completed conversation but replayed no messages; check its history retention, or explicitly attach without earlier history"
+        "hive::transcript::operation_rejected: ACP {protocol} {method} was advertised but is not implemented; check the agent's protocol implementation"
     )]
-    HistoryMissing,
+    Rejected {
+        protocol: &'static str,
+        method: &'static str,
+    },
     #[error(
         "hive::transcript::session_missing: saved session not found by ACP {protocol} {method}; verify the original agent's retained sessions and cwd, then restart Hive"
     )]
@@ -34,6 +37,9 @@ pub enum RestoreError {
 
 impl RestoreError {
     pub fn downstream(protocol: &'static str, method: &'static str, error: &Error) -> Self {
+        if i32::from(error.code) == -32601 {
+            return Self::Rejected { protocol, method };
+        }
         // Classify known missing-session text without exposing arbitrary agent error payloads.
         if error
             .data
@@ -56,9 +62,13 @@ impl RestoreError {
 pub struct Transcript {
     entries: Vec<Value>,
     indices: HashMap<String, usize>,
+    limited: bool,
 }
 
 impl Transcript {
+    pub fn limited(&self) -> bool {
+        self.limited
+    }
     pub fn has_messages(&self) -> bool {
         self.indices
             .keys()
@@ -77,6 +87,7 @@ impl Transcript {
                 | "agent_message"
                 | "user_message_chunk"
                 | "agent_message_chunk"
+                | "agent_thought"
                 | "agent_thought_chunk"
         );
         let tool = matches!(
@@ -87,20 +98,28 @@ impl Transcript {
                 | "_hive_v1_tool_update"
         );
         if !message && !tool {
+            // These entities carry history that this projection cannot yet reconstruct.
+            if matches!(
+                kind.as_str(),
+                "terminal_update"
+                    | "terminal_output_chunk"
+                    | "compaction"
+                    | "compaction_update"
+                    | "compaction_content_chunk"
+            ) {
+                self.limited = true;
+            }
             if matches!(kind.as_str(), "_hive_error" | "_hive_opencode_error") {
                 self.entries.push(value);
             }
             return Ok(());
         }
-        // Thoughts have no full-message equivalent; preserve their protocol form separately.
-        if kind == "agent_thought_chunk" {
-            self.entries.push(value);
-            return Ok(());
-        }
         let chunk = kind.ends_with("_chunk");
         // Normalize chunks to full-message upserts; speaker namespaces prevent user/agent ID collisions.
         let (key, target) = if message {
-            let speaker = if kind.starts_with("user") {
+            let speaker = if kind.starts_with("agent_thought") {
+                "agent_thought"
+            } else if kind.starts_with("user") {
                 "user_message"
             } else {
                 "agent_message"
@@ -230,6 +249,33 @@ mod tests {
         );
         assert_eq!(updates[1]["content"][0]["text"], "0");
         assert_eq!(updates[300]["content"][0]["text"], "299");
+    }
+
+    #[test]
+    fn thought_upserts_replace_chunks_without_colliding_with_assistant_messages() {
+        let mut transcript = Transcript::default();
+        for value in [
+            json!({"sessionUpdate":"agent_thought_chunk", "messageId":"same", "content":{"type":"text", "text":"draft"}}),
+            json!({"sessionUpdate":"agent_message", "messageId":"same", "content":[{"type":"text", "text":"answer"}]}),
+            json!({"sessionUpdate":"agent_thought", "messageId":"same", "content":[{"type":"text", "text":"revised reasoning"}]}),
+        ] {
+            ingest(&mut transcript, value);
+        }
+        let updates = serde_json::to_value(transcript.updates().unwrap()).unwrap();
+        assert_eq!(updates.as_array().unwrap().len(), 2);
+        assert_eq!(updates[0]["sessionUpdate"], "agent_thought");
+        assert_eq!(updates[0]["content"][0]["text"], "revised reasoning");
+        assert_eq!(updates[1]["content"][0]["text"], "answer");
+    }
+
+    #[test]
+    fn omitted_terminal_history_marks_the_projection_as_limited() {
+        let mut transcript = Transcript::default();
+        ingest(
+            &mut transcript,
+            json!({"sessionUpdate":"terminal_update", "terminalId":"term"}),
+        );
+        assert!(transcript.limited());
     }
 
     #[test]

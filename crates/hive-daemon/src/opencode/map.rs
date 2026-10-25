@@ -511,24 +511,10 @@ pub(crate) fn answers(
         .collect()
 }
 
-/// A bounded, secret-free summary of an OpenCode error object.
-///
-/// Provider errors can echo request details, so only the error's name and a clipped message
-/// are kept, never its raw `data` blob.
+/// Classify provider failures without retaining arbitrary messages that can echo secrets.
 pub(crate) fn summarize_error(error: &Value) -> String {
-    let name = error["name"]
-        .as_str()
-        .or_else(|| error["type"].as_str())
-        .unwrap_or("error");
-    let message = error["data"]["message"]
-        .as_str()
-        .or_else(|| error["message"].as_str())
-        .unwrap_or_default();
-    if message.is_empty() {
-        name.to_owned()
-    } else {
-        truncate(&format!("{name}: {message}"), 200)
-    }
+    let failure = hive_protocol::AgentFailure::classify(&error.to_string());
+    format!("{failure} — {}", failure.help())
 }
 
 fn truncate(text: &str, max: usize) -> String {
@@ -690,7 +676,8 @@ mod tests {
         let [Mapped::Failed(summary)] = &first[..] else {
             panic!("expected a failure");
         };
-        assert!(summary.contains("APIError") && summary.contains("bad key"));
+        assert!(summary.contains("provider credentials"));
+        assert!(!summary.contains("bad key"));
         assert!(!summary.contains("sk-secret"));
         assert!(mapper.event(&updated).is_empty(), "reported only once");
     }
@@ -753,14 +740,18 @@ mod tests {
         let failed = json!({"type": "session.next.step.failed",
             "data": {"sessionID": SESSION, "error": {"type": "unknown", "message": "boom"}}});
         let out = mapper.event(&failed);
-        assert!(matches!(&out[0], Mapped::Failed(summary) if summary.contains("boom")));
+        assert!(
+            matches!(&out[0], Mapped::Failed(summary) if summary.contains("Check the agent") && !summary.contains("boom"))
+        );
         assert!(matches!(out[1], Mapped::CheckStatus));
     }
 
     #[test]
-    fn error_summaries_are_clipped() {
-        let long = "x".repeat(1000);
-        let summary = summarize_error(&json!({"name": "E", "data": {"message": long}}));
-        assert!(summary.chars().count() <= 202);
+    fn known_expired_keys_get_actionable_guidance_without_echoing_arbitrary_message_text() {
+        let summary = summarize_error(
+            &json!({"name": "E", "data": {"message": "This API key has expired. sk-secret"}}),
+        );
+        assert!(summary.contains("Create a new API key in OpenCode Console"));
+        assert!(!summary.contains("sk-secret"));
     }
 }

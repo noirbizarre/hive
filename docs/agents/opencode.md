@@ -34,6 +34,22 @@ adoption. Confirm the wire version after upgrades and keep initialization,
 prompting, and recovery evidence separate in the
 [compatibility matrix](../acp-compatibility.md#installed-agent-capability-matrix-2026-10-11).
 
+### Model selection and provider errors
+
+When OpenCode advertises ACP session configuration, choose **Provider / Model**
+in the browser or press `Ctrl-P` in the TUI. Create the session first to discover
+its choices; no inference is required for discovery. The selected model belongs
+to OpenCode, independently of Hive's `opencode` backend profile. Hive forwards
+changes only from the pilot of an idle session.
+
+An expired-key error requires creating a new API key in OpenCode Console and
+replacing it in the client or secret store. Signing in again does not renew an
+expired key. Changing the main model to another configured provider can avoid
+that provider's failure, but auxiliary title/small-model calls may still use
+their separately configured provider. Check OpenCode's configuration and logs
+if those calls continue to fail. Hive displays controlled error guidance rather
+than raw provider payloads; unrecognized failures direct you to those logs.
+
 ## Server-backed sessions
 
 Start an OpenCode server separately, with its model/provider configured. Set

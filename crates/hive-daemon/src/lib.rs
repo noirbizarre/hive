@@ -40,6 +40,7 @@ mod interactions;
 mod opencode;
 mod persistence;
 mod pricing;
+mod session_config;
 mod usage;
 use activity::Activity;
 use config::{Config, Pricing, Profile, ProfileKind};
@@ -173,6 +174,8 @@ struct Control {
     agent: String,
     pricing: Pricing,
     selected_model: Option<String>,
+    config_options: Vec<v2::SessionConfigOption>,
+    configuring: bool,
     /// Set while a native client (not Hive) is driving the session. Hive prompts are refused
     /// meanwhile: OpenCode cannot arbitrate between clients, so Hive must not add a second writer.
     external_activity: bool,
@@ -196,6 +199,7 @@ struct PromptRecord {
 }
 
 enum Command {
+    Configure(session_config::Change),
     Prompt(v2::PromptRequest, u64, String),
     Cancel(u64),
     Close(u64, oneshot::Sender<Result<(), String>>),
@@ -253,6 +257,8 @@ impl Control {
             agent: record.profile.clone(),
             pricing,
             selected_model: None,
+            config_options: Vec::new(),
+            configuring: false,
             external_activity: false,
             native: None,
         }
@@ -304,6 +310,8 @@ impl Control {
             agent,
             pricing,
             selected_model: None,
+            config_options: Vec::new(),
+            configuring: false,
             external_activity: false,
             native: None,
         }
@@ -317,6 +325,7 @@ impl Control {
             "activitySnapshot": self.activity,
             "usageSnapshot": self.usage.summary(),
             "usageSeq": self.next_seq.saturating_sub(1),
+            "configSeq": self.next_seq.saturating_sub(1),
             "recoveryRequired": self.recovery_required,
             "role": if self.pilot.as_deref() == Some(client_id) { "pilot" } else { "observer" },
         });
@@ -1015,7 +1024,7 @@ impl Broker {
             // Say *why* it is busy: the generic message would send users hunting for a Hive prompt.
             return Err(opencode::error::OpencodeError::ExternallyControlled.to_acp());
         }
-        if state.running || state.closing {
+        if state.running || state.closing || state.configuring {
             return Err(Error::invalid_request().data(
                 "session has active foreground work; wait for idle or cancel before prompting",
             ));
@@ -1179,7 +1188,9 @@ impl Broker {
         } else if attached {
             state.notify();
         }
-        let response = v2::ResumeSessionResponse::new().meta(state.metadata(client_id));
+        let response = v2::ResumeSessionResponse::new()
+            .config_options(state.config_options.clone())
+            .meta(state.metadata(client_id));
         let control = entry.control.clone();
         let id = request.session_id.clone();
         let subscriber = client_id.to_owned();
@@ -1725,6 +1736,7 @@ fn forward_locked(
     }
     if let v2::SessionUpdate::ConfigOptionUpdate(options) = &update {
         state.selected_model = selected_model(&options.config_options);
+        state.config_options = options.config_options.clone();
     }
     if is_agent_update {
         record_activity(state);
@@ -2058,7 +2070,7 @@ async fn run_agent(
                 // Route updates sent during session/resume, before its response is available.
                 if let Ok(mut route) = downstream.lock() { *route = Some(id.clone()); }
                 match cx.send_request(v2::ResumeSessionRequest::new(id.clone(), request.cwd)).block_task().await {
-                    Ok(_) => (v2::NewSessionResponse::new(hive_id.clone()), id),
+                    Ok(response) => (v2::NewSessionResponse::new(hive_id.clone()).config_options(response.config_options), id),
                     Err(error) => {
                         tracing::warn!(code = ?error.code, "agent session/resume failed");
                         let missing = error.data.as_ref().and_then(serde_json::Value::as_str)
@@ -2087,11 +2099,27 @@ async fn run_agent(
             }
             if let Ok(mut state) = control.lock() {
                 state.selected_model = selected_model(&opened.config_options);
+                state.config_options = opened.config_options.clone();
             }
             let _ = ready.send(Ok((opened, downstream_id.to_string())));
             if active.await.is_err() { return Ok(()); }
             while let Some(command) = rx.recv().await {
                 match command {
+                    Command::Configure(mut change) => {
+                        change.request.session_id = downstream_id.clone();
+                        let pending = {
+                            let state = control.lock().map_err(|_| Error::internal_error())?;
+                            if state.generation != change.generation {
+                                drop(state);
+                                change.finish(&hive_id, Err(Error::invalid_request().data("controller was superseded; take control before changing configuration")));
+                                continue;
+                            }
+                            // Publish under the ownership lock, establishing dispatch-before-takeover ordering.
+                            cx.send_request(change.request.clone()).block_task()
+                        };
+                        let result = pending.await.map(|response| response.config_options).map_err(|_| session_config::failed());
+                        change.finish(&hive_id, result);
+                    }
                     Command::Prompt(mut request, generation, key) => {
                         request.session_id = downstream_id.clone();
                         let prompt = {
@@ -2118,6 +2146,7 @@ async fn run_agent(
                                 incoming = rx.recv() => match incoming {
                                     Some(Command::Cancel(epoch)) if epoch == 0 || current(&control, epoch) => { let _ = cx.send_notification(v2::CancelSessionNotification::new(downstream_id.clone())); }
                                     Some(Command::Cancel(_)) => {}
+                                    Some(Command::Configure(change)) => change.finish(&hive_id, Err(session_config::failed())),
                                     Some(Command::Prompt(_, _, key)) => { complete(&control, &key, Err("session already has foreground work".into())); }
                                     Some(Command::Close(_, reply)) => {
                                         let _ = reply.send(Err("cancel active work before closing".into()));
@@ -2197,6 +2226,10 @@ async fn run_v1_agent(
                     // V1 chunks have no message ID: assign one per Hive prompt.
                     let source = notification.update.clone();
                     match notification.update {
+                        v1::SessionUpdate::ConfigOptionUpdate(update) => {
+                            let options = session_config::from_v1(update.config_options)?;
+                            forward(&control, &hive_id, v2::SessionUpdate::ConfigOptionUpdate(v2::ConfigOptionUpdate::new(options)))?;
+                        }
                         v1::SessionUpdate::UsageUpdate(update) => {
                             report_v1_cost(&control, &hive_id, &update)?;
                         }
@@ -2321,29 +2354,32 @@ async fn run_v1_agent(
                 ));
                 return Ok(());
             }
-            let downstream_id = if let Some(id) = recovering {
+            let (downstream_id, options) = if let Some(id) = recovering {
                 let id = v1::SessionId::new(id);
                 if let Ok(mut route) = route.lock() { *route = Some(id.clone()); }
                 let result = if capabilities.session_capabilities.resume.is_some() {
-                    cx.send_request(v1::ResumeSessionRequest::new(id.clone(), request.cwd.0)).block_task().await.map(|_| ())
+                    cx.send_request(v1::ResumeSessionRequest::new(id.clone(), request.cwd.0)).block_task().await.map(|response| response.config_options.unwrap_or_default())
                 } else if capabilities.load_session {
-                    cx.send_request(v1::LoadSessionRequest::new(id.clone(), request.cwd.0)).block_task().await.map(|_| ())
+                    cx.send_request(v1::LoadSessionRequest::new(id.clone(), request.cwd.0)).block_task().await.map(|response| response.config_options.unwrap_or_default())
                 } else {
                     let _ = ready.send(Err("agent does not advertise ACPv1 session/resume or session/load; saved session is orphaned".into()));
                     return Ok(());
                 };
-                if let Err(error) = result {
+                let options = match result {
+                    Ok(options) => options,
+                    Err(error) => {
                     tracing::warn!(code = ?error.code, "v1 agent reattachment failed");
                     let missing = error.data.as_ref().and_then(serde_json::Value::as_str)
                         .is_some_and(|data| data.contains("unknown session") || data.contains("not found"));
                     let detail = if missing { "saved session not found" } else { "reattachment failed" };
                     let _ = ready.send(Err(format!("v1 agent {detail} ({:?}); verify its saved session and restart Hive", error.code)));
                     return Ok(());
-                }
-                id
+                    }
+                };
+                (id, options)
             } else {
                 match cx.send_request(v1::NewSessionRequest::new(request.cwd.0)).block_task().await {
-                    Ok(response) => response.session_id,
+                    Ok(response) => (response.session_id, response.config_options.unwrap_or_default()),
                     Err(error) => {
                         tracing::warn!(code = ?error.code, "v1 session/new failed");
                         let _ = ready.send(Err("v1 session/new failed; check agent availability".into()));
@@ -2354,10 +2390,32 @@ async fn run_v1_agent(
             if let Ok(mut route) = route.lock() {
                 *route = Some(downstream_id.clone());
             }
-            let _ = ready.send(Ok((v2::NewSessionResponse::new(hive_id.clone()), downstream_id.to_string())));
+            let options = session_config::from_v1(options)?;
+            if let Ok(mut state) = control.lock() {
+                state.selected_model = selected_model(&options);
+                state.config_options = options.clone();
+            }
+            let _ = ready.send(Ok((v2::NewSessionResponse::new(hive_id.clone()).config_options(options), downstream_id.to_string())));
             if active.await.is_err() { return Ok(()); }
             while let Some(command) = rx.recv().await {
                 match command {
+                    Command::Configure(change) => {
+                        let request = session_config::to_v1(&change.request, &downstream_id)?;
+                        let pending = {
+                            let state = control.lock().map_err(|_| Error::internal_error())?;
+                            if state.generation != change.generation {
+                                drop(state);
+                                change.finish(&hive_id, Err(Error::invalid_request().data("controller was superseded; take control before changing configuration")));
+                                continue;
+                            }
+                            cx.send_request(request).block_task()
+                        };
+                        let result = match pending.await {
+                            Ok(response) => session_config::from_v1(response.config_options),
+                            Err(_) => Err(session_config::failed()),
+                        };
+                        change.finish(&hive_id, result);
+                    }
                     Command::Prompt(request, generation, key) => {
                         if !current(&control, generation) {
                             complete(&control, &key, Err("controller was superseded before prompt dispatch; resume with a new key".into()));
@@ -2403,6 +2461,7 @@ async fn run_v1_agent(
                                 command = rx.recv() => match command {
                                      Some(Command::Cancel(epoch)) if epoch == 0 || current(&control, epoch) => { let _ = cx.send_notification(v1::CancelNotification::new(downstream_id.clone())); }
                                      Some(Command::Cancel(_)) => {}
+                                     Some(Command::Configure(change)) => change.finish(&hive_id, Err(session_config::failed())),
                                      Some(Command::Prompt(_, _, key)) => { complete(&control, &key, Err("session already has foreground work".into())); }
                                      Some(Command::Close(_, reply)) => { let _ = reply.send(Err("cancel active work before closing".into())); }
                                     None => break Err(Error::internal_error().data("client disconnected")),
@@ -2418,7 +2477,10 @@ async fn run_v1_agent(
                                 )),
                             }, response.usage),
                             Err(error) => {
-                                tracing::warn!(%error, "v1 prompt failed");
+                                tracing::warn!(code = ?error.code, "v1 prompt failed");
+                                // Admission already succeeded: a replayable event carries late failure, not a second RPC response.
+                                let failure = hive_protocol::AgentFailure::classify(&error.data.unwrap_or_default().to_string());
+                                let _ = forward(&control, &hive_id, failure.update("acp-v1"));
                                 (v2::StopReason::Other(v2::OtherStopReason::new(
                                     "_v1_error",
                                     Default::default(),
@@ -2465,14 +2527,23 @@ pub fn router(broker: Broker) -> Router {
     router_with_origin(broker, None)
 }
 
-/// Only the specified same-origin browser UI may initiate a WebSocket upgrade.
+/// Only the specified browser origin and its listener-local aliases may initiate an upgrade.
 pub fn router_with_origin(broker: Broker, origin: Option<&str>) -> Router {
     let state = broker.clone();
     let agent = move || gateway_agent(state.clone());
     let mut server = AcpHttpServer::new(agent);
     if let Some(origin) = origin {
         // The SDK otherwise rejects browser WS upgrades that carry an Origin header.
-        let cors = CorsOptions::allow_origins([origin])
+        let mut origins = vec![origin.to_owned()];
+        // Only aliases of this listener's loopback address and exact port are trusted browser origins.
+        if let Some(address) = origin
+            .strip_prefix("http://")
+            .and_then(|address| address.parse::<SocketAddr>().ok())
+            && address.ip().is_loopback()
+        {
+            origins.push(format!("http://localhost:{}", address.port()));
+        }
+        let cors = CorsOptions::allow_origins(origins)
             .expect("a loopback socket origin is a valid header");
         server = server.with_options(ServerOptions::default().with_cors(cors));
     }
@@ -2566,6 +2637,15 @@ pub fn router_with_origin(broker: Broker, origin: Option<&str>) -> Router {
                 (
                     [(axum::http::header::CONTENT_TYPE, "text/javascript")],
                     include_str!("../../../clients/hive-web/app.js"),
+                )
+            }),
+        )
+        .route(
+            "/ui/icon.svg",
+            get(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "image/svg+xml")],
+                    include_str!("../../../docs/images/icon.svg"),
                 )
             }),
         )
@@ -2723,6 +2803,40 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
             {
                 let broker = broker.clone();
                 let client_id = client_id.clone();
+                async move |mut request: v2::SetSessionConfigOptionRequest,
+                            responder: Responder<v2::SetSessionConfigOptionResponse>,
+                            cx: V2ConnectionTo<Client>| {
+                    let entry = broker.entry(&request.session_id)?;
+                    let (reply, received) = oneshot::channel();
+                    let mut state = entry.control.lock().map_err(|_| Error::internal_error())?;
+                    state.owner(&client_id, request.meta.as_ref())?;
+                    if state.running || state.closing || state.configuring || state.recovery_required || state.external_activity {
+                        return responder.respond_with_error(Error::invalid_request().data("wait for idle and resolve recovery before changing configuration"));
+                    }
+                    if !session_config::advertised(&state.config_options, &request) {
+                        return responder.respond_with_error(Error::invalid_params().data("this backend does not advertise that configuration option"));
+                    }
+                    // Reserve before enqueueing, otherwise a prompt could use the previous model while the setter is pending.
+                    state.configuring = true;
+                    let generation = state.generation;
+                    if let Some(meta) = request.meta.as_mut() { meta.remove("hive"); }
+                    let change = session_config::Change { request, generation, reply: Some(reply), control: entry.control.clone() };
+                    let sent = entry.commands.send(Command::Configure(change));
+                    drop(state);
+                    // A failed send drops the reservation guard; never do that while holding its mutex.
+                    if sent.is_err() { return responder.respond_with_error(Error::internal_error().data("agent disconnected; reopen the session")); }
+                    cx.spawn(async move {
+                        let result = received.await.unwrap_or_else(|_| Err(Error::internal_error().data("agent disconnected during configuration; reopen the session to inspect its current value")));
+                        responder.respond_with_result(result)
+                    })
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let broker = broker.clone();
+                let client_id = client_id.clone();
                 async move |request: v2::CloseSessionRequest,
                             responder: Responder<v2::CloseSessionResponse>,
                             cx: V2ConnectionTo<Client>| {
@@ -2732,7 +2846,7 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
                         let mut state =
                             entry.control.lock().map_err(|_| Error::internal_error())?;
                         state.owner(&client_id, request.meta.as_ref())?;
-                        if state.running || state.closing {
+                        if state.running || state.closing || state.configuring {
                             return responder.respond_with_error(
                                 Error::invalid_request()
                                     .data("cancel active work and wait for idle before closing"),
@@ -3042,6 +3156,8 @@ mod control_tests {
             agent: "test".into(),
             pricing: Pricing::default(),
             selected_model: None,
+            config_options: Vec::new(),
+            configuring: false,
             external_activity: false,
             native: None,
         }

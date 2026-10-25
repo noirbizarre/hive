@@ -8,6 +8,8 @@ hive web
 
 The browser opens <http://127.0.0.1:8765/ui>. Assets are embedded in
 Hive and served by the daemon. No separate frontend process is needed.
+The equivalent `http://localhost:8765/ui` address is also supported; browser
+origins must use the daemon's actual listening port.
 
 For another loopback port, use `hive web --url http://127.0.0.1:9000`.
 This command opens a page; it does not start the daemon or check its health.
@@ -30,6 +32,21 @@ and selection. Recently visited sessions appear first during the current run.
 Selecting a session observes it read-only. Typing in the prompt box requests
 pilot control. Send becomes available only after ownership is confirmed and the
 session is idle. A previous pilot becomes read-only after takeover.
+
+## Choose a provider and model
+
+For a fresh session, choose a **Hive backend**, then **Create session**. This
+discovers the agent's configuration without sending a prompt. Choose its
+**Provider / Model** before sending the first message. Provider names and model
+choices come from the agent; the Hive backend selects the agent process or
+server, not its model provider.
+
+Existing sessions show the current configuration. Use **Take control to change
+model** before editing a read-only session. Controls are unavailable during an
+active turn or pending configuration change. Changes become visible to other
+clients and are restored on attachment from the daemon's authoritative state.
+Backends without advertised configuration show an unsupported-selection message.
+The OpenCode server adapter currently requires configuring models in OpenCode.
 
 Only the pilot can cancel or answer session-scoped permission/input requests.
 Forms use labelled controls with validation errors. URL consent does not itself

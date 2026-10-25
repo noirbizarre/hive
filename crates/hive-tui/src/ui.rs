@@ -40,6 +40,7 @@ pub enum Page {
     #[default]
     Sessions,
     Profiles,
+    Configuration,
     Chat,
 }
 
@@ -63,9 +64,63 @@ pub struct App {
     pub dialog: Option<String>,
     pub dialog_scroll: u16,
     pub skip_replay: bool,
+    pub configuration: Option<
+        tokio::sync::oneshot::Receiver<(
+            String,
+            Result<v2::SetSessionConfigOptionResponse, String>,
+        )>,
+    >,
 }
 
 impl App {
+    pub fn config_choices(&self) -> Vec<(String, String, String)> {
+        let mut choices = Vec::new();
+        for option in self
+            .conversation()
+            .into_iter()
+            .flat_map(|state| &state.config_options)
+        {
+            let value = serde_json::to_value(option).unwrap_or_default();
+            if value["type"] != "select" {
+                continue;
+            }
+            if let Some(options) = value["options"].as_array() {
+                for choice in options {
+                    let grouped = choice["options"].as_array();
+                    for item in grouped.map_or_else(|| vec![choice], |items| items.iter().collect())
+                    {
+                        let Some(id) = item["value"].as_str() else {
+                            continue;
+                        };
+                        let group = choice["name"]
+                            .as_str()
+                            .or(choice["group"].as_str())
+                            .unwrap_or_default();
+                        let label = item["name"].as_str().unwrap_or(id);
+                        let current = if value["currentValue"] == id {
+                            " *"
+                        } else {
+                            ""
+                        };
+                        choices.push((
+                            option.config_id.to_string(),
+                            id.into(),
+                            format!(
+                                "{} · {}{}{}{}",
+                                option.name,
+                                if grouped.is_some() { group } else { "" },
+                                if grouped.is_some() { " / " } else { "" },
+                                label,
+                                current
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+        choices
+    }
+
     pub fn toggle_sessions(&mut self) -> bool {
         if self.page == Page::Sessions && self.active.is_some() {
             self.page = Page::Chat;
@@ -167,6 +222,23 @@ impl App {
         match self.page {
             Page::Sessions => self.render_sessions(frame, sections[1], theme),
             Page::Profiles => self.render_profiles(frame, sections[1], theme),
+            Page::Configuration => {
+                let choices = self.config_choices();
+                if choices.is_empty() {
+                    frame.render_widget(Paragraph::new("This backend does not expose model selection. Tab returns to sessions."), sections[1]);
+                } else {
+                    let list = List::new(
+                        choices
+                            .iter()
+                            .map(|(_, _, label)| ListItem::new(label.as_str())),
+                    )
+                    .highlight_symbol("▸ ")
+                    .highlight_style(theme.selected());
+                    let mut selected = ListState::default()
+                        .with_selected(Some(self.selected.min(choices.len() - 1)));
+                    frame.render_stateful_widget(list, sections[1], &mut selected);
+                }
+            }
             Page::Chat => self.render_conversation(frame, sections[1], theme),
         }
         self.render_composer(frame, sections[2], theme);
@@ -187,12 +259,26 @@ impl App {
                 .unwrap_or("Select a session"),
             Page::Sessions => "Sessions",
             Page::Profiles => "New session · Select an agent",
+            Page::Configuration => "Provider / Model · Session configuration",
         };
         frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("  ▪ hive  ", theme.accent()),
-                Span::styled(title, theme.text()),
-            ])),
+            Paragraph::new(vec![
+                Line::from(vec![
+                    Span::styled("  ▪ hive  ", theme.accent()),
+                    Span::styled(title, theme.text()),
+                ]),
+                Line::styled(
+                    self.config_choices()
+                        .iter()
+                        .filter(|(_, _, label)| label.ends_with(" *"))
+                        .map(|(_, _, label)| {
+                            format!("  {} · Ctrl-P configure", label.trim_end_matches(" *"))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" · "),
+                    theme.muted(),
+                ),
+            ]),
             area,
         );
     }
@@ -461,9 +547,12 @@ impl App {
             }
             Page::Profiles if self.profiles.is_empty() => "Tab sessions  Esc quit",
             Page::Profiles => "↑↓ select  Enter create  Tab sessions  Esc quit",
+            Page::Configuration => {
+                "↑↓ select  Enter apply  Ctrl-T take control  Ctrl-P chat  Tab sessions"
+            }
             Page::Chat if self.dialog.is_some() => "Enter confirm  Esc decline",
             Page::Chat => {
-                "Enter send  Tab sessions  Ctrl-B recent  Ctrl-N new  Ctrl-T pilot  Ctrl-H handoff  Ctrl-R live  Ctrl-Y acknowledge recovery  Ctrl-C cancel  Esc quit"
+                "Enter send  Ctrl-P model  Tab sessions  Ctrl-B recent  Ctrl-N new  Ctrl-T pilot  Ctrl-H handoff  Ctrl-R live  Ctrl-Y acknowledge recovery  Ctrl-C cancel  Esc quit"
             }
         };
         let mut lines = vec![Line::from(vec![

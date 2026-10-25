@@ -20,6 +20,32 @@ async fn connected(body: impl AsyncFnOnce(V2ConnectionTo<Agent>) -> Result<(), E
         .on_receive_notification(
             async |_: v2::CancelSessionNotification, _: V2ConnectionTo<Client>| Ok(()),
             agent_client_protocol::on_receive_notification!(),
+        )
+        .on_receive_request(
+            async |request: v2::SetSessionConfigOptionRequest,
+                   responder: agent_client_protocol::Responder<
+                v2::SetSessionConfigOptionResponse,
+            >,
+                   _: V2ConnectionTo<Client>| {
+                assert_eq!(request.session_id.to_string(), "hive-test");
+                assert_eq!(request.config_id.to_string(), "model");
+                assert_eq!(request.meta.unwrap()["hive"]["token"], "test");
+                let v2::SessionConfigOptionValue::Id { value } = request.value else {
+                    return Err(Error::invalid_params());
+                };
+                responder.respond(v2::SetSessionConfigOptionResponse::new(vec![
+                    v2::SessionConfigOption::select(
+                        v2::SessionConfigId::new("model"),
+                        "Model",
+                        value,
+                        vec![v2::SessionConfigSelectOption::new(
+                            v2::SessionConfigValueId::new("careful"),
+                            "Careful",
+                        )],
+                    ),
+                ]))
+            },
+            agent_client_protocol::on_receive_request!(),
         );
     tokio::time::timeout(
         Duration::from_secs(5),
@@ -85,6 +111,92 @@ async fn erase(cx: &V2ConnectionTo<Agent>, app: &mut App, pending: &mut Option<I
     while !app.input.is_empty() {
         press(cx, app, pending, KeyCode::Backspace).await;
     }
+}
+
+#[tokio::test]
+async fn submitted_prompts_wait_for_the_authoritative_echo_and_identical_prompts_stay_distinct() {
+    connected(async |cx| {
+        let mut app = App {
+            connected: true,
+            ..App::default()
+        };
+        app.select_session("hive-test".into());
+        app.conversations
+            .entry("hive-test".into())
+            .or_default()
+            .generation = 1;
+        app.owner = Some(
+            [(
+                "hive".into(),
+                json!({"role":"pilot","generation":1,"token":"test"}),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        for seq in 1..=2 {
+            app.input = "same question".into();
+            press(&cx, &mut app, &mut None, KeyCode::Enter).await;
+            assert_eq!(app.conversation().unwrap().lines.len(), seq as usize - 1);
+            let event = v2::UpdateSessionNotification::new(
+                v2::SessionId::new("hive-test"),
+                v2::SessionUpdate::UserMessage(
+                    v2::UserMessage::new(v2::MessageId::new(format!("user-{seq}")))
+                        .content(vec!["same question".into()]),
+                ),
+            )
+            .meta(
+                [("hive".into(), json!({"seq":seq}))]
+                    .into_iter()
+                    .collect::<v2::Meta>(),
+            );
+            let state = app.conversations.get_mut("hive-test").unwrap();
+            assert!(state.apply(event.clone()));
+            assert!(!state.apply(event));
+            assert_eq!(state.lines.len(), seq as usize);
+            app.pending.clear();
+        }
+        key(
+            &cx,
+            &mut app,
+            &mut None,
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL,
+        )
+        .await;
+        assert!(app.page == Page::Configuration);
+        app.owner = None;
+        press(&cx, &mut app, &mut None, KeyCode::Enter).await;
+        assert!(app.configuration.is_none());
+        assert!(app.status.contains("Take control"));
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn the_model_picker_preserves_provider_labels_and_sends_the_advertised_value_with_ownership()
+{
+    connected(async |cx| {
+        let mut app = App { connected: true, ..App::default() };
+        app.select_session("hive-test".into());
+        let state = app.conversations.entry("hive-test".into()).or_default();
+        state.generation = 1;
+        state.config_options = serde_json::from_value(json!([{
+            "configId":"model", "name":"Model", "category":"model", "type":"select", "currentValue":"fast",
+            "options":[{"groupId":"opaque-provider", "name":"Provider", "options":[{"value":"fast","name":"Fast"},{"value":"careful","name":"Careful"}]}]
+        }])).unwrap();
+        app.owner = Some([("hive".into(), json!({"role":"pilot","generation":1,"token":"test"}))].into_iter().collect());
+        key(&cx, &mut app, &mut None, KeyCode::Char('p'), KeyModifiers::CONTROL).await;
+        assert!(app.config_choices()[1].2.contains("Provider / Careful"));
+        press(&cx, &mut app, &mut None, KeyCode::Down).await;
+        press(&cx, &mut app, &mut None, KeyCode::Enter).await;
+        let (id, response) = app.configuration.take().unwrap().await.unwrap();
+        assert_eq!(id, "hive-test");
+        assert_eq!(serde_json::to_value(response.unwrap().config_options).unwrap()[0]["currentValue"], "careful");
+        // Selection confirmation must come from the response/update, never the requested value alone.
+        assert!(app.config_choices()[0].2.ends_with(" *"));
+        Ok(())
+    }).await;
 }
 
 fn form(

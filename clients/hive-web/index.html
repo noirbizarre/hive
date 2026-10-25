@@ -1,13 +1,14 @@
 <!doctype html>
 <html lang="en">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Hive</title>
+<link rel="icon" type="image/svg+xml" href="/ui/icon.svg">
 <style>
   body { margin: 0; font: 1rem system-ui, sans-serif; color: #e8eaf0; background: #161a22; }
   button, input, select { font: inherit; }
   button { cursor: pointer; }
   button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid #73d9e7; outline-offset: 2px; }
   header { padding: .8rem 1rem; border-bottom: 1px solid #566174; display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; }
-  header h1 { margin: 0; font-size: 1.3rem; }
+  header h1 { margin: 0; font-size: 1.3rem; display: flex; align-items: center; gap: .5rem; }
   #status { margin: 0; }
   #layout { display: grid; grid-template-columns: minmax(16rem, 22rem) minmax(0, 1fr); min-height: calc(100vh - 4rem); }
   #layout.nav-hidden { grid-template-columns: minmax(0, 1fr); }
@@ -40,13 +41,15 @@
   }
 </style></head>
 <body>
-<header><h1>Hive</h1><button id="toggle-sessions" type="button" aria-controls="navigation" aria-expanded="true">Hide sessions</button><p id="status" role="status">Connecting…</p></header>
+<header><h1><img src="/ui/icon.svg" width="32" height="32" alt="">Hive</h1><button id="toggle-sessions" type="button" aria-controls="navigation" aria-expanded="true">Hide sessions</button><p id="status" role="status">Connecting…</p></header>
 <div id="layout"><nav id="navigation" aria-label="Session navigation"><h2>Sessions</h2><p id="session-list-status" role="status">Loading sessions…</p><ul id="sessions"></ul>
 <form id="takeover"><label>Hive session ID <input name="session" placeholder="hive-…"></label><button>Open read-only</button></form></nav>
 <main><h2>Conversation</h2><button id="skip-history" type="button" hidden>Attach without earlier history</button>
+<section id="configuration" aria-label="Session configuration"></section>
+<button id="control" type="button" hidden>Take control to change model</button>
 <div id="output" role="log" aria-live="polite"></div>
 <section id="interaction" aria-label="Agent input request" hidden></section>
-<form id="prompt"><label>Agent <select id="agent"><option value="">Default agent</option></select></label>
+<form id="prompt"><label>Hive backend <select id="agent"><option value="">Default agent</option></select></label><button id="create" type="button">Create session</button>
 <label>Prompt <input name="text" aria-label="Prompt" placeholder="Type to take control"></label><button id="send">Send</button></form>
 <div><button id="recover" type="button" hidden>Acknowledge interrupted work and take control</button><button id="retry" type="button" hidden>Retry uncertain prompt</button><button id="cancel" type="button" disabled>Cancel</button></div></main></div>
 <script type="module" src="/ui/app.js"></script>

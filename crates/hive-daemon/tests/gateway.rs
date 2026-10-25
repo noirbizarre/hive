@@ -33,6 +33,168 @@ async fn summaries(address: SocketAddr) -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn browser_origins_accept_localhost_on_the_listener_port_and_reject_other_origins() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let broker = hive_daemon::Broker::new(Config::default());
+    let origin = format!("http://{address}");
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            hive_daemon::router_with_origin(broker, Some(&origin)),
+        )
+        .await
+        .unwrap();
+    });
+    for (origin, expected) in [
+        (Some(format!("http://{address}")), 101),
+        (Some(format!("http://localhost:{}", address.port())), 101),
+        (None, 101),
+        (Some("http://localhost:1".into()), 403),
+        (
+            Some(format!("http://localhost.evil:{}", address.port())),
+            403,
+        ),
+        (Some("https://example.com".into()), 403),
+        (Some("null".into()), 403),
+    ] {
+        let mut request = reqwest::Client::new()
+            .get(format!("http://{address}/acp"))
+            .header("connection", "upgrade")
+            .header("upgrade", "websocket")
+            .header("sec-websocket-version", "13")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==");
+        if let Some(origin) = &origin {
+            request = request.header("origin", origin);
+        }
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status().as_u16(), expected, "origin {origin:?}");
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn model_choices_survive_translation_setters_rejection_and_observer_attachment() {
+    for version in [AgentVersion::V1, AgentVersion::V2] {
+        for transport in ["ws", "http"] {
+            let command = format!(
+                "{}{}",
+                env!("CARGO_BIN_EXE_hive-test-agent"),
+                if version == AgentVersion::V1 {
+                    " v1"
+                } else {
+                    ""
+                }
+            );
+            let (address, server) =
+                start_gateway(config_with_agent("mock", &command, version)).await;
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let connection = HttpClient::new(format!("{transport}://{address}")).unwrap();
+            timeout(Duration::from_secs(15), Client.v2().on_receive_notification(
+                async move |update: v2::UpdateSessionNotification, _: V2ConnectionTo<Agent>| { tx.send(update).map_err(Error::into_internal_error) },
+                agent_client_protocol::on_receive_notification!(),
+            ).connect_with(connection, async move |cx| {
+                cx.send_request(v2::InitializeRequest::new(ProtocolVersion::V2, v2::Implementation::new("model-test", "1"))).block_task().await?;
+                let cwd = std::env::current_dir().map_err(Error::into_internal_error)?;
+                let opened = cx.send_request(v2::NewSessionRequest::new(cwd.clone())).block_task().await?;
+                assert_eq!(opened.config_options[0].config_id.to_string(), "model");
+                let id = opened.session_id;
+                let setter = |value: &str, meta: Option<v2::Meta>| v2::SetSessionConfigOptionRequest::new(id.clone(), v2::SessionConfigId::new("model"), v2::SessionConfigOptionValue::Id { value: v2::SessionConfigValueId::new(value.to_owned()) }).meta(meta);
+                // The mock rejects a Hive ID or leaked token, verifying routing and credential stripping.
+                for value in ["careful", "fast"] {
+                    let response = cx.send_request(setter(value, opened.meta.clone())).block_task().await?;
+                    assert_eq!(serde_json::to_value(&response.config_options).unwrap()[0]["currentValue"], value);
+                }
+                assert!(cx.send_request(setter("rejected", opened.meta.clone())).block_task().await.is_err());
+                // A failed setter must release its reservation, permitting the next change immediately.
+                let response = cx.send_request(setter("careful", opened.meta.clone())).block_task().await?;
+                assert_eq!(serde_json::to_value(response.config_options).unwrap()[0]["currentValue"], "careful");
+                let observer = cx.send_request(v2::ResumeSessionRequest::new(id.clone(), cwd.clone()).meta({
+                    let mut meta = opened.meta.clone().unwrap(); meta.get_mut("hive").unwrap()["mode"] = serde_json::json!("relinquish"); meta
+                })).block_task().await?;
+                assert_eq!(serde_json::to_value(&observer.config_options).unwrap()[0]["currentValue"], "careful");
+                assert!(cx.send_request(setter("fast", observer.meta)).block_task().await.is_err());
+                let pilot = cx.send_request(v2::ResumeSessionRequest::new(id.clone(), cwd)).block_task().await?;
+                assert!(cx.send_request(setter("fast", opened.meta)).block_task().await.is_err());
+                cx.send_request(setter("fast", pilot.meta.clone())).block_task().await?;
+                if version == AgentVersion::V1 {
+                    let prompt = || v2::PromptRequest::new(id.clone(), vec!["fail-prompt".into()]).meta(controlled(&pilot.meta, "failed"));
+                    cx.send_request(prompt()).block_task().await?;
+                    let mut errors = 0;
+                    loop {
+                        let update = rx.recv().await.ok_or_else(Error::internal_error)?;
+                        assert!(!serde_json::to_string(&update).unwrap().contains("sk-must-not-leak"));
+                        match update.update {
+                            v2::SessionUpdate::Other(other) if other.session_update == "_hive_error" => {
+                                errors += 1;
+                                assert_eq!(other.fields["code"], "hive::agent::prompt_failed");
+                            }
+                            v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(_)) => break,
+                            _ => {}
+                        }
+                    }
+                    assert_eq!(errors, 1);
+                    cx.send_request(prompt()).block_task().await?;
+                    assert_eq!(summaries(address).await["sessions"][0]["usage"]["turns"], 1);
+                }
+                Ok::<_, Error>(())
+            })).await.unwrap().unwrap();
+            server.abort();
+        }
+    }
+}
+
+#[tokio::test]
+async fn configuration_reserves_admission_and_a_takeover_after_dispatch_keeps_the_authoritative_result()
+ {
+    for version in [AgentVersion::V1, AgentVersion::V2] {
+        let command = format!(
+            "{}{}",
+            env!("CARGO_BIN_EXE_hive-test-agent"),
+            if version == AgentVersion::V1 {
+                " v1"
+            } else {
+                ""
+            }
+        );
+        let mut config = config_with_agent("mock", &command, version);
+        config
+            .agents
+            .get_mut("mock")
+            .unwrap()
+            .env
+            .insert("HIVE_MOCK_PAUSE_CONFIG".into(), "1".into());
+        let (address, server) = start_gateway(config).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        timeout(Duration::from_secs(10), Client.v2().on_receive_notification(
+            async move |update: v2::UpdateSessionNotification, _: V2ConnectionTo<Agent>| { tx.send(update).map_err(Error::into_internal_error) },
+            agent_client_protocol::on_receive_notification!(),
+        ).connect_with(HttpClient::new(format!("ws://{address}")).unwrap(), async move |cx| {
+            cx.send_request(v2::InitializeRequest::new(ProtocolVersion::V2, v2::Implementation::new("configuration-race", "1"))).block_task().await?;
+            let cwd = std::env::current_dir().map_err(Error::into_internal_error)?;
+            let created = cx.send_request(v2::NewSessionRequest::new(cwd.clone())).block_task().await?;
+            let id = created.session_id;
+            let setter = cx.send_request(v2::SetSessionConfigOptionRequest::new(id.clone(), v2::SessionConfigId::new("model"), v2::SessionConfigOptionValue::Id { value: v2::SessionConfigValueId::new("careful") }).meta(created.meta.clone())).block_task();
+            let (sent, received) = oneshot::channel();
+            cx.spawn(async move { let _ = sent.send(setter.await); Ok(()) })?;
+            while let Some(event) = rx.recv().await {
+                if matches!(event.update, v2::SessionUpdate::ConfigOptionUpdate(_)) || matches!(event.update, v2::SessionUpdate::Other(ref other) if other.session_update == "_mock_configuring") { break; }
+            }
+            assert!(cx.send_request(v2::PromptRequest::new(id.clone(), vec!["must not dispatch".into()]).meta(controlled(&created.meta, "during-config"))).block_task().await.is_err());
+            assert!(cx.send_request(v2::SetSessionConfigOptionRequest::new(id.clone(), v2::SessionConfigId::new("model"), v2::SessionConfigOptionValue::Id { value: v2::SessionConfigValueId::new("fast") }).meta(created.meta.clone())).block_task().await.is_err());
+            let pilot = cx.send_request(v2::ResumeSessionRequest::new(id.clone(), cwd.clone())).block_task().await?;
+            received.await.map_err(Error::into_internal_error)??;
+            let resumed = cx.send_request(v2::ResumeSessionRequest::new(id, cwd).meta({ let mut meta = v2::Meta::new(); meta.insert("hive".into(), serde_json::json!({"mode":"observe"})); meta })).block_task().await?;
+            assert_eq!(serde_json::to_value(resumed.config_options).unwrap()[0]["currentValue"], "careful");
+            assert_ne!(pilot.meta.as_ref().unwrap()["hive"]["generation"], created.meta.as_ref().unwrap()["hive"]["generation"]);
+            assert_eq!(summaries(address).await["sessions"][0]["usage"]["turns"], 0);
+            Ok::<_, Error>(())
+        })).await.unwrap().unwrap();
+        server.abort();
+    }
+}
+
+#[tokio::test]
 async fn provider_turn_usage_and_missing_usage_are_isolated_and_not_charged_on_retry() {
     for version in [AgentVersion::V1, AgentVersion::V2] {
         let command = if version == AgentVersion::V1 {
@@ -222,6 +384,17 @@ async fn exercise_gateway(transport: &str, version: AgentVersion) {
         .await
         .unwrap();
     assert!(web.contains("/ui/app.js"));
+    assert!(web.contains("rel=\"icon\""));
+    let icon = reqwest::get(format!("http://{address}/ui/icon.svg"))
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(icon.headers()["content-type"], "image/svg+xml");
+    assert_eq!(
+        icon.text().await.unwrap(),
+        include_str!("../../../docs/images/icon.svg")
+    );
     let script = reqwest::get(format!("http://{address}/ui/app.js"))
         .await
         .unwrap()
@@ -613,6 +786,18 @@ async fn a_restart_reattaches_the_original_downstream_session_without_creating_a
                     .send_request(v2::NewSessionRequest::new(cwd))
                     .block_task()
                     .await?;
+                cx.send_request(
+                    v2::SetSessionConfigOptionRequest::new(
+                        opened.session_id.clone(),
+                        v2::SessionConfigId::new("model"),
+                        v2::SessionConfigOptionValue::Id {
+                            value: v2::SessionConfigValueId::new("careful"),
+                        },
+                    )
+                    .meta(opened.meta),
+                )
+                .block_task()
+                .await?;
                 Ok(opened.session_id)
             },
         )
@@ -652,6 +837,10 @@ async fn a_restart_reattaches_the_original_downstream_session_without_creating_a
                     .send_request(v2::ResumeSessionRequest::new(id.clone(), cwd))
                     .block_task()
                     .await?;
+                assert_eq!(
+                    serde_json::to_value(attached.config_options).unwrap()[0]["currentValue"],
+                    "careful"
+                );
                 assert_eq!(attached.meta.unwrap()["hive"]["role"], "pilot");
                 Ok(())
             },

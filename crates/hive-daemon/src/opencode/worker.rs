@@ -332,6 +332,14 @@ impl Worker {
     /// Returns `true` when the worker should stop.
     async fn command(&mut self, command: Command) -> bool {
         match command {
+            Command::Configure(change) => {
+                change.finish(
+                    &self.hive_id,
+                    Err(agent_client_protocol::Error::invalid_request()
+                        .data("this backend does not expose ACP model configuration")),
+                );
+                false
+            }
             Command::Prompt(request, generation, key) => {
                 if !current(&self.control, generation) {
                     complete(

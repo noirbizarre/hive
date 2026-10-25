@@ -244,7 +244,19 @@ impl App {
 
     fn render_picker(&mut self, frame: &mut Frame, theme: Theme) {
         let choices = self.config_choices();
-        let unsupported = choices.is_empty();
+        // An advertised selector still supports selection when its catalog is empty.
+        let supports_selection = self
+            .conversation()
+            .into_iter()
+            .flat_map(|state| &state.config_options)
+            .any(|option| serde_json::to_value(option).unwrap_or_default()["type"] == "select");
+        let empty_message = if !supports_selection {
+            "This backend does not expose model selection."
+        } else if choices.is_empty() {
+            "No models available."
+        } else {
+            "No matching models."
+        };
         let Some(picker) = self.picker.as_mut() else {
             return;
         };
@@ -293,14 +305,7 @@ impl App {
             sections[0],
         );
         if picker.choices.is_empty() {
-            frame.render_widget(
-                Paragraph::new(if unsupported {
-                    "This backend does not expose model selection."
-                } else {
-                    "No matching models."
-                }),
-                sections[1],
-            );
+            frame.render_widget(Paragraph::new(empty_message), sections[1]);
         } else {
             let list = List::new(picker.choices.iter().map(|c| ListItem::new(c.2.as_str())))
                 .highlight_symbol("▸ ")
@@ -1048,6 +1053,55 @@ mod tests {
         }
         assert!(screen(&terminal).contains("Provider / Model"));
         assert!(screen(&terminal).contains("draft underneath"));
+    }
+
+    #[test]
+    fn an_advertised_empty_model_selector_reports_no_models_available() {
+        for options in [
+            serde_json::json!([]),
+            serde_json::json!([{ "groupId": "provider", "name": "Provider", "options": [] }]),
+        ] {
+            let mut app = App::default();
+            app.select_session("session".into());
+            app.conversations
+                .entry("session".into())
+                .or_default()
+                .config_options = serde_json::from_value(serde_json::json!([{
+                "configId": "model", "name": "Model", "type": "select",
+                "currentValue": "", "options": options
+            }]))
+            .unwrap();
+            app.picker = Some(Picker::new("session".into(), app.config_choices()));
+            let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+            terminal.draw(|frame| app.show(frame)).unwrap();
+            let rendered = screen(&terminal);
+            assert!(rendered.contains("No models available."));
+            assert!(!rendered.contains("does not expose model selection"));
+            assert!(!rendered.contains("No matching models."));
+        }
+    }
+
+    #[test]
+    fn a_search_without_matching_models_reports_no_matches() {
+        let mut app = App::default();
+        app.select_session("session".into());
+        app.conversations
+            .entry("session".into())
+            .or_default()
+            .config_options = serde_json::from_value(serde_json::json!([{
+            "configId": "model", "name": "Model", "type": "select",
+            "currentValue": "fast", "options": [{ "value": "fast", "name": "Fast" }]
+        }]))
+        .unwrap();
+        let mut picker = Picker::new("session".into(), app.config_choices());
+        picker.query = "zzzzzz".into();
+        app.picker = Some(picker);
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        terminal.draw(|frame| app.show(frame)).unwrap();
+        let rendered = screen(&terminal);
+        assert!(rendered.contains("No matching models."));
+        assert!(!rendered.contains("No models available."));
+        assert!(!rendered.contains("does not expose model selection"));
     }
 
     #[test]

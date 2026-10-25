@@ -279,6 +279,10 @@ fn agent_text(updates: &[v2::SessionUpdate]) -> String {
     updates
         .iter()
         .filter_map(|update| match update {
+            v2::SessionUpdate::AgentMessage(message) => serde_json::to_value(&message.content)
+                .ok()?[0]["text"]
+                .as_str()
+                .map(str::to_owned),
             v2::SessionUpdate::AgentMessageChunk(chunk) => serde_json::to_value(&chunk.content)
                 .ok()?["text"]
                 .as_str()

@@ -158,8 +158,9 @@ Press Esc in the TUI or close the browser to detach. The daemon and session
 remain alive. Detaching does not cancel active work.
 
 To stop Hive, interrupt the foreground daemon with `Ctrl-C`. On the next start,
-Hive attempts to reattach saved downstream sessions where supported. Conversation
-replay does not survive daemon restart, and interrupted work may need explicit
+Hive attempts to reattach saved downstream sessions where supported and restore
+their conversation from agent-retained history. Incremental replay cursors do not
+survive daemon restart, and interrupted work may need explicit
 acknowledgement. Read [session recovery](operations.md#restart-and-recovery)
 before relying on restart continuity.
 

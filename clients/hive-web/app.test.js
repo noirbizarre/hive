@@ -398,6 +398,70 @@ test('usage snapshots and repricing events replace totals without adding a repla
   assert.equal(view.usage.actualSessionCost.amount, 0.003);
 });
 
+test('a fresh page restores multi-turn snapshots before live events without issuing new prompts', async () => {
+  const sockets = transport((socket, message, result) => {
+    if (message.method !== 'session/resume') return;
+    if (message.params.replayFrom?.type !== 'start') return;
+    for (const [index, text] of ['first', 'answer', 'second', 'response'].entries()) {
+      const event = update(2048, { sessionUpdate: index % 2 ? 'agent_message' : 'user_message',
+        messageId: String(index), content: [{ type: 'text', text }] });
+      event.params._meta.hive.snapshot = true;
+      socket.receive(event);
+    }
+    socket.receive(update(2049, { sessionUpdate: 'agent_message_chunk', messageId: '3', content: { type: 'text', text: '!' } }));
+    return { ...result, _meta: { hive: { ...result._meta.hive, snapshotThroughSeq: 2048, nextSeq: 2050 } } };
+  });
+  for (let reload = 0; reload < 2; reload++) {
+    const client = connect('ws://localhost/acp');
+    await client.open(session);
+    assert.deepEqual(client.state().lines.map(line => line.text), ['first', 'answer', 'second', 'response!']);
+    // Opening an already-owned view is a no-op; switch away to exercise a real new attachment.
+    await client.open({ ...session, sessionId: 'hive-other' });
+    await client.open(session);
+    assert.deepEqual(client.state().lines.map(line => line.text), ['first', 'answer', 'second', 'response!']);
+    assert.equal(client.state().gap, false);
+    client.close();
+  }
+  assert.equal(sockets.flatMap(socket => socket.sent).some(message => ['session/new', 'session/prompt'].includes(message.method)), false);
+  const attachments = sockets.flatMap(socket => socket.sent).filter(message => message.method === 'session/resume');
+  assert.equal(attachments.filter(message => message.params.sessionId === session.sessionId).length, 4);
+  assert.ok(attachments.every(message => message.params.cwd === session.cwd));
+});
+
+test('empty restored snapshots establish their cursor without hiding a takeover event', () => {
+  const history = conversation();
+  history.restore([], 4096);
+  assert.equal(history.seq, 4096);
+  history.apply(update(4097, { sessionUpdate: '_hive_control', generation: 8, pilot: true }).params);
+  assert.equal(history.generation, 8);
+  assert.equal(history.gap, false);
+});
+
+test('failed snapshot attachments discard staged messages and unsupported replay offers explicit live-only attachment', async () => {
+  let rejected = false;
+  const sockets = transport((socket, message) => {
+    if (message.method !== 'session/resume' || !message.params.replayFrom) return;
+    const event = update(2048, { sessionUpdate: 'agent_message', messageId: 'uncommitted', content: [{ type: 'text', text: 'discard' }] });
+    event.params._meta.hive.snapshot = true;
+    socket.receive(event);
+    queueMicrotask(() => {
+      socket.receive({ jsonrpc: '2.0', id: message.id, error: { code: -32600, message: 'Unsupported history', data: 'hive::transcript::unsupported: attach without earlier history' } });
+      rejected = true;
+    });
+    return false;
+  });
+  const client = connect('ws://localhost/acp');
+  await assert.rejects(client.open(session), /hive::transcript::unsupported/);
+  assert.equal(rejected, true);
+  assert.equal(client.state().gap, true);
+  assert.deepEqual(client.state().lines, []);
+  await client.attachWithoutHistory();
+  assert.equal(client.state().gap, false);
+  assert.equal(sockets[0].sent.at(-1).params.replayFrom, undefined);
+  assert.equal(client.state().lines.some(line => line.text === 'discard'), false);
+  client.close();
+});
+
 test('activity snapshots reconcile missed tools and later task updates without reopening idle', () => {
   const view = conversation();
   view.reconcile({ version: 1, seq: 14, foreground: 'idle', tools: {

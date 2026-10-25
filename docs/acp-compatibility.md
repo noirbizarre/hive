@@ -102,18 +102,34 @@ For each successful local run, retain the `PROBE`, `FIRST`,
 wire version before upgrading any cell to guaranteed/best-effort. Failed
 initialization is **not** evidence that session creation, load, or prompts work.
 
-For both agents over **ACP**, Hive's upstream ACPv2 resume is guaranteed by
-deterministic mock tests **only for an existing live Hive session**. Native
+For both agents over **ACP**, Hive's upstream ACPv2 resume and conversation
+restoration after daemon restart are covered by deterministic v1/v2 mock tests. Native
 session adoption through an ACP profile remains unsupported. OpenCode sessions
 can be adopted through its server API instead. See
 [the OpenCode server adapter](#opencode-server-adapter). Daemon-restart recovery attempts the saved
-downstream ID through v2 `session/resume` or advertised v1 `session/resume` or
-`session/load`. Capability negotiation does not guarantee downstream persistence:
+downstream ID through v2 `session/resume` with `replayFrom: start`, or advertised
+v1 `session/load`. V1 load takes precedence over resume because v1 resume does
+not replay history. A resume-only v1 agent can reattach context, but a fresh
+history request returns `hive::transcript::unsupported`; explicitly attach
+without earlier history to continue. Capability negotiation does not guarantee downstream persistence:
 failure retains a visible offline record, never a replacement session.
 
 Direct native ACP
 `session/load` (v1) or `session/resume` (v2) probes bypass Hive and must be
 recorded independently.
+
+An initialize-only `hive doctor opencode --json` run on 2026-10-25 negotiated
+ACPv1 with OpenCode 1.19.4 and reported `loadSession=true`, `resume=true`, and
+`list=true`. The ignored direct native-session ACP probe also passed with a
+nonempty retained conversation on that version/date; it sends no prompt and
+asserts replayed message updates. This establishes direct load/replay, while
+Hive restart and browser reconstruction remain covered by deterministic tests.
+Runtime logs record the negotiated protocol/capabilities and chosen restoration
+method. Sanitized failures distinguish `hive::transcript::session_missing` from
+`hive::transcript::replay_failed`; they never create a replacement session.
+If durable accounting establishes earlier completed turns but the agent returns
+no conversation messages, fresh attachment reports `hive::transcript::history_missing`
+instead of presenting the session as empty. A genuinely new empty session remains valid.
 
 Hive forwards downstream permissions and supported
 elicitation modes to the current pilot. This is covered by scripted agents,
@@ -294,25 +310,44 @@ mode remains available without acknowledgement.
 
 ## Replay cursors
 
-Every `session/update` carries `_meta.hive.seq`, an increasing per-session
-integer, unchanged on replay. On `session/resume`, omit `replayFrom` to attach
-without history. `{ "type": "start" }` requests the full history if retained.
+Live `session/update` events carry `_meta.hive.seq`, an increasing per-session
+integer, unchanged on incremental replay. On `session/resume`, omit `replayFrom` to attach
+without history. `{ "type": "start" }` requests a materialized transcript snapshot.
 `{ "type": "_hive_seq", "seq": N }` requests updates **at or after** N,
 inclusive. Send `lastProcessedSeq + 1` to avoid duplicates. `nextSeq` in the
 resume response identifies the first event not yet produced at the atomic
 takeover boundary.
 
-The most recent 256 updates (including chunks and state
+For incremental replay, the most recent 256 updates (including chunks and state
 transitions) are available. An expired or future cursor fails with the current
 available range and leaves the old controller in place. Live updates are
 ordered after replay. A partially delivered replay must be retried using the
 last actually processed sequence.
 
+Full transcript snapshots are independent of this bounded ring. They contain
+full message/tool upserts in first-appearance order. Snapshot notifications carry
+`_meta.hive.snapshot: true` and share a boundary sequence; they are not contiguous
+incremental events. The resume response's `_meta.hive.snapshotThroughSeq` gives
+that boundary. Stage marked entries until the response succeeds, replace the
+conversation view, set the incremental cursor to this boundary, then process
+queued ordinary events above it. Do not append ring chunks to the snapshot or
+advance past takeover events emitted after snapshot capture. Current activity,
+usage, configuration and running state come from the attachment response.
+
 The WebUI rebuilds from `start` on reload
 and retains the cursor alongside rendered history only while the page is
 alive. An expired cursor requires a visible attach-without-history choice.
 
-Replay does not survive a daemon restart. Prompt deduplication records do.
+The materialized transcript is in memory only and grows with conversation
+content; adjacent text chunks are compacted. On daemon restart it is rebuilt
+from the downstream agent's retained history. Historical import does not repeat
+usage accounting, dispatch interactions, or issue prompts. V1 synthetic message
+IDs group consecutive chunks by speaker; v1 cannot provide exact native message
+identities or distinguish consecutive same-speaker messages without a boundary.
+Hive cannot reconstruct content the agent no longer retains, and a successful
+ACPv2 `start` response only establishes replay of the agent's retained history.
+
+Incremental replay does not survive a daemon restart. Prompt deduplication records do.
 Cursor blocks are reserved on disk before publishing updates: a restart can
 skip numbers, and an expired cursor fails rather than silently replaying an
 incomplete history.
@@ -528,8 +563,9 @@ are preserved.
 Finished tools are retained up to 128 per session. Streaming chunk snapshots
 retain the latest 64 chunks and
 flag `chunksTruncated` when earlier chunks have been evicted. Raw event history
-remains bounded at 256 updates (now including normalized activity), so a full
-replay can expire sooner than before.
+remains bounded at 256 updates (now including normalized activity), so an
+incremental cursor can expire sooner than before. Full transcript snapshots
+are independent of these activity and ring limits.
 
 Apply replay in sequence order and ignore repeated sequence numbers. Identical
 downstream content chunks without provider event IDs cannot be distinguished
@@ -589,8 +625,8 @@ Both `agent` and `adopt` are required in this request. Duplicate protection is
 scoped to the profile/native ID, not globally across profiles pointing to the
 same server. See the [OpenCode guide](agents/opencode.md) for the user workflow.
 
-Up to the 50 most recent native messages are replayed into the session's
-256-update ring (not pushed live to the adopting client): resume with
+Up to the 50 most recent native messages are imported into the session's
+transcript projection (not pushed live to the adopting client): resume with
 `replayFrom: {"type":"start"}` to read them. Older history stays in OpenCode.
 
 ### Capability and version matrix

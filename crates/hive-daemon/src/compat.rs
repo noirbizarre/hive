@@ -104,7 +104,7 @@ pub enum CompatError {
     EndpointUnreachable { reason: &'static str },
 }
 
-/// What an agent said about itself at `initialize`. Capabilities the wire cannot express are `false`.
+/// Effective capabilities advertised at `initialize`, including the v2 session baseline.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapabilityReport {
     pub agent_name: String,
@@ -112,7 +112,7 @@ pub struct CapabilityReport {
     pub protocol: AgentVersion,
     /// v1: `session/load`. Always `false` on v2, which has `session/resume` instead.
     pub load_session: bool,
-    /// v1: `sessionCapabilities.resume`. Not reported by v2 capabilities.
+    /// v1: `sessionCapabilities.resume`; v2: baseline session support.
     pub resume: bool,
     pub list: bool,
     pub image: bool,
@@ -349,8 +349,8 @@ fn report_v2(response: v2::InitializeResponse) -> Result<CapabilityReport, Compa
         agent_version: response.info.version,
         protocol: AgentVersion::V2,
         load_session: false,
-        resume: false,
-        list: false,
+        resume: true,
+        list: true,
         image: prompt.as_ref().is_some_and(|p| p.image.is_some()),
         audio: prompt.as_ref().is_some_and(|p| p.audio.is_some()),
         embedded_context: prompt

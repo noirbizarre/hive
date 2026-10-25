@@ -83,9 +83,15 @@ client is working; wait for it to finish or cancel deliberately as pilot.
 
 ## History is missing or a prompt outcome is uncertain
 
-The in-memory replay window is bounded to 256 updates and is lost on daemon
-restart. Accept live-only attachment explicitly when you no longer need the
-missing messages. Current activity can be restored, but missing text cannot.
+The incremental replay window is bounded to 256 updates and is lost on daemon
+restart. Reload the browser page or restart the TUI to rebuild the conversation from a full
+in-memory transcript snapshot; after restart this depends on agent-retained
+history. `hive::transcript::unsupported` means the agent cannot replay history;
+`hive::transcript::session_missing` means its saved session was not found.
+`hive::transcript::history_missing` means a known completed conversation resumed
+without any retained messages.
+Check the original agent, cwd and retained sessions, then restart Hive to retry.
+Accept live-only attachment explicitly to continue without earlier messages.
 
 Retry an uncertain prompt only through a client's explicit retry action retaining
 the original key. After restart, inspect interrupted work and use the separate

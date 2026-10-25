@@ -113,7 +113,7 @@ protection is scoped to the configured profile and native ID. Avoid configuring
 multiple profiles as independent controllers of the same native session.
 
 The returned Hive ID can be opened in ordinary Hive clients. Up to 50 recent
-native messages feed the bounded replay ring. An ACP client must resume from
+native messages feed the in-memory transcript snapshot. An ACP client must resume from
 `start` to read that backfill. Older history remains in OpenCode.
 
 ## Continue in OpenCode

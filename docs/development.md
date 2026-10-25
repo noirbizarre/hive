@@ -149,7 +149,9 @@ HIVE_REAL_OPENCODE=1 HIVE_REAL_OPENCODE_WIRE=v1 HIVE_REAL_OPENCODE_CWD=/same/abs
 
 Replace `OPENCODE`/`opencode` with `PI`/`pi` to test Pi through `pi-acp`.
 The v1 direct probe calls `session/load`. V2 calls
-`session/resume`. A failed load does not establish that native sessions cannot
+`session/resume` with `replayFrom: start`. Both require a nonempty retained
+conversation, count replayed message updates without printing their contents,
+and fail if attachment returns no conversation. A failed load does not establish that native sessions cannot
 be reopened via their own CLI or server. Hive adopts native IDs only through an
 `opencode-server` profile (below), never an ACP one: record native-CLI reopen,
 direct ACP attachment and Hive's live-worker resume as **separate** results in the

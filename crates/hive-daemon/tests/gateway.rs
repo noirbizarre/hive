@@ -879,6 +879,342 @@ async fn start_gateway(config: Config) -> (SocketAddr, tokio::task::JoinHandle<(
     (address, server)
 }
 
+#[test]
+fn earlier_conversations_restore_once_under_the_original_identity_for_both_acp_versions() {
+    for (version, mode) in [
+        (AgentVersion::V1, "both"),
+        (AgentVersion::V1, "load-only"),
+        (AgentVersion::V1, "resume-only"),
+        (AgentVersion::V1, "none"),
+        (AgentVersion::V1, "empty"),
+        (AgentVersion::V1, "live"),
+        (AgentVersion::V2, "both"),
+        (AgentVersion::V2, "reject"),
+        (AgentVersion::V2, "missing"),
+        (AgentVersion::V2, "empty"),
+        (AgentVersion::V2, "live"),
+    ] {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let base = runtime.block_on(restore_conversation(version, mode));
+        // Connection watchers can retain the database after broker shutdown. Drop their
+        // runtime before unlinking fixtures so Windows sees no outstanding SQLite handles.
+        drop(runtime);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+}
+
+async fn transcript_snapshot(
+    address: SocketAddr,
+    id: v2::SessionId,
+) -> agent_client_protocol::Result<(Vec<String>, u64)> {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let boundary = tx.clone();
+    Client
+        .v2()
+        .on_receive_notification(
+            async move |update: v2::UpdateSessionNotification, _: V2ConnectionTo<Agent>| {
+                tx.send(Some(update)).map_err(Error::into_internal_error)
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .connect_with(
+            HttpClient::new(format!("ws://{address}")).unwrap(),
+            async move |cx| {
+                cx.send_request(v2::InitializeRequest::new(
+                    ProtocolVersion::V2,
+                    v2::Implementation::new("reload", "1"),
+                ))
+                .block_task()
+                .await?;
+                let mut meta = v2::Meta::new();
+                meta.insert("hive".into(), serde_json::json!({"mode":"observe"}));
+                let (completed, response) = oneshot::channel();
+                cx.prepare_request(
+                    v2::ResumeSessionRequest::new(id.clone(), std::env::current_dir().unwrap())
+                        .replay_from(v2::ReplayFrom::Start(v2::ReplayFromStart::new()))
+                        .meta(meta),
+                )
+                .on_receiving_result(async move |result| {
+                    // An ordered marker closes the entire replay batch, including duplicates.
+                    let _ = boundary.send(None);
+                    let _ = completed.send(result);
+                    Ok(())
+                })?;
+                let resumed = response.await.map_err(|_| Error::internal_error())??;
+                let hive = &resumed.meta.unwrap()["hive"];
+                assert_eq!(hive["role"], "observer");
+                let through = hive["snapshotThroughSeq"].as_u64().unwrap();
+                let mut texts = Vec::new();
+                while let Some(event) = timeout(Duration::from_secs(5), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                {
+                    assert_eq!(event.session_id, id);
+                    assert_eq!(event.meta.as_ref().unwrap()["hive"]["snapshot"], true);
+                    let value = serde_json::to_value(event.update).unwrap();
+                    assert!(matches!(
+                        value["sessionUpdate"].as_str(),
+                        Some("user_message" | "agent_message")
+                    ));
+                    texts.push(value["content"][0]["text"].as_str().unwrap().to_owned());
+                }
+                Ok((texts, through))
+            },
+        )
+        .await
+}
+
+async fn post_recovery_updates_and_permissions_are_live(address: SocketAddr, id: v2::SessionId) {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    Client
+        .v2()
+        .on_receive_request(
+            async move |_request: v2::RequestPermissionRequest,
+                        responder: Responder<v2::RequestPermissionResponse>,
+                        _: V2ConnectionTo<Agent>| {
+                tx.send(()).map_err(Error::into_internal_error)?;
+                responder.respond(v2::RequestPermissionResponse::new(
+                    v2::RequestPermissionOutcome::Cancelled,
+                ))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .connect_with(
+            HttpClient::new(format!("ws://{address}")).unwrap(),
+            async move |cx| {
+                cx.send_request(v2::InitializeRequest::new(
+                    ProtocolVersion::V2,
+                    v2::Implementation::new("post-recovery", "1"),
+                ))
+                .block_task()
+                .await?;
+                let resume =
+                    || v2::ResumeSessionRequest::new(id.clone(), std::env::current_dir().unwrap());
+                let mut observe = v2::Meta::new();
+                observe.insert("hive".into(), serde_json::json!({"mode":"observe"}));
+                let attached = cx.send_request(resume().meta(observe)).block_task().await?;
+                let mut takeover = resume();
+                if attached.meta.as_ref().unwrap()["hive"]["recoveryRequired"] == true {
+                    // Fast v2 idle can precede durable acknowledgement; this fixture has inspected
+                    // both completed turns and must explicitly acknowledge before taking control.
+                    let mut acknowledge = v2::Meta::new();
+                    acknowledge.insert(
+                        "hive".into(),
+                        serde_json::json!({"recoveryAction":"acknowledge"}),
+                    );
+                    takeover = takeover.meta(acknowledge);
+                }
+                cx.send_request(takeover).block_task().await?;
+                // Permission is sent after config/usage on the downstream connection; observing it
+                // proves those immediately post-response messages have crossed dispatch as live work.
+                timeout(Duration::from_secs(5), rx.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let current = cx.send_request(resume()).block_task().await?;
+                assert_eq!(
+                    serde_json::to_value(current.config_options).unwrap()[0]["currentValue"],
+                    "careful"
+                );
+                assert_eq!(
+                    current.meta.unwrap()["hive"]["usageSnapshot"]["contextUsed"],
+                    321
+                );
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+}
+
+async fn restore_conversation(version: AgentVersion, mode: &str) -> std::path::PathBuf {
+    let base = std::env::temp_dir().join(format!("hive-transcript-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&base).unwrap();
+    let database = base.join("hive/sessions.sqlite3");
+    let agent_state = base.join("agent.json");
+    let command = format!(
+        "{}{}",
+        env!("CARGO_BIN_EXE_hive-test-agent"),
+        if version == AgentVersion::V1 {
+            " v1"
+        } else {
+            ""
+        }
+    );
+    let mut config = config_with_agent("mock", &command, version);
+    let profile = config.agents.get_mut("mock").unwrap();
+    profile
+        .env
+        .insert("HIVE_MOCK_STATE".into(), agent_state.display().to_string());
+    profile.env.insert("HIVE_MOCK_RESTORE".into(), mode.into());
+    if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
+        profile.env.insert(
+            "LLVM_PROFILE_FILE".into(),
+            if cfg!(windows) { "NUL" } else { "/dev/null" }.into(),
+        );
+    }
+    let broker = hive_daemon::Broker::persistent(config.clone(), database.clone()).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = hive_daemon::router(broker.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let id = Client
+        .v2()
+        .on_receive_notification(
+            async move |update: v2::UpdateSessionNotification, _: V2ConnectionTo<Agent>| {
+                tx.send(update).map_err(Error::into_internal_error)
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
+        .connect_with(
+            HttpClient::new(format!("ws://{address}")).unwrap(),
+            async move |cx| {
+                cx.send_request(v2::InitializeRequest::new(
+                    ProtocolVersion::V2,
+                    v2::Implementation::new("original", "1"),
+                ))
+                .block_task()
+                .await?;
+                let opened = cx
+                    .send_request(v2::NewSessionRequest::new(std::env::current_dir().unwrap()))
+                    .block_task()
+                    .await?;
+                for text in ["first", "second"] {
+                    cx.send_request(
+                        v2::PromptRequest::new(opened.session_id.clone(), vec![text.into()])
+                            .meta(controlled(&opened.meta, text)),
+                    )
+                    .block_task()
+                    .await?;
+                    loop {
+                        let update = timeout(Duration::from_secs(5), rx.recv())
+                            .await
+                            .unwrap()
+                            .unwrap();
+                        if matches!(
+                            update.update,
+                            v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(_))
+                        ) {
+                            break;
+                        }
+                    }
+                }
+                Ok(opened.session_id)
+            },
+        )
+        .await
+        .unwrap();
+    let expected = vec!["first", "Echo: first", "second", "Echo: second"];
+    let (texts, old_seq) = transcript_snapshot(address, id.clone()).await.unwrap();
+    assert_eq!(texts, expected);
+    assert_eq!(
+        transcript_snapshot(address, id.clone()).await.unwrap().0,
+        expected
+    );
+    let before: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&agent_state).unwrap()).unwrap();
+    broker.shutdown().await;
+    server.abort();
+    let _ = server.await;
+    drop(broker);
+
+    let recovered = hive_daemon::Broker::persistent(config, database.clone()).unwrap();
+    recovered.reconcile().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = hive_daemon::router(recovered.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let catalog = summaries(address).await;
+    assert_eq!(catalog["sessions"][0]["sessionId"], id.to_string());
+    if mode == "live" {
+        post_recovery_updates_and_permissions_are_live(address, id.clone()).await;
+    }
+    match mode {
+        "none" | "reject" | "missing" => {
+            let reason = catalog["sessions"][0]["recoveryReason"]
+                .as_str()
+                .unwrap_or_else(|| catalog["sessions"][0]["reason"].as_str().unwrap_or(""));
+            assert!(
+                reason.contains(if mode == "none" {
+                    "hive::transcript::unsupported"
+                } else if mode == "missing" {
+                    "hive::transcript::session_missing"
+                } else {
+                    "hive::transcript::replay_failed"
+                }),
+                "{catalog}"
+            );
+        }
+        "resume-only" | "empty" => {
+            let error = transcript_snapshot(address, id.clone()).await.unwrap_err();
+            assert!(
+                error
+                    .data
+                    .unwrap()
+                    .to_string()
+                    .contains(if mode == "empty" {
+                        "hive::transcript::history_missing"
+                    } else {
+                        "hive::transcript::unsupported"
+                    })
+            );
+        }
+        _ => {
+            let (texts, seq) = transcript_snapshot(address, id.clone()).await.unwrap();
+            assert_eq!(texts, expected, "{version:?} {mode}");
+            assert!(seq > old_seq, "restart must not reuse old live cursors");
+            assert_eq!(transcript_snapshot(address, id).await.unwrap().0, expected);
+        }
+    }
+    let after: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&agent_state).unwrap()).unwrap();
+    assert_eq!(
+        before["next"], after["next"],
+        "restoration cannot create a replacement"
+    );
+    assert_eq!(
+        before["sessions"], after["sessions"],
+        "restoration cannot execute another v2 prompt"
+    );
+    assert_eq!(
+        before["v1_sessions"], after["v1_sessions"],
+        "restoration cannot execute another v1 prompt"
+    );
+    if matches!(mode, "both" | "load-only" | "resume-only") {
+        assert_eq!(
+            after["restores"],
+            serde_json::json!([if version == AgentVersion::V2 {
+                "v2:start"
+            } else if mode == "resume-only" {
+                "v1:resume"
+            } else {
+                "v1:load"
+            }])
+        );
+    }
+    recovered.shutdown().await;
+    server.abort();
+    let _ = server.await;
+    drop(recovered);
+    if mode == "live" {
+        let db = rusqlite::Connection::open(database).unwrap();
+        let saved: String = db
+            .query_row("SELECT record FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        let saved: serde_json::Value = serde_json::from_str(&saved).unwrap();
+        assert_eq!(
+            saved["usage"]["contextUsed"], 321,
+            "recovery publication must not overwrite live accounting"
+        );
+    }
+    base
+}
+
 #[tokio::test]
 async fn a_restart_reattaches_the_original_downstream_session_without_creating_another() {
     let base = std::env::temp_dir().join(format!("hive-recovery-{}", uuid::Uuid::new_v4()));
@@ -1686,7 +2022,10 @@ async fn a_cross_transport_handoff_fences_the_old_controller_and_replays_once() 
                     assert_eq!(snapshot["sessions"][0]["title"], "once");
                     assert!(snapshot["sessions"][0].get("token").is_none());
                     handoff_tx.send(()).unwrap();
-                    let mut seq = 0;
+                    let mut seq = resumed.meta.as_ref().unwrap()["hive"]["snapshotThroughSeq"]
+                        .as_u64()
+                        .unwrap();
+                    let mut snapshot_messages = 0;
                     while seq + 1
                         < resumed.meta.as_ref().unwrap()["hive"]["nextSeq"]
                             .as_u64()
@@ -1696,14 +2035,25 @@ async fn a_cross_transport_handoff_fences_the_old_controller_and_replays_once() 
                             .await
                             .unwrap()
                             .unwrap();
-                        let next = update.meta.unwrap()["hive"]["seq"].as_u64().unwrap();
+                        let hive = &update.meta.as_ref().unwrap()["hive"];
+                        if hive["snapshot"] == true {
+                            assert!(matches!(
+                                update.update,
+                                v2::SessionUpdate::UserMessage(_)
+                                    | v2::SessionUpdate::AgentMessage(_)
+                            ));
+                            snapshot_messages += 1;
+                            continue;
+                        }
+                        let next = hive["seq"].as_u64().unwrap();
                         assert_eq!(
                             next,
                             seq + 1,
-                            "every retained event is replayed exactly once"
+                            "live events following a snapshot remain contiguous"
                         );
                         seq = next;
                     }
+                    assert_eq!(snapshot_messages, 2);
                     let retry = cx
                         .send_request(
                             v2::PromptRequest::new(id.clone(), vec!["once".into()])

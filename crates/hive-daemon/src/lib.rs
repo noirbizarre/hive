@@ -13,8 +13,8 @@ use std::{
 
 use agent_client_protocol::schema::{ProtocolVersion, v1, v2};
 use agent_client_protocol::{
-    AcpAgent, AcpAgentConfig, Agent, Client, ConnectTo, ConnectionTo, Error, Responder,
-    V2ConnectionTo,
+    AcpAgent, AcpAgentConfig, Agent, Client, ConnectTo, ConnectionTo, Error, PreparedRequest,
+    Responder, V2ConnectionTo,
 };
 use agent_client_protocol_http::{CorsOptions, HttpClient, ServerOptions};
 use axum::{
@@ -42,6 +42,7 @@ mod persistence;
 mod pricing;
 pub mod reload;
 mod session_config;
+mod transcript;
 mod usage;
 use activity::Activity;
 use config::{Config, Pricing, Profile, ProfileKind};
@@ -159,6 +160,11 @@ struct Control {
     changed: watch::Sender<u64>,
     next_seq: u64,
     events: VecDeque<(u64, v2::SessionUpdate)>,
+    transcript: transcript::Transcript,
+    // Recovery replay must not run accounting or dispatch historical interactions.
+    hydrating: bool,
+    history_error: Option<transcript::RestoreError>,
+    expected_history: bool,
     running: bool,
     activity_known: bool,
     title: Option<String>,
@@ -242,6 +248,10 @@ impl Control {
             changed,
             next_seq: record.next_seq,
             events: VecDeque::new(),
+            transcript: transcript::Transcript::default(),
+            hydrating: true,
+            history_error: None,
+            expected_history: !record.usage.turns.is_empty(),
             running: false,
             activity_known: false,
             title: record.title.clone(),
@@ -295,6 +305,10 @@ impl Control {
             changed,
             next_seq: 1,
             events: VecDeque::new(),
+            transcript: transcript::Transcript::default(),
+            hydrating: false,
+            history_error: None,
+            expected_history: false,
             running: false,
             activity_known: false,
             title: None,
@@ -337,6 +351,19 @@ impl Control {
         }
         meta.insert("hive".into(), hive);
         meta
+    }
+
+    fn finish_history(&mut self) {
+        // A known completed turn distinguishes erased history from a legitimately empty session.
+        if self.expected_history && !self.transcript.has_messages() && self.history_error.is_none()
+        {
+            self.history_error = Some(transcript::RestoreError::HistoryMissing);
+            tracing::warn!(
+                diagnostic_code = "hive::transcript::history_missing",
+                "agent resumed without retained conversation messages"
+            );
+        }
+        self.hydrating = false;
     }
 
     fn status_update(&self) -> v2::SessionUpdate {
@@ -508,7 +535,8 @@ fn replay_start(
     let first = state.events.front().map_or(state.next_seq, |(seq, _)| *seq);
     let from = match replay {
         None => None,
-        Some(v2::ReplayFrom::Start(_)) => Some(1),
+        // Full history has a separate snapshot boundary, not an incremental event cursor.
+        Some(v2::ReplayFrom::Start(_)) => None,
         Some(v2::ReplayFrom::Other(cursor)) if cursor.type_ == "_hive_seq" => Some(
             cursor
                 .fields
@@ -569,13 +597,13 @@ impl Broker {
                     broker.recover(&id).await;
                     let retry = broker.offline.lock().ok().and_then(|records| records.get(&id).cloned())
                         .is_some_and(|record| matches!(record.outcome, Outcome::Unavailable)
-                            && record.reason.as_deref().is_some_and(|reason| reason.contains("timed out") || reason.contains("reattachment failed") || reason.contains("session/resume failed")
+                            && record.reason.as_deref().is_some_and(|reason| reason.contains("timed out") || reason.contains("reattachment failed") || reason.contains("session/resume failed") || reason.contains("hive::transcript::replay_failed")
                             // A server that is merely down comes back; a missing or unsupported one does not.
                             || reason.contains(opencode::error::code::UNREACHABLE) || reason.contains(opencode::error::code::STREAM_LOST)));
                     if !retry { break; }
                     if attempt == 2 {
                         if let Ok(mut offline) = broker.offline.lock() && let Some(record) = offline.get_mut(&id) {
-                            record.reason = Some("agent recovery failed after three attempts; check agent state and restart Hive to retry".into());
+                            record.reason = Some(format!("{}; agent recovery failed after three attempts; check agent state and restart Hive to retry", record.reason.as_deref().unwrap_or("agent unavailable")));
                             if let Some(store) = &broker.store { let _ = store.save(record); }
                         }
                     } else {
@@ -651,7 +679,9 @@ impl Broker {
         let (active_tx, active_rx) = oneshot::channel();
         let hive_id = v2::SessionId::new(record.id.clone());
         let cwd = v2::AbsolutePath::from(PathBuf::from(&record.cwd));
-        let request = v2::NewSessionRequest::new(cwd.clone());
+        let request = v2::NewSessionRequest::new(cwd.clone())
+            .additional_directories(record.additional_directories.clone())
+            .mcp_servers(record.mcp_servers.clone());
         let downstream_id = record.downstream_id.clone();
         let worker_control = control.clone();
         let broker = self.clone();
@@ -731,16 +761,18 @@ impl Broker {
         let result = tokio::time::timeout(std::time::Duration::from_secs(12), ready_rx).await;
         match result {
             Ok(Ok(Ok((_, returned_id)))) if returned_id == record.downstream_id => {
-                record.outcome = Outcome::Active;
-                record.reason = None;
-                if let Err(error) = store.save(&record) {
+                // Live updates may already have changed usage/cursors after the ordered resume
+                // response; publishing recovery must not overwrite them with the startup copy.
+                let mut stored = saved.lock().expect("session record is not poisoned");
+                stored.outcome = Outcome::Active;
+                stored.reason = None;
+                if let Err(error) = store.save(&stored) {
                     tracing::error!(%error, "cannot save reattached session");
                     worker.abort();
                     return;
                 }
-                if let Ok(mut stored) = saved.lock() {
-                    *stored = record.clone();
-                }
+                record = stored.clone();
+                drop(stored);
                 let entry = Entry {
                     cwd,
                     profile: record.profile.clone(),
@@ -777,6 +809,7 @@ impl Broker {
                 {
                     Outcome::Lost
                 } else if error.contains("does not advertise")
+                    || error.contains("hive::transcript::unsupported")
                     || error.contains(opencode::error::code::API_UNAVAILABLE)
                     || error.contains("-32601")
                     || error.contains("-32602")
@@ -1171,6 +1204,10 @@ impl Broker {
             return Err(Error::invalid_request().data("session is closing; select another session"));
         }
         let from = replay_start(&state, request.replay_from.as_ref())?;
+        let snapshot = matches!(request.replay_from, Some(v2::ReplayFrom::Start(_)));
+        if snapshot && let Some(error) = &state.history_error {
+            return Err(Error::invalid_request().data(error.to_string()));
+        }
         let hive = request.meta.as_ref().and_then(|meta| meta.get("hive"));
         let mode = hive
             .and_then(|hive| hive.get("mode"))
@@ -1191,6 +1228,17 @@ impl Broker {
             return Err(Error::invalid_request().data("interrupted generation may have produced external effects; inspect agent state and explicitly acknowledge with _meta.hive.recoveryAction = acknowledge on session/resume"));
         }
         // Keep replay and live forwarding in one critical section: no update can cross this boundary twice.
+        let snapshot_through = state.next_seq.saturating_sub(1);
+        if snapshot {
+            for update in state.transcript.updates()? {
+                let mut meta = event_meta(snapshot_through);
+                meta.get_mut("hive").expect("event metadata")["snapshot"] = true.into();
+                cx.send_notification(
+                    v2::UpdateSessionNotification::new(request.session_id.clone(), update)
+                        .meta(meta),
+                )?;
+            }
+        }
         if let Some(from) = from {
             for (seq, update) in state.events.iter().filter(|(seq, _)| *seq >= from) {
                 cx.send_notification(
@@ -1232,9 +1280,14 @@ impl Broker {
         } else if attached {
             state.notify();
         }
+        let mut meta = state.metadata(client_id);
+        if snapshot {
+            meta.get_mut("hive").expect("control metadata")["snapshotThroughSeq"] =
+                snapshot_through.into();
+        }
         let response = v2::ResumeSessionResponse::new()
             .config_options(state.config_options.clone())
-            .meta(state.metadata(client_id));
+            .meta(meta);
         let control = entry.control.clone();
         let id = request.session_id.clone();
         let subscriber = client_id.to_owned();
@@ -1505,6 +1558,8 @@ impl Broker {
                 id: hive_id.to_string(),
                 downstream_id: String::new(),
                 cwd: cwd.0.display().to_string(),
+                additional_directories: request.additional_directories.clone(),
+                mcp_servers: request.mcp_servers.clone(),
                 profile: chosen.clone(),
                 version: if provider.preferred_version() == AgentVersion::V1 {
                     "v1"
@@ -1731,6 +1786,27 @@ fn forward(
     forward_locked(&mut state, id, Some(update))
 }
 
+async fn restore_history(
+    request: PreparedRequest<Vec<v2::SessionConfigOption>>,
+    control: Arc<Mutex<Control>>,
+) -> agent_client_protocol::Result<Vec<v2::SessionConfigOption>> {
+    let (tx, rx) = oneshot::channel();
+    // Install the barrier before publication: block_task alone lets post-response live
+    // notifications overtake the task that ends historical ingestion.
+    request.on_receiving_result(async move |result| {
+        let result = result.and_then(|options| {
+            let mut state = control.lock().map_err(|_| Error::internal_error())?;
+            state.selected_model = selected_model(&options);
+            state.config_options = options.clone();
+            state.finish_history();
+            Ok(options)
+        });
+        let _ = tx.send(result);
+        Ok(())
+    })?;
+    rx.await.map_err(|_| Error::internal_error())?
+}
+
 fn forward_v1(
     control: &Mutex<Control>,
     id: &v2::SessionId,
@@ -1739,6 +1815,10 @@ fn forward_v1(
 ) -> agent_client_protocol::Result<()> {
     let mut state = control.lock().map_err(|_| Error::internal_error())?;
     forward_locked(&mut state, id, Some(raw))?;
+    if state.hydrating {
+        // Old v1 tools are transcript entries, not current activity to publish again.
+        return Ok(());
+    }
     if let Some(event) = state.activity.v1(source) {
         publish_activity(&mut state, id, event)?;
     }
@@ -1819,6 +1899,22 @@ fn forward_locked(
 ) -> agent_client_protocol::Result<()> {
     let is_agent_update = update.is_some();
     let update = update.unwrap_or_else(|| state.status_update());
+    state.transcript.ingest(&update)?;
+    if state.hydrating {
+        // Resume's final state describes current execution; historical usage never enters the ledger.
+        match &update {
+            v2::SessionUpdate::StateUpdate(status) => {
+                state.running = matches!(status, v2::StateUpdate::Running(_));
+                state.activity_known = true;
+            }
+            v2::SessionUpdate::ConfigOptionUpdate(options) => {
+                state.config_options = options.config_options.clone();
+                state.selected_model = selected_model(&options.config_options);
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
     if let v2::SessionUpdate::UsageUpdate(usage) = &update {
         let cost = usage
             .cost
@@ -2061,7 +2157,7 @@ async fn run_agent(
                     }
                     let idle = matches!(notification.update, v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(_)));
                     forward(&control, &hive_id, notification.update)?;
-                    if idle { schedule_price(control.clone(), hive_id.clone()); }
+                    if idle && !control.lock().map_err(|_| Error::internal_error())?.hydrating { schedule_price(control.clone(), hive_id.clone()); }
                     Ok(())
                 }
             },
@@ -2076,6 +2172,9 @@ async fn run_agent(
                    responder: Responder<v2::RequestPermissionResponse>,
                    cx: V2ConnectionTo<Agent>| {
                     if downstream.lock().map_err(|_| Error::internal_error())?.as_ref() != Some(&request.session_id) {
+                        return responder.respond(v2::RequestPermissionResponse::new(v2::RequestPermissionOutcome::Cancelled));
+                    }
+                    if control.lock().map_err(|_| Error::internal_error())?.hydrating {
                         return responder.respond(v2::RequestPermissionResponse::new(v2::RequestPermissionOutcome::Cancelled));
                     }
                     request.session_id = hive_id.clone();
@@ -2099,6 +2198,9 @@ async fn run_agent(
                 async move |mut request: v2::CreateElicitationRequest,
                     responder: Responder<v2::CreateElicitationResponse>,
                     cx: V2ConnectionTo<Agent>| {
+                    if control.lock().map_err(|_| Error::internal_error())?.hydrating {
+                        return responder.respond(v2::CreateElicitationResponse::new(v2::ElicitationAction::Cancel));
+                    }
                     let epoch = control.lock().map_err(|_| Error::internal_error())?.interaction_epoch;
                     let scope = match &mut request.mode {
                         v2::ElicitationMode::Form(mode) => &mut mode.scope,
@@ -2146,7 +2248,9 @@ async fn run_agent(
                 .block_task()
                 .await;
             match initialized {
-                Ok(response) if response.protocol_version == ProtocolVersion::V2 && response.capabilities.session.is_some() => {}
+                Ok(response) if response.protocol_version == ProtocolVersion::V2 && response.capabilities.session.is_some() => {
+                    tracing::info!(protocol = "v2", session = true, "agent capabilities negotiated");
+                }
                 Ok(_) => {
                     let _ =
                         ready.send(Err("agent does not advertise ACPv2 session support".into()));
@@ -2158,18 +2262,23 @@ async fn run_agent(
                     return Ok(());
                 }
             }
+            let restoring = recovering.is_some();
             let (opened, downstream_id) = if let Some(id) = recovering {
                 let id = v2::SessionId::new(id);
                 // Route updates sent during session/resume, before its response is available.
                 if let Ok(mut route) = downstream.lock() { *route = Some(id.clone()); }
-                match cx.send_request(v2::ResumeSessionRequest::new(id.clone(), request.cwd)).block_task().await {
-                    Ok(response) => (v2::NewSessionResponse::new(hive_id.clone()).config_options(response.config_options), id),
+                tracing::info!(protocol = "v2", method = "session/resume", replay = "start", "restoring agent history");
+                let prepared = cx.prepare_request(v2::ResumeSessionRequest::new(id.clone(), request.cwd)
+                    .additional_directories(request.additional_directories)
+                    .mcp_servers(request.mcp_servers)
+                    .replay_from(v2::ReplayFrom::Start(v2::ReplayFromStart::new())))
+                    .map(|response| Ok(response.config_options));
+                match restore_history(prepared, control.clone()).await {
+                    Ok(options) => (v2::NewSessionResponse::new(hive_id.clone()).config_options(options), id),
                     Err(error) => {
-                        tracing::warn!(code = ?error.code, "agent session/resume failed");
-                        let missing = error.data.as_ref().and_then(serde_json::Value::as_str)
-                            .is_some_and(|data| data.contains("unknown session") || data.contains("not found"));
-                        let detail = if missing { "saved session not found" } else { "session/resume failed" };
-                        let _ = ready.send(Err(format!("agent {detail} ({:?}); verify its saved session and restart Hive", error.code)));
+                        let failure = transcript::RestoreError::downstream("v2", "session/resume", &error);
+                        tracing::warn!(protocol = "v2", method = "session/resume", code = ?error.code, reason = %failure, "history restoration failed");
+                        let _ = ready.send(Err(failure.to_string()));
                         return Ok(());
                     }
                 }
@@ -2190,7 +2299,8 @@ async fn run_agent(
             if let Ok(mut route) = downstream.lock() {
                 *route = Some(downstream_id.clone());
             }
-            if let Ok(mut state) = control.lock() {
+            if !restoring && let Ok(mut state) = control.lock() {
+                state.finish_history();
                 state.selected_model = selected_model(&opened.config_options);
                 state.config_options = opened.config_options.clone();
             }
@@ -2301,6 +2411,8 @@ async fn run_v1_agent(
     let notifications = route.clone();
     let message_id = Arc::new(Mutex::new(None::<v2::MessageId>));
     let chunk_message_id = message_id.clone();
+    // V1 history lacks message IDs; role transitions delimit historical message segments.
+    let history_message = Mutex::new(None::<(bool, v2::MessageId)>);
     let result = Client
         .builder()
         .on_receive_notification(
@@ -2324,13 +2436,26 @@ async fn run_v1_agent(
                             forward(&control, &hive_id, v2::SessionUpdate::ConfigOptionUpdate(v2::ConfigOptionUpdate::new(options)))?;
                         }
                         v1::SessionUpdate::UsageUpdate(update) => {
-                            report_v1_cost(&control, &hive_id, &update)?;
-                        }
-                        v1::SessionUpdate::AgentMessageChunk(chunk) => {
-                            if let v1::ContentBlock::Text(text) = chunk.content {
-                                let id = chunk_message_id.lock().map_err(|_| Error::internal_error())?.clone().ok_or_else(Error::internal_error)?;
-                                forward(&control, &hive_id, v2::SessionUpdate::AgentMessageChunk(v2::ContentChunk::new(text.text.into(), id)))?;
+                            if !control.lock().map_err(|_| Error::internal_error())?.hydrating {
+                                report_v1_cost(&control, &hive_id, &update)?;
                             }
+                        }
+                        v1::SessionUpdate::AgentMessageChunk(chunk) | v1::SessionUpdate::UserMessageChunk(chunk) => {
+                            let user = matches!(source, v1::SessionUpdate::UserMessageChunk(_));
+                            let hydrating = control.lock().map_err(|_| Error::internal_error())?.hydrating;
+                            // Hive already publishes the authoritative user message for live prompts.
+                            if user && !hydrating { return Ok(()); }
+                            let id = if hydrating {
+                                let mut history = history_message.lock().map_err(|_| Error::internal_error())?;
+                                let entry = history.get_or_insert_with(|| (user, v2::MessageId::new(uuid::Uuid::new_v4().to_string())));
+                                if entry.0 != user { *entry = (user, v2::MessageId::new(uuid::Uuid::new_v4().to_string())); }
+                                entry.1.clone()
+                            } else {
+                                chunk_message_id.lock().map_err(|_| Error::internal_error())?.clone().ok_or_else(Error::internal_error)?
+                            };
+                            let content = serde_json::from_value(serde_json::to_value(chunk.content).map_err(Error::into_internal_error)?).map_err(Error::into_internal_error)?;
+                            let chunk = v2::ContentChunk::new(content, id);
+                            forward(&control, &hive_id, if user { v2::SessionUpdate::UserMessageChunk(chunk) } else { v2::SessionUpdate::AgentMessageChunk(chunk) })?;
                         }
                         v1::SessionUpdate::ToolCall(call) => {
                             let mut fields = BTreeMap::new();
@@ -2365,6 +2490,9 @@ async fn run_v1_agent(
                     if route.lock().map_err(|_| Error::internal_error())?.as_ref() != Some(&request.session_id) {
                         return responder.respond(v1::RequestPermissionResponse::new(v1::RequestPermissionOutcome::Cancelled));
                     }
+                    if control.lock().map_err(|_| Error::internal_error())?.hydrating {
+                        return responder.respond(v1::RequestPermissionResponse::new(v1::RequestPermissionOutcome::Cancelled));
+                    }
                     let options = request.options.iter().map(|option| {
                         serde_json::from_value::<v2::PermissionOption>(serde_json::to_value(option).map_err(Error::into_internal_error)?)
                             .map_err(Error::into_internal_error)
@@ -2394,6 +2522,9 @@ async fn run_v1_agent(
                 async move |request: v1::CreateElicitationRequest,
                     responder: Responder<v1::CreateElicitationResponse>,
                     cx: ConnectionTo<Agent>| {
+                    if control.lock().map_err(|_| Error::internal_error())?.hydrating {
+                        return responder.respond(v1::CreateElicitationResponse::new(v1::ElicitationAction::Cancel));
+                    }
                     let mut request: v2::CreateElicitationRequest = serde_json::from_value(
                         serde_json::to_value(request).map_err(Error::into_internal_error)?,
                     ).map_err(Error::into_internal_error)?;
@@ -2430,7 +2561,10 @@ async fn run_v1_agent(
                 .block_task()
                 .await;
             let capabilities = match initialized {
-                Ok(response) if response.protocol_version == ProtocolVersion::V1 => response.agent_capabilities,
+                Ok(response) if response.protocol_version == ProtocolVersion::V1 => {
+                    tracing::info!(protocol = "v1", load_session = response.agent_capabilities.load_session, resume = response.agent_capabilities.session_capabilities.resume.is_some(), "agent capabilities negotiated");
+                    response.agent_capabilities
+                }
                 Ok(_) => {
                     let _ = ready.send(Err("agent negotiated a different protocol version; correct the profile's versions setting".into()));
                     return Ok(());
@@ -2441,38 +2575,45 @@ async fn run_v1_agent(
                     return Ok(());
                 }
             };
-            if !request.mcp_servers.is_empty() {
+            if !request.mcp_servers.is_empty() || !request.additional_directories.is_empty() {
                 let _ = ready.send(Err(
-                    "v1 adapter cannot translate v2 MCP server declarations".into(),
+                    "v1 adapter cannot translate v2 MCP server declarations or additional workspace roots; use a v2 profile for this session".into(),
                 ));
                 return Ok(());
             }
+            let restoring = recovering.is_some();
             let (downstream_id, options) = if let Some(id) = recovering {
                 let id = v1::SessionId::new(id);
                 if let Ok(mut route) = route.lock() { *route = Some(id.clone()); }
-                let result = if capabilities.session_capabilities.resume.is_some() {
-                    cx.send_request(v1::ResumeSessionRequest::new(id.clone(), request.cwd.0)).block_task().await.map(|response| response.config_options.unwrap_or_default())
-                } else if capabilities.load_session {
-                    cx.send_request(v1::LoadSessionRequest::new(id.clone(), request.cwd.0)).block_task().await.map(|response| response.config_options.unwrap_or_default())
+                let result = if capabilities.load_session {
+                    tracing::info!(protocol = "v1", method = "session/load", replay = "start", "restoring agent history");
+                    let prepared = cx.prepare_request(v1::LoadSessionRequest::new(id.clone(), request.cwd.0))
+                        .map(|response| session_config::from_v1(response.config_options.unwrap_or_default()));
+                    restore_history(prepared, control.clone()).await
+                } else if capabilities.session_capabilities.resume.is_some() {
+                    if let Ok(mut state) = control.lock() { state.history_error = Some(transcript::RestoreError::Unsupported); }
+                    tracing::warn!(protocol = "v1", method = "session/resume", diagnostic_code = "hive::transcript::unsupported", "agent can resume context but cannot restore history");
+                    let prepared = cx.prepare_request(v1::ResumeSessionRequest::new(id.clone(), request.cwd.0))
+                        .map(|response| session_config::from_v1(response.config_options.unwrap_or_default()));
+                    restore_history(prepared, control.clone()).await
                 } else {
-                    let _ = ready.send(Err("agent does not advertise ACPv1 session/resume or session/load; saved session is orphaned".into()));
+                    let _ = ready.send(Err(format!("{}; agent also lacks session/resume, so the saved session is orphaned", transcript::RestoreError::Unsupported)));
                     return Ok(());
                 };
                 let options = match result {
                     Ok(options) => options,
                     Err(error) => {
-                    tracing::warn!(code = ?error.code, "v1 agent reattachment failed");
-                    let missing = error.data.as_ref().and_then(serde_json::Value::as_str)
-                        .is_some_and(|data| data.contains("unknown session") || data.contains("not found"));
-                    let detail = if missing { "saved session not found" } else { "reattachment failed" };
-                    let _ = ready.send(Err(format!("v1 agent {detail} ({:?}); verify its saved session and restart Hive", error.code)));
+                    let method = if capabilities.load_session { "session/load" } else { "session/resume" };
+                    let failure = transcript::RestoreError::downstream("v1", method, &error);
+                    tracing::warn!(protocol = "v1", method, code = ?error.code, reason = %failure, "history restoration failed");
+                    let _ = ready.send(Err(failure.to_string()));
                     return Ok(());
                     }
                 };
                 (id, options)
             } else {
                 match cx.send_request(v1::NewSessionRequest::new(request.cwd.0)).block_task().await {
-                    Ok(response) => (response.session_id, response.config_options.unwrap_or_default()),
+                    Ok(response) => (response.session_id, session_config::from_v1(response.config_options.unwrap_or_default())?),
                     Err(error) => {
                         tracing::warn!(code = ?error.code, "v1 session/new failed");
                         let _ = ready.send(Err("v1 session/new failed; check agent availability".into()));
@@ -2483,8 +2624,8 @@ async fn run_v1_agent(
             if let Ok(mut route) = route.lock() {
                 *route = Some(downstream_id.clone());
             }
-            let options = session_config::from_v1(options)?;
-            if let Ok(mut state) = control.lock() {
+            if !restoring && let Ok(mut state) = control.lock() {
+                state.finish_history();
                 state.selected_model = selected_model(&options);
                 state.config_options = options.clone();
             }
@@ -3305,6 +3446,10 @@ mod control_tests {
             changed,
             next_seq: 1,
             events: VecDeque::new(),
+            transcript: transcript::Transcript::default(),
+            hydrating: false,
+            history_error: None,
+            expected_history: false,
             running: false,
             activity_known: false,
             title: None,
@@ -3479,6 +3624,61 @@ mod control_tests {
     }
 
     #[test]
+    fn historical_replay_does_not_repeat_accounting_or_clear_interrupted_work() {
+        let mut state = detached();
+        state.hydrating = true;
+        state.recovery_required = true;
+        state.active_turn = Some("interrupted".into());
+        let ledger = serde_json::to_value(&state.usage).unwrap();
+        let state = Mutex::new(state);
+        let id = v2::SessionId::new("original");
+        for update in [
+            v2::SessionUpdate::UsageUpdate(
+                v2::UsageUpdate::new(120, 200_000).cost(v2::Cost::new(1.0, "USD")),
+            ),
+            v2::SessionUpdate::ToolCallUpdate(
+                v2::ToolCallUpdate::new("old-tool")
+                    .title("Previously executed")
+                    .status(v2::ToolCallStatus::Completed),
+            ),
+            v2::SessionUpdate::AgentMessageChunk(v2::ContentChunk::new(
+                "retained answer".into(),
+                v2::MessageId::new("old-answer"),
+            )),
+            v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(
+                v2::IdleStateUpdate::new().usage(v2::Usage::new(120, 80, 40)),
+            )),
+        ] {
+            forward(&state, &id, update).unwrap();
+        }
+        let old_tool =
+            v1::SessionUpdate::ToolCall(v1::ToolCall::new("v1-old-tool", "Already executed"));
+        let raw = v2::SessionUpdate::Other(v2::OtherSessionUpdate::new(
+            "_hive_v1_tool_call",
+            BTreeMap::from([(
+                "tool".into(),
+                serde_json::json!({"toolCallId":"v1-old-tool", "title":"Already executed"}),
+            )]),
+        ));
+        forward_v1(&state, &id, &old_tool, raw).unwrap();
+        let state = state.lock().unwrap();
+        assert_eq!(serde_json::to_value(&state.usage).unwrap(), ledger);
+        assert_eq!(state.active_turn.as_deref(), Some("interrupted"));
+        assert!(state.recovery_required);
+        assert!(state.last_activity_at.is_none());
+        assert_eq!(state.next_seq, 1);
+        assert!(state.events.is_empty());
+        assert_eq!(state.transcript.updates().unwrap().len(), 3);
+        assert!(
+            serde_json::to_value(&state.activity).unwrap()["tools"]
+                .as_object()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!state.running);
+    }
+
+    #[test]
     fn a_replay_gap_is_visible_after_the_event_ring_wraps() {
         let state = Mutex::new(detached());
         let id = v2::SessionId::new("hive-test");
@@ -3506,7 +3706,7 @@ mod control_tests {
                 &state,
                 Some(&v2::ReplayFrom::Start(v2::ReplayFromStart::new()))
             )
-            .is_err()
+            .is_ok()
         );
         let available = v2::ReplayFrom::Other(v2::OtherReplayFrom::new(
             "_hive_seq",
@@ -3520,7 +3720,7 @@ mod control_tests {
     }
 
     #[test]
-    fn expired_history_retains_current_activity_for_a_live_only_attachment() {
+    fn wrapped_incremental_history_retains_the_complete_transcript_and_current_activity() {
         let state = Mutex::new(detached());
         let id = v2::SessionId::new("hive-test");
         forward(
@@ -3550,8 +3750,10 @@ mod control_tests {
                 &state,
                 Some(&v2::ReplayFrom::Start(v2::ReplayFromStart::new()))
             )
-            .is_err()
+            .is_ok()
         );
+        let transcript = serde_json::to_value(state.transcript.updates().unwrap()).unwrap();
+        assert_eq!(transcript[1]["content"][0]["text"], "text".repeat(260));
         assert!(replay_start(&state, None).unwrap().is_none());
         let snapshot = serde_json::to_value(&state.activity).unwrap();
         assert_eq!(snapshot["tools"]["finished"]["status"], "failed");

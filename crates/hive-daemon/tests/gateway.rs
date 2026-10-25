@@ -523,6 +523,8 @@ async fn exercise_gateway(transport: &str, version: AgentVersion) {
         .await
         .unwrap();
     assert!(web.contains("/ui/app.js"));
+    assert!(web.contains("/ui/style.css"));
+    assert!(!web.contains("/src/main.js"));
     assert!(web.contains("rel=\"icon\""));
     let icon = reqwest::get(format!("http://{address}/ui/icon.svg"))
         .await
@@ -540,9 +542,21 @@ async fn exercise_gateway(transport: &str, version: AgentVersion) {
         .error_for_status()
         .unwrap();
     assert_eq!(script.headers()["content-type"], "text/javascript");
+    assert_eq!(script.headers()["cache-control"], "no-cache");
     assert_eq!(
         script.text().await.unwrap(),
-        include_str!("../../../clients/hive-web/app.js")
+        include_str!("../../../clients/hive-web/dist/app.js")
+    );
+    let stylesheet = reqwest::get(format!("http://{address}/ui/style.css"))
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(stylesheet.headers()["content-type"], "text/css");
+    assert_eq!(stylesheet.headers()["cache-control"], "no-cache");
+    assert_eq!(
+        stylesheet.text().await.unwrap(),
+        include_str!("../../../clients/hive-web/dist/style.css")
     );
     // Removed paths must not survive as aliases that keep clients on the old prefix.
     for path in ["/hive/v1/web", "/hive/v1/web/app.js", "/hive/v1/status"] {

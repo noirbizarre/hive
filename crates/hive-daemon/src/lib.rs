@@ -2884,14 +2884,35 @@ pub fn router_with_origin(broker: Broker, origin: Option<&str>) -> Router {
         )
         .route(
             "/ui",
-            get(|| async { Html(include_str!("../../../clients/hive-web/index.html")) }),
+            get(|| async {
+                (
+                    [(axum::http::header::CACHE_CONTROL, "no-cache")],
+                    Html(include_str!("../../../clients/hive-web/dist/index.html")),
+                )
+            }),
         )
         .route(
             "/ui/app.js",
             get(|| async {
                 (
-                    [(axum::http::header::CONTENT_TYPE, "text/javascript")],
-                    include_str!("../../../clients/hive-web/app.js"),
+                    [
+                        (axum::http::header::CONTENT_TYPE, "text/javascript"),
+                        // Stable bundle names must be revalidated after a daemon upgrade.
+                        (axum::http::header::CACHE_CONTROL, "no-cache"),
+                    ],
+                    include_str!("../../../clients/hive-web/dist/app.js"),
+                )
+            }),
+        )
+        .route(
+            "/ui/style.css",
+            get(|| async {
+                (
+                    [
+                        (axum::http::header::CONTENT_TYPE, "text/css"),
+                        (axum::http::header::CACHE_CONTROL, "no-cache"),
+                    ],
+                    include_str!("../../../clients/hive-web/dist/style.css"),
                 )
             }),
         )

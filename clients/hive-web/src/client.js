@@ -34,6 +34,7 @@ export function conversation() {
     }
     const line = lines[map.get(key)];
     line.text = replace ? text : line.text + text;
+    return line;
   }
 
   function reconcileConfig(options, number) {
@@ -58,9 +59,17 @@ export function conversation() {
         (update.content || []).map(block => block.text || `[${block.type || 'content'}]`).join('\n'), true);
     } else if (kind === 'tool_call_update' || kind === 'tool_call_content_chunk' || kind.startsWith('_hive_v1_tool')) {
       const tool = update.tool || update;
-      upsert(tools, tool.toolCallId || 'tool', 'tool',
-        kind === 'tool_call_content_chunk' ? JSON.stringify(tool) : `${tool.title || 'Tool'} — ${tool.status || ''} ${JSON.stringify(tool.content || '')}`,
-        kind !== 'tool_call_content_chunk');
+      const id = tool.toolCallId || 'tool';
+      const previous = tools.has(id) ? lines[tools.get(id)] : undefined;
+      const content = tool.content ?? tool.rawOutput;
+      const readable = value => typeof value === 'string' ? value
+        : Array.isArray(value) ? value.map(block => block.content?.text ?? block.text ?? JSON.stringify(block, null, 2)).join('\n')
+        : JSON.stringify(value, null, 2);
+      // Status-only patches must not erase the original title or completed output.
+      const line = upsert(tools, id, 'tool', content == null ? '' : readable(content), content != null && kind !== 'tool_call_content_chunk');
+      line.title = tool.title ?? previous?.title ?? 'Tool activity';
+      line.status = tool.status ?? previous?.status ?? 'unknown';
+      if (tool.rawInput != null) line.input = readable(tool.rawInput);
     } else if (kind === 'config_option_update') {
       reconcileConfig(update.configOptions, number);
     } else if (kind === '_hive_error' || kind === '_hive_opencode_error') {
@@ -682,15 +691,7 @@ export function catalog(onChange, onError = () => {}, onProviders) {
   return { refresh, close() { stopped = true; clearTimeout(providerRetry); events.close(); } };
 }
 
-function add(parent, tag, text, attributes = {}) {
-  const element = document.createElement(tag);
-  element.textContent = text;
-  for (const [name, value] of Object.entries(attributes)) element.setAttribute(name, value);
-  parent.append(element);
-  return element;
-}
-
-function formValues(schema, form) {
+export function formValues(schema, form) {
   // Agent-provided property names such as __proto__ must remain ordinary form keys.
   const content = Object.create(null);
   for (const [name, field] of Object.entries(schema?.properties || {})) {
@@ -710,285 +711,4 @@ function formValues(schema, form) {
     }
   }
   return validateContent(schema, content);
-}
-
-export function mount(client, root = document) {
-  const status = root.querySelector('#status');
-  const list = root.querySelector('#sessions');
-  const listStatus = root.querySelector('#session-list-status');
-  const toggle = root.querySelector('#toggle-sessions');
-  const layout = root.querySelector('#layout');
-  const output = root.querySelector('#output');
-  const prompt = root.querySelector('#prompt');
-  const input = prompt.elements.namedItem('text');
-  const send = root.querySelector('#send');
-  const agentSelect = root.querySelector('#agent');
-  const cancel = root.querySelector('#cancel');
-  const dialog = root.querySelector('#interaction');
-  const retry = root.querySelector('#retry');
-  const recover = root.querySelector('#recover');
-  const skip = root.querySelector('#skip-history');
-  let sessions = [];
-  let recent = [];
-  let navigationVisible = true;
-  let selectedBefore;
-  let opening;
-  let sending = false;
-  let currentInteraction;
-
-  function show(state) {
-    status.textContent = state.status;
-    if (state.session?.sessionId !== selectedBefore) {
-      selectedBefore = state.session?.sessionId;
-      if (selectedBefore) {
-        recent = [selectedBefore, ...recent.filter(id => id !== selectedBefore)];
-        history.replaceState?.(null, '', `?${new URLSearchParams({ session: selectedBefore })}`);
-      }
-    }
-    renderRows(state);
-    const pilot = state.role === 'pilot' && state.connected && !state.gap;
-    const create = root.querySelector('#create');
-    if (create) {
-      create.hidden = Boolean(state.session);
-      create.disabled = !state.connected || state.creating || state.opening;
-      create.onclick = () => client.create(agentSelect.value).catch(error => { status.textContent = error.message; });
-    }
-    const control = root.querySelector('#control');
-    if (control) {
-      control.hidden = !state.session || pilot;
-      control.disabled = !state.connected || state.recoveryRequired || state.takingControl;
-      control.onclick = () => client.takeControl().catch(error => { status.textContent = error.message; });
-    }
-    const configuration = root.querySelector('#configuration');
-    if (configuration) {
-      const focused = root.activeElement?.dataset?.configId;
-      configuration.replaceChildren();
-      const options = (state.configOptions || []).filter(option => option.type === 'select');
-      if (!options.length) add(configuration, 'p', state.session ? 'This backend does not expose model selection' : 'Create a session to choose its provider / model before sending a prompt');
-      for (const option of options) {
-        const label = add(configuration, 'label', option.category === 'model' ? 'Provider / Model ' : `${option.name} `);
-        const select = add(label, 'select', '', { 'aria-label': option.category === 'model' ? 'Provider / Model' : option.name });
-        select.dataset.configId = option.configId;
-        for (const choice of option.options || []) {
-          if (Array.isArray(choice.options)) {
-            const group = add(select, 'optgroup', '', { label: choice.name || choice.group });
-            for (const item of choice.options) add(group, 'option', item.name, { value: item.value });
-          } else add(select, 'option', choice.name, { value: choice.value });
-        }
-        select.value = option.currentValue;
-        select.disabled = !pilot || state.opening || state.running || state.configuring || state.creating || state.recoveryRequired || Boolean(state.uncertain);
-        select.onchange = () => client.configure(option.configId, select.value).catch(error => { status.textContent = error.message; });
-        if (focused === option.configId) select.focus();
-      }
-    }
-    input.disabled = !state.connected || state.gap || state.opening;
-    send.disabled = !state.connected || state.gap || sending || state.takingControl || state.running || state.recoveryRequired ||
-      state.opening || state.configuring || state.creating || (!state.session && Boolean(create)) || (Boolean(state.session) && !pilot) || Boolean(state.uncertain);
-    cancel.disabled = !pilot || !state.running;
-    retry.hidden = !state.uncertain || state.recoveryRequired;
-    retry.disabled = !pilot || !state.connected || sending;
-    if (recover) {
-      recover.hidden = !state.recoveryRequired;
-      recover.disabled = !state.connected || state.gap || sending;
-    }
-    skip.hidden = !state.gap;
-    agentSelect.disabled = Boolean(state.session);
-    if (state.session?.agent && Array.from(agentSelect.options).some(option => option.value === state.session.agent)) {
-      agentSelect.value = state.session.agent;
-    }
-    output.replaceChildren();
-    for (const line of state.lines) add(output, 'div', `${line.kind === 'notice' ? '' : `${line.kind}: `}${line.text}`);
-    const usage = state.usage || {};
-    const actual = usage.actualSessionCost;
-    const estimated = usage.estimatedCost;
-    const price = actual?.amount != null ? `actual ${actual.amount.toFixed(4)} ${actual.currency}`
-      : estimated?.amount != null ? `estimated ${estimated.amount.toFixed(4)} ${estimated.currency}` : 'unknown';
-    const usagePanel = add(output, 'section', '');
-    add(usagePanel, 'h3', 'Usage');
-    add(usagePanel, 'div', `Tokens: ${usage.tokens?.totalTokens ?? 'unknown'} · Cost: ${price}`);
-    add(usagePanel, 'div', `Reported turns: ${usage.reportedTurns ?? 0} / ${usage.turns ?? 0}`);
-    const activity = state.activity;
-    if (activity) {
-      const panel = add(output, 'section', '');
-      add(panel, 'h3', `Activity · ${activity.session || 'active'} / ${activity.foreground}`);
-      for (const [label, key] of [['Tools', 'tools'], ['Tasks', 'tasks'], ['Todos', 'plans']]) {
-        add(panel, 'h4', `${label} · ${activity.support?.[key] || 'unknown'}`);
-        for (const [id, item] of Object.entries(activity[key] || {})) {
-          if (key === 'plans') {
-            for (const entry of item.entries || []) add(panel, 'div', `${entry.status}: ${entry.content}`);
-          } else add(panel, 'div', `${item.title || id} · ${item.status || 'unknown'}`);
-        }
-      }
-    }
-    for (const flow of state.urlFlows || []) add(output, 'p', `${flow.message}: ${flow.complete ? 'Completed' : flow.expires <= Date.now() ? 'Completion not received before timeout' : 'Waiting for external completion'}`);
-    if (currentInteraction?.id === state.interaction?.id && currentInteraction?.epoch === state.interaction?.epoch && currentInteraction?.generation === state.interaction?.generation) return;
-    currentInteraction = state.interaction;
-    dialog.replaceChildren();
-    dialog.hidden = !state.interaction || (!pilot && !state.interaction.requestScoped);
-    if (dialog.hidden) return;
-    const interaction = state.interaction;
-    const params = interaction.params;
-    add(dialog, 'p', params.title || params.message || 'Agent needs input');
-    if (params.description) add(dialog, 'p', params.description);
-    if (params.subject) add(dialog, 'pre', JSON.stringify(params.subject, null, 2));
-    const form = add(dialog, 'form', '');
-    if (interaction.method === 'session/request_permission') {
-      for (const option of params.options || []) {
-        const button = add(form, 'button', `${option.name}${option.kind ? ` (${option.kind})` : ''}`, { type: 'button' });
-        button.onclick = () => client.respond({ outcome: { outcome: 'selected', optionId: option.optionId } }, interaction.id);
-      }
-    } else if (params.mode === 'form') {
-      if (params.requestedSchema.title) add(form, 'h3', params.requestedSchema.title);
-      if (params.requestedSchema.description) add(form, 'p', params.requestedSchema.description);
-      for (const [name, field] of Object.entries(params.requestedSchema?.properties || {})) {
-        const label = add(form, 'label', `${field.title || name}${params.requestedSchema.required?.includes(name) ? ' (required)' : ''}`);
-        const options = field.enum?.map(value => ({ const: value, title: value })) || field.oneOf || field.items?.enum?.map(value => ({ const: value, title: value })) || field.items?.anyOf;
-        let control;
-        if (options) {
-          control = add(label, 'select', '', { name });
-          if (field.type === 'array') control.multiple = true;
-          else add(control, 'option', 'Choose…', { value: '' });
-          for (const option of options) add(control, 'option', option.title || option.const, { value: option.const });
-        } else control = add(label, 'input', '', { name, type: field.type === 'integer' || field.type === 'number' ? 'number' : 'text' });
-        if (field.type === 'boolean') {
-          const select = add(label, 'select', '', { name });
-          control.remove();
-          for (const value of ['', 'true', 'false']) add(select, 'option', value || 'Choose…', { value });
-          control = select;
-        }
-        if (field.description) add(label, 'small', field.description);
-        const constraints = add(form, 'details', '');
-        add(constraints, 'summary', `Constraints for ${field.title || name}`);
-        add(constraints, 'pre', JSON.stringify(field, null, 2));
-        if (field.type === 'string' && !params.requestedSchema.required?.includes(name)) {
-          const empty = add(label, 'button', 'Include empty value', { type: 'button' });
-          empty.onclick = () => { control.dataset.includeEmpty = control.dataset.includeEmpty === 'true' ? 'false' : 'true'; empty.textContent = control.dataset.includeEmpty === 'true' ? 'Omit empty value' : 'Include empty value'; };
-        }
-        if (field.default != null) {
-          if (control.multiple) for (const option of control.options) option.selected = field.default.includes(option.value);
-          else control.value = String(field.default);
-        }
-        if (field.type === 'number') control.step = 'any';
-        control.setAttribute('aria-required', String(Boolean(params.requestedSchema.required?.includes(name))));
-        if (field.type === 'integer') control.step = '1';
-        if (field.minimum != null) control.min = field.minimum;
-        if (field.maximum != null) control.max = field.maximum;
-      }
-      const errors = add(form, 'p', '', { role: 'alert' });
-      const accept = add(form, 'button', 'Submit', { type: 'submit' });
-      accept.disabled = false;
-      form.onsubmit = event => {
-        event.preventDefault();
-        try { client.respond({ action: 'accept', content: formValues(params.requestedSchema, form) }, interaction.id); }
-        catch (error) { errors.textContent = error.message; }
-      };
-    } else if (params.mode === 'url') {
-      try {
-        const url = new URL(params.url);
-        if (url.protocol === 'http:' || url.protocol === 'https:') add(form, 'a', url.href, { href: url.href, target: '_blank', rel: 'noopener noreferrer' });
-      } catch { /* An invalid agent URL must not become an unsafe browser link. */ }
-      add(form, 'p', 'Continue to allow the external flow; Hive will report completion when the agent notifies it.');
-      add(form, 'button', 'Continue', { type: 'button' }).onclick = () => client.respond({ action: 'accept' }, interaction.id);
-    }
-    add(form, 'button', 'Decline', { type: 'button' }).onclick = () => client.respond(
-      interaction.method === 'session/request_permission' ? { outcome: { outcome: 'cancelled' } } : { action: 'decline' }, interaction.id);
-    form.querySelector('input, select, button, a')?.focus();
-  }
-
-  async function open(id) {
-    const session = sessions.find(item => item.sessionId === id);
-    if (!session) { status.textContent = `Hive session ${id} not found; choose a listed session`; return; }
-    try {
-      await client.open(session);
-    } catch (error) { status.textContent = error.message; }
-  }
-  const history = globalThis.history;
-  const selectedId = new URLSearchParams(globalThis.location?.search || '').get('session');
-  function renderRows(state) {
-    const focused = root.activeElement?.dataset?.sessionId;
-    list.replaceChildren();
-    const ordered = [...sessions].sort((a, b) => {
-      const first = recent.indexOf(a.sessionId);
-      const second = recent.indexOf(b.sessionId);
-      if (first !== -1 || second !== -1) return (first === -1 ? Infinity : first) - (second === -1 ? Infinity : second);
-      return (b.lastActivityAt || 0) - (a.lastActivityAt || 0) || a.sessionId.localeCompare(b.sessionId);
-    });
-    for (const session of ordered) {
-      const row = add(list, 'li', '');
-      const button = add(row, 'button', session.title || session.sessionId, { type: 'button' });
-      button.dataset.sessionId = session.sessionId;
-      if (session.sessionId === state.session?.sessionId) button.setAttribute('aria-current', 'page');
-      button.onclick = () => open(session.sessionId);
-      const control = session.controlOwner
-        ? session.sessionId === state.session?.sessionId && state.role === 'pilot' && state.connected
-          && state.generation === session.generation ? 'controlled here' : 'controlled by another client'
-        : 'unclaimed';
-      const activity = session.lifecycle && session.lifecycle !== 'active' ? session.lifecycle : session.activity;
-      const attention = session.sessionId === state.session?.sessionId && state.interaction ? ' · needs attention' : '';
-      const detail = add(button, 'small', `${session.sessionId} · ${session.agent || 'unknown agent'} · ${activity || 'unknown'}${session.recoveryReason ? ` · ${session.recoveryReason}` : ''}${attention} · ${control} · ` +
-        `${session.lastActivityAt == null ? 'no activity yet' : new Date(session.lastActivityAt).toLocaleString()}`);
-      if (attention || activity === 'running' || activity === 'closing') detail.className = 'attention';
-    }
-    if (focused) list.querySelectorAll('button').forEach(button => { if (button.dataset.sessionId === focused) button.focus(); });
-    if (listStatus) listStatus.textContent = sessions.length ? `${sessions.length} sessions` : 'No sessions yet. Send a prompt to start one.';
-  }
-  function renderList(items) {
-    sessions = items;
-    // Creation may publish before its catalog snapshot arrives; keep the new ID until then.
-    recent = recent.filter(id => id === client.state().session?.sessionId || items.some(item => item.sessionId === id));
-    renderRows(client.state());
-    if (selectedId && !opening) { opening = true; open(selectedId); }
-  }
-  const feed = catalog(renderList, message => { if (listStatus) listStatus.textContent = message; else status.textContent = message; }, ({ agents, defaultAgent }) => {
-    const selected = agentSelect.value || client.state().session?.agent;
-    agentSelect.replaceChildren();
-    for (const agent of agents) add(agentSelect, 'option', agent.name, { value: agent.id });
-    agentSelect.value = agents.some(agent => agent.id === selected) ? selected : defaultAgent || agents[0]?.id || '';
-  });
-  if (toggle) toggle.onclick = () => {
-    navigationVisible = !navigationVisible;
-    layout.classList.toggle('nav-hidden', !navigationVisible);
-    toggle.setAttribute('aria-expanded', String(navigationVisible));
-    toggle.textContent = navigationVisible ? 'Hide sessions' : 'Show sessions';
-    if (navigationVisible) list.querySelector('[aria-current="page"]')?.focus();
-  };
-  root.querySelector('#takeover').onsubmit = event => {
-    event.preventDefault();
-    open(new FormData(event.target).get('session').trim());
-  };
-  input.oninput = () => {
-    if (input.value && client.state().session && client.state().role !== 'pilot') {
-      client.takeControl().catch(error => { status.textContent = error.message; });
-    }
-  };
-  prompt.onsubmit = async event => {
-    event.preventDefault();
-    if (sending) return;
-    sending = true;
-    show(client.state());
-    try {
-      if (client.state().session) await client.takeControl();
-      await client.prompt(input.value, agentSelect.value);
-      input.value = '';
-    } catch (error) { status.textContent = error.message; }
-    finally { sending = false; show(client.state()); }
-  };
-  retry.onclick = async () => {
-    sending = true;
-    show(client.state());
-    try { await client.prompt(client.state().uncertain.text); }
-    catch (error) { status.textContent = error.message; }
-    finally { sending = false; show(client.state()); }
-  };
-  if (recover) recover.onclick = () => client.acknowledgeRecovery().catch(error => { status.textContent = error.message; });
-  skip.onclick = () => client.attachWithoutHistory().catch(error => { status.textContent = error.message; });
-  cancel.onclick = () => client.cancel();
-  show(client.state());
-  return { show, close() { feed.close(); client.close(); } };
-}
-
-if (typeof document !== 'undefined') {
-  let view;
-  const client = connect(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/acp`, state => view?.show(state));
-  view = mount(client);
 }

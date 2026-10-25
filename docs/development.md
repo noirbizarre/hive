@@ -8,7 +8,7 @@ for hooks, commit conventions, and releases.
 
 | Task | Command |
 | --- | --- |
-| Build workspace | `cargo build --workspace` |
+| Build workspace and embedded assets | `mise run hive:build` |
 | Format / check formatting | `mise run format` / `mise run format:check` |
 | Clippy | `mise run lint` |
 | Deterministic tests | `mise run test` |
@@ -23,9 +23,21 @@ CI job, including browser checks and MSRV testing.
 
 ## Client checks
 
-The browser has no third-party runtime dependency. Its DOM tests use `jsdom`.
-Run `mise run hive:web` to install test dependencies, check JavaScript syntax,
-and execute the tests.
+The browser uses Vue 3.5, OpenVue 1.0.0 and the Aura theme. Vite compiles its
+JavaScript and CSS into `clients/hive-web/dist/`, which Rust embeds. Generated
+assets are not committed. Install Node 22.22.2+ and run `mise run hive:web` before
+Cargo on a clean checkout and after frontend changes. This installs the locked
+dependencies, builds production assets, and runs Node protocol tests and Vue
+component tests with Vitest/jsdom. Use `mise run hive:ci` to prepare/test the
+frontend before aggregate CI without racing duplicate builds.
+
+For focused iterations after installation, run `npm test --prefix clients/hive-web`
+or `npm run build --prefix clients/hive-web`. Rebuild Rust to update the embedded
+UI. No frontend server is needed at runtime. The adapter in
+`clients/hive-web/src/client.js` owns the browser's derived protocol view;
+Vue components consume its snapshots and commands, never a separate registry.
+See [ADR-008](adr/008-embedded-vue-interface.md) for the dependency evaluation and
+the [browser smoke checklist](guides/web.md#browser-smoke-checklist) for visual checks.
 
 ## Local runtime
 

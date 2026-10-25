@@ -42,6 +42,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Project assets must exist before hooks invoke Clippy.
+      - uses: ./.github/actions/build-web
+
       # The channel comes from the action ref, not rust-toolchain.toml,
       # and each job installs the components it needs.
       - uses: dtolnay/rust-toolchain@stable
@@ -86,6 +89,7 @@ jobs:
             flag: macos
     steps:
       - uses: actions/checkout@v7
+      - uses: ./.github/actions/build-web
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
@@ -161,6 +165,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+      - uses: ./.github/actions/build-web
 
       - name: Read the MSRV from Cargo.toml
         id: msrv

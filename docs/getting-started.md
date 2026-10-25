@@ -35,20 +35,22 @@ If you want to try Hive without an account or model, use the
 
 ## 1. Install Hive
 
-Clone the repository and install from its root:
+With Rust and Node 22.22.2+ installed, clone the repository and install from its root:
 
 ```sh
 git clone https://github.com/noirbizarre/hive.git
 cd hive
+npm ci --prefix clients/hive-web
+npm run build --prefix clients/hive-web
 cargo install --path crates/hive-cli --bin hive
 hive --version
 ```
 
-If you already have a checkout, run the Cargo command from that checkout instead.
+If you already have a checkout, run the npm and Cargo commands from its root.
 
 Ensure Cargo's executable directory, normally `~/.cargo/bin`, is on `PATH`.
 This installs `hive`, including its terminal client and embedded browser assets.
-There is no separate browser build or Node.js requirement to run Hive.
+The browser build is embedded at compile time; Node.js is not required to run Hive.
 
 Source installation is the verified installation path in this repository.
 For development without installation, use `cargo run -p hive-cli -- <arguments>`.

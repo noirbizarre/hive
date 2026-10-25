@@ -222,8 +222,24 @@ git tpl diff --exit-code --stat
 # committed binaries, so a routine run would dirty the working tree every time.
 
 [tasks."hive:web"]
-description = "Check and test the zero-dependency browser client"
-run = "npm ci --prefix clients/hive-web && npm run build --prefix clients/hive-web && npm run test --prefix clients/hive-web"
+description = "Build and test the embedded Vue browser client"
+depends = ["hive:web:build"]
+run = "npm run test --prefix clients/hive-web"
+
+[tasks."hive:web:build"]
+description = "Install locked frontend dependencies and build assets before Cargo"
+run = "npm ci --prefix clients/hive-web && npm run build --prefix clients/hive-web"
+
+[tasks."hive:build"]
+description = "Build frontend assets and the Rust workspace from a clean checkout"
+depends = ["hive:web:build"]
+run = "cargo build --workspace"
+
+[tasks."hive:ci"]
+description = "Prepare and test the frontend, then run aggregate Rust and documentation checks"
+depends = ["hive:web"]
+# Keep the project prerequisite outside template-owned task definitions.
+run = "mise run ci"
 
 [tasks."hive:tui"]
 description = "Run the Hive TUI"

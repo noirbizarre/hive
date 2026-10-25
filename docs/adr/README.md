@@ -27,6 +27,7 @@ by editing the old one. The history is the value.
 - [ADR-005](005-explicit-downstream-protocol-compatibility.md) — Explicit downstream protocol compatibility
 - [ADR-006](006-local-operational-http-and-acp-boundary.md) — Local operational HTTP and ACP boundary
 - [ADR-007](007-capability-aware-human-interaction-routing.md) — Capability-aware human interaction routing
+- [ADR-008](008-embedded-vue-interface.md) — Embedded Vue and OpenVue interface
 
 ## Subsequent decisions and current interpretation
 

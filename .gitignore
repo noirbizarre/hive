@@ -33,6 +33,7 @@ site/
 
 # Installed by the commitlint prek hook.
 node_modules/
+clients/hive-web/dist/
 
 # The gh-ship release artifact, written by the prepare-release workflow.
 /ship.release.json

@@ -84,3 +84,4 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 webbrowser = "1"
 ratatui = "0.30.2"
 crossterm = "0.29"
+nucleo-matcher = "0.3"

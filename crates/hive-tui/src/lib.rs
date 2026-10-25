@@ -1,5 +1,6 @@
 //! Full-screen ACPv2 client; the daemon remains the sole session authority.
 
+mod picker;
 mod state;
 mod theme;
 mod ui;
@@ -359,6 +360,7 @@ fn resume_failure(error: &agent_client_protocol::Error) -> String {
 }
 
 fn show_interaction(app: &mut App, interaction: &Interaction) {
+    app.picker = None;
     app.dialog_scroll = 0;
     app.dialog = Some(match interaction {
         Interaction::Permission(req, _) => format!(
@@ -623,15 +625,40 @@ async fn handle_key(
         return false;
     }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    if app.picker.is_some() {
+        let choices = app.config_choices();
+        let picker = app.picker.as_mut().unwrap();
+        picker.refresh(choices);
+        match (key.code, ctrl) {
+            (KeyCode::Esc, _) | (KeyCode::Char('p'), true) => app.picker = None,
+            (KeyCode::Char('q'), true) => return true,
+            (KeyCode::Up, _) => picker.navigate(-1),
+            (KeyCode::Down, _) => picker.navigate(1),
+            (KeyCode::PageUp, _) => picker.navigate(-10),
+            (KeyCode::PageDown, _) => picker.navigate(10),
+            (KeyCode::Backspace, false) => {
+                picker.query.pop();
+            }
+            (KeyCode::Char(ch), false) if !key.modifiers.contains(KeyModifiers::ALT) => {
+                picker.query.push(ch)
+            }
+            (KeyCode::Enter, _) => apply_configuration(cx, app),
+            _ => {}
+        }
+        let choices = app.config_choices();
+        if let Some(picker) = app.picker.as_mut() {
+            picker.refresh(choices);
+        }
+        return false;
+    }
     match (key.code, ctrl) {
         // Ctrl-M aliases Enter in terminals; Ctrl-P remains distinguishable for the model picker.
         (KeyCode::Char('p'), true) => {
-            app.page = if app.page == Page::Configuration {
-                Page::Chat
+            if let Some(id) = app.active.clone() {
+                app.picker = Some(picker::Picker::new(id, app.config_choices()));
             } else {
-                Page::Configuration
-            };
-            app.selected = 0;
+                app.status = "Open a session before choosing a model".into();
+            }
         }
         (KeyCode::Esc, _) | (KeyCode::Char('q'), true) => return true,
         (KeyCode::Tab, _) => {
@@ -650,7 +677,7 @@ async fn handle_key(
         }
         (KeyCode::Char('n'), true) => {
             app.page = Page::Profiles;
-            app.selected = 0;
+            app.profile_selected = 0;
         }
         (KeyCode::Char('r'), true) => {
             if let Some(id) = app.active.clone() {
@@ -735,13 +762,24 @@ async fn handle_key(
                 }
             }
         }
-        (KeyCode::Up, _) => app.selected = app.selected.saturating_sub(1),
+        (KeyCode::Up, _) => {
+            let selected = if app.page == Page::Profiles {
+                &mut app.profile_selected
+            } else {
+                &mut app.selected
+            };
+            *selected = selected.saturating_sub(1);
+        }
         (KeyCode::Down, _) => {
-            app.selected = app.selected.saturating_add(1).min(
+            let selected = if app.page == Page::Profiles {
+                &mut app.profile_selected
+            } else {
+                &mut app.selected
+            };
+            *selected = selected.saturating_add(1).min(
                 match app.page {
                     Page::Sessions => app.sessions.len(),
                     Page::Profiles => app.profiles.len(),
-                    Page::Configuration => app.config_choices().len(),
                     Page::Chat => 0,
                 }
                 .saturating_sub(1),
@@ -761,53 +799,6 @@ async fn handle_key(
             }
         }
         (KeyCode::Enter, _) => match app.page {
-            Page::Configuration => {
-                if !app.connected
-                    || !app.pilot()
-                    || app.conversation().is_some_and(|state| state.running)
-                    || app.configuration.is_some()
-                    || app
-                        .active
-                        .as_ref()
-                        .is_some_and(|id| app.pending.contains_key(id))
-                {
-                    app.status = "Take control of an idle session before changing its model".into();
-                } else if let (Some(id), Some((config_id, value, _)), Some(owner)) = (
-                    app.active.clone(),
-                    app.config_choices().get(app.selected).cloned(),
-                    app.owner.clone(),
-                ) {
-                    let request = v2::SetSessionConfigOptionRequest::new(
-                        v2::SessionId::new(id.clone()),
-                        v2::SessionConfigId::new(config_id),
-                        v2::SessionConfigOptionValue::Id {
-                            value: v2::SessionConfigValueId::new(value),
-                        },
-                    )
-                    .meta(owner);
-                    let request = cx.send_request(request).block_task();
-                    let (sent, received) = tokio::sync::oneshot::channel();
-                    app.configuration = Some(received);
-                    app.status = "Updating session configuration…".into();
-                    if let Err(error) = cx.spawn(async move {
-                        let _ = sent.send((
-                            id,
-                            request.await.map_err(|error| {
-                                error
-                                    .data
-                                    .as_ref()
-                                    .and_then(serde_json::Value::as_str)
-                                    .unwrap_or("Agent configuration failed; check the agent logs")
-                                    .to_owned()
-                            }),
-                        ));
-                        Ok(())
-                    }) {
-                        app.configuration = None;
-                        app.status = error.to_string();
-                    }
-                }
-            }
             Page::Sessions => {
                 if let Some(info) = app.sessions.get(app.selected).cloned()
                     && let Err(error) = resume(cx, app, info.session_id, info.cwd, "pilot").await
@@ -816,7 +807,7 @@ async fn handle_key(
                 }
             }
             Page::Profiles => {
-                if let Some(profile) = app.profiles.get(app.selected).cloned() {
+                if let Some(profile) = app.profiles.get(app.profile_selected).cloned() {
                     let mut meta = v2::Meta::new();
                     meta.insert("hive".into(), serde_json::json!({"agent": profile}));
                     if let Err(error) = relinquish_active(cx, app).await {
@@ -863,6 +854,113 @@ async fn handle_key(
         _ => {}
     }
     false
+}
+
+fn apply_configuration(cx: &V2ConnectionTo<Agent>, app: &mut App) {
+    // Repeated Enter must preserve both the in-flight request and its pending feedback.
+    if app.configuration.is_some() {
+        if let Some(picker) = app.picker.as_mut() {
+            picker.message = "Updating session configuration…".into();
+        }
+        return;
+    }
+    if !app.connected
+        || !app.pilot()
+        || app.conversation().is_some_and(|state| state.running)
+        || app
+            .active
+            .as_ref()
+            .is_some_and(|id| app.pending.contains_key(id))
+    {
+        app.status = "Take control of an idle session before changing its model".into();
+        if let Some(picker) = app.picker.as_mut() {
+            picker.message.clone_from(&app.status);
+        }
+        return;
+    }
+    let Some(picker) = app.picker.as_mut() else {
+        return;
+    };
+    if app.active.as_ref() != Some(&picker.session) {
+        return;
+    }
+    let Some((config_id, value, _)) = picker.selected().cloned() else {
+        return;
+    };
+    let Some(owner) = app.owner.clone() else {
+        return;
+    };
+    let id = picker.session.clone();
+    let request = v2::SetSessionConfigOptionRequest::new(
+        v2::SessionId::new(id.clone()),
+        v2::SessionConfigId::new(config_id),
+        v2::SessionConfigOptionValue::Id {
+            value: v2::SessionConfigValueId::new(value),
+        },
+    )
+    .meta(owner);
+    let request = cx.send_request(request).block_task();
+    let (sent, received) = oneshot::channel();
+    app.configuration = Some(received);
+    picker.pending = true;
+    picker.message = "Updating session configuration…".into();
+    app.status.clone_from(&picker.message);
+    if let Err(error) = cx.spawn(async move {
+        let _ = sent.send((
+            id,
+            request.await.map_err(|error| {
+                error
+                    .data
+                    .as_ref()
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("Agent configuration failed; check the agent logs")
+                    .to_owned()
+            }),
+        ));
+        Ok(())
+    }) {
+        app.configuration = None;
+        picker.pending = false;
+        picker.message = error.to_string();
+        app.status.clone_from(&picker.message);
+    }
+}
+
+fn configuration_result(
+    app: &mut App,
+    id: String,
+    result: Result<v2::SetSessionConfigOptionResponse, String>,
+) {
+    // A dismissed/reopened picker has pending=false, so an old result cannot close it.
+    let owns_result = app
+        .picker
+        .as_ref()
+        .is_some_and(|p| p.pending && p.session == id);
+    match result {
+        Ok(response) => {
+            let seq = response
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("hive"))
+                .and_then(|hive| hive["configSeq"].as_u64())
+                .unwrap_or(0);
+            app.conversations
+                .entry(id)
+                .or_default()
+                .config_snapshot(response.config_options, seq);
+            app.status = "Session configuration updated".into();
+            if owns_result {
+                app.picker = None;
+            }
+        }
+        Err(error) => {
+            if owns_result && let Some(picker) = app.picker.as_mut() {
+                picker.pending = false;
+                picker.message.clone_from(&error);
+            }
+            app.status = error;
+        }
+    }
 }
 
 async fn interaction_client<R>(
@@ -962,6 +1060,17 @@ async fn interaction_client<R>(
         .await
 }
 
+fn read_keys(keys: mpsc::UnboundedSender<Event>, mut next: impl FnMut() -> Option<Event>) {
+    // Tokio waits for blocking workers on shutdown even when no more terminal input arrives.
+    while !keys.is_closed() {
+        if let Some(event) = next()
+            && keys.send(event).is_err()
+        {
+            break;
+        }
+    }
+}
+
 pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut app = App {
         cwd: std::env::current_dir()?,
@@ -986,21 +1095,19 @@ pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error + Sen
         if options.session.is_none() {
             app.page = Page::Profiles;
         }
-        app.selected = app.profiles.iter().position(|id| id == agent).unwrap_or(0);
+        app.profile_selected = app.profiles.iter().position(|id| id == agent).unwrap_or(0);
     }
     let _guard = TerminalGuard::enter()?;
     let mut terminal =
         ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))?;
     let (keys_tx, mut keys) = mpsc::unbounded_channel();
-    tokio::task::spawn_blocking(move || {
-        loop {
-            if event::poll(Duration::from_millis(80)).unwrap_or(false)
-                && let Ok(event) = event::read()
-                && keys_tx.send(event).is_err()
-            {
-                break;
-            }
-        }
+    let reader = tokio::task::spawn_blocking(move || {
+        read_keys(keys_tx, || {
+            event::poll(Duration::from_millis(80))
+                .unwrap_or(false)
+                .then(|| event::read().ok())
+                .flatten()
+        });
     });
     let mut quit = false;
     while !quit {
@@ -1017,7 +1124,7 @@ pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error + Sen
                 app.connected = true;
                  if let Err(error) = refresh(&options.address, &mut app).await { app.status = error; }
                 if app.page == Page::Profiles && app.active.is_none() {
-                    app.selected = options.agent.as_ref().and_then(|agent| app.profiles.iter().position(|id| id == agent)).unwrap_or(0);
+                    app.profile_selected = options.agent.as_ref().and_then(|agent| app.profiles.iter().position(|id| id == agent)).unwrap_or(0);
                 }
                 let initial = app.active.clone().or_else(|| options.session.clone());
                 if let Some(id) = initial {
@@ -1039,16 +1146,13 @@ pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error + Sen
                         match receiver.try_recv() {
                             Ok((id, result)) => {
                                 app.configuration = None;
-                                match result {
-                                    Ok(response) => {
-                                        let seq = response.meta.as_ref().and_then(|meta| meta.get("hive")).and_then(|hive| hive["configSeq"].as_u64()).unwrap_or(0);
-                                        app.conversations.entry(id).or_default().config_snapshot(response.config_options, seq);
-                                        app.status = "Session configuration updated".into();
-                                    }
-                                    Err(error) => app.status = error,
-                                }
+                                 configuration_result(&mut app, id, result);
                             }
-                            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => { app.configuration = None; app.status = "Configuration interrupted; reopen the session to inspect its current model".into(); }
+                             Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                                 app.configuration = None;
+                                 let id = app.active.clone().unwrap_or_default();
+                                 configuration_result(&mut app, id, Err("Configuration interrupted; reopen the session to inspect its current model".into()));
+                             }
                             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
                         }
                     }
@@ -1146,6 +1250,7 @@ pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error + Sen
                 Ok(())
             }).await;
         app.connected = false;
+        app.picker = None;
         // A disconnected form draft must never reappear as an ordinary chat prompt.
         if app.dialog.take().is_some() {
             app.input.clear();
@@ -1157,12 +1262,36 @@ pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error + Sen
         terminal.draw(|frame| app.show(frame))?;
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
+    keys.close();
+    reader.await?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closing_the_keyboard_receiver_stops_an_idle_reader_without_another_key() {
+        let (keys, receiver) = mpsc::unbounded_channel();
+        let (started, ready) = std::sync::mpsc::channel();
+        let (finished, done) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            read_keys(keys, || {
+                let _ = started.send(());
+                std::thread::sleep(Duration::from_millis(10));
+                // A failing implementation eventually unblocks too, so it cannot hang the test runner.
+                (std::time::Instant::now() >= deadline).then_some(Event::FocusGained)
+            });
+            let _ = finished.send(());
+        });
+        ready.recv_timeout(Duration::from_secs(1)).unwrap();
+        drop(receiver);
+        let result = done.recv_timeout(Duration::from_millis(500));
+        worker.join().unwrap();
+        result.expect("an idle keyboard reader must observe receiver closure");
+    }
 
     #[tokio::test]
     async fn the_tui_adapter_keeps_concurrent_permissions_forms_and_url_completion_responsive() {

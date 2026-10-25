@@ -163,7 +163,7 @@ async fn submitted_prompts_wait_for_the_authoritative_echo_and_identical_prompts
             KeyModifiers::CONTROL,
         )
         .await;
-        assert!(app.page == Page::Configuration);
+        assert!(app.picker.is_some());
         app.owner = None;
         press(&cx, &mut app, &mut None, KeyCode::Enter).await;
         assert!(app.configuration.is_none());
@@ -188,15 +188,99 @@ async fn the_model_picker_preserves_provider_labels_and_sends_the_advertised_val
         app.owner = Some([("hive".into(), json!({"role":"pilot","generation":1,"token":"test"}))].into_iter().collect());
         key(&cx, &mut app, &mut None, KeyCode::Char('p'), KeyModifiers::CONTROL).await;
         assert!(app.config_choices()[1].2.contains("Provider / Careful"));
-        press(&cx, &mut app, &mut None, KeyCode::Down).await;
+        app.input = "unfinished prompt".into();
+        text(&cx, &mut app, &mut None, "prv crfl").await;
+        assert_eq!(app.picker.as_ref().unwrap().choices.len(), 1);
         press(&cx, &mut app, &mut None, KeyCode::Enter).await;
+        // A second Enter must keep the in-flight receiver rather than submit another change.
+        press(&cx, &mut app, &mut None, KeyCode::Enter).await;
+        assert_eq!(app.picker.as_ref().unwrap().message, "Updating session configuration…");
         let (id, response) = app.configuration.take().unwrap().await.unwrap();
         assert_eq!(id, "hive-test");
-        assert_eq!(serde_json::to_value(response.unwrap().config_options).unwrap()[0]["currentValue"], "careful");
+        let response = response.unwrap();
+        assert_eq!(serde_json::to_value(&response.config_options).unwrap()[0]["currentValue"], "careful");
         // Selection confirmation must come from the response/update, never the requested value alone.
         assert!(app.config_choices()[0].2.ends_with(" *"));
+        configuration_result(&mut app, id, Ok(response));
+        assert!(app.picker.is_none());
+        assert_eq!(app.input, "unfinished prompt");
         Ok(())
     }).await;
+}
+
+#[tokio::test]
+async fn dismissing_search_preserves_the_draft_and_no_matches_cannot_submit() {
+    connected(async |cx| {
+        let mut app = App {
+            connected: true,
+            ..App::default()
+        };
+        app.select_session("hive-test".into());
+        app.owner = Some(
+            [(
+                "hive".into(),
+                json!({"role":"pilot","generation":1,"token":"test"}),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let state = app.conversations.entry("hive-test".into()).or_default();
+        state.generation = 1;
+        state.config_options = serde_json::from_value(json!([{
+            "configId":"model", "name":"Model", "type":"select", "currentValue":"fast",
+            "options":[{"value":"fast","name":"Fast"}]
+        }]))
+        .unwrap();
+        app.input = "keep this draft".into();
+        key(
+            &cx,
+            &mut app,
+            &mut None,
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL,
+        )
+        .await;
+        text(&cx, &mut app, &mut None, "unmatched").await;
+        assert!(app.picker.as_ref().unwrap().choices.is_empty());
+        press(&cx, &mut app, &mut None, KeyCode::Enter).await;
+        assert!(app.configuration.is_none());
+        press(&cx, &mut app, &mut None, KeyCode::Esc).await;
+        assert!(app.picker.is_none());
+        assert_eq!(app.input, "keep this draft");
+        assert!(app.page == Page::Chat);
+        Ok(())
+    })
+    .await;
+}
+
+#[test]
+fn rejected_changes_keep_search_and_old_successes_do_not_close_a_reopened_picker() {
+    let mut app = App::default();
+    app.select_session("session".into());
+    app.picker = Some(picker::Picker::new("session".into(), vec![]));
+    let picker = app.picker.as_mut().unwrap();
+    picker.pending = true;
+    picker.query = "careful".into();
+    configuration_result(
+        &mut app,
+        "session".into(),
+        Err("Agent rejected model".into()),
+    );
+    let picker = app.picker.as_ref().unwrap();
+    assert_eq!(picker.query, "careful");
+    assert_eq!(picker.message, "Agent rejected model");
+    assert!(!picker.pending);
+    app.picker = Some(picker::Picker::new("session".into(), vec![]));
+    configuration_result(
+        &mut app,
+        "session".into(),
+        Ok(v2::SetSessionConfigOptionResponse::new(vec![])),
+    );
+    assert!(app.picker.is_some());
+    let (interaction, _receiver) = permission();
+    show_interaction(&mut app, &interaction);
+    assert!(app.picker.is_none());
+    assert!(app.dialog.is_some());
 }
 
 fn form(

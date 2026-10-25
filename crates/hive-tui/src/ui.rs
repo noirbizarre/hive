@@ -5,11 +5,12 @@ use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, List, ListItem, ListState, Padding, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap},
 };
 use serde::Deserialize;
 
 use crate::{
+    picker::Picker,
     state::{Conversation, LineKind},
     theme::Theme,
 };
@@ -40,7 +41,6 @@ pub enum Page {
     #[default]
     Sessions,
     Profiles,
-    Configuration,
     Chat,
 }
 
@@ -49,7 +49,13 @@ pub struct App {
     pub page: Page,
     pub sessions: Vec<SessionSummary>,
     pub profiles: Vec<String>,
+    // Catalog refreshes reconcile only the session cursor, never another picker's selection.
     pub selected: usize,
+    pub profile_selected: usize,
+    // List widgets update offsets while drawing; retaining them prevents viewport jumps on redraw.
+    pub session_list: ListState,
+    pub profile_list: ListState,
+    pub picker: Option<Picker>,
     pub all: bool,
     pub active: Option<String>,
     pub recent: Vec<String>,
@@ -148,6 +154,7 @@ impl App {
     }
 
     pub fn select_session(&mut self, id: String) {
+        self.picker = None;
         if let Some(previous) = self.active.take() {
             self.drafts
                 .insert(previous, std::mem::take(&mut self.input));
@@ -189,7 +196,7 @@ impl App {
             })
     }
 
-    pub fn show(&self, frame: &mut Frame) {
+    pub fn show(&mut self, frame: &mut Frame) {
         let theme = Theme;
         let area = frame.area();
         frame.render_widget(Block::default().style(theme.text()), area);
@@ -222,23 +229,6 @@ impl App {
         match self.page {
             Page::Sessions => self.render_sessions(frame, sections[1], theme),
             Page::Profiles => self.render_profiles(frame, sections[1], theme),
-            Page::Configuration => {
-                let choices = self.config_choices();
-                if choices.is_empty() {
-                    frame.render_widget(Paragraph::new("This backend does not expose model selection. Tab returns to sessions."), sections[1]);
-                } else {
-                    let list = List::new(
-                        choices
-                            .iter()
-                            .map(|(_, _, label)| ListItem::new(label.as_str())),
-                    )
-                    .highlight_symbol("▸ ")
-                    .highlight_style(theme.selected());
-                    let mut selected = ListState::default()
-                        .with_selected(Some(self.selected.min(choices.len() - 1)));
-                    frame.render_stateful_widget(list, sections[1], &mut selected);
-                }
-            }
             Page::Chat => self.render_conversation(frame, sections[1], theme),
         }
         self.render_composer(frame, sections[2], theme);
@@ -246,6 +236,84 @@ impl App {
         if columns[1].width > 0 {
             self.render_sidebar(frame, columns[1], theme);
         }
+        self.render_picker(frame, theme);
+    }
+
+    fn render_picker(&mut self, frame: &mut Frame, theme: Theme) {
+        let choices = self.config_choices();
+        let unsupported = choices.is_empty();
+        let Some(picker) = self.picker.as_mut() else {
+            return;
+        };
+        picker.refresh(choices);
+        let screen = frame.area();
+        let width = screen
+            .width
+            .saturating_sub(4)
+            .max(screen.width.min(4))
+            .min(90);
+        let height = screen
+            .height
+            .saturating_sub(4)
+            .max(screen.height.min(4))
+            .min(24);
+        let area = Rect::new(
+            screen.x + (screen.width - width) / 2,
+            screen.y + (screen.height - height) / 2,
+            width,
+            height,
+        );
+        frame.render_widget(Clear, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Provider / Model ")
+            .style(theme.text());
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let sections = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(2),
+        ])
+        .split(inner);
+        // Tail-scroll the query so typing remains visible on narrow terminals.
+        let query = format!("Search: {}", picker.query);
+        let scroll = query
+            .chars()
+            .count()
+            .saturating_sub(sections[0].width.saturating_sub(1) as usize)
+            .min(u16::MAX as usize) as u16;
+        frame.render_widget(
+            Paragraph::new(query)
+                .scroll((0, scroll))
+                .style(theme.accent()),
+            sections[0],
+        );
+        if picker.choices.is_empty() {
+            frame.render_widget(
+                Paragraph::new(if unsupported {
+                    "This backend does not expose model selection."
+                } else {
+                    "No matching models."
+                }),
+                sections[1],
+            );
+        } else {
+            let list = List::new(picker.choices.iter().map(|c| ListItem::new(c.2.as_str())))
+                .highlight_symbol("▸ ")
+                .highlight_style(theme.selected());
+            frame.render_stateful_widget(list, sections[1], &mut picker.list);
+        }
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::styled(&picker.message, theme.warning()),
+                Line::styled(
+                    "↑↓ select · Enter apply · Esc close · Ctrl-Q quit",
+                    theme.muted(),
+                ),
+            ]),
+            sections[2],
+        );
     }
 
     fn render_heading(&self, frame: &mut Frame, area: Rect, theme: Theme) {
@@ -259,7 +327,6 @@ impl App {
                 .unwrap_or("Select a session"),
             Page::Sessions => "Sessions",
             Page::Profiles => "New session · Select an agent",
-            Page::Configuration => "Provider / Model · Session configuration",
         };
         frame.render_widget(
             Paragraph::new(vec![
@@ -283,7 +350,7 @@ impl App {
         );
     }
 
-    fn render_sessions(&self, frame: &mut Frame, area: Rect, theme: Theme) {
+    fn render_sessions(&mut self, frame: &mut Frame, area: Rect, theme: Theme) {
         if self.sessions.is_empty() {
             let (title, help) = if self.all {
                 ("No sessions yet", "Ctrl-N  create a session")
@@ -371,12 +438,12 @@ impl App {
             .block(Block::default().padding(Padding::horizontal(3)))
             .highlight_symbol("▸ ")
             .highlight_style(theme.selected());
-        let mut selected = ListState::default()
-            .with_selected(self.sessions.get(self.selected).map(|_| self.selected));
-        frame.render_stateful_widget(list, area, &mut selected);
+        self.session_list
+            .select(self.sessions.get(self.selected).map(|_| self.selected));
+        frame.render_stateful_widget(list, area, &mut self.session_list);
     }
 
-    fn render_profiles(&self, frame: &mut Frame, area: Rect, theme: Theme) {
+    fn render_profiles(&mut self, frame: &mut Frame, area: Rect, theme: Theme) {
         if self.profiles.is_empty() {
             // Profiles are loaded at startup, so restarting only the daemon leaves this picker empty.
             frame.render_widget(
@@ -401,9 +468,12 @@ impl App {
         .block(Block::default().padding(Padding::horizontal(3)))
         .highlight_symbol("▸ ")
         .highlight_style(theme.selected());
-        let mut selected = ListState::default()
-            .with_selected(self.profiles.get(self.selected).map(|_| self.selected));
-        frame.render_stateful_widget(list, area, &mut selected);
+        self.profile_list.select(
+            self.profiles
+                .get(self.profile_selected)
+                .map(|_| self.profile_selected),
+        );
+        frame.render_stateful_widget(list, area, &mut self.profile_list);
     }
 
     fn render_conversation(&self, frame: &mut Frame, area: Rect, theme: Theme) {
@@ -547,9 +617,6 @@ impl App {
             }
             Page::Profiles if self.profiles.is_empty() => "Tab sessions  Esc quit",
             Page::Profiles => "↑↓ select  Enter create  Tab sessions  Esc quit",
-            Page::Configuration => {
-                "↑↓ select  Enter apply  Ctrl-T take control  Ctrl-P chat  Tab sessions"
-            }
             Page::Chat if self.dialog.is_some() => "Enter confirm  Esc decline",
             Page::Chat => {
                 "Enter send  Ctrl-P model  Tab sessions  Ctrl-B recent  Ctrl-N new  Ctrl-T pilot  Ctrl-H handoff  Ctrl-R live  Ctrl-Y acknowledge recovery  Ctrl-C cancel  Esc quit"
@@ -738,7 +805,7 @@ mod tests {
 
     #[test]
     fn an_empty_session_overview_explains_how_to_create_a_session() {
-        let app = App {
+        let mut app = App {
             all: true,
             ..App::default()
         };
@@ -850,7 +917,7 @@ mod tests {
                 "daemon and TUI.",
             ),
         ] {
-            let app = App {
+            let mut app = App {
                 page,
                 all,
                 ..App::default()
@@ -970,6 +1037,49 @@ mod tests {
     }
 
     #[test]
+    fn catalog_refresh_and_redraws_preserve_picker_identity_and_viewport() {
+        let mut app = App::default();
+        app.select_session("session".into());
+        app.input = "draft underneath".into();
+        app.conversations.entry("session".into()).or_default().config_options =
+            serde_json::from_value(serde_json::json!([{
+                "configId": "model", "name": "Model", "type": "select", "currentValue": "0",
+                "options": (0..60).map(|i| serde_json::json!({"value": i.to_string(), "name": format!("Model {i}")})).collect::<Vec<_>>()
+            }])).unwrap();
+        app.picker = Some(Picker::new("session".into(), app.config_choices()));
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        app.picker.as_mut().unwrap().navigate(35);
+        terminal.draw(|frame| app.show(frame)).unwrap();
+        let offset = app.picker.as_ref().unwrap().list.offset();
+        assert!(offset > 0);
+        app.profile_selected = 12;
+        app.update_sessions(vec![]);
+        assert_eq!(app.profile_selected, 12);
+        app.picker.as_mut().unwrap().navigate(-1);
+        for _ in 0..3 {
+            terminal.draw(|frame| app.show(frame)).unwrap();
+            assert_eq!(app.picker.as_ref().unwrap().list.offset(), offset);
+            assert_eq!(app.picker.as_ref().unwrap().selected().unwrap().1, "34");
+        }
+        assert!(screen(&terminal).contains("Provider / Model"));
+        assert!(screen(&terminal).contains("draft underneath"));
+    }
+
+    #[test]
+    fn the_configuration_modal_handles_empty_results_and_tiny_terminals() {
+        let mut app = App::default();
+        app.select_session("session".into());
+        app.picker = Some(Picker::new("session".into(), vec![]));
+        for (width, height) in [(80, 20), (18, 5), (3, 2), (1, 1), (0, 0)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| app.show(frame)).unwrap();
+            if width == 80 {
+                assert!(screen(&terminal).contains("does not expose model selection"));
+            }
+        }
+    }
+
+    #[test]
     fn hiding_the_overview_keeps_the_active_conversation() {
         let mut app = App {
             page: Page::Chat,
@@ -1049,10 +1159,10 @@ mod tests {
 
     #[test]
     fn selected_profiles_are_visible_on_the_terminal_background() {
-        let app = App {
+        let mut app = App {
             page: Page::Profiles,
             profiles: vec!["pi".into(), "opencode".into()],
-            selected: 1,
+            profile_selected: 1,
             ..App::default()
         };
         let mut terminal = Terminal::new(TestBackend::new(100, 14)).unwrap();
@@ -1070,7 +1180,7 @@ mod tests {
 
     #[test]
     fn narrow_and_tiny_terminals_keep_dialogs_and_control_visible() {
-        let app = App {
+        let mut app = App {
             page: Page::Chat,
             dialog: Some("Allow access?\n1: yes".into()),
             active: Some("hive-one".into()),

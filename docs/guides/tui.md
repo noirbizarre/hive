@@ -32,21 +32,22 @@ so the same sessions are available in the Web UI and other ACP clients.
 | `Ctrl-C` | Cancel foreground work |
 | `Ctrl-R` | Accept live-only attachment after a history gap |
 | `Ctrl-Y` | Acknowledge interrupted work and take control |
-| Esc / `Ctrl-Q` | Quit without closing the session |
+| Esc | Close the model picker, or quit outside dialogs |
+| `Ctrl-Q` | Quit without closing the session (outside agent questions) |
 
 Recovery acknowledgement requires checking the downstream state first. See
 [sessions and handoff](sessions.md) for what these operations guarantee.
 
-If quitting restores the screen but leaves the process waiting, press Enter
-once. See the [terminal-reader workaround](../troubleshooting.md#the-tui-leaves-its-screen-but-does-not-return-to-the-shell).
-
 ## Choose a provider and model
 
 Create a session with `Ctrl-N`, then press `Ctrl-P` before sending a prompt.
-The picker lists the agent's advertised configuration choices, grouped by
-provider when available; `*` marks current values. Use arrows and Enter to
-apply a choice, and `Ctrl-P` to return to chat. Current choices also appear
-under the conversation heading when space permits.
+The modal lists the agent's advertised configuration choices, grouped by
+provider when available; `*` marks current values. Type to fuzzy-search provider
+and model names. Use arrows or Page Up/Down to navigate and Enter to apply a
+choice. Successful changes close the modal; errors keep the search open for
+retry. Esc or `Ctrl-P` closes it without changing your chat draft. Selection and
+scroll position stay stable while the session catalog refreshes. Current choices
+also appear under the conversation heading when space permits.
 
 The backend profile chooses the agent process or server; provider/model
 selection configures that agent. Take control with `Ctrl-T` before editing an

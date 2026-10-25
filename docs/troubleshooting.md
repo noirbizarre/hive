@@ -99,14 +99,6 @@ recovery acknowledgement action before sending anything new. See
 Native adoption needs both `agent` and `adopt` metadata. An OpenCode REST server
 is not an ACP endpoint. See [OpenCode integration](agents/opencode.md).
 
-## The TUI leaves its screen but does not return to the shell
-
-After Esc closes the interface, the process can still be waiting for its
-blocking terminal-input reader to finish. Press Enter once to deliver the final
-input event and let it exit. The session has detached and remains in the daemon.
-
-This workaround was observed in the isolated mock-agent quickstart check.
-
 ## Reporting a problem
 
 Include Hive/agent versions, transport, selected profile ID, diagnostic code,

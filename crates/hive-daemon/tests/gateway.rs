@@ -33,6 +33,145 @@ async fn summaries(address: SocketAddr) -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn reload_changes_new_sessions_without_interrupting_an_existing_worker() {
+    let dir = std::env::temp_dir().join(format!("hive-live-reload-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("config.toml");
+    let command = env!("CARGO_BIN_EXE_hive-test-agent");
+    std::fs::write(
+        &path,
+        format!("default_agent = 'old'\n[agents.old]\ncommand = {command:?}\n"),
+    )
+    .unwrap();
+    let source = hive_daemon::config::ConfigSource::new(Some(path.clone())).unwrap();
+    let broker = hive_daemon::Broker::new(source.load().unwrap()).with_config_source(source);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router =
+        hive_daemon::router_with_origin(broker.clone(), Some(&format!("http://{address}")));
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let connection = HttpClient::new(format!("ws://{address}")).unwrap();
+    timeout(
+        Duration::from_secs(15),
+        Client.v2().connect_with(connection, async |cx| {
+            cx.send_request(v2::InitializeRequest::new(
+                ProtocolVersion::V2,
+                v2::Implementation::new("reload-test", "1"),
+            ))
+            .block_task()
+            .await?;
+            let cwd = std::env::current_dir().map_err(Error::into_internal_error)?;
+            let original = cx
+                .send_request(v2::NewSessionRequest::new(cwd.clone()))
+                .block_task()
+                .await?;
+            std::fs::write(
+                &path,
+                format!("default_agent = 'new'\n[agents.new]\ncommand = {command:?}\n"),
+            )
+            .unwrap();
+            let client = reqwest::Client::new();
+            let endpoint = format!("http://{address}/v1/config/reload");
+            let before = summaries(address).await["revision"].as_u64().unwrap();
+            let forbidden = client
+                .post(&endpoint)
+                .header("origin", "https://example.com")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(forbidden.status(), 403);
+            assert_eq!(summaries(address).await["revision"], before);
+            let reloaded: serde_json::Value = client
+                .post(&endpoint)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert!(reloaded["revision"].as_u64().unwrap() > before);
+            let providers: serde_json::Value =
+                reqwest::get(format!("http://{address}/v1/providers"))
+                    .await
+                    .unwrap()
+                    .json()
+                    .await
+                    .unwrap();
+            assert_eq!(providers["defaultAgent"], "new");
+            assert_eq!(providers["agents"].as_array().unwrap().len(), 1);
+            let new = cx
+                .send_request(v2::NewSessionRequest::new(cwd.clone()))
+                .block_task()
+                .await?;
+            assert_ne!(new.session_id, original.session_id);
+            let list = summaries(address).await;
+            assert!(
+                list["sessions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s["agent"] == "old")
+            );
+            assert!(
+                list["sessions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s["agent"] == "new")
+            );
+            // Both model setting and prompting exercise the retained original subprocess after removal.
+            cx.send_request(
+                v2::SetSessionConfigOptionRequest::new(
+                    original.session_id.clone(),
+                    v2::SessionConfigId::new("model"),
+                    v2::SessionConfigOptionValue::Id {
+                        value: v2::SessionConfigValueId::new("careful"),
+                    },
+                )
+                .meta(original.meta.clone()),
+            )
+            .block_task()
+            .await?;
+            cx.send_request(
+                v2::PromptRequest::new(original.session_id.clone(), vec!["still alive".into()])
+                    .meta(controlled(&original.meta, "after-reload")),
+            )
+            .block_task()
+            .await?;
+            std::fs::write(&path, "unknown = 'secret-must-not-leak'\n[").unwrap();
+            let revision = summaries(address).await["revision"].clone();
+            let rejected = client.post(&endpoint).send().await.unwrap();
+            assert_eq!(rejected.status(), 422);
+            let error = rejected.text().await.unwrap();
+            assert!(error.contains("hive::config::syntax"));
+            assert!(!error.contains("secret-must-not-leak"));
+            assert!(
+                !broker
+                    .reload_config()
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("secret-must-not-leak")
+            );
+            // Worker activity can advance the catalog independently; the selected default remains new.
+            assert!(
+                summaries(address).await["revision"].as_u64().unwrap()
+                    >= revision.as_u64().unwrap()
+            );
+            Ok::<_, Error>(())
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    broker.shutdown().await;
+    server.abort();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
 async fn browser_origins_accept_localhost_on_the_listener_port_and_reject_other_origins() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();

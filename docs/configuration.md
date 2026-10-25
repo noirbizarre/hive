@@ -14,8 +14,8 @@ The file is selected in this order:
 5. `./hive/config.toml` when both variables are unset.
 
 An absent default file produces an empty configuration. An absent explicitly
-selected file is an error. Files are not merged, and changes require a daemon
-restart. Unknown fields are rejected rather than silently ignored.
+selected file is an error. Files are not merged. Unknown fields are rejected
+rather than silently ignored.
 
 Use the same file when checking and serving:
 
@@ -23,6 +23,36 @@ Use the same file when checking and serving:
 hive doctor --config /absolute/path/config.toml
 hive daemon --config /absolute/path/config.toml
 ```
+
+## Reloading changes
+
+After editing, run `hive daemon reload`, or send SIGHUP to the daemon on Unix.
+Hive rereads the original path, including files replaced atomically by an editor.
+It validates the entire candidate before publishing it. Invalid or unreadable
+files leave the previous configuration active; deleting even an implicit default
+file causes reload to fail rather than clear the registry.
+
+New defaults and profiles apply to new sessions. Existing sessions keep their
+original agents, connections, credentials, and pricing, even when their profile
+is removed. Open browser and TUI clients refresh their provider lists automatically.
+Reload does not retry recovery of offline sessions.
+
+An OpenCode profile ID remains associated with its existing sessions, including
+saved offline sessions. Changing its server connection identity or adapter kind
+is rejected with `hive::reload::profile_identity`; use a new profile ID for the
+new server. Removing and re-adding the old ID does not erase that association.
+Connection identity conservatively includes endpoint, headers, authentication
+username, and password environment-variable name, so routing/authentication edits
+can also require a new ID. Secrets are not stored as plaintext in the identity.
+Older saved sessions establish their initial identity from the startup profile;
+that pre-upgrade identity cannot be independently verified. If the startup profile
+is absent, an unknown legacy binding reserves its ID; use a new ID rather than
+reusing it for another server.
+
+Reload uses the daemon's environment, including `HIVE_DEFAULT_AGENT`; exporting
+variables in the calling shell does not update a running process. The original
+file path is retained even if the reload caller sets another `HIVE_CONFIG`.
+Listen address, state/runtime locations, and tracing settings require restart.
 
 ## Top-level settings
 

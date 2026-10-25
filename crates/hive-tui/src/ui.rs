@@ -172,9 +172,12 @@ impl App {
         self.recent.retain(|id| {
             self.active.as_ref() == Some(id) || self.sessions.iter().any(|s| &s.session_id == id)
         });
-        self.selected = selected_id
-            .and_then(|id| self.sessions.iter().position(|s| s.session_id == id))
-            .unwrap_or_else(|| self.selected.min(self.sessions.len().saturating_sub(1)));
+        if self.page != Page::Profiles {
+            // The provider picker uses this index for a different list.
+            self.selected = selected_id
+                .and_then(|id| self.sessions.iter().position(|s| s.session_id == id))
+                .unwrap_or_else(|| self.selected.min(self.sessions.len().saturating_sub(1)));
+        }
     }
 
     pub fn conversation(&self) -> Option<&Conversation> {
@@ -458,7 +461,7 @@ impl App {
                 Paragraph::new(vec![
                     Line::styled("No agents configured", theme.text()),
                     Line::styled(
-                        "Add an [agents.<id>] profile to the daemon configuration, then restart the daemon and TUI.",
+                        "Add an [agents.<id>] profile to the daemon configuration, then run hive daemon reload.",
                         theme.muted(),
                     ),
                 ])
@@ -904,7 +907,7 @@ mod tests {
                 Page::Profiles,
                 false,
                 "No agents configured",
-                "daemon and TUI.",
+                "daemon reload.",
             ),
         ] {
             let mut app = App {

@@ -347,6 +347,75 @@ fn data_code(error: &Error) -> String {
 
 // ---- discovery and adoption ---------------------------------------------------------------
 
+#[test]
+fn reload_keeps_native_sessions_on_their_original_server_until_explicit_close() {
+    let dir = std::env::temp_dir().join(format!("hive-oc-reload-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    {
+        // Axum's upgraded connections can outlive its listener. Drop the runtime before
+        // removing SQLite files so Windows also observes all background handles closing.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+    let (first, first_url) = fake_opencode::start(Options::default()).await;
+    let (_second, second_url) = fake_opencode::start(Options::default()).await;
+    first.add_session("ses_a", "Original", &cwd());
+    let path = dir.join("config.toml");
+    let text = |url: &str| {
+        format!("default_agent = 'oc'\n[agents.oc]\nkind = 'opencode-server'\nendpoint = {url:?}\n")
+    };
+    std::fs::write(&path, text(&first_url)).unwrap();
+    let source = hive_daemon::config::ConfigSource::new(Some(path.clone())).unwrap();
+    let broker =
+        hive_daemon::Broker::persistent(source.load().unwrap(), dir.join("state/sessions.sqlite3"))
+            .unwrap()
+            .with_config_source(source);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = hive_daemon::router(broker.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    connect(address, Pilot::default(), async |cx, mut updates| {
+        let session = cx.send_request(adopt_request("ses_a")).block_task().await?;
+        std::fs::write(&path, text(&second_url)).unwrap();
+        assert!(matches!(
+            broker.reload_config().await,
+            Err(hive_daemon::reload::ReloadError::Identity(_))
+        ));
+        std::fs::write(&path, "").unwrap();
+        broker.reload_config().await.unwrap();
+        std::fs::write(&path, text(&second_url)).unwrap();
+        assert!(matches!(
+            broker.reload_config().await,
+            Err(hive_daemon::reload::ReloadError::Identity(_))
+        ));
+        cx.send_request(prompt(
+            &session.session_id,
+            &session.meta,
+            "after-reload",
+            "continue",
+        ))
+        .block_task()
+        .await?;
+        until(&mut updates, &session.session_id, is_idle).await;
+        cx.send_request(v2::CloseSessionRequest::new(session.session_id).meta(session.meta))
+            .block_task()
+            .await?;
+        broker.reload_config().await.unwrap();
+        assert_eq!(discover(address, "oc", None).await.0, 200);
+        Ok(())
+    })
+    .await;
+    broker.shutdown().await;
+    server.abort();
+    let _ = server.await;
+    drop(broker);
+    });
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
 #[tokio::test]
 async fn discovery_lists_native_sessions_and_marks_the_adopted_ones() {
     let (fake, url) = fake_opencode::start(Options::default()).await;

@@ -2,13 +2,80 @@ import { afterEach, beforeEach, test } from 'node:test';
 import { strict as assert } from 'node:assert';
 import { JSDOM } from 'jsdom';
 import { readFileSync } from 'node:fs';
-import { connect, conversation, mount, validateContent } from './app.js';
+import { catalog, connect, conversation, mount, validateContent } from './app.js';
 
 const session = { sessionId: 'hive-tui', cwd: '/workspace', agent: 'pi', title: 'Review parser',
   activity: 'idle', controlOwner: 'tui-connection', lastActivityAt: 1791754566280 };
 
 const modelOptions = currentValue => [{ configId: 'model', name: 'Model', category: 'model', type: 'select', currentValue,
   options: [{ groupId: 'provider', name: 'Provider', options: [{ value: 'fast', name: 'Fast' }, { value: 'careful', name: 'Careful' }] }] }];
+
+test('provider invalidations preserve selection and drafts without changing the attached conversation', async () => {
+  const dom = new JSDOM(readFileSync(new URL('./index.html', import.meta.url), 'utf8'), { url: 'http://localhost/ui?session=hive-tui' });
+  globalThis.document = dom.window.document;
+  globalThis.location = dom.window.location;
+  globalThis.history = dom.window.history;
+  globalThis.FormData = dom.window.FormData;
+  let revision = 1;
+  let agents = [{ id: 'pi', name: 'Pi' }, { id: 'other', name: 'Other' }];
+  globalThis.fetch = async url => ({ ok: true, json: async () => url.includes('providers')
+    ? { agents, defaultAgent: agents[0]?.id } : { revision, sessions: [session] } });
+  let source;
+  globalThis.EventSource = class {
+    constructor() { source = this; }
+    addEventListener(_, listener) { this.revision = listener; }
+    close() {}
+  };
+  const sockets = transport();
+  let view;
+  const client = connect('ws://localhost/acp', state => view?.show(state));
+  view = mount(client);
+  await new Promise(resolve => setImmediate(resolve));
+  const select = document.querySelector('#agent');
+  select.value = 'other';
+  const input = document.querySelector('#prompt input');
+  input.value = 'unsent draft';
+  const sent = sockets[0].sent.length;
+  agents = [{ id: 'new', name: 'New' }, { id: 'other', name: 'Renamed' }];
+  source.revision({ data: String(++revision) });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(select.value, 'other');
+  assert.equal(select.selectedOptions[0].textContent, 'Renamed');
+  agents = [{ id: 'new', name: 'New' }];
+  source.revision({ data: String(++revision) });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(select.value, 'new');
+  assert.equal(select.options.length, 1);
+  assert.equal(input.value, 'unsent draft');
+  assert.equal(client.state().session.sessionId, 'hive-tui');
+  assert.equal(sockets[0].sent.length, sent);
+  view.close();
+  dom.window.close();
+});
+
+test('older provider responses cannot overwrite a newer catalog refresh', async () => {
+  const pending = [];
+  let revision = 1;
+  globalThis.fetch = async url => url.includes('providers')
+    ? new Promise(resolve => pending.push(inventory => resolve({ ok: true, json: async () => inventory })))
+    : { ok: true, json: async () => ({ revision, sessions: [] }) };
+  let source;
+  globalThis.EventSource = class {
+    constructor() { source = this; }
+    addEventListener(_, listener) { this.revision = listener; }
+    close() {}
+  };
+  const applied = [];
+  const feed = catalog(() => {}, () => {}, inventory => applied.push(inventory));
+  await new Promise(resolve => setImmediate(resolve));
+  source.revision({ data: String(++revision) });
+  pending[1]({ agents: [{ id: 'latest' }] });
+  await new Promise(resolve => setImmediate(resolve));
+  pending[0]({ agents: [{ id: 'obsolete' }] });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(applied, [{ agents: [{ id: 'latest' }] }]);
+  feed.close();
+});
 
 test('failed initialization rejects pending clicks and reconnect opens only the latest desired session', async () => {
   const sockets = transport((socket, message) => {

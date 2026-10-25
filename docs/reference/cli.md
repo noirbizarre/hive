@@ -10,6 +10,7 @@ Use `hive <command> --help` for the installed executable's exact help.
 | `hive` / `hive tui` | Terminal client | `--address`, `--transport`, `--agent`, `--session` |
 | `hive daemon` | Foreground daemon | `--listen`, `--config` |
 | `hive daemon status` | Print daemon status response | `--url` |
+| `hive daemon reload` | Reload the original config for new sessions | `--url` |
 | `hive web` | Open embedded browser client | `--url` |
 | `hive doctor [AGENT]...` | Diagnose all or selected profiles and daemon setup | `--config`, `--listen`, `--json` |
 | `hive completions <shell>` | Write shell completion script to stdout | Shell argument |
@@ -41,7 +42,7 @@ Doctor checks every profile unless IDs are supplied. `--json` prints one report
 object. Errors exit 1; warnings alone exit 0. It probes initialization without
 prompting and does not create daemon lock/state files.
 
-## Web and status URLs
+## Web, status, and reload URLs
 
 Their daemon base URL is selected in this order:
 
@@ -54,10 +55,16 @@ For status, place `--url` on the status subcommand:
 
 ```sh
 hive daemon status --url http://127.0.0.1:9000
+hive daemon reload --url http://127.0.0.1:9000
 ```
 
-The parent daemon `--listen` option does not set the status URL. Web appends
+The parent daemon `--listen` option does not set the status or reload URL. Web appends
 `/ui` to its base URL.
+
+Reload accepts no configuration-path option: the running daemon retains its
+startup source. It prints JSON on success and a diagnostic with nonzero exit
+status on failure. Unix SIGHUP invokes the same operation. See
+[operations](../operations.md#reloading-configuration).
 
 ## Environment variables
 
@@ -65,8 +72,8 @@ The parent daemon `--listen` option does not set the status URL. Web appends
 | --- | --- | --- |
 | `HIVE_CONFIG` | Daemon, doctor, serve | Configuration file |
 | `HIVE_DEFAULT_AGENT` | Configuration loading | Override default profile ID |
-| `HIVE_LISTEN` | Daemon, doctor, serve | Listen address; URL fallback for status/web |
-| `HIVE_URL` | Status, web | Daemon base URL |
+| `HIVE_LISTEN` | Daemon, doctor, serve | Listen address; URL fallback for status/web/reload |
+| `HIVE_URL` | Status, web, reload | Daemon base URL |
 | `RUST_LOG` | Daemon tracing | Log filter |
 | `XDG_CONFIG_HOME` | Configuration lookup | Configuration base directory |
 | `XDG_RUNTIME_DIR` | Instance lock | Runtime base directory |

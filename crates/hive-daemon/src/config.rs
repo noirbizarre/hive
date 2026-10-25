@@ -13,6 +13,43 @@ pub struct Config {
     pub agents: BTreeMap<String, Profile>,
 }
 
+/// The selected path is anchored once, so reload cannot switch sources with the caller's cwd.
+#[derive(Clone, Debug)]
+pub struct ConfigSource {
+    path: PathBuf,
+    implicit: bool,
+}
+
+impl ConfigSource {
+    pub fn new(path: Option<PathBuf>) -> Result<Self, ConfigError> {
+        let implicit = path.is_none();
+        let path = path.unwrap_or_else(default_path);
+        let path = std::path::absolute(path).map_err(|_| {
+            ConfigError::Unreadable(
+                "cannot resolve Hive config path; check the working directory".into(),
+            )
+        })?;
+        Ok(Self { path, implicit })
+    }
+
+    pub fn load(&self) -> Result<Config, ConfigError> {
+        self.read(self.implicit)
+    }
+
+    pub fn reload(&self) -> Result<Config, ConfigError> {
+        // A disappearing file must never silently erase a working registry.
+        self.read(false)
+    }
+
+    fn read(&self, missing_ok: bool) -> Result<Config, ConfigError> {
+        let config = Config::read_path(self.path.clone(), missing_ok)?;
+        if let Some(problem) = config.problems().into_iter().next() {
+            return Err(problem.error);
+        }
+        Ok(config)
+    }
+}
+
 /// Which downstream adapter speaks for a profile.
 ///
 /// Explicit rather than inferred from `endpoint`: an OpenCode server and an ACP
@@ -332,6 +369,10 @@ impl Config {
     pub fn read(path: Option<PathBuf>) -> Result<Self, ConfigError> {
         let explicit = path.is_some();
         let path = path.unwrap_or_else(default_path);
+        Self::read_path(path, !explicit)
+    }
+
+    fn read_path(path: PathBuf, missing_ok: bool) -> Result<Self, ConfigError> {
         let mut config: Self = match std::fs::read_to_string(&path) {
             Ok(text) => toml::from_str(&text).map_err(|error: toml::de::Error| {
                 let line = error.span().map(|span| {
@@ -348,7 +389,7 @@ impl Config {
                     line.map_or(String::new(), |line| format!(" near line {line}"))
                 ))
             })?,
-            Err(error) if !explicit && error.kind() == std::io::ErrorKind::NotFound => {
+            Err(error) if missing_ok && error.kind() == std::io::ErrorKind::NotFound => {
                 Self::default()
             }
             Err(error) => {
@@ -452,7 +493,29 @@ pub fn default_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::Config;
+    use super::{Config, ConfigError, ConfigSource};
+
+    #[test]
+    fn a_missing_implicit_source_is_allowed_only_at_startup() {
+        let source = ConfigSource {
+            path: std::env::temp_dir().join(format!("hive-missing-{}.toml", uuid::Uuid::new_v4())),
+            implicit: true,
+        };
+        assert!(source.load().is_ok());
+        assert!(matches!(source.reload(), Err(ConfigError::Unreadable(_))));
+        let explicit = ConfigSource {
+            implicit: false,
+            ..source
+        };
+        assert!(matches!(explicit.load(), Err(ConfigError::Unreadable(_))));
+    }
+
+    #[test]
+    fn relative_sources_are_anchored_without_requiring_the_file_to_exist() {
+        let path = std::path::PathBuf::from(format!("missing-{}.toml", uuid::Uuid::new_v4()));
+        let source = ConfigSource::new(Some(path.clone())).unwrap();
+        assert_eq!(source.path, std::env::current_dir().unwrap().join(path));
+    }
 
     #[test]
     fn multiple_profiles_parse_without_disclosing_private_launch_settings() {

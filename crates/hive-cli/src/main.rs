@@ -3,7 +3,7 @@ use std::{net::SocketAddr, path::PathBuf, time::Duration};
 use clap::builder::styling::{AnsiColor, Styles};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::{Shell, generate};
-use hive_daemon::config::Config;
+use hive_daemon::config::ConfigSource;
 use hive_tui::Options as TuiOptions;
 
 mod doctor;
@@ -64,6 +64,8 @@ struct DaemonOptions {
 enum DaemonCommand {
     /// Query the running daemon.
     Status(StatusOptions),
+    /// Reload the daemon's original configuration without interrupting sessions.
+    Reload(StatusOptions),
 }
 
 #[derive(Args)]
@@ -108,10 +110,45 @@ async fn serve(options: ServeOptions) -> miette::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
-    let registry = Config::load(options.config).map_err(|error| miette::miette!("{error}"))?;
-    hive_daemon::serve(options.listen, registry)
+    let source = ConfigSource::new(options.config).map_err(miette::Report::new)?;
+    hive_daemon::serve_configured(options.listen, source)
         .await
         .map_err(|error| miette::miette!("cannot serve Hive on {}: {error}", options.listen))
+}
+
+async fn reload(options: StatusOptions) -> miette::Result<()> {
+    let url = format!("{}/v1/config/reload", daemon_url(options.url));
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|error| miette::miette!("HTTP client: {error}"))?
+        .post(&url)
+        .send()
+        .await
+        .map_err(|error| {
+            miette::miette!(
+                "cannot reload daemon at {url}: {error}; check `hive daemon status` and retry"
+            )
+        })?;
+    let status = response.status();
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|error| miette::miette!("cannot read reload response: {error}"))?;
+    if !status.is_success() {
+        return Err(miette::miette!(
+            "{}: {}; {}",
+            body["code"].as_str().unwrap_or("hive::reload::http"),
+            body["message"]
+                .as_str()
+                .unwrap_or("configuration reload failed"),
+            body["help"].as_str().unwrap_or(
+                "fix the configuration and retry; the previous configuration remains active"
+            )
+        ));
+    }
+    println!("{body}");
+    Ok(())
 }
 
 async fn status(options: StatusOptions) -> miette::Result<()> {
@@ -180,6 +217,10 @@ async fn main() -> miette::Result<()> {
             ..
         }))
         | Some(Command::Status(options)) => status(options).await,
+        Some(Command::Daemon(DaemonOptions {
+            command: Some(DaemonCommand::Reload(options)),
+            ..
+        })) => reload(options).await,
         Some(Command::Daemon(DaemonOptions {
             serve: options,
             command: None,

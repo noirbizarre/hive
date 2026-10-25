@@ -347,13 +347,21 @@ fn data_code(error: &Error) -> String {
 
 // ---- discovery and adoption ---------------------------------------------------------------
 
-#[tokio::test]
-async fn reload_keeps_native_sessions_on_their_original_server_until_explicit_close() {
+#[test]
+fn reload_keeps_native_sessions_on_their_original_server_until_explicit_close() {
+    let dir = std::env::temp_dir().join(format!("hive-oc-reload-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&dir).unwrap();
+    {
+        // Axum's upgraded connections can outlive its listener. Drop the runtime before
+        // removing SQLite files so Windows also observes all background handles closing.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
     let (first, first_url) = fake_opencode::start(Options::default()).await;
     let (_second, second_url) = fake_opencode::start(Options::default()).await;
     first.add_session("ses_a", "Original", &cwd());
-    let dir = std::env::temp_dir().join(format!("hive-oc-reload-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir(&dir).unwrap();
     let path = dir.join("config.toml");
     let text = |url: &str| {
         format!("default_agent = 'oc'\n[agents.oc]\nkind = 'opencode-server'\nendpoint = {url:?}\n")
@@ -403,6 +411,8 @@ async fn reload_keeps_native_sessions_on_their_original_server_until_explicit_cl
     server.abort();
     let _ = server.await;
     drop(broker);
+    });
+    }
     std::fs::remove_dir_all(dir).unwrap();
 }
 

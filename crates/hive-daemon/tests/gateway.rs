@@ -1757,11 +1757,15 @@ async fn live_tools_and_late_tasks_reach_every_observer_and_survive_live_only_re
                     assert_eq!(response.meta.unwrap()["hive"]["activitySnapshot"]["support"]["tools"], "unknown");
                     let _ = ready.send(());
                     let mut kinds = Vec::new();
+                    let mut plans = Vec::new();
                     let mut last = 0;
                     while let Some(event) = rx.recv().await {
                         let seq = event.meta.as_ref().unwrap()["hive"]["seq"].as_u64().unwrap();
                         assert!(seq > last);
                         last = seq;
+                        if let v2::SessionUpdate::PlanUpdate(plan) = &event.update {
+                            plans.push(serde_json::to_value(plan).unwrap());
+                        }
                         if let v2::SessionUpdate::Other(other) = event.update
                             && other.session_update == "_hive_activity" {
                                 kinds.push(other.fields["kind"].as_str().unwrap().to_owned());
@@ -1770,27 +1774,305 @@ async fn live_tools_and_late_tasks_reach_every_observer_and_survive_live_only_re
                     }
                     assert!(kinds.windows(2).any(|window| window == ["tool", "plan"]));
                     assert_eq!(kinds.last().unwrap(), "task");
-                    Ok(())
-                }).await.unwrap();
+                     Ok(plans)
+                 }).await.unwrap()
             });
             attached.await.map_err(Error::into_internal_error)?;
-            cx.send_request(v2::PromptRequest::new(opened.session_id.clone(), vec!["activity-sequence".into()])
+            cx.send_request(v2::PromptRequest::new(opened.session_id.clone(), vec!["activity-sequence plan-sequence".into()])
                 .meta(controlled(&opened.meta, "activity-prompt"))).block_task().await?;
+            let mut plans = Vec::new();
             while let Some(event) = observed_rx.recv().await {
+                assert_eq!(event.session_id, opened.session_id);
+                if let v2::SessionUpdate::PlanUpdate(plan) = &event.update {
+                    plans.push(serde_json::to_value(plan).unwrap());
+                }
                 if let v2::SessionUpdate::Other(other) = &event.update
                     && other.session_update == "_hive_activity" && other.fields["kind"] == "task" { break; }
             }
-            observer.await.map_err(Error::into_internal_error)?;
+            assert_eq!(observer.await.map_err(Error::into_internal_error)?, plans);
+            assert_eq!(plans.len(), 6);
+            assert_eq!(plans[1]["plan"]["entries"][0]["content"], "Inspect");
+            assert_eq!(plans[2]["plan"]["entries"][0]["content"], "Verify");
+            assert_eq!(plans[3]["plan"]["entries"][0]["status"], "cancelled");
+            assert_eq!(plans[1]["_meta"]["update"], true);
+            assert_eq!(plans[1]["plan"]["_meta"]["plan"], true);
+            assert_eq!(plans[1]["plan"]["entries"][0]["_meta"]["entry"], "Inspect");
             let mut meta = v2::Meta::new();
             meta.insert("hive".into(), serde_json::json!({"mode":"observe"}));
-            let response = cx.send_request(v2::ResumeSessionRequest::new(opened.session_id, std::env::current_dir().unwrap()).meta(meta)).block_task().await?;
-            let snapshot = &response.meta.unwrap()["hive"]["activitySnapshot"];
+            let response = cx.send_request(v2::ResumeSessionRequest::new(opened.session_id.clone(), std::env::current_dir().unwrap()).meta(meta)).block_task().await?;
+            let metadata = response.meta.unwrap();
+            let snapshot = &metadata["hive"]["activitySnapshot"];
             assert_eq!(snapshot["foreground"], "idle");
             assert_eq!(snapshot["tools"]["mock-tool"]["status"], "completed");
             assert_eq!(snapshot["tasks"]["background"]["status"], "completed");
+            let current = &metadata["hive"]["planSnapshot"];
+            assert_eq!(current["plans"]["steps"], plans[3]);
+            assert_eq!(current["plans"]["empty"], plans[4]);
+            assert_eq!(current["plans"]["custom"], plans[5]);
+            let (full, replayed) = plan_attachment(address, opened.session_id.clone(), Some(v2::ReplayFrom::Start(v2::ReplayFromStart::new())), 4).await;
+            assert_eq!(full["plans"], current["plans"]);
+            for plan in replayed { assert_eq!(full["plans"][plan["plan"]["planId"].as_str().unwrap()], plan); }
+            let (incremental, replayed) = plan_attachment(address, opened.session_id, Some(v2::ReplayFrom::Other(v2::OtherReplayFrom::new("_hive_seq", BTreeMap::from([("seq".into(), serde_json::json!(1))])))), 6).await;
+            assert_eq!(incremental["plans"], current["plans"]);
+            assert_eq!(replayed, plans);
             Ok(())
         })).await.unwrap().unwrap();
     server.abort();
+}
+
+async fn plan_attachment(
+    address: SocketAddr,
+    id: v2::SessionId,
+    replay: Option<v2::ReplayFrom>,
+    native_count: usize,
+) -> (serde_json::Value, Vec<serde_json::Value>) {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    timeout(
+        Duration::from_secs(10),
+        Client
+            .v2()
+            .on_receive_notification(
+                async move |event: v2::UpdateSessionNotification, _: V2ConnectionTo<Agent>| {
+                    tx.send(event).map_err(Error::into_internal_error)
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(
+                HttpClient::new(format!("http://{address}")).unwrap(),
+                async move |cx| {
+                    cx.send_request(v2::InitializeRequest::new(
+                        ProtocolVersion::V2,
+                        v2::Implementation::new("plan-observer", "1"),
+                    ))
+                    .block_task()
+                    .await?;
+                    let mut request =
+                        v2::ResumeSessionRequest::new(id.clone(), std::env::current_dir().unwrap())
+                            .meta(v2::Meta::from_iter([(
+                                "hive".into(),
+                                serde_json::json!({"mode":"observe"}),
+                            )]));
+                    let full_snapshot = matches!(replay, Some(v2::ReplayFrom::Start(_)));
+                    request.replay_from = replay;
+                    let response = cx.send_request(request).block_task().await?;
+                    let hive = &response.meta.unwrap()["hive"];
+                    assert_eq!(hive["role"], "observer");
+                    assert!(hive.get("token").is_none());
+                    let mut plans = Vec::new();
+                    let mut replayed_ids = std::collections::BTreeSet::new();
+                    while plans.len() < native_count {
+                        let event = rx.recv().await.unwrap();
+                        assert_eq!(event.session_id, id);
+                        if let v2::SessionUpdate::PlanUpdate(plan) = event.update {
+                            let value = serde_json::to_value(plan).unwrap();
+                            if full_snapshot {
+                                let meta = &event.meta.as_ref().unwrap()["hive"];
+                                assert_eq!(meta["snapshot"], true);
+                                assert_eq!(meta["seq"], hive["snapshotThroughSeq"]);
+                                assert!(
+                                    replayed_ids.insert(
+                                        value["plan"]["planId"].as_str().unwrap().to_owned()
+                                    ),
+                                    "full replay must not duplicate plans"
+                                );
+                            }
+                            plans.push(value);
+                        }
+                    }
+                    if full_snapshot {
+                        let expected_ids = hive["planSnapshot"]["plans"]
+                            .as_object()
+                            .unwrap()
+                            .keys()
+                            .cloned()
+                            .collect();
+                        assert_eq!(
+                            replayed_ids, expected_ids,
+                            "full replay must include every current plan"
+                        );
+                    }
+                    Ok::<_, Error>((hive["planSnapshot"].clone(), plans))
+                },
+            ),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+}
+
+#[tokio::test]
+async fn plans_outlive_the_replay_ring_and_restart_when_the_agent_replays_them() {
+    restore_plans(false).await;
+}
+
+#[tokio::test]
+async fn a_restart_does_not_invent_plans_that_the_agent_did_not_retain() {
+    restore_plans(true).await;
+}
+
+async fn restore_plans(forget: bool) {
+    let base = std::env::temp_dir().join(format!("hive-plan-recovery-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&base).unwrap();
+    let database = base.join("hive/sessions.sqlite3");
+    let agent_state = base.join("agent.json");
+    let mut config = config_with_agent(
+        "mock",
+        env!("CARGO_BIN_EXE_hive-test-agent"),
+        AgentVersion::V2,
+    );
+    let profile = config.agents.get_mut("mock").unwrap();
+    profile
+        .env
+        .insert("HIVE_MOCK_STATE".into(), agent_state.display().to_string());
+    if forget {
+        profile
+            .env
+            .insert("HIVE_MOCK_FORGET_PLANS".into(), "1".into());
+    }
+    if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
+        // Test agents are killed on shutdown, so only the parent can flush a coverage profile.
+        profile.env.insert(
+            "LLVM_PROFILE_FILE".into(),
+            if cfg!(windows) { "NUL" } else { "/dev/null" }.into(),
+        );
+    }
+    let broker = hive_daemon::Broker::persistent(config.clone(), database.clone()).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = hive_daemon::router(broker.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (id, expected) = timeout(
+        Duration::from_secs(15),
+        Client
+            .v2()
+            .on_receive_notification(
+                async move |event: v2::UpdateSessionNotification, _: V2ConnectionTo<Agent>| {
+                    tx.send(event).map_err(Error::into_internal_error)
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(
+                HttpClient::new(format!("ws://{address}")).unwrap(),
+                async move |cx| {
+                    cx.send_request(v2::InitializeRequest::new(
+                        ProtocolVersion::V2,
+                        v2::Implementation::new("plan-recovery", "1"),
+                    ))
+                    .block_task()
+                    .await?;
+                    let cwd = std::env::current_dir().unwrap();
+                    let opened = cx
+                        .send_request(v2::NewSessionRequest::new(cwd.clone()))
+                        .block_task()
+                        .await?;
+                    let initial = &opened.meta.as_ref().unwrap()["hive"]["planSnapshot"];
+                    assert_eq!(initial["support"], "supported");
+                    assert_eq!(initial["observation"], "not_observed");
+                    cx.send_request(
+                        v2::PromptRequest::new(
+                            opened.session_id.clone(),
+                            vec!["plan-sequence plan-flood usage-fixture".into()],
+                        )
+                        .meta(controlled(&opened.meta, "plans")),
+                    )
+                    .block_task()
+                    .await?;
+                    let mut expected = serde_json::Map::new();
+                    loop {
+                        let event = rx.recv().await.unwrap();
+                        match event.update {
+                            v2::SessionUpdate::PlanUpdate(plan) => {
+                                let value = serde_json::to_value(plan).unwrap();
+                                expected.insert(
+                                    value["plan"]["planId"].as_str().unwrap().to_owned(),
+                                    value,
+                                );
+                            }
+                            v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(_)) => break,
+                            _ => {}
+                        }
+                    }
+                    let expired = cx
+                        .send_request(
+                            v2::ResumeSessionRequest::new(opened.session_id.clone(), cwd)
+                                .replay_from(v2::ReplayFrom::Other(v2::OtherReplayFrom::new(
+                                    "_hive_seq",
+                                    BTreeMap::from([("seq".into(), 1.into())]),
+                                ))),
+                        )
+                        .block_task()
+                        .await
+                        .unwrap_err();
+                    assert!(
+                        expired
+                            .data
+                            .unwrap()
+                            .to_string()
+                            .contains("replay cursor unavailable")
+                    );
+                    Ok::<_, Error>((opened.session_id, serde_json::Value::Object(expected)))
+                },
+            ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let (live, _) = plan_attachment(address, id.clone(), None, 0).await;
+    assert_eq!(live["plans"], expected);
+    let (full, native) = plan_attachment(
+        address,
+        id.clone(),
+        Some(v2::ReplayFrom::Start(v2::ReplayFromStart::new())),
+        3,
+    )
+    .await;
+    assert_eq!(full["plans"], expected);
+    for plan in native {
+        assert_eq!(expected[plan["plan"]["planId"].as_str().unwrap()], plan);
+    }
+    broker.shutdown().await;
+    server.abort();
+    let _ = server.await;
+    drop(broker);
+
+    let recovered = hive_daemon::Broker::persistent(config, database).unwrap();
+    recovered.reconcile().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = hive_daemon::router(recovered.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let (snapshot, _) = plan_attachment(
+        address,
+        id.clone(),
+        Some(v2::ReplayFrom::Start(v2::ReplayFromStart::new())),
+        if forget { 0 } else { 3 },
+    )
+    .await;
+    assert_eq!(snapshot["support"], "supported");
+    if forget {
+        assert_eq!(snapshot["observation"], "not_observed");
+        assert_eq!(snapshot["plans"], serde_json::json!({}));
+    } else {
+        assert_eq!(snapshot["observation"], "observed");
+        assert_eq!(snapshot["plans"], expected);
+    }
+    assert_eq!(
+        summaries(address).await["sessions"][0]["sessionId"],
+        id.to_string()
+    );
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&agent_state).unwrap()).unwrap();
+    assert_eq!(saved["sessions"].as_object().unwrap().len(), 1);
+    assert_eq!(
+        saved["next"], 2,
+        "observing must not prompt or create a replacement session"
+    );
+    recovered.shutdown().await;
+    server.abort();
+    let _ = server.await;
+    drop(recovered);
+    std::fs::remove_dir_all(base).unwrap();
 }
 
 #[tokio::test]

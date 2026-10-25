@@ -96,6 +96,15 @@ following. Updates preserve composer drafts, interaction fields and open tools.
 The composer explains why sending is unavailable. Connection and pilot/read-only
 indicators remain separate from session activity.
 
+The initially expanded Activity panel includes **Plans**, separate from background
+tasks. Plans show their IDs and the agent's ordered descriptions, statuses, and
+priorities. “Supported · not yet observed” means Hive handles plans but this agent
+has not emitted one; it is not an unsupported-agent claim. Unknown content types
+show a generic text view, and empty plans are explicitly labelled. Plans remain
+visible after idle and reconnect, even when their original events have expired.
+After daemon restart, recovery depends on whether the agent replays its plans.
+See the [native plan contract](../acp-compatibility.md#native-acpv2-plans).
+
 ## Browser smoke checklist
 
 Build with `mise run hive:build`, then start the daemon using the deterministic

@@ -327,6 +327,7 @@ async fn resume(
         hive["configSeq"].as_u64().unwrap_or(0),
     );
     conversation.snapshot(&hive["activitySnapshot"]);
+    conversation.plans_snapshot(&hive["planSnapshot"]);
     conversation.usage_snapshot(
         &hive["usageSnapshot"],
         hive["usageSeq"].as_u64().unwrap_or(0),
@@ -1271,8 +1272,9 @@ pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error + Sen
                                   state.pilot_present = true;
                                   let seq = created.meta.as_ref().and_then(|meta| meta.get("hive")).and_then(|hive| hive["configSeq"].as_u64()).unwrap_or(0);
                                   state.config_snapshot(created.config_options, seq);
-                                  if let Some(hive) = created.meta.as_ref().and_then(|meta| meta.get("hive")) {
-                                      state.transcript_snapshot(&hive["transcript"], hive["transcriptSeq"].as_u64().unwrap_or(0));
+                                   if let Some(hive) = created.meta.as_ref().and_then(|meta| meta.get("hive")) {
+                                       state.plans_snapshot(&hive["planSnapshot"]);
+                                       state.transcript_snapshot(&hive["transcript"], hive["transcriptSeq"].as_u64().unwrap_or(0));
                                   }
                                  app.owner = created.meta;
                                  app.select_session(id);

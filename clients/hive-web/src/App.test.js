@@ -42,6 +42,37 @@ beforeEach(() => {
 });
 afterEach(() => { wrapper?.unmount(); document.body.innerHTML = ''; vi.unstubAllGlobals(); });
 
+test('plans show known support before observation and render native content once in source order', async () => {
+  const state = { session, lines: [], planSnapshot: { version: 1, authoritative: true, support: 'supported', observation: 'not_observed', plans: {} } };
+  render(TranscriptView, { state });
+  expect(wrapper.get('[aria-label="Plans"]').text()).toContain('supported · not yet observed');
+  expect(wrapper.get('.activity-panel').attributes()).toHaveProperty('open');
+  const entries = [{ content: 'Verify', status: 'in_progress', priority: 'high' }, { content: 'Inspect', status: 'cancelled', priority: 'future' }];
+  await wrapper.setProps({ state: { ...state, activity: { plans: { steps: { entries } } }, planSnapshot: { ...state.planSnapshot, observation: 'observed', plans: {
+    steps: { plan: { type: 'items', planId: 'steps', entries } }, empty: { plan: { type: 'items', planId: 'empty', entries: [] } },
+    other: { plan: { type: '_future', planId: 'other', payload: '<script>unsafe</script>' } },
+  } } } });
+  const text = wrapper.get('[aria-label="Plans"]').text();
+  expect(text).toContain('supported · observed');
+  expect(text.indexOf('Verify')).toBeLessThan(text.indexOf('Inspect'));
+  expect(text.match(/Verify/g)).toHaveLength(1);
+  expect(text).toContain('cancelled · future · Inspect');
+  expect(text).toContain('Empty plan');
+  expect(text).toContain('Unsupported plan content type: _future');
+  expect(wrapper.find('script').exists()).toBe(false);
+  await wrapper.setProps({ state: { ...state, activity: { plans: {
+    stale: { type: 'items', entries: [{ content: 'Stale native plan' }] },
+    'v1-plan': { source: 'acp-v1', entries: [{ content: 'Adapted v1 plan', status: 'pending', priority: 'low' }] },
+  } } } });
+  expect(wrapper.get('[aria-label="Plans"]').text()).not.toContain('Stale native plan');
+  expect(wrapper.get('[aria-label="Plans"]').text()).toContain('Adapted v1 plan');
+  expect(wrapper.get('[aria-label="Plans"]').text()).toContain('supported · not yet observed');
+  await wrapper.setProps({ state: { ...state, planSnapshot: { ...state.planSnapshot, authoritative: false, observation: 'observed', plans: { steps: { plan: { type: 'items', entries } } } },
+    activity: { plans: { other: { entries: [{ content: 'Retained older-daemon plan' }] } } } } });
+  expect(wrapper.get('[aria-label="Plans"]').text()).toContain('Retained older-daemon plan');
+  expect(wrapper.get('[aria-label="Plans"]').text()).toContain('Verify');
+});
+
 test('session selection observes the original session and typing requests control before send', async () => {
   const { client } = application();
   await flushPromises();

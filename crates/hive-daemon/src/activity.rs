@@ -46,6 +46,8 @@ impl Activity {
                 self.support.insert("plans".into(), "observed");
                 let mut value = serde_json::to_value(plan).ok()?;
                 value.as_object_mut()?.remove("_meta");
+                // Clients must distinguish this adapter-only plan from stale native activity views.
+                value["source"] = json!("acp-v1");
                 self.plans.insert("v1-plan".into(), value.clone());
                 Some(
                     json!({"kind": "plan", "planId": "v1-plan", "plan": value, "source": "acp-v1"}),
@@ -82,12 +84,10 @@ impl Activity {
                 Some(json!({"kind": "tool", "toolCallId": id, "tool": tool, "source": "acp-v2"}))
             }
             v2::SessionUpdate::PlanUpdate(plan) => {
-                let v2::PlanUpdateContent::Items(items) = &plan.plan else {
-                    return None;
-                };
                 self.support.insert("plans".into(), "observed");
-                let id = items.plan_id.to_string();
-                let mut value = serde_json::to_value(items).ok()?;
+                let mut value = serde_json::to_value(&plan.plan).ok()?;
+                let id = value["planId"].as_str()?.to_owned();
+                // This filtered compatibility view is not the canonical native plan snapshot.
                 value.as_object_mut()?.remove("_meta");
                 self.plans.insert(id.clone(), value.clone());
                 Some(json!({"kind": "plan", "planId": id, "plan": value, "source": "acp-v2"}))

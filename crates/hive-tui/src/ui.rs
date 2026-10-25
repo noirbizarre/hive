@@ -747,33 +747,80 @@ impl App {
         if let Some(activity) = self.conversation().map(|c| &c.activity) {
             lines.push(Line::default());
             lines.push(Line::styled("Activity", theme.muted()));
-            for (label, field) in [("Tools", "tools"), ("Tasks", "tasks"), ("Todos", "plans")] {
+            for (label, field) in [("Tools", "tools"), ("Tasks", "tasks")] {
                 let status = activity["support"][field].as_str().unwrap_or("unknown");
                 lines.push(Line::styled(format!("{label} · {status}"), theme.text()));
                 if let Some(items) = activity[field].as_object() {
                     for (id, item) in items {
-                        if field == "plans" {
-                            for entry in item["entries"].as_array().into_iter().flatten() {
-                                lines.push(Line::styled(
-                                    format!(
-                                        "  {} · {}",
-                                        entry["status"].as_str().unwrap_or("?"),
-                                        entry["content"].as_str().unwrap_or("?")
-                                    ),
-                                    theme.text(),
-                                ));
-                            }
-                        } else {
-                            lines.push(Line::styled(
-                                format!(
-                                    "  {} · {}",
-                                    item["status"].as_str().unwrap_or("unknown"),
-                                    item["title"].as_str().unwrap_or(id)
-                                ),
-                                theme.text(),
-                            ));
-                        }
+                        lines.push(Line::styled(
+                            format!(
+                                "  {} · {}",
+                                item["status"].as_str().unwrap_or("unknown"),
+                                item["title"].as_str().unwrap_or(id)
+                            ),
+                            theme.text(),
+                        ));
                     }
+                }
+            }
+        }
+        if let Some(conversation) = self.conversation() {
+            let snapshot = &conversation.plan_snapshot;
+            // Canonical native content wins over the filtered activity compatibility view.
+            let mut plans = conversation.activity["plans"]
+                .as_object()
+                .cloned()
+                .unwrap_or_default();
+            if conversation.plans_authoritative {
+                // Old activity can survive a restart; only explicit v1 adaptations are a fallback.
+                plans.retain(|_, plan| plan["source"] == "acp-v1");
+            }
+            if let Some(native) = snapshot["plans"].as_object() {
+                for (id, update) in native {
+                    plans.insert(id.clone(), update["plan"].clone());
+                }
+            }
+            let support = snapshot["support"].as_str().unwrap_or("unknown");
+            let observation = if snapshot["observation"] == "observed" {
+                "observed"
+            } else {
+                "not yet observed"
+            };
+            lines.push(Line::styled(
+                format!("Plans · {support} · {observation}"),
+                theme.text(),
+            ));
+            for (id, plan) in plans {
+                lines.push(Line::styled(id, theme.muted()));
+                if plan["type"] == "items" || (plan["type"].is_null() && plan["entries"].is_array())
+                {
+                    let entries = plan["entries"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>();
+                    if entries.is_empty() {
+                        lines.push(Line::styled("  Empty plan", theme.muted()));
+                    }
+                    for entry in entries {
+                        lines.push(Line::styled(
+                            format!(
+                                "  {} · {} · {}",
+                                entry["status"].as_str().unwrap_or("?"),
+                                entry["priority"].as_str().unwrap_or("?"),
+                                entry["content"].as_str().unwrap_or("?")
+                            ),
+                            theme.text(),
+                        ));
+                    }
+                } else {
+                    lines.push(Line::styled(
+                        format!(
+                            "  Unsupported plan content type: {} · {plan}",
+                            plan["type"].as_str().unwrap_or("unknown")
+                        ),
+                        theme.text(),
+                    ));
                 }
             }
         }
@@ -1207,7 +1254,7 @@ mod tests {
     }
 
     #[test]
-    fn the_sidebar_shows_tool_task_and_todo_status_from_the_shared_snapshot() {
+    fn the_sidebar_shows_tool_task_and_plan_status_from_the_shared_snapshot() {
         let mut app = App {
             page: Page::Chat,
             active: Some("hive-one".into()),
@@ -1237,9 +1284,49 @@ mod tests {
         let rendered = screen(&terminal);
         assert!(rendered.contains("failed · Compile"));
         assert!(rendered.contains("completed · Index"));
-        assert!(rendered.contains("in_progress · Review"));
+        assert!(rendered.contains("in_progress · ? · Review"));
+        assert!(rendered.contains("Plans · unknown"));
         assert!(rendered.contains("Tokens  120"));
         assert!(rendered.contains("estimated 0.0005 USD"));
+        app.conversations.get_mut("hive-one").unwrap().apply(
+            v2::UpdateSessionNotification::new(
+                "hive-one",
+                v2::SessionUpdate::PlanUpdate(v2::PlanUpdate::new(v2::PlanUpdateContent::items(
+                    "native",
+                    vec![v2::PlanEntry::new(
+                        "Native",
+                        v2::PlanEntryPriority::High,
+                        v2::PlanEntryStatus::Pending,
+                    )],
+                ))),
+            )
+            .meta(v2::Meta::from_iter([(
+                "hive".into(),
+                serde_json::json!({"seq":1}),
+            )])),
+        );
+        terminal.draw(|frame| app.show(frame)).unwrap();
+        let rendered = screen(&terminal);
+        assert!(
+            rendered.contains("Review"),
+            "one native update must not hide other older-daemon plans"
+        );
+        assert!(rendered.contains("Native"));
+        let conversation = app.conversations.get_mut("hive-one").unwrap();
+        conversation.activity["plans"]["v1-plan"] = serde_json::json!({"source":"acp-v1","entries":[{"content":"V1","status":"pending","priority":"low"}]});
+        conversation.plans_snapshot(&serde_json::json!({"version":1,"seq":6,"support":"supported","observation":"not_observed","plans":{}}));
+        terminal.draw(|frame| app.show(frame)).unwrap();
+        let rendered = screen(&terminal);
+        assert!(
+            !rendered.contains("Review"),
+            "canonical recovery must not resurrect a stale native plan"
+        );
+        assert!(rendered.contains("pending · low · V1"));
+        assert!(rendered.contains("Plans · supported"));
+        assert!(
+            rendered.contains("not yet observed"),
+            "adapted v1 plans do not establish native v2 observation"
+        );
     }
 
     #[test]

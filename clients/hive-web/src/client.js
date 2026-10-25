@@ -10,6 +10,8 @@ export function conversation() {
   let activity = { version: 1, seq: 0, session: 'active', foreground: 'unknown', tools: {}, plans: {}, tasks: {},
     support: { tools: 'unknown', plans: 'unknown', tasks: 'unknown' } };
   let usage = {};
+  let planSnapshot = { version: 1, seq: 0, support: 'unknown', observation: 'not_observed', plans: {} };
+  let plansAuthoritative = false;
   let usageSeq = 0;
   let configOptions = [];
   let configSeq = 0;
@@ -26,6 +28,14 @@ export function conversation() {
     if (snapshot && Number.isSafeInteger(number) && number >= usageSeq) {
       usage = structuredClone(snapshot);
       usageSeq = number;
+    }
+  }
+
+  function reconcilePlans(snapshot) {
+    // An older attachment cannot roll back plans already observed beyond its boundary.
+    if (snapshot?.version === 1 && Number.isSafeInteger(snapshot.seq) && snapshot.seq >= planSnapshot.seq) {
+      planSnapshot = structuredClone(snapshot);
+      plansAuthoritative = true;
     }
   }
 
@@ -80,6 +90,13 @@ export function conversation() {
       line.title = tool.title ?? previous?.title ?? 'Tool activity';
       line.status = tool.status ?? previous?.status ?? 'unknown';
       if (tool.rawInput != null) line.input = readable(tool.rawInput);
+    } else if (kind === 'plan_update' && (snapshot ? number >= planSnapshot.seq : number > planSnapshot.seq) && typeof update.plan?.planId === 'string') {
+      // Full snapshot upserts share a boundary; ordinary replay must be strictly newer.
+      // ACP itemized updates replace the entire ordered plan, never merge entries by position.
+      planSnapshot.plans = { ...planSnapshot.plans, [update.plan.planId]: structuredClone(update) };
+      planSnapshot.seq = number;
+      planSnapshot.support = 'supported';
+      planSnapshot.observation = 'observed';
     } else if (kind === 'config_option_update') {
       reconcileConfig(update.configOptions, number);
     } else if (kind === '_hive_error' || kind === '_hive_opencode_error') {
@@ -118,6 +135,8 @@ export function conversation() {
     notice(text) { lines.push({ kind: 'notice', text }); },
     skip(nextSeq) { seq = Math.max(seq, nextSeq - 1); gap = false; },
     reconcile,
+    reconcilePlans,
+    get planSnapshot() { return { ...structuredClone(planSnapshot), authoritative: plansAuthoritative }; },
     reconcileUsage,
     reconcileConfig,
     reconcileTranscript,
@@ -210,7 +229,7 @@ export function connect(url, onChange = () => {}) {
 
   const snapshot = () => ({ connected, status, session: selected && { ...selected }, role: owner?.role || 'observer',
     generation: owner?.generation,
-    running: history.runningNow, lines: history.lines, activity: history.activity, usage: history.usage, configOptions: history.configOptions, transcript: history.transcript,
+    running: history.runningNow, lines: history.lines, activity: history.activity, planSnapshot: history.planSnapshot, usage: history.usage, configOptions: history.configOptions, transcript: history.transcript,
     configuring, creating, opening: Boolean(desired && desired.sessionId !== selected?.sessionId), pendingSession: desired?.sessionId, seq: history.seq, gap, interaction,
     urlFlows: [...urlFlows.values()], uncertain: uncertain && { ...uncertain }, recoveryRequired, takingControl: Boolean(takingControl) });
   const publish = () => onChange(snapshot());
@@ -342,6 +361,7 @@ export function connect(url, onChange = () => {}) {
     owner = hive.role === 'pilot' ? hive : { generation: hive.generation, role: 'observer' };
     recoveryRequired = Boolean(hive.recoveryRequired);
     history.reconcileTranscript(hive.transcript, hive.transcriptSeq ?? 0);
+    history.reconcilePlans(hive.planSnapshot);
     history.running(hive.running);
     gap = false;
     status = `${owner.role === 'pilot' ? 'Controlling' : 'Read-only'} ${selected.sessionId}${hive.running ? ' (running)' : ''}`;
@@ -382,6 +402,7 @@ export function connect(url, onChange = () => {}) {
         queuedUpdates = queuedUpdates.filter(message => !message.params._meta?.hive?.snapshot);
       }
       history.reconcile(hive.activitySnapshot);
+      history.reconcilePlans(hive.planSnapshot);
       history.reconcileUsage(hive.usageSnapshot, hive.usageSeq);
       history.reconcileConfig(response.configOptions || [], hive.configSeq || 0);
       if (!replay) {

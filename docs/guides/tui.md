@@ -101,6 +101,15 @@ output, and file changes; text output is decoded and formatted instead of showin
 the serialized protocol event. You can also select tools with `Ctrl-Up` /
 `Ctrl-Down` and toggle details with `Ctrl-O`.
 
+The session sidebar shows **Plans** separately from tools and background tasks,
+with plan IDs and ordered descriptions, priorities, and statuses. Known Hive
+support and whether the agent has emitted a plan are shown separately. “Not yet
+observed” does not mean unsupported. Empty plans and unfamiliar content types are
+explicitly labelled; unfamiliar content is displayed generically. Reconnect
+restores current plans independently of the bounded event history. After daemon
+restart, only plans replayed by the agent can be restored. See the
+[native plan contract](../acp-compatibility.md#native-acpv2-plans).
+
 Page Up/Down and the mouse wheel browse the retained conversation history. Home
 jumps to the beginning; End returns to the latest output and resumes automatic
 following. New output does not pull you away while reading older messages, and

@@ -216,10 +216,15 @@ impl App {
             .split(area);
         let main = columns[0];
         let compact = main.height < 9;
+        let history_label = self.history_label();
+        // Keep coverage warnings separate from the transient connection/submission status.
+        let history_height = history_label.as_ref().map_or(0, |label| {
+            (label.chars().count() as u16 / main.width.max(1) + 1).min(if compact { 1 } else { 4 })
+        });
         let sections = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(if compact { 1 } else { 2 }),
+                Constraint::Length(if compact { 1 } else { 2 } + history_height),
                 Constraint::Min(0),
                 Constraint::Length(if compact {
                     2
@@ -339,26 +344,39 @@ impl App {
             Page::Sessions => "Sessions",
             Page::Profiles => "New session · Select an agent",
         };
-        frame.render_widget(
-            Paragraph::new(vec![
-                Line::from(vec![
-                    Span::styled("  ▪ hive  ", theme.accent()),
-                    Span::styled(title, theme.text()),
-                ]),
-                Line::styled(
-                    self.config_choices()
-                        .iter()
-                        .filter(|(_, _, label)| label.ends_with(" *"))
-                        .map(|(_, _, label)| {
-                            format!("  {} · Ctrl-P configure", label.trim_end_matches(" *"))
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" · "),
-                    theme.muted(),
-                ),
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled("  ▪ hive  ", theme.accent()),
+                Span::styled(title, theme.text()),
             ]),
-            area,
-        );
+            Line::styled(
+                self.config_choices()
+                    .iter()
+                    .filter(|(_, _, label)| label.ends_with(" *"))
+                    .map(|(_, _, label)| {
+                        format!("  {} · Ctrl-P configure", label.trim_end_matches(" *"))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" · "),
+                theme.muted(),
+            ),
+        ];
+        if let Some(label) = self.history_label() {
+            // Compact layouts can hide the model line, but must keep history coverage visible.
+            lines.insert(1, Line::styled(label, theme.warning()));
+        }
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    }
+
+    fn history_label(&self) -> Option<String> {
+        (self.page == Page::Chat)
+            .then(|| {
+                self.active
+                    .as_ref()
+                    .and_then(|id| self.conversations.get(id))
+                    .map(|conversation| conversation.transcript.label())
+            })
+            .flatten()
     }
 
     fn render_sessions(&mut self, frame: &mut Frame, area: Rect, theme: Theme) {
@@ -810,6 +828,30 @@ mod tests {
         assert!(!rendered.contains("Select an item"));
         assert!(!rendered.contains("Enter pilot"));
         assert!(!rendered.contains("o observe"));
+    }
+
+    #[test]
+    fn partial_history_warnings_remain_visible_when_transient_status_changes() {
+        let mut app = App {
+            page: Page::Chat,
+            active: Some("session".into()),
+            ..App::default()
+        };
+        let conversation = app.conversations.entry("session".into()).or_default();
+        conversation
+            .transcript
+            .partial(hive_protocol::history::WarningCode::Truncated);
+        conversation.push_notice("Retained answer".into());
+        let mut terminal = Terminal::new(TestBackend::new(120, 25)).unwrap();
+        for status in ["Connected", "Prompt sent"] {
+            app.status = status.into();
+            terminal.draw(|frame| app.show(frame)).unwrap();
+            let rendered = screen(&terminal);
+            assert!(rendered.contains("History: partial"));
+            assert!(rendered.contains("bounded portion"));
+            assert!(rendered.contains("Retained answer"));
+            assert!(rendered.contains(status));
+        }
     }
 
     #[test]

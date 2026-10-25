@@ -1,6 +1,7 @@
 //! Versioned ACP integration lives here; clients never select a downstream version.
 
 pub use agent_client_protocol::schema::v2;
+pub mod history;
 pub mod interactions;
 pub use agent_client_protocol_http::{AcpHttpServer, HttpClient};
 

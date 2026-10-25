@@ -165,6 +165,13 @@ Atomic new/resume responses carry current activity and usage snapshots,
 independently of conversation history. Clients must make unavailable history
 visible before choosing live-only attachment. No durable transcript archive is maintained.
 
+Agents own retained conversation history. Hive owns the registry and prompt
+safety journal, plus the volatile projection. A shared `transcript` status
+describes source, negotiated restoration support, availability, and coverage
+separately from execution/recovery state. Available partial history renders with
+warnings; successful replay does not certify unlimited retention. See
+[ADR-009](adr/009-agent-owned-history-and-session-registry.md).
+
 The catalog's separate SSE stream only invalidates discovery snapshots. Clients
 re-list on revision changes. It is neither conversation replay nor a durable log.
 
@@ -194,7 +201,7 @@ back to `$HOME/.local/state/hive/sessions.sqlite3`.
 | Durable | Volatile |
 | --- | --- |
 | Hive/downstream IDs, profile and adapter choices | Worker/process and upstream connections |
-| Prompt content, reservations, and confirmed results | Conversation replay payloads |
+| Request keys, content fingerprints, acknowledgement IDs/failure markers | Prompt bodies and conversation replay payloads |
 | Recovery metadata and sequence reservations | Pilot tokens and activity snapshots |
 | Usage ledger | Process-local pricing cache |
 
@@ -207,6 +214,13 @@ Sequence blocks are reserved durably before publication to avoid cursor reuse
 after crashes. Restart can introduce gaps and loses incremental replay; transcript
 snapshots are rebuilt from the downstream agent's retained history. Database
 migrations use SQLite `user_version`; future schemas are refused.
+
+Schema 2 removes legacy prompt bodies and arbitrary acknowledgement metadata
+transactionally, preserving all request keys and uncertainty markers. The same
+canonical fingerprint compares content before and after restart. Durable retries
+reconstruct message-ID-only acknowledgements or controlled failure diagnostics;
+they do not recover conversation content. See
+[ADR-009](adr/009-agent-owned-history-and-session-registry.md).
 
 See [ADR-003](adr/003-durable-session-catalog-and-conservative-recovery.md) and
 [operations](operations.md) for recovery, pruning, privacy, and backups.

@@ -73,6 +73,15 @@ An agent that cannot replay history or no longer retains the session returns
 an actionable diagnostic. Hive keeps the original session identity. See
 [restart and recovery](../operations.md#restart-and-recovery).
 
+The agent owns retained history; Hive's session registry does not contain a
+duplicate assistant transcript. Both clients show history coverage persistently.
+Unknown coverage means the protocol cannot certify retention; partial means Hive
+knows the view omits content. Available content still renders with warnings.
+Successful empty replay can warn that earlier work has no returned messages.
+Without replay support, content already observed by the running daemon remains
+viewable; after context-only recovery, new live content forms a partial view.
+History warnings do not acknowledge interrupted work or grant control.
+
 ## Uncertain prompts and interrupted work
 
 A lost prompt acknowledgement does not prove the agent did nothing. Hive clients

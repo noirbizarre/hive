@@ -332,6 +332,10 @@ async fn resume(
         hive["usageSeq"].as_u64().unwrap_or(0),
     );
     conversation.gap = false;
+    conversation.transcript_snapshot(
+        &hive["transcript"],
+        hive["transcriptSeq"].as_u64().unwrap_or(0),
+    );
     let next_seq = hive["nextSeq"].as_u64().unwrap_or(1);
     app.owner = response.meta;
     if app.skip_replay {
@@ -1267,6 +1271,9 @@ pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error + Sen
                                   state.pilot_present = true;
                                   let seq = created.meta.as_ref().and_then(|meta| meta.get("hive")).and_then(|hive| hive["configSeq"].as_u64()).unwrap_or(0);
                                   state.config_snapshot(created.config_options, seq);
+                                  if let Some(hive) = created.meta.as_ref().and_then(|meta| meta.get("hive")) {
+                                      state.transcript_snapshot(&hive["transcript"], hive["transcriptSeq"].as_u64().unwrap_or(0));
+                                  }
                                  app.owner = created.meta;
                                  app.select_session(id);
                                  app.status = "Session created".into();

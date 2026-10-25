@@ -1,7 +1,11 @@
 //! The catalog is durable; ACP event payloads and controller credentials are deliberately not.
+//!
+//! Fingerprints and minimal acknowledgements form a safety journal, not a transcript archive.
+//! Unfinished reservations survive restart so uncertain prompts are never executed twice.
 
 use std::{path::PathBuf, sync::Mutex};
 
+use crate::prompt_journal::{Fingerprint, JournalError, Outcome as PromptOutcome};
 use crate::usage::Ledger;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -81,6 +85,14 @@ fn default_origin() -> String {
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
+    #[error(
+        "session database {path} contains an invalid request journal entry ({source}); restore a backup or inspect the journal without deleting pending reservations"
+    )]
+    Journal {
+        path: PathBuf,
+        #[source]
+        source: JournalError,
+    },
     #[error(
         "session database {path}: {source}; check disk space and permissions, then restart Hive"
     )]
@@ -213,12 +225,10 @@ impl Store {
         };
         db.busy_timeout(std::time::Duration::from_secs(3))
             .map_err(wrap)?;
-        db.pragma_update(None, "journal_mode", "WAL")
-            .map_err(wrap)?;
         let version: u32 = db
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(wrap)?;
-        if version > 1 {
+        if version > 2 {
             return Err(StoreError::Future { path, version });
         }
         if version == 0 {
@@ -226,6 +236,56 @@ impl Store {
             migration.execute_batch("CREATE TABLE sessions (id TEXT PRIMARY KEY, record TEXT NOT NULL); CREATE TABLE prompts (session_id TEXT NOT NULL, key TEXT NOT NULL, content TEXT NOT NULL, result TEXT, PRIMARY KEY(session_id, key), FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE); PRAGMA user_version = 1;").map_err(wrap)?;
             migration.commit().map_err(wrap)?;
         }
+        if version < 2 {
+            let migration = db.transaction().map_err(wrap)?;
+            migration
+                .execute_batch(
+                    "ALTER TABLE prompts ADD COLUMN content_fingerprint TEXT NOT NULL DEFAULT ''; ",
+                )
+                .map_err(wrap)?;
+            // Load identities only: migration memory must not grow with every saved prompt body.
+            let keys = {
+                let mut statement = migration
+                    .prepare("SELECT session_id,key FROM prompts")
+                    .map_err(wrap)?;
+                statement
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .map_err(wrap)?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(wrap)?
+            };
+            let journal = |source| StoreError::Journal {
+                path: path.clone(),
+                source,
+            };
+            for (session, key) in keys {
+                let (content, result): (String, Option<String>) = migration
+                    .query_row(
+                        "SELECT content,result FROM prompts WHERE session_id=?1 AND key=?2",
+                        params![session, key],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .map_err(wrap)?;
+                let fingerprint = Fingerprint::legacy(&content).map_err(journal)?;
+                let result = result
+                    .as_deref()
+                    .map(|value| PromptOutcome::legacy(value).and_then(|outcome| outcome.encode()))
+                    .transpose()
+                    .map_err(journal)?;
+                // Scrub bodies and arbitrary result payloads without releasing any reservation.
+                migration.execute("UPDATE prompts SET content='',content_fingerprint=?3,result=?4 WHERE session_id=?1 AND key=?2",
+                    params![session, key, fingerprint.as_str(), result]).map_err(wrap)?;
+            }
+            migration
+                .pragma_update(None, "user_version", 2)
+                .map_err(wrap)?;
+            migration.commit().map_err(wrap)?;
+        }
+        // A future schema or failed migration must not change the existing journal mode.
+        db.pragma_update(None, "journal_mode", "WAL")
+            .map_err(wrap)?;
         db.pragma_update(None, "foreign_keys", "ON").map_err(wrap)?;
         Ok(Self {
             connection: Mutex::new(db),
@@ -235,6 +295,13 @@ impl Store {
 
     fn sql(&self, source: rusqlite::Error) -> StoreError {
         StoreError::Sql {
+            path: self.path.clone(),
+            source,
+        }
+    }
+
+    fn journal(&self, source: JournalError) -> StoreError {
+        StoreError::Journal {
             path: self.path.clone(),
             source,
         }
@@ -296,7 +363,7 @@ impl Store {
         &self,
         record: &Record,
         key: &str,
-        content: &str,
+        fingerprint: &Fingerprint,
     ) -> Result<(), StoreError> {
         let mut db = self.connection.lock().expect("store lock poisoned");
         let tx = db.transaction().map_err(|e| self.sql(e))?;
@@ -312,8 +379,8 @@ impl Store {
         )
         .map_err(|e| self.sql(e))?;
         tx.execute(
-            "INSERT INTO prompts (session_id,key,content) VALUES (?1,?2,?3)",
-            params![record.id, key, content],
+            "INSERT INTO prompts (session_id,key,content,content_fingerprint) VALUES (?1,?2,'',?3)",
+            params![record.id, key, fingerprint.as_str()],
         )
         .map_err(|e| self.sql(e))?;
         tx.commit().map_err(|e| self.sql(e))?;
@@ -324,18 +391,36 @@ impl Store {
         &self,
         id: &str,
         key: &str,
-    ) -> Result<Option<(String, Option<String>)>, StoreError> {
+    ) -> Result<Option<(Fingerprint, Option<PromptOutcome>)>, StoreError> {
         let db = self.connection.lock().expect("store lock poisoned");
-        db.query_row(
-            "SELECT content,result FROM prompts WHERE session_id=?1 AND key=?2",
-            params![id, key],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()
-        .map_err(|e| self.sql(e))
+        let row: Option<(String, Option<String>)> = db
+            .query_row(
+                "SELECT content_fingerprint,result FROM prompts WHERE session_id=?1 AND key=?2",
+                params![id, key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| self.sql(e))?;
+        row.map(|(fingerprint, result)| {
+            Ok((
+                Fingerprint::parse(fingerprint).map_err(|e| self.journal(e))?,
+                result
+                    .as_deref()
+                    .map(PromptOutcome::decode)
+                    .transpose()
+                    .map_err(|e| self.journal(e))?,
+            ))
+        })
+        .transpose()
     }
 
-    pub fn finish_prompt(&self, id: &str, key: &str, result: &str) -> Result<(), StoreError> {
+    pub fn finish_prompt(
+        &self,
+        id: &str,
+        key: &str,
+        result: &PromptOutcome,
+    ) -> Result<(), StoreError> {
+        let result = result.encode().map_err(|e| self.journal(e))?;
         self.connection
             .lock()
             .expect("store lock poisoned")
@@ -398,6 +483,188 @@ mod tests {
             origin: "hive".into(),
             identity: None,
         }
+    }
+
+    fn legacy_database() -> (PathBuf, Connection) {
+        let path = temporary();
+        let store = Store::open(path.clone()).unwrap();
+        store.save(&record("one")).unwrap();
+        drop(store);
+        let db = Connection::open(&path).unwrap();
+        // Recreate the exact schema-1 journal; registry JSON is deliberately untouched.
+        db.execute_batch(
+            "ALTER TABLE prompts DROP COLUMN content_fingerprint; PRAGMA user_version=1;",
+        )
+        .unwrap();
+        (path, db)
+    }
+
+    #[test]
+    fn migration_scrubs_bodies_and_metadata_without_releasing_reservations_or_losing_acknowledgements()
+     {
+        let (path, db) = legacy_database();
+        let registry: String = db
+            .query_row("SELECT record FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        let body = r#"[{"type":"text","text":"private prompt sentinel"}]"#;
+        for (key, result) in [
+            ("pending", None),
+            (
+                "ack",
+                Some(r#"{"Ok":{"messageId":"original","_meta":{"private":"metadata sentinel"}}}"#),
+            ),
+            ("failed", Some(r#"{"Err":"private error sentinel"}"#)),
+        ] {
+            db.execute(
+                "INSERT INTO prompts (session_id,key,content,result) VALUES ('one',?1,?2,?3)",
+                params![key, body, result],
+            )
+            .unwrap();
+        }
+        drop(db);
+        for _ in 0..2 {
+            let store = Store::open(path.clone()).unwrap();
+            let fingerprint = Fingerprint::legacy(body).unwrap();
+            assert_eq!(
+                store.prompt("one", "pending").unwrap(),
+                Some((fingerprint.clone(), None))
+            );
+            assert_eq!(
+                store.prompt("one", "ack").unwrap(),
+                Some((
+                    fingerprint.clone(),
+                    Some(PromptOutcome::Acknowledged {
+                        message_id: "original".into()
+                    })
+                ))
+            );
+            assert_eq!(
+                store.prompt("one", "failed").unwrap(),
+                Some((fingerprint, Some(PromptOutcome::Failed {})))
+            );
+            let db = store.connection.lock().unwrap();
+            assert_eq!(
+                db.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                    .unwrap(),
+                2
+            );
+            assert_eq!(
+                db.query_row("SELECT record FROM sessions", [], |row| row
+                    .get::<_, String>(0))
+                    .unwrap(),
+                registry
+            );
+            let mut rows = db
+                .prepare("SELECT content,content_fingerprint,result FROM prompts")
+                .unwrap();
+            for row in rows
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })
+                .unwrap()
+            {
+                let (content, fingerprint, result) = row.unwrap();
+                assert!(content.is_empty());
+                assert!(Fingerprint::parse(fingerprint.clone()).is_ok());
+                let logical_row = format!("{content}{fingerprint}{result:?}");
+                assert!(!logical_row.contains("sentinel"));
+            }
+        }
+        std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn malformed_legacy_rows_roll_back_the_whole_upgrade_without_echoing_private_content() {
+        for (content, result) in [
+            ("private malformed content sentinel", None),
+            ("[]", Some("private malformed outcome sentinel")),
+        ] {
+            let (path, db) = legacy_database();
+            db.execute("INSERT INTO prompts VALUES ('one','valid','[]',NULL)", [])
+                .unwrap();
+            db.execute(
+                "INSERT INTO prompts VALUES ('one','invalid',?1,?2)",
+                params![content, result],
+            )
+            .unwrap();
+            drop(db);
+            let error = Store::open(path.clone()).err().unwrap();
+            assert!(matches!(error, StoreError::Journal { .. }));
+            assert!(!error.to_string().contains("sentinel"));
+            let db = Connection::open(&path).unwrap();
+            assert_eq!(
+                db.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                db.query_row(
+                    "SELECT content FROM prompts WHERE key='invalid'",
+                    [],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+                content
+            );
+            assert!(
+                db.prepare("SELECT content_fingerprint FROM prompts")
+                    .is_err()
+            );
+            assert_eq!(
+                db.query_row("SELECT COUNT(*) FROM prompts", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                2
+            );
+            drop(db);
+            std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn new_journal_rows_store_only_fingerprints_and_typed_outcomes_and_corrupt_rows_fail_closed() {
+        let path = temporary();
+        let store = Store::open(path.clone()).unwrap();
+        store.save(&record("one")).unwrap();
+        let fingerprint = Fingerprint::content(&["private prompt sentinel".into()]).unwrap();
+        store
+            .reserve_prompt(&record("one"), "key", &fingerprint)
+            .unwrap();
+        store
+            .finish_prompt("one", "key", &PromptOutcome::Failed {})
+            .unwrap();
+        let db = store.connection.lock().unwrap();
+        let (content, result): (String, String) = db
+            .query_row("SELECT content,result FROM prompts", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert!(content.is_empty());
+        assert_eq!(result, r#"{"status":"failed"}"#);
+        db.execute("UPDATE prompts SET content_fingerprint=''", [])
+            .unwrap();
+        drop(db);
+        assert!(matches!(
+            store.prompt("one", "key"),
+            Err(StoreError::Journal { .. })
+        ));
+        let db = store.connection.lock().unwrap();
+        db.execute(
+            "UPDATE prompts SET content_fingerprint=?1,result='invalid'",
+            [fingerprint.as_str()],
+        )
+        .unwrap();
+        drop(db);
+        assert!(matches!(
+            store.prompt("one", "key"),
+            Err(StoreError::Journal { .. })
+        ));
+        drop(store);
+        std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
     }
 
     #[test]
@@ -477,13 +744,14 @@ mod tests {
         store.save(&record("two")).unwrap();
         let mut first = record("one");
         first.uncertain = true;
-        store.reserve_prompt(&first, "key", "[]").unwrap();
+        let fingerprint = Fingerprint::content(&[]).unwrap();
+        store.reserve_prompt(&first, "key", &fingerprint).unwrap();
         drop(store);
         let store = Store::open(path.clone()).unwrap();
         assert_eq!(store.records().unwrap().len(), 2);
         assert_eq!(
             store.prompt("one", "key").unwrap(),
-            Some(("[]".into(), None))
+            Some((fingerprint, None))
         );
         assert!(store.prompt("two", "key").unwrap().is_none());
         store.remove("one").unwrap();
@@ -498,12 +766,25 @@ mod tests {
         let path = temporary();
         Store::open(path.clone()).unwrap();
         let db = Connection::open(&path).unwrap();
+        db.pragma_update(None, "journal_mode", "DELETE").unwrap();
         db.pragma_update(None, "user_version", 42).unwrap();
         drop(db);
         assert!(matches!(
             Store::open(path.clone()),
             Err(StoreError::Future { version: 42, .. })
         ));
+        let db = Connection::open(&path).unwrap();
+        assert_eq!(
+            db.pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
+                .unwrap(),
+            "delete"
+        );
+        assert_eq!(
+            db.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .unwrap(),
+            42
+        );
+        drop(db);
         std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
     }
 
@@ -513,9 +794,31 @@ mod tests {
         let store = Store::open(path.clone()).unwrap();
         store.save(&record("one")).unwrap();
         store.save(&record("two")).unwrap();
-        store.reserve_prompt(&record("one"), "key", "[]").unwrap();
-        assert!(store.reserve_prompt(&record("one"), "key", "[1]").is_err());
-        assert_eq!(store.prompt("one", "key").unwrap().unwrap().0, "[]");
+        let fingerprint = Fingerprint::content(&[]).unwrap();
+        store
+            .reserve_prompt(&record("one"), "key", &fingerprint)
+            .unwrap();
+        let mut changed = record("one");
+        changed.uncertain = true;
+        assert!(
+            store
+                .reserve_prompt(
+                    &changed,
+                    "key",
+                    &Fingerprint::content(&["changed".into()]).unwrap()
+                )
+                .is_err()
+        );
+        assert_eq!(store.prompt("one", "key").unwrap().unwrap().0, fingerprint);
+        assert!(
+            !store
+                .records()
+                .unwrap()
+                .iter()
+                .find(|record| record.id == "one")
+                .unwrap()
+                .uncertain
+        );
         assert!(store.prompt("two", "key").unwrap().is_none());
         drop(store);
         std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
@@ -558,7 +861,7 @@ mod tests {
         assert_eq!(
             db.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
                 .unwrap(),
-            1
+            2
         );
         drop(db);
         std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();

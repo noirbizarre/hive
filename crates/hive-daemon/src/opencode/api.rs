@@ -17,8 +17,13 @@ use super::{
 };
 
 /// History fetched when attaching to an existing session. Bounded so a very long native
-/// conversation cannot stall startup; the replay ring holds 256 updates anyway.
+/// conversation cannot stall startup; omitted prefixes must be reported as partial history.
 pub(crate) const BACKFILL_MESSAGES: usize = 50;
+
+pub(crate) struct HistoryBatch {
+    pub updates: Vec<Mapped>,
+    pub truncated: bool,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Flavor {
@@ -235,8 +240,9 @@ impl Native {
     }
 
     /// Recent history, mapped through `mapper` so later live events never repeat it.
-    pub(crate) async fn history(&self, mapper: &mut Mapper) -> Result<Vec<Mapped>, OpencodeError> {
+    pub(crate) async fn history(&self, mapper: &mut Mapper) -> Result<HistoryBatch, OpencodeError> {
         let mut out = Vec::new();
+        let mut truncated = false;
         match self.flavor {
             Flavor::V1 => {
                 let messages: Value = self
@@ -253,6 +259,7 @@ impl Native {
                     what: "message list",
                 })?;
                 let skip = messages.len().saturating_sub(BACKFILL_MESSAGES);
+                truncated |= skip > 0;
                 for message in &messages[skip..] {
                     out.extend(mapper.v1_message(message));
                 }
@@ -278,18 +285,24 @@ impl Native {
                         after = seq;
                     }
                     events.extend(data);
+                    // Exhausting the page budget is a known omission, even if the tail is short.
+                    truncated = page["hasMore"] == true;
                     if page["hasMore"] != true {
                         break;
                     }
                 }
                 let skip = events.len().saturating_sub(BACKFILL_MESSAGES * 4);
+                truncated |= skip > 0;
                 for event in &events[skip..] {
                     out.extend(mapper.event(event));
                 }
                 out.push(Mapped::Cursor(after));
             }
         }
-        Ok(out)
+        Ok(HistoryBatch {
+            updates: out,
+            truncated,
+        })
     }
 
     pub(crate) async fn prompt(&self, blocks: &[v2::ContentBlock]) -> Result<(), OpencodeError> {

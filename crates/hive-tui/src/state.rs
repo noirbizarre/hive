@@ -35,9 +35,21 @@ pub struct Conversation {
     pub gap: bool,
     pub config_options: Vec<v2::SessionConfigOption>,
     pub config_seq: u64,
+    pub transcript: hive_protocol::history::TranscriptStatus,
+    pub transcript_seq: u64,
 }
 
 impl Conversation {
+    pub fn transcript_snapshot(&mut self, value: &serde_json::Value, seq: u64) {
+        // Resume metadata is newer than control events replayed from an earlier cursor.
+        if seq >= self.transcript_seq
+            && value.is_object()
+            && let Ok(status) = serde_json::from_value(value.clone())
+        {
+            self.transcript = status;
+            self.transcript_seq = seq;
+        }
+    }
     pub fn begin_transcript(&mut self, through: u64) {
         // The request must succeed before queued snapshot notifications can replace this view.
         *self = Self {
@@ -200,6 +212,22 @@ impl Conversation {
                 &content_text(&chunk.content),
                 false,
             ),
+            v2::SessionUpdate::AgentThoughtChunk(chunk) => self.upsert(
+                format!("thought:{}", chunk.message_id),
+                LineKind::Notice,
+                &content_text(&chunk.content),
+                false,
+            ),
+            v2::SessionUpdate::AgentThought(message) => {
+                if let Some(text) = message_content(&message.content) {
+                    self.upsert(
+                        format!("thought:{}", message.message_id),
+                        LineKind::Notice,
+                        &text,
+                        true,
+                    );
+                }
+            }
             v2::SessionUpdate::UserMessageChunk(chunk) => self.upsert(
                 format!("user:{}", chunk.message_id),
                 LineKind::User,
@@ -256,6 +284,9 @@ impl Conversation {
                     .as_u64()
                     .unwrap_or(self.generation);
                 self.pilot_present = other.fields["pilot"].as_bool().unwrap_or(false);
+                if let Some(status) = other.fields.get("transcript") {
+                    self.transcript_snapshot(status, seq);
+                }
             }
             v2::SessionUpdate::Other(other) if other.session_update == "_hive_usage" => {
                 if seq > self.usage_seq

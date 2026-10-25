@@ -116,6 +116,12 @@ The returned Hive ID can be opened in ordinary Hive clients. Up to 50 recent
 native messages feed the in-memory transcript snapshot. An ACP client must resume from
 `start` to read that backfill. Older history remains in OpenCode.
 
+Known bounded-import omissions are reported through Hive's shared `transcript`
+status as partial, including preview history pagination budget exhaustion. This
+status is independent of session recovery; no omitted entries does not certify
+complete retention. ACP profiles use only negotiated ACP capabilities, without
+an OpenCode-specific restoration policy.
+
 ## Continue in OpenCode
 
 The catalog exposes `nativeId` for server-backed sessions, including sessions

@@ -738,6 +738,7 @@ async fn v2_interrupt(State(fake): State<Fake>, Path(id): Path<String>) -> Statu
 #[derive(serde::Deserialize)]
 struct After {
     after: Option<u64>,
+    limit: Option<usize>,
 }
 
 async fn v2_history(
@@ -746,6 +747,7 @@ async fn v2_history(
     Query(after): Query<After>,
 ) -> Json<Value> {
     fake.log(format!("GET /api/session/{id}/history"));
+    let limit = after.limit.unwrap_or(usize::MAX);
     let after = after.after.unwrap_or(0);
     let state = fake.state();
     let data: Vec<_> = state
@@ -754,7 +756,8 @@ async fn v2_history(
         .filter(|e| e["durable"]["seq"].as_u64().unwrap_or(0) > after)
         .cloned()
         .collect();
-    Json(json!({"data": data, "hasMore": false}))
+    let has_more = data.len() > limit;
+    Json(json!({"data": &data[..data.len().min(limit)], "hasMore": has_more}))
 }
 
 async fn v2_events_stream(

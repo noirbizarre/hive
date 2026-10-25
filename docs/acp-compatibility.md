@@ -128,8 +128,12 @@ Runtime logs record the negotiated protocol/capabilities and chosen restoration
 method. Sanitized failures distinguish `hive::transcript::session_missing` from
 `hive::transcript::replay_failed`; they never create a replacement session.
 If durable accounting establishes earlier completed turns but the agent returns
-no conversation messages, fresh attachment reports `hive::transcript::history_missing`
-instead of presenting the session as empty. A genuinely new empty session remains valid.
+no conversation messages, attachment succeeds with a `hive::transcript::history_missing`
+warning. Accounting is not proof of retention or a protocol violation. A genuinely
+new empty session remains valid. Restoration selection follows negotiated protocol
+capabilities, never agent names. V2's advertised session surface includes `start`
+replay; no separate history capability is required. A successful v2 resume without
+its required current-state update produces `hive::transcript::state_missing`.
 
 Hive forwards downstream permissions and supported
 elicitation modes to the current pilot. This is covered by scripted agents,
@@ -308,6 +312,21 @@ on `session/resume`. This permits *new* keys, but does not establish that
 previous work completed or allow the interrupted key to be reused. Observe
 mode remains available without acknowledgement.
 
+Hive's durable journal stores a versioned SHA-256 fingerprint of decoded prompt
+content, not the prompt body. The same comparison applies live and after restart:
+object-member order is ignored recursively, while array order, exact text,
+content-level metadata, annotations and media/resource payloads participate.
+Serialized numeric distinctions, including signed annotation zero, are preserved.
+Request-level control credentials and keys are not part of the content hash.
+
+Durable successful outcomes retain only `messageId`; arbitrary response `_meta`
+is not persisted. A matching retry after restart reconstructs that minimal
+acknowledgement. Failed requests retain a failure marker and return a controlled
+previous-failure diagnostic rather than the original downstream error text.
+Normal live acknowledgements and in-memory retries may still include protocol
+metadata. Schema 2 migrates earlier journal rows without releasing pending keys;
+see [storage and backups](operations.md#storage-and-backups).
+
 ## Replay cursors
 
 Live `session/update` events carry `_meta.hive.seq`, an increasing per-session
@@ -346,6 +365,17 @@ IDs group consecutive chunks by speaker; v1 cannot provide exact native message
 identities or distinguish consecutive same-speaker messages without a boundary.
 Hive cannot reconstruct content the agent no longer retains, and a successful
 ACPv2 `start` response only establishes replay of the agent's retained history.
+
+The shared `transcript` object in new/resume `_meta.hive`, session summaries and
+`_hive_control` updates identifies agent ownership, projection source, restoration
+support, availability, unknown/partial completeness and controlled warnings. See
+[the status fields](hive-api.md#transcript-ownership-and-status). `transcriptSeq`
+in attachment metadata fences older replayed control status. Stage status with
+the successful attachment and accept subsequent control status at or above that
+watermark. Available partial projections render without live-only acknowledgement.
+Context-only recovery initially has no earlier snapshot; newly observed content
+can form an available partial snapshot. A fresh session's volatile snapshot works
+even if the downstream cannot reconstruct it after restart.
 
 Incremental replay does not survive a daemon restart. Prompt deduplication records do.
 Cursor blocks are reserved on disk before publishing updates: a restart can

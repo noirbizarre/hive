@@ -349,6 +349,30 @@ test('empty restored snapshots establish their cursor without hiding a takeover 
   assert.equal(history.gap, false);
 });
 
+test('transcript coverage survives older replay and live updates without blocking partial history', async () => {
+  const partial = { owner: 'agent', source: 'agent_history', restoration: 'supported', availability: 'available',
+    completeness: 'partial', warnings: [{ code: 'hive::transcript::truncated', message: 'Earlier content is retained by the agent' }] };
+  transport((socket, message, result) => {
+    if (message.method !== 'session/resume') return;
+    const event = update(20, { sessionUpdate: 'agent_message', messageId: 'retained', content: [{ type: 'text', text: 'Retained answer' }] });
+    event.params._meta.hive.snapshot = true;
+    socket.receive(event);
+    return { ...result, _meta: { hive: { ...result._meta.hive, transcript: partial, transcriptSeq: 20, snapshotThroughSeq: 20, nextSeq: 21 } } };
+  });
+  const client = connect('ws://localhost/acp');
+  await client.open(session);
+  assert.equal(client.state().gap, false);
+  assert.equal(client.state().lines[0].text, 'Retained answer');
+  assert.deepEqual(client.state().transcript, partial);
+  client.close();
+  const view = conversation();
+  view.reconcileTranscript(partial, 20);
+  view.apply(update(1, { sessionUpdate: '_hive_control', generation: 1, pilot: false,
+    transcript: { ...partial, completeness: 'unknown', warnings: [] } }).params);
+  view.apply(update(2, { sessionUpdate: 'agent_message_chunk', messageId: 'live', content: { type: 'text', text: 'New content' } }).params);
+  assert.deepEqual(view.transcript, partial);
+});
+
 test('failed snapshot attachments discard staged messages and unsupported replay offers explicit live-only attachment', async () => {
   let rejected = false;
   const sockets = transport((socket, message) => {
@@ -356,6 +380,8 @@ test('failed snapshot attachments discard staged messages and unsupported replay
     const event = update(2048, { sessionUpdate: 'agent_message', messageId: 'uncommitted', content: [{ type: 'text', text: 'discard' }] });
     event.params._meta.hive.snapshot = true;
     socket.receive(event);
+    socket.receive(update(2049, { sessionUpdate: '_hive_control', generation: 1, pilot: false,
+      transcript: { completeness: 'partial', warnings: [{ message: 'Uncommitted status' }] } }));
     queueMicrotask(() => {
       socket.receive({ jsonrpc: '2.0', id: message.id, error: { code: -32600, message: 'Unsupported history', data: 'hive::transcript::unsupported: attach without earlier history' } });
       rejected = true;
@@ -367,6 +393,7 @@ test('failed snapshot attachments discard staged messages and unsupported replay
   assert.equal(rejected, true);
   assert.equal(client.state().gap, true);
   assert.deepEqual(client.state().lines, []);
+  assert.equal(client.state().transcript, undefined);
   await client.attachWithoutHistory();
   assert.equal(client.state().gap, false);
   assert.equal(sockets[0].sent.at(-1).params.replayFrom, undefined);

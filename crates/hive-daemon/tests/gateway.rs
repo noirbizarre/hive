@@ -740,8 +740,8 @@ async fn start_gateway(config: Config) -> (SocketAddr, tokio::task::JoinHandle<(
     (address, server)
 }
 
-#[tokio::test]
-async fn earlier_conversations_restore_once_under_the_original_identity_for_both_acp_versions() {
+#[test]
+fn earlier_conversations_restore_once_under_the_original_identity_for_both_acp_versions() {
     for (version, mode) in [
         (AgentVersion::V1, "both"),
         (AgentVersion::V1, "load-only"),
@@ -755,7 +755,15 @@ async fn earlier_conversations_restore_once_under_the_original_identity_for_both
         (AgentVersion::V2, "empty"),
         (AgentVersion::V2, "live"),
     ] {
-        restore_conversation(version, mode).await;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let base = runtime.block_on(restore_conversation(version, mode));
+        // Connection watchers can retain the database after broker shutdown. Drop their
+        // runtime before unlinking fixtures so Windows sees no outstanding SQLite handles.
+        drop(runtime);
+        std::fs::remove_dir_all(base).unwrap();
     }
 }
 
@@ -884,7 +892,7 @@ async fn post_recovery_updates_and_permissions_are_live(address: SocketAddr, id:
         .unwrap();
 }
 
-async fn restore_conversation(version: AgentVersion, mode: &str) {
+async fn restore_conversation(version: AgentVersion, mode: &str) -> std::path::PathBuf {
     let base = std::env::temp_dir().join(format!("hive-transcript-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&base).unwrap();
     let database = base.join("hive/sessions.sqlite3");
@@ -1065,24 +1073,7 @@ async fn restore_conversation(version: AgentVersion, mode: &str) {
             "recovery publication must not overwrite live accounting"
         );
     }
-    // Aborted workers/connection watchers release their Store clones asynchronously; Windows
-    // refuses to unlink their SQLite files until those handles have actually been dropped.
-    timeout(Duration::from_secs(5), async {
-        loop {
-            match std::fs::remove_dir_all(&base) {
-                Ok(()) => break,
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::PermissionDenied
-                        || error.raw_os_error() == Some(32) =>
-                {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-                Err(error) => panic!("cannot remove recovery fixture: {error}"),
-            }
-        }
-    })
-    .await
-    .expect("recovery fixture handles were not released");
+    base
 }
 
 #[tokio::test]

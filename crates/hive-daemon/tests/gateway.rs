@@ -847,7 +847,21 @@ async fn post_recovery_updates_and_permissions_are_live(address: SocketAddr, id:
                 .await?;
                 let resume =
                     || v2::ResumeSessionRequest::new(id.clone(), std::env::current_dir().unwrap());
-                cx.send_request(resume()).block_task().await?;
+                let mut observe = v2::Meta::new();
+                observe.insert("hive".into(), serde_json::json!({"mode":"observe"}));
+                let attached = cx.send_request(resume().meta(observe)).block_task().await?;
+                let mut takeover = resume();
+                if attached.meta.as_ref().unwrap()["hive"]["recoveryRequired"] == true {
+                    // Fast v2 idle can precede durable acknowledgement; this fixture has inspected
+                    // both completed turns and must explicitly acknowledge before taking control.
+                    let mut acknowledge = v2::Meta::new();
+                    acknowledge.insert(
+                        "hive".into(),
+                        serde_json::json!({"recoveryAction":"acknowledge"}),
+                    );
+                    takeover = takeover.meta(acknowledge);
+                }
+                cx.send_request(takeover).block_task().await?;
                 // Permission is sent after config/usage on the downstream connection; observing it
                 // proves those immediately post-response messages have crossed dispatch as live work.
                 timeout(Duration::from_secs(5), rx.recv())
@@ -1051,7 +1065,24 @@ async fn restore_conversation(version: AgentVersion, mode: &str) {
             "recovery publication must not overwrite live accounting"
         );
     }
-    std::fs::remove_dir_all(base).unwrap();
+    // Aborted workers/connection watchers release their Store clones asynchronously; Windows
+    // refuses to unlink their SQLite files until those handles have actually been dropped.
+    timeout(Duration::from_secs(5), async {
+        loop {
+            match std::fs::remove_dir_all(&base) {
+                Ok(()) => break,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::PermissionDenied
+                        || error.raw_os_error() == Some(32) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("cannot remove recovery fixture: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("recovery fixture handles were not released");
 }
 
 #[tokio::test]

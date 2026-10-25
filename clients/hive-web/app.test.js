@@ -1,57 +1,13 @@
 import { afterEach, beforeEach, test } from 'node:test';
 import { strict as assert } from 'node:assert';
-import { JSDOM } from 'jsdom';
 import { readFileSync } from 'node:fs';
-import { catalog, connect, conversation, mount, validateContent } from './app.js';
+import { catalog, connect, conversation, validateContent } from './src/client.js';
 
 const session = { sessionId: 'hive-tui', cwd: '/workspace', agent: 'pi', title: 'Review parser',
   activity: 'idle', controlOwner: 'tui-connection', lastActivityAt: 1791754566280 };
 
 const modelOptions = currentValue => [{ configId: 'model', name: 'Model', category: 'model', type: 'select', currentValue,
   options: [{ groupId: 'provider', name: 'Provider', options: [{ value: 'fast', name: 'Fast' }, { value: 'careful', name: 'Careful' }] }] }];
-
-test('provider invalidations preserve selection and drafts without changing the attached conversation', async () => {
-  const dom = new JSDOM(readFileSync(new URL('./index.html', import.meta.url), 'utf8'), { url: 'http://localhost/ui?session=hive-tui' });
-  globalThis.document = dom.window.document;
-  globalThis.location = dom.window.location;
-  globalThis.history = dom.window.history;
-  globalThis.FormData = dom.window.FormData;
-  let revision = 1;
-  let agents = [{ id: 'pi', name: 'Pi' }, { id: 'other', name: 'Other' }];
-  globalThis.fetch = async url => ({ ok: true, json: async () => url.includes('providers')
-    ? { agents, defaultAgent: agents[0]?.id } : { revision, sessions: [session] } });
-  let source;
-  globalThis.EventSource = class {
-    constructor() { source = this; }
-    addEventListener(_, listener) { this.revision = listener; }
-    close() {}
-  };
-  const sockets = transport();
-  let view;
-  const client = connect('ws://localhost/acp', state => view?.show(state));
-  view = mount(client);
-  await new Promise(resolve => setImmediate(resolve));
-  const select = document.querySelector('#agent');
-  select.value = 'other';
-  const input = document.querySelector('#prompt input');
-  input.value = 'unsent draft';
-  const sent = sockets[0].sent.length;
-  agents = [{ id: 'new', name: 'New' }, { id: 'other', name: 'Renamed' }];
-  source.revision({ data: String(++revision) });
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(select.value, 'other');
-  assert.equal(select.selectedOptions[0].textContent, 'Renamed');
-  agents = [{ id: 'new', name: 'New' }];
-  source.revision({ data: String(++revision) });
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(select.value, 'new');
-  assert.equal(select.options.length, 1);
-  assert.equal(input.value, 'unsent draft');
-  assert.equal(client.state().session.sessionId, 'hive-tui');
-  assert.equal(sockets[0].sent.length, sent);
-  view.close();
-  dom.window.close();
-});
 
 test('older provider responses cannot overwrite a newer catalog refresh', async () => {
   const pending = [];
@@ -131,50 +87,6 @@ test('configuration snapshots cannot be regressed by older replay and failures r
   assert.equal(state.apply(failure), false);
   state.apply(update(3, { sessionUpdate: 'state_update', state: 'idle', stopReason: '_v1_error' }).params);
   assert.deepEqual(state.lines, [{ kind: 'notice', text: 'API key expired — Replace the key' }]);
-});
-
-test('the web shell uses the canonical embedded icon for its header and favicon', () => {
-  const dom = new JSDOM(readFileSync(new URL('./index.html', import.meta.url), 'utf8'));
-  const root = dom.window.document;
-  assert.equal(root.querySelector('link[rel="icon"]').getAttribute('href'), '/ui/icon.svg');
-  assert.equal(root.querySelector('header h1 img').getAttribute('src'), '/ui/icon.svg');
-  assert.equal(root.querySelector('header h1 img').getAttribute('alt'), '');
-  assert.equal(root.querySelector('#create').type, 'button');
-  dom.window.close();
-});
-
-test('the web controls discover grouped providers and configure before enabling inference', async () => {
-  const dom = new JSDOM(readFileSync(new URL('./index.html', import.meta.url), 'utf8'), { url: 'http://localhost/ui' });
-  globalThis.document = dom.window.document;
-  globalThis.location = dom.window.location;
-  globalThis.history = dom.window.history;
-  globalThis.FormData = dom.window.FormData;
-  globalThis.fetch = async url => ({ ok: true, json: async () => url.includes('providers') ? { agents: [{ id: 'opencode', name: 'OpenCode' }] } : { revision: 1, sessions: [] } });
-  globalThis.EventSource = class { addEventListener() {} close() {} };
-  const sockets = transport((_, message, result) => {
-    if (message.method === 'session/new') return { ...result, configOptions: modelOptions('fast') };
-    if (message.method === 'session/set_config_option') return { configOptions: modelOptions(message.params.value) };
-  });
-  let view;
-  const client = connect('ws://localhost/acp', state => view?.show(state));
-  view = mount(client);
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(document.querySelector('#send').disabled, true);
-  document.querySelector('#agent').value = 'opencode';
-  document.querySelector('#create').click();
-  await new Promise(resolve => setImmediate(resolve));
-  const select = document.querySelector('#configuration select');
-  assert.equal(select.value, 'fast');
-  assert.equal(select.querySelector('optgroup').label, 'Provider');
-  assert.equal(select.disabled, false);
-  select.value = 'careful';
-  select.dispatchEvent(new dom.window.Event('change'));
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(document.querySelector('#configuration select').value, 'careful');
-  assert.equal(document.querySelector('#send').disabled, false);
-  assert.deepEqual(sockets[0].sent.map(message => message.method), ['initialize', 'session/new', 'session/set_config_option']);
-  view.close();
-  dom.window.close();
 });
 
 test('browser and native form validation obey the same conformance cases', () => {
@@ -462,6 +374,14 @@ test('failed snapshot attachments discard staged messages and unsupported replay
   client.close();
 });
 
+test('tool status patches preserve readable output and the original title', () => {
+  const view = conversation();
+  view.apply(update(1, { sessionUpdate: 'tool_call_update', toolCallId: 'call', title: 'Check files', status: 'in_progress', rawInput: { command: 'ls' } }).params);
+  view.apply(update(2, { sessionUpdate: 'tool_call_update', toolCallId: 'call', content: [{ type: 'content', content: { type: 'text', text: 'first\nsecond' } }] }).params);
+  view.apply(update(3, { sessionUpdate: 'tool_call_update', toolCallId: 'call', status: 'completed' }).params);
+  assert.deepEqual(view.lines, [{ kind: 'tool', title: 'Check files', status: 'completed', input: '{\n  "command": "ls"\n}', text: 'first\nsecond' }]);
+});
+
 test('activity snapshots reconcile missed tools and later task updates without reopening idle', () => {
   const view = conversation();
   view.reconcile({ version: 1, seq: 14, foreground: 'idle', tools: {
@@ -599,152 +519,6 @@ test('agent input arriving just before takeover acknowledgement is still offered
   assert.equal(client.respond({ outcome: { outcome: 'cancelled' } }, 40), true);
   assert.equal(sockets[0].sent.at(-1).id, 40);
   client.close();
-});
-
-test('session UI lists daemon sessions and typing triggers handoff before send', async () => {
-  const dom = new JSDOM(`<!doctype html><p id="status"></p><ul id="sessions"></ul>
-    <form id="takeover"><input name="session"><button>Open</button></form><button id="skip-history"></button>
-    <div id="output"></div><section id="interaction"></section>
-    <form id="prompt"><select id="agent"><option value="">Default</option></select><input name="text"><button id="send">Send</button></form>
-    <button id="retry"></button><button id="cancel"></button>`, { url: 'http://localhost/ui' });
-  globalThis.document = dom.window.document;
-  globalThis.location = dom.window.location;
-  globalThis.history = dom.window.history;
-  globalThis.FormData = dom.window.FormData;
-  const requests = [];
-  globalThis.fetch = async url => {
-    requests.push(url);
-    assert.ok(['/v1/providers', '/v1/sessions'].includes(url));
-    return { ok: true, json: async () => url === '/v1/providers'
-      ? { agents: [{ id: 'pi', name: 'Pi' }] } : { revision: 1, sessions: [session] } };
-  };
-  let eventsUrl;
-  globalThis.EventSource = class {
-    constructor(url) { eventsUrl = url; }
-    addEventListener() {}
-    close() {}
-  };
-  const sockets = transport();
-  let view;
-  const client = connect('ws://localhost/acp', state => view?.show(state));
-  view = mount(client);
-  await new Promise(resolve => setImmediate(resolve));
-  assert.deepEqual(requests.toSorted(), ['/v1/providers', '/v1/sessions']);
-  assert.equal(eventsUrl, '/v1/sessions/events');
-  assert.match(document.querySelector('#sessions').textContent, /pi · idle · controlled by another client/);
-  document.querySelector('#sessions button').click();
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(client.state().role, 'observer');
-  assert.equal(document.querySelector('#send').disabled, true);
-  const input = document.querySelector('#prompt input');
-  input.value = 'follow up';
-  input.dispatchEvent(new dom.window.Event('input', { bubbles: true }));
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(client.state().role, 'pilot');
-  assert.equal(document.querySelector('#send').disabled, false);
-  assert.equal(sockets[0].sent.filter(item => item.method === 'session/resume').length, 2);
-  view.close();
-  dom.window.close();
-});
-
-test('agent input UI collects typed form values and prevents stale interaction responses', async () => {
-  const dom = new JSDOM(`<!doctype html><p id="status"></p><ul id="sessions"></ul>
-    <form id="takeover"><input name="session"></form><button id="skip-history"></button><div id="output"></div>
-    <section id="interaction"></section><form id="prompt"><select id="agent"></select><input name="text"><button id="send"></button></form>
-    <button id="retry"></button><button id="cancel"></button>`, { url: 'http://localhost/' });
-  globalThis.document = dom.window.document;
-  globalThis.location = dom.window.location;
-  globalThis.history = dom.window.history;
-  globalThis.FormData = dom.window.FormData;
-  globalThis.fetch = async url => ({ ok: true, json: async () => url.includes('providers')
-    ? { agents: [] } : { revision: 1, sessions: [session] } });
-  globalThis.EventSource = class { addEventListener() {} close() {} };
-  const sockets = transport();
-  let view;
-  const client = connect('ws://localhost/acp', state => view?.show(state));
-  view = mount(client);
-  await new Promise(resolve => setImmediate(resolve));
-  document.querySelector('#sessions button').click();
-  await new Promise(resolve => setImmediate(resolve));
-  const input = document.querySelector('#prompt input');
-  input.value = 'take over';
-  input.dispatchEvent(new dom.window.Event('input'));
-  await new Promise(resolve => setImmediate(resolve));
-  sockets[0].receive({ jsonrpc: '2.0', id: 50, method: 'elicitation/create', params: {
-    sessionId: 'hive-tui', mode: 'form', message: 'Choose', requestedSchema: {
-      properties: { approved: { type: 'boolean' }, count: { type: 'integer' } }, required: ['approved', 'count'],
-    },
-  } });
-  const form = document.querySelector('#interaction form');
-  form.elements.namedItem('approved').value = 'true';
-  form.elements.namedItem('count').value = '4';
-  form.dispatchEvent(new dom.window.Event('submit', { bubbles: true, cancelable: true }));
-  assert.deepEqual(sockets[0].sent.at(-1).result, { action: 'accept', content: { approved: true, count: 4 } });
-  sockets[0].receive({ jsonrpc: '2.0', id: 52, method: 'elicitation/create', params: {
-    sessionId: 'hive-tui', mode: 'url', message: 'Authenticate', url: 'https://example.org/auth',
-  } });
-  assert.equal(document.querySelector('#interaction a').href, 'https://example.org/auth');
-  assert.equal(document.querySelector('#interaction a').rel, 'noopener noreferrer');
-  document.querySelector('#interaction button').click();
-  assert.deepEqual(sockets[0].sent.at(-1).result, { action: 'accept' });
-  sockets[0].receive({ jsonrpc: '2.0', id: 51, method: 'session/request_permission', params: {
-    sessionId: 'hive-tui', title: 'Allow?', options: [{ name: 'Allow once', optionId: 'allow-once' }],
-  } });
-  assert.match(document.querySelector('#interaction').textContent, /Allow once/);
-  sockets[0].receive(update(1, { sessionUpdate: '_hive_control', generation: 4, pilot: true }));
-  assert.equal(document.querySelector('#interaction').hidden, true);
-  assert.equal(client.respond({ outcome: { outcome: 'selected', optionId: 'allow-once' } }, 51), false);
-  view.close();
-  dom.window.close();
-});
-
-test('the session rail toggles, follows catalog revisions and keeps recent selection', async () => {
-  const dom = new JSDOM(readFileSync(new URL('./index.html', import.meta.url), 'utf8'),
-    { url: 'http://localhost/ui?session=hive-tui' });
-  globalThis.document = dom.window.document;
-  globalThis.location = dom.window.location;
-  globalThis.history = dom.window.history;
-  globalThis.FormData = dom.window.FormData;
-  let revision = 1;
-  let items = [{ ...session, lifecycle: 'active', generation: 3 }, { ...session, sessionId: 'hive-second',
-    title: null, activity: 'unknown', controlOwner: null, lastActivityAt: null }];
-  globalThis.fetch = async url => ({ ok: true, json: async () => url.includes('providers')
-    ? { agents: [] } : { revision, sessions: items } });
-  let source;
-  globalThis.EventSource = class {
-    constructor() { source = this; }
-    addEventListener(_, listener) { this.revision = listener; }
-    close() {}
-  };
-  const sockets = transport();
-  let view;
-  const client = connect('ws://localhost/acp', state => view?.show(state));
-  view = mount(client);
-  await new Promise(resolve => setImmediate(resolve));
-  const toggle = document.querySelector('#toggle-sessions');
-  assert.equal(client.state().session.sessionId, 'hive-tui');
-  toggle.click();
-  assert.equal(toggle.getAttribute('aria-expanded'), 'false');
-  assert.equal(document.querySelector('#layout').classList.contains('nav-hidden'), true);
-  toggle.click();
-  assert.equal(toggle.getAttribute('aria-expanded'), 'true');
-  document.querySelector('[data-session-id="hive-second"]').click();
-  await new Promise(resolve => setImmediate(resolve));
-  assert.equal(client.state().session.sessionId, 'hive-second');
-  assert.equal(location.pathname, '/ui');
-  assert.equal(location.search, '?session=hive-second');
-  assert.equal(document.querySelector('#sessions button').dataset.sessionId, 'hive-second');
-  assert.equal(document.querySelector('#sessions [aria-current="page"]').dataset.sessionId, 'hive-second');
-  revision = 2;
-  items = items.map(item => item.sessionId === 'hive-second'
-    ? { ...item, activity: 'running', controlOwner: 'other', lastActivityAt: Date.now() } : item);
-  source.revision({ data: '2' });
-  await new Promise(resolve => setImmediate(resolve));
-  assert.match(document.querySelector('#sessions').textContent, /running · controlled by another client/);
-  assert.equal(document.querySelector('#sessions [aria-current="page"]').dataset.sessionId, 'hive-second');
-  assert.equal(sockets[0].sent.filter(message => message.method === 'session/new').length, 0);
-  view.close();
-  dom.window.close();
 });
 
 test('rapid selections ignore obsolete attachment responses without forking a session', async () => {

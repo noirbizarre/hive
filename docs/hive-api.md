@@ -18,6 +18,7 @@ user. Session conversation/control methods live exclusively on `/acp`.
 | `GET /v1/sessions/events` | SSE catalog revision invalidations |
 | `GET /ui` | Embedded browser HTML |
 | `GET /ui/app.js` | Embedded browser JavaScript |
+| `GET /ui/style.css` | Embedded browser stylesheet |
 
 Provider discovery omits commands, endpoints, arguments, environment, and headers.
 It describes configuration rather than successful availability probes.

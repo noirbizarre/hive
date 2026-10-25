@@ -9,6 +9,7 @@ and some task-launched tools, including Zensical, are not version-pinned.
 ```bash
 mise install          # the tools
 prek install          # the Git hooks
+mise run hive:web     # prepare embedded assets and run browser checks (Node 22.22.2+)
 mise run ci           # aggregate local checks and documentation build
 ```
 
@@ -33,7 +34,9 @@ and cross-compilation targets.
 | `mise run ci` | `check` plus the documentation build |
 | `mise run docs` | Serve the documentation locally |
 | `mise run docs:build` | Build the documentation site |
-| `mise run hive:web` | Install browser test dependencies, check syntax, and run tests |
+| `mise run hive:web` | Install locked dependencies, build embedded assets, and run browser tests |
+| `mise run hive:build` | Build frontend assets, then the Rust workspace |
+| `mise run hive:ci` | Run browser checks, then aggregate local CI |
 | `mise run changelog` | Preview the changelog for unreleased commits |
 | `mise run release` | Show the version the next release would take |
 | `mise run tpl:update` | Bring the rendered template ref up to date |
@@ -42,6 +45,8 @@ and cross-compilation targets.
 `mise run ci` covers the aggregate checks and documentation build. Browser,
 MSRV, and other workflow-specific checks have separate CI jobs. See the
 [development guide](docs/development.md) for focused checks and live smoke tests.
+Run `mise run hive:web` before Cargo or hooks on a clean checkout and after UI
+changes. Node 22.22.2+ is required to build assets, not to run the resulting binary.
 
 `mise <task>` is a shorthand for `mise run <task>`, but a builtin subcommand of
 the same name wins it silently — which is why the format task is `format` and

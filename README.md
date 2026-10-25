@@ -30,9 +30,11 @@ trusted local user on loopback, without remote multi-user authentication.
 
 ## Installation
 
-With Rust installed, run this from a Hive checkout:
+With Rust and Node 22.22.2+ installed, run this from a Hive checkout:
 
 ```sh
+npm ci --prefix clients/hive-web
+npm run build --prefix clients/hive-web
 cargo install --path crates/hive-cli --bin hive
 ```
 

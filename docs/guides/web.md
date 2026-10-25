@@ -11,6 +11,10 @@ Hive and served by the daemon. No separate frontend process is needed.
 The equivalent `http://localhost:8765/ui` address is also supported; browser
 origins must use the daemon's actual listening port.
 
+The interface uses Vue 3.5 and OpenVue 1.0.0 with system-following light and dark
+themes. Source builds require Node 22.22.2+ and a frontend build before Cargo;
+see [development](../development.md#client-checks). The binary needs no Node runtime.
+
 For another loopback port, use `hive web --url http://127.0.0.1:9000`.
 This command opens a page; it does not start the daemon or check its health.
 
@@ -23,9 +27,12 @@ original directory and downstream identity.
 > **New-session working directory:** the browser currently uses `/` and has no
 > project-directory picker. Use a TUI-created session for project work.
 
-The rail is visible by default. “Hide sessions” and “Show sessions” change its
+The desktop rail is visible by default. “Hide sessions” and “Show sessions” change its
 presentation without closing the conversation. Catalog refreshes preserve focus
 and selection. Recently visited sessions appear first during the current run.
+Search filters by title, ID, backend or project directory. On narrow screens,
+the **Sessions** button opens a keyboard-accessible drawer. **New session** opens
+a fresh browser view without terminating the existing agent session.
 
 ## Take control
 
@@ -41,8 +48,8 @@ discovers the agent's configuration without sending a prompt. Choose its
 choices come from the agent; the Hive backend selects the agent process or
 server, not its model provider.
 
-Existing sessions show the current configuration. Use **Take control to change
-model** before editing a read-only session. Controls are unavailable during an
+Existing sessions show the current configuration. Use **Take control**
+before editing a read-only session. Controls are unavailable during an
 active turn or pending configuration change. Changes become visible to other
 clients and are restored on attachment from the daemon's authoritative state.
 Backends without advertised configuration show an unsupported-selection message.
@@ -75,3 +82,53 @@ transcript archive.
 
 Close the page to detach. The downstream agent keeps running while the daemon
 remains alive.
+
+## Conversation and activity
+
+User messages, agent messages and session notices have distinct presentation.
+Tool output and the activity summary expand independently. Content is rendered
+as text, preserving whitespace without interpreting agent-provided HTML. Usage
+distinguishes actual costs, estimates and unknown values.
+
+Streaming follows the latest content while you are near the bottom. Scroll up
+to read earlier messages without being pulled away; **Jump to latest** resumes
+following. Updates preserve composer drafts, interaction fields and open tools.
+The composer explains why sending is unavailable. Connection and pilot/read-only
+indicators remain separate from session activity.
+
+## Browser smoke checklist
+
+Build with `mise run hive:build`, then start the daemon using the deterministic
+[mock setup](../getting-started.md#try-without-a-model) or a configured local
+agent. Open `/ui` from the daemon, not a frontend development server. The
+automated adapter/component tests cover protocol and rendered interactions;
+use this checklist for real browser layout, transport and accessibility checks.
+
+1. Check the network panel: HTML, `/ui/app.js`, `/ui/style.css` and `/ui/icon.svg`
+   load successfully, without external assets or browser console errors.
+2. With an empty catalog, verify creation guidance. Stop/restart the daemon and
+   verify visible connection errors/reconnect. Check list/backend retry actions
+   when their endpoints fail.
+3. Choose a backend, create a session, select an advertised grouped model, send
+   a prompt, inspect streamed text/tool activity/usage, then stop active work.
+   Model changes and send must be unavailable during pending operations.
+4. Open a TUI-created session and a `?session=` deep link. Confirm the original
+   project and retained transcript. Switch rapidly and search the session rail;
+   no replacement sessions should be created.
+5. In two tabs, take control in one, then the other. Verify the old pilot becomes
+   read-only, stale actions do not succeed, and typing requests control explicitly.
+6. Exercise permission choices, concurrent requests, cancellation, typed form
+   validation and a request-scoped form during creation. Streaming must preserve
+   unfinished fields. A withdrawn request must not accept an old answer.
+7. For a URL request, verify safe external navigation and consent separately
+   from the agent's eventual completion notification.
+8. Disconnect during a prompt, reconnect to the original session, and confirm no
+   automatic resend or pilot reclamation. Explicit retry retains the original
+   content/key. Check explicit recovery acknowledgement after a daemon restart
+   and attach-without-history when the replay window expires.
+9. Scroll up during streaming, expand tools and type a draft. Confirm position,
+   expanded state and focus persist; jump-to-latest resumes following.
+10. Test desktop and 375 px mobile widths, long messages/tool output/model names,
+    both OS color schemes and reduced motion. Tab through labelled controls,
+    use the skip link and keyboard model choices, close the mobile drawer with
+    Escape and verify focus returns. Status must be understandable without color.

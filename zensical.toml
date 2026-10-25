@@ -52,6 +52,7 @@ nav = [
     { "005: Protocol compatibility" = "adr/005-explicit-downstream-protocol-compatibility.md" },
     { "006: Local HTTP boundary" = "adr/006-local-operational-http-and-acp-boundary.md" },
     { "007: Human interactions" = "adr/007-capability-aware-human-interaction-routing.md" },
+    { "008: Embedded Vue UI" = "adr/008-embedded-vue-interface.md" },
   ] },
   { "Development" = [
     { "Development guide" = "development.md" },

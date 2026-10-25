@@ -30,6 +30,9 @@ pub struct Conversation {
     pub pilot_present: bool,
     pub activity: serde_json::Value,
     pub activity_seq: u64,
+    pub plan_snapshot: serde_json::Value,
+    pub plan_seq: u64,
+    pub plans_authoritative: bool,
     pub usage: serde_json::Value,
     pub usage_seq: u64,
     pub gap: bool,
@@ -71,6 +74,18 @@ impl Conversation {
         if seq >= self.usage_seq && value.is_object() {
             self.usage = value.clone();
             self.usage_seq = seq;
+        }
+    }
+
+    pub fn plans_snapshot(&mut self, value: &serde_json::Value) {
+        // A stale attachment cannot replace plans already reduced from later live events.
+        if value["version"] == 1
+            && let Some(seq) = value["seq"].as_u64()
+            && seq >= self.plan_seq
+        {
+            self.plan_snapshot = value.clone();
+            self.plan_seq = seq;
+            self.plans_authoritative = true;
         }
     }
 
@@ -203,6 +218,21 @@ impl Conversation {
         }
         // Replay and live events share sequence numbers; only advance after reducing the event.
         match notification.update {
+            v2::SessionUpdate::PlanUpdate(update) if seq > self.plan_seq => {
+                // Native observation alone does not make an older daemon's activity fallback complete.
+                let value = serde_json::to_value(update).unwrap_or_default();
+                if let Some(id) = value["plan"]["planId"].as_str().map(str::to_owned) {
+                    if !self.plan_snapshot.is_object() {
+                        self.plan_snapshot = serde_json::json!({"version":1,"plans":{}});
+                    }
+                    // A replacement also preserves unknown content types and native metadata.
+                    self.plan_snapshot["plans"][id] = value;
+                    self.plan_snapshot["support"] = "supported".into();
+                    self.plan_snapshot["observation"] = "observed".into();
+                    self.plan_snapshot["seq"] = seq.into();
+                    self.plan_seq = seq;
+                }
+            }
             v2::SessionUpdate::ConfigOptionUpdate(update) => {
                 self.config_snapshot(update.config_options, seq)
             }
@@ -468,6 +498,57 @@ mod tests {
             )),
         ));
         assert_eq!(conversation.usage["actualSessionCost"]["amount"], 0.04);
+    }
+
+    #[test]
+    fn native_plans_replace_ordered_entries_and_cannot_regress_the_attachment_snapshot() {
+        let mut conversation = Conversation::default();
+        let plan = |entries| serde_json::json!({"plan":{"type":"items","planId":"steps","entries":entries,"_meta":{"plan":true}},"_meta":{"update":true}});
+        let first = plan(
+            serde_json::json!([{"content":"A","priority":"high","status":"pending"},{"content":"B","priority":"future","status":"in_progress","_meta":{"entry":true}}]),
+        );
+        let second = plan(
+            serde_json::json!([first["plan"]["entries"][1],{"content":"A","priority":"low","status":"cancelled"}]),
+        );
+        for (seq, value) in [(1, first), (2, second.clone())] {
+            conversation.apply(event(
+                seq,
+                v2::SessionUpdate::PlanUpdate(serde_json::from_value(value).unwrap()),
+            ));
+        }
+        assert_eq!(conversation.plan_snapshot["plans"]["steps"], second);
+        assert!(!conversation.plans_authoritative);
+        let current = serde_json::json!({"version":1,"seq":5,"support":"supported","observation":"observed","plans":{"steps":plan(serde_json::json!([]))}});
+        conversation.plans_snapshot(&current);
+        assert!(conversation.plans_authoritative);
+        conversation.apply(event(
+            3,
+            v2::SessionUpdate::PlanUpdate(serde_json::from_value(second).unwrap()),
+        ));
+        assert_eq!(conversation.plan_snapshot, current);
+        conversation.apply(event(
+            4,
+            v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(v2::IdleStateUpdate::new())),
+        ));
+        conversation.apply(event(
+            5,
+            v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(v2::IdleStateUpdate::new())),
+        ));
+        let unknown =
+            serde_json::json!({"plan":{"type":"_future","planId":"other","nested":[2,1]}});
+        conversation.apply(event(
+            6,
+            v2::SessionUpdate::PlanUpdate(serde_json::from_value(unknown.clone()).unwrap()),
+        ));
+        conversation.plans_snapshot(&current);
+        assert_eq!(conversation.plan_snapshot["plans"]["other"], unknown);
+        assert_eq!(
+            conversation.plan_snapshot["plans"]["steps"]["plan"]["entries"],
+            serde_json::json!([])
+        );
+        assert_eq!(conversation.plan_seq, 6);
+        assert!(!conversation.running);
+        assert!(!conversation.gap);
     }
 
     #[test]

@@ -545,6 +545,119 @@ HIVE_REAL_PI=1 cargo test -p hive-daemon --test real_agents \
   pi_initialize_probe_reports_a_capability_report -- --ignored --exact --nocapture
 ```
 
+## Native ACPv2 plans
+
+Hive's pinned SDK (3.4.0, schema 1.12.0, `unstable_protocol_v2`) accepts native
+`session/update` notifications with this shape:
+
+```json
+{
+  "sessionId": "hive-example",
+  "update": {
+    "sessionUpdate": "plan_update",
+    "plan": {
+      "type": "items",
+      "planId": "execution",
+      "entries": [
+        {"content": "Inspect implementation", "priority": "high", "status": "completed"},
+        {"content": "Verify changes", "priority": "medium", "status": "in_progress"}
+      ]
+    }
+  },
+  "_meta": {"hive": {"seq": 12}}
+}
+```
+
+Each itemized update replaces the **entire ordered entries array** for its
+session-scoped `planId`. Entries are not patches or individually identified
+tasks: this schema has no standard entry-ID field. Empty entries clear the list
+without removing the plan. Idle does not clear plans. Priorities and statuses
+(including `pending`, `in_progress`, `completed`, `cancelled`, and unknown string
+values) retain their native meaning. Hive neither sorts entries nor infers task
+identities from their descriptions.
+
+The gateway broadcasts the complete typed native update to every attached client
+authorized to observe that session. Native updates retain their update, plan,
+and entry `_meta` fields. Unknown plan content types retain their discriminator,
+ID, and extension fields; clients may ignore them or show generic escaped content.
+Hive does not enable unstable plan operations or interpret unknown variants as
+instructions to read files, fetch URLs, or remove plans.
+
+Preservation is at the pinned SDK's **typed deserialization boundary**, not a
+byte-for-byte JSON proxy guarantee. In particular, invalid itemized entries are
+skipped, malformed entries collections can normalize to empty, and unmodeled
+fields on known types can be discarded by that schema. Missing/non-string IDs
+and invalid known content schemas fail deserialization rather than becoming
+invented plans. Malformed notifications do not establish support observation.
+
+### Current plan snapshot and support
+
+New/resume responses include `_meta.hive.planSnapshot`:
+
+```json
+{
+  "version": 1,
+  "seq": 12,
+  "support": "supported",
+  "observation": "observed",
+  "plans": {
+    "execution": {
+      "plan": {
+        "type": "items",
+        "planId": "execution",
+        "entries": []
+      }
+    }
+  }
+}
+```
+
+Each map value is the complete latest `PlanUpdate` object (`plan` and optional
+`_meta`, without the `sessionUpdate` discriminator). This is the canonical volatile
+native plan projection. The filtered `_hive_activity` plan view remains a
+compatibility convenience, separate from `_hive_task` background activity; do not
+render both as independent plans.
+
+`support: supported` describes Hive's native plan transport and itemized client
+rendering contract. ACP exposes no dedicated agent plan capability flag, so this
+does not promise the agent will emit a plan. `observation` is `not_observed` until
+a valid native plan arrives, then `observed`, including empty plans and unknown
+content types. An older daemon without this metadata has unknown support. A
+client's unsupported rich rendering of a particular content type is distinct
+from unknown agent emission; both built-in clients display unfamiliar content
+generically. Silence never means unsupported. V1 plans continue through the
+separate `v1-plan` activity adaptation (`plan.source: acp-v1`) and do not establish
+native v2 observation. When a canonical snapshot is present, clients must not
+resurrect native plans from an older activity projection; only explicitly marked
+v1 adaptations remain a fallback. Receiving an individual native update does not
+establish snapshot completeness: when attached to an older daemon without a
+canonical snapshot, retain other activity-derived plans until their native
+updates arrive. V1 fallback content does not change the native observation label.
+
+### Attachment and replay
+
+- Snapshot `seq` is the session's atomic attachment boundary (last included
+  session sequence), not a separate plan counter. Buffer notifications arriving
+  before the response; reconcile the snapshot before reducing buffered events.
+  Apply newer native plans as complete replacements and ignore plans at or below
+  the snapshot watermark. Continue consuming unrelated events with the ordinary
+  session cursor; a plan watermark must not suppress other activity.
+- Incremental `_hive_seq` replay retains original native plan updates, ordered
+  with other session events, within the 256-event ring.
+- `replayFrom: start` emits each current native plan alongside the materialized
+  transcript, using `_meta.hive.snapshot: true` and the shared snapshot boundary.
+  Multiple snapshot notifications can share that sequence: use snapshot upserts,
+  not ordinary duplicate-event suppression. It restores current plans, not every
+  historical plan revision.
+- Live-only attachment includes the current plan snapshot even after original
+  plan events expire. On an expired cursor, use the existing explicit history-gap
+  decision, restore the snapshot, and continue live from `nextSeq`.
+- A daemon restart loses the volatile projection. During downstream restoration,
+  agent-replayed plans rebuild it without republishing historical activity or
+  repeating accounting. If the agent does not retain/replay plans, the new
+  projection is empty and `not_observed`; Hive does not manufacture a plan,
+  create a replacement session, or prompt the agent to reconstruct one.
+
 ## Live execution activity
 
 Native ACPv2 tool, plan, and state updates remain on the shared session stream.
@@ -555,7 +668,7 @@ selected by `kind`:
 | Kind | Fields | Meaning |
 | --- | --- | --- |
 | `tool` | `toolCallId`, `tool`, `source` | Current full tool-call state after applying an ACP patch or content chunk. `status` uses ACP's `pending`, `in_progress`, `completed`, `failed`, `cancelled` values. Raw input/output and result/error content are retained when sent. |
-| `plan` | `planId`, `plan`, `source` | Full replacement of structured entries, including each status. A v1 plan uses the session-scoped ID `v1-plan`. |
+| `plan` | `planId`, `plan`, `source` | Full replacement of plan content, including its type and ordered entries/statuses when itemized. Unknown content remains generic. A v1 plan uses the session-scoped ID `v1-plan`. |
 | `foreground` | `state`, `source` | ACP foreground running, idle (with stop reason), or requires-action state. Idle ends foreground work only. |
 | `session` | `status`, `source` | Hive worker ended (`ended`), distinct from turn idle or background task completion. |
 | `task` | `taskId`, `task`, `source` | Explicitly identified background task update from a `_hive_task` downstream extension; unrecognized extensions are forwarded unchanged. |
@@ -572,7 +685,8 @@ Tool patches follow these rules:
 - Explicit null clears a field.
 - Arrays replace previous arrays.
 - Content chunks append until a full content update replaces them.
-- Top-level provider `_meta` is excluded from tool/plan/task projections.
+- Top-level provider `_meta` is excluded from these convenience projections;
+  native plans and `planSnapshot` preserve typed metadata.
 
 IDs are scoped to the Hive session.
 Turn IDs, parent task IDs, and other relationships are present only when the
@@ -586,7 +700,7 @@ first not-yet-produced *session update*.
 
 The support values for tools, plans,
 and tasks are `observed`, `unknown`, or `unsupported`. V1 task identities are
-unsupported by Hive's stable v1 adapter. Otherwise an absent todo update cannot
+unsupported by Hive's stable v1 adapter. Otherwise an absent plan update cannot
 justify an invented plan or an unsupported claim. Unrecognized provider statuses
 are preserved.
 
@@ -608,8 +722,10 @@ activity*, not missed conversation text.
 
 Buffer updates that arrive before the
 resume response and reduce them after the snapshot so later activity cannot be
-overwritten. A daemon restart loses both history and this in-memory snapshot.
-Activity resumes as unknown rather than assuming the interrupted turn was idle.
+overwritten. A daemon restart loses this in-memory snapshot. Agent history can
+restore conversation text and replayed plans; tools/tasks are not reconstructed
+as current activity from historical events. Foreground activity remains unknown
+unless the agent supplies current state, rather than assuming interrupted work was idle.
 V1 tool calls and plans are adapted. ACPv2 provides tool, plan, and foreground
 updates natively. Background tasks require explicit provider extension events.
 Neither wire version guarantees them.

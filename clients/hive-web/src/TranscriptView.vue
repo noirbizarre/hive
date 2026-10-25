@@ -5,6 +5,13 @@ const props = defineProps({ state: { type: Object, required: true } });
 const viewport = ref();
 const following = ref(true);
 const hasNew = ref(false);
+// A canonical empty snapshot must clear stale native activity after daemon recovery.
+const plans = computed(() => ({
+  ...Object.fromEntries(Object.entries(props.state.activity?.plans || {}).filter(([, plan]) =>
+    !props.state.planSnapshot?.authoritative || plan.source === 'acp-v1')),
+  ...Object.fromEntries(Object.entries(props.state.planSnapshot?.plans || {}).map(([id, update]) => [id, update.plan])) }));
+const planSupport = computed(() => props.state.planSnapshot?.support || 'unknown');
+const planObservation = computed(() => props.state.planSnapshot?.observation === 'observed' ? 'observed' : 'not yet observed');
 const cost = computed(() => {
   const usage = props.state.usage || {};
   const actual = usage.actualSessionCost;
@@ -43,14 +50,25 @@ watch(() => props.state, async (state, previous) => {
           <div class="message-text">{{ line.text }}</div>
         </article>
       </template>
-      <details v-if="state.session" class="activity-panel">
+      <details v-if="state.session" class="activity-panel" open>
         <summary>Activity · {{ state.activity?.session || 'active' }} / {{ state.activity?.foreground || 'unknown' }}</summary>
-        <div v-for="[label, key] in [['Tools', 'tools'], ['Tasks', 'tasks'], ['Todos', 'plans']]" :key="key">
+        <section aria-label="Plans">
+          <h3>Plans <small>{{ planSupport }} · {{ planObservation }}</small></h3>
+          <p v-if="!Object.keys(plans).length" class="muted">No reported plans</p>
+          <div v-for="(plan, id) in plans" :key="id" class="activity-item">
+            <h4>{{ id }}</h4>
+            <template v-if="plan.type === 'items' || (!plan.type && Array.isArray(plan.entries))">
+              <p v-if="!plan.entries.length" class="muted">Empty plan</p>
+              <p v-for="(entry, i) in plan.entries" :key="i">{{ entry.status }} · {{ entry.priority }} · {{ entry.content }}</p>
+            </template>
+            <template v-else><p>Unsupported plan content type: {{ plan.type }}</p><pre>{{ JSON.stringify(plan, null, 2) }}</pre></template>
+          </div>
+        </section>
+        <div v-for="[label, key] in [['Tools', 'tools'], ['Tasks', 'tasks']]" :key="key">
           <h3>{{ label }} <small>{{ state.activity?.support?.[key] || 'unknown' }}</small></h3>
           <p v-if="!Object.keys(state.activity?.[key] || {}).length" class="muted">No reported {{ label.toLowerCase() }}</p>
           <div v-for="(item, id) in state.activity?.[key] || {}" :key="id" class="activity-item">
-            <template v-if="key === 'plans'"><p v-for="(entry, i) in item.entries || []" :key="i">{{ entry.status }} · {{ entry.content }}</p></template>
-            <template v-else>{{ item.title || id }} · {{ item.status || 'unknown' }}</template>
+            {{ item.title || id }} · {{ item.status || 'unknown' }}
           </div>
         </div>
       </details>

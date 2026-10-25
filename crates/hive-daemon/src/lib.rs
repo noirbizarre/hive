@@ -42,6 +42,7 @@ pub mod doctor;
 mod interactions;
 mod opencode;
 mod persistence;
+mod plans;
 mod pricing;
 mod prompt_journal;
 pub mod reload;
@@ -179,6 +180,7 @@ struct Control {
     closing: bool,
     prompts: HashMap<String, PromptRecord>,
     activity: Activity,
+    plans: plans::Plans,
     recovery_required: bool,
     reattached: bool,
     store: Option<Arc<Store>>,
@@ -271,6 +273,7 @@ impl Control {
             closing: false,
             prompts: HashMap::new(),
             activity,
+            plans: plans::Plans::default(),
             recovery_required: record.uncertain,
             reattached: true,
             store: Some(store),
@@ -334,6 +337,7 @@ impl Control {
             closing: false,
             prompts: HashMap::new(),
             activity,
+            plans: plans::Plans::default(),
             recovery_required: false,
             reattached: false,
             store: None,
@@ -356,6 +360,7 @@ impl Control {
             "generation": self.generation, "nextSeq": self.next_seq,
             "running": self.running, "pilot": self.pilot.is_some(),
             "activitySnapshot": self.activity,
+            "planSnapshot": self.plans.snapshot(self.next_seq.saturating_sub(1)),
             "usageSnapshot": self.usage.summary(),
             "usageSeq": self.next_seq.saturating_sub(1),
             "configSeq": self.next_seq.saturating_sub(1),
@@ -1283,7 +1288,12 @@ impl Broker {
         // Keep replay and live forwarding in one critical section: no update can cross this boundary twice.
         let snapshot_through = state.next_seq.saturating_sub(1);
         if snapshot {
-            for update in state.transcript.updates()? {
+            for update in state
+                .transcript
+                .updates()?
+                .into_iter()
+                .chain(state.plans.updates())
+            {
                 let mut meta = event_meta(snapshot_through);
                 meta.get_mut("hive").expect("event metadata")["snapshot"] = true.into();
                 cx.send_notification(
@@ -1870,6 +1880,9 @@ fn forward_v1(
     forward_locked(&mut state, id, Some(raw))?;
     if state.hydrating {
         // Old v1 tools are transcript entries, not current activity to publish again.
+        if matches!(source, v1::SessionUpdate::Plan(_)) {
+            state.activity.v1(source);
+        }
         return Ok(());
     }
     if let Some(event) = state.activity.v1(source) {
@@ -1960,6 +1973,13 @@ fn forward_locked(
         state.history_status.warnings.len(),
     );
     state.transcript.ingest(&update)?;
+    if let v2::SessionUpdate::PlanUpdate(plan) = &update {
+        state.plans.ingest(plan);
+        if state.hydrating {
+            // Restore only the convenience view; historical plans must not publish live events.
+            state.activity.v2(&update);
+        }
+    }
     if state.transcript.limited() {
         state.history_status.partial(WarningCode::ProjectionLimited);
     }
@@ -3605,6 +3625,7 @@ mod control_tests {
             closing: false,
             prompts: HashMap::new(),
             activity: Activity::new(),
+            plans: plans::Plans::default(),
             recovery_required: false,
             reattached: false,
             store: None,
@@ -3780,6 +3801,14 @@ mod control_tests {
         let state = Mutex::new(state);
         let id = v2::SessionId::new("original");
         for update in [
+            v2::SessionUpdate::PlanUpdate(v2::PlanUpdate::new(v2::PlanUpdateContent::items(
+                "restored",
+                vec![v2::PlanEntry::new(
+                    "Retained step",
+                    v2::PlanEntryPriority::High,
+                    v2::PlanEntryStatus::Completed,
+                )],
+            ))),
             v2::SessionUpdate::UsageUpdate(
                 v2::UsageUpdate::new(120, 200_000).cost(v2::Cost::new(1.0, "USD")),
             ),
@@ -3815,6 +3844,14 @@ mod control_tests {
         assert!(state.last_activity_at.is_none());
         assert_eq!(state.next_seq, 1);
         assert!(state.events.is_empty());
+        assert_eq!(
+            state.plans.snapshot(0)["plans"]["restored"]["plan"]["entries"][0]["status"],
+            "completed"
+        );
+        assert_eq!(
+            state.activity.plans["restored"]["entries"][0]["status"],
+            "completed"
+        );
         assert_eq!(state.transcript.updates().unwrap().len(), 3);
         assert!(
             serde_json::to_value(&state.activity).unwrap()["tools"]

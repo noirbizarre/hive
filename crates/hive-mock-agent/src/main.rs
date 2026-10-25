@@ -76,6 +76,24 @@ fn invalid(message: &str) -> Error {
     Error::invalid_params().data(message.to_owned())
 }
 
+fn plan_sequence() -> Vec<v2::SessionUpdate> {
+    // Distinct metadata layers catch gateways that retain entries but lose the native envelope.
+    let entry = |content: &str, status: &str| {
+        serde_json::json!({
+            "content": content, "priority": "high", "status": status, "_meta": {"entry": content}
+        })
+    };
+    [
+        serde_json::json!({"type":"items", "planId":"steps", "entries":[entry("Inspect", "in_progress"), entry("Verify", "pending")], "_meta":{"plan":true}}),
+        serde_json::json!({"type":"items", "planId":"steps", "entries":[entry("Verify", "in_progress"), entry("Inspect", "completed")]}),
+        serde_json::json!({"type":"items", "planId":"steps", "entries":[entry("Verify", "cancelled")]}),
+        serde_json::json!({"type":"items", "planId":"empty", "entries":[]}),
+        serde_json::json!({"type":"_future", "planId":"custom", "description":"Opaque plan", "payload":{"ordered":[2,1]}}),
+    ].into_iter().map(|plan| serde_json::from_value(serde_json::json!({
+        "sessionUpdate":"plan_update", "plan":plan, "_meta":{"update":true}
+    })).expect("valid mock plan")).collect()
+}
+
 #[tokio::main]
 async fn main() -> agent_client_protocol::Result<()> {
     if std::env::args().nth(1).as_deref() == Some("v1") {
@@ -408,6 +426,27 @@ async fn main() -> agent_client_protocol::Result<()> {
                             ),
                         )?;
                     }
+                    let plans = if text.contains("plan-sequence") {
+                        plan_sequence()
+                    } else {
+                        Vec::new()
+                    };
+                    for plan in &plans {
+                        notify(&cx, &request.session_id, plan.clone())?;
+                    }
+                    if text.contains("plan-flood") {
+                        // Evict native plan events without changing their current state.
+                        for _ in 0..270 {
+                            notify(
+                                &cx,
+                                &request.session_id,
+                                v2::SessionUpdate::Other(v2::OtherSessionUpdate::new(
+                                    "_mock_padding",
+                                    Default::default(),
+                                )),
+                            )?;
+                        }
+                    }
                     let reply = format!(
                         "{}Echo: {text}",
                         std::env::var("HIVE_MOCK_LABEL").unwrap_or_default()
@@ -429,6 +468,10 @@ async fn main() -> agent_client_protocol::Result<()> {
                         let mut state = state.lock().map_err(|_| Error::internal_error())?;
                         if let Some((_, history)) = state.sessions.get_mut(&request.session_id) {
                             history.extend([user, snapshot]);
+                            // Some agents do not retain plans; tests must not mistake that for Hive history.
+                            if std::env::var_os("HIVE_MOCK_FORGET_PLANS").is_none() {
+                                history.extend(plans);
+                            }
                         }
                         save(&state)?;
                     }

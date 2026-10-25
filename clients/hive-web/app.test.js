@@ -409,6 +409,59 @@ test('tool status patches preserve readable output and the original title', () =
   assert.deepEqual(view.lines, [{ kind: 'tool', title: 'Check files', status: 'completed', input: '{\n  "command": "ls"\n}', text: 'first\nsecond' }]);
 });
 
+test('native plans preserve replacements metadata and ordering independently of activity', () => {
+  const view = conversation();
+  const plan = entries => ({ sessionUpdate: 'plan_update', _meta: { provider: true },
+    plan: { type: 'items', planId: 'steps', _meta: { plan: true }, entries } });
+  const first = plan([{ content: 'A', status: 'pending', priority: 'high', _meta: { id: 'a' } },
+    { content: 'B', status: 'in_progress', priority: 'future' }]);
+  view.apply(update(1, first).params);
+  assert.deepEqual(view.planSnapshot.plans.steps, first);
+  const second = plan([first.plan.entries[1], { ...first.plan.entries[0], status: 'cancelled' }]);
+  view.apply(update(2, second).params);
+  assert.deepEqual(view.planSnapshot.plans.steps, second);
+  view.apply(update(3, plan([])).params);
+  assert.deepEqual(view.planSnapshot.plans.steps.plan.entries, []);
+  const unknown = { sessionUpdate: 'plan_update', plan: { type: '_future', planId: 'other', payload: [2, 1] } };
+  view.apply(update(4, unknown).params);
+  assert.deepEqual(view.planSnapshot.plans.other, unknown);
+  assert.equal(view.planSnapshot.observation, 'observed');
+  assert.equal(view.planSnapshot.support, 'supported');
+  assert.equal(view.planSnapshot.authoritative, false);
+  assert.equal(view.activity.support.plans, 'unknown');
+  view.reconcilePlans({ version: 1, seq: 1, plans: {} });
+  assert.deepEqual(view.planSnapshot.plans.other, unknown);
+});
+
+test('plan snapshots fence older replay while preserving newer pre-acknowledgement updates', async () => {
+  const old = { sessionUpdate: 'plan_update', plan: { type: 'items', planId: 'steps', entries: [] } };
+  const current = { ...old, _meta: { preserved: true }, plan: { ...old.plan, entries: [{ content: 'Current', status: 'completed', priority: 'high' }] } };
+  const view = conversation();
+  view.reconcilePlans({ version: 1, seq: 10, support: 'supported', observation: 'observed', plans: { steps: current } });
+  assert.equal(view.planSnapshot.authoritative, true);
+  view.apply(update(1, old).params);
+  assert.deepEqual(view.planSnapshot.plans.steps, current);
+  assert.equal(view.planSnapshot.seq, 10);
+  const sockets = transport((socket, message, result) => {
+    if (message.method === 'session/resume') {
+      result._meta.hive.planSnapshot = { version: 1, seq: 10, support: 'supported', observation: 'observed', plans: { steps: current } };
+      queueMicrotask(() => {
+        socket.receive(update(1, old));
+        // Contiguous unrelated events must still pass even though the plan watermark is ahead.
+        for (let seq = 2; seq <= 10; seq++) socket.receive(update(seq, { sessionUpdate: 'state_update', state: 'idle' }));
+        socket.receive(update(11, { ...old, plan: { ...old.plan, type: '_future', value: 'newer' } }));
+      });
+    }
+  });
+  const client = connect('ws://localhost/acp');
+  await client.open(session);
+  assert.equal(client.state().planSnapshot.plans.steps.plan.value, 'newer');
+  assert.equal(client.state().planSnapshot.seq, 11);
+  assert.equal(client.state().gap, false);
+  client.close();
+  assert.equal(sockets.length, 1);
+});
+
 test('activity snapshots reconcile missed tools and later task updates without reopening idle', () => {
   const view = conversation();
   view.reconcile({ version: 1, seq: 14, foreground: 'idle', tools: {

@@ -183,6 +183,30 @@ test('streaming updates preserve composer drafts focus and open tools without re
   expect(wrapper.get('.tool-message').element.open).toBe(true);
   expect(wrapper.find('#output script').exists()).toBe(false);
   expect(wrapper.get('.message-text').text()).toBe('<b>plain text</b>');
+  publish({ lines: [{ kind: 'tool', text: '<script>bad()</script> more' }, { kind: 'agent', text: '**Rendered**\n\n```js\nconst value = 42;\n```' }] });
+  await flushPromises();
+  expect(wrapper.get('.message.agent strong').text()).toBe('Rendered');
+  expect(wrapper.get('.message.agent pre code').element.textContent).toBe('const value = 42;\n');
+  expect(document.activeElement).toBe(input.element);
+  expect(input.element.value).toBe('draft');
+  expect(wrapper.get('.tool-message').element.open).toBe(true);
+});
+
+test('retained user and agent Markdown renders while notices and tools stay literal', () => {
+  render(TranscriptView, { state: { session, lines: [
+    { kind: 'user', text: '# Question\n\n**Details**' },
+    { kind: 'agent', text: '## Answer\n\n- Explanation' },
+    { kind: 'notice', text: '**Notice** <b>literal</b>' },
+    { kind: 'tool', input: '`input`', text: '# Output <b>literal</b>' },
+  ] } });
+  expect(wrapper.get('.message.user h1').text()).toBe('Question');
+  expect(wrapper.get('.message.user strong').text()).toBe('Details');
+  expect(wrapper.get('.message.agent h2').text()).toBe('Answer');
+  expect(wrapper.get('.message.agent li').text()).toBe('Explanation');
+  expect(wrapper.get('.message.notice .message-text').text()).toBe('**Notice** <b>literal</b>');
+  expect(wrapper.find('.message.notice strong, .message.notice b').exists()).toBe(false);
+  expect(wrapper.findAll('.tool-message pre').map(item => item.text())).toEqual(['`input`', '# Output <b>literal</b>']);
+  expect(wrapper.find('.tool-message h1, .tool-message b').exists()).toBe(false);
 });
 
 test('catalog and backend failures expose retries and empty lists explain creation', async () => {
@@ -258,8 +282,9 @@ test('scrolling away from the bottom preserves reading position until jumping to
   const element = wrapper.get('#output').element;
   Object.defineProperties(element, { scrollHeight: { value: 1200 }, clientHeight: { value: 400 } });
   element.scrollTop = 100; await wrapper.get('#output').trigger('scroll');
-  await wrapper.setProps({ state: { session, lines: [{ kind: 'agent', text: 'First more' }], usage: {} } });
+  await wrapper.setProps({ state: { session, lines: [{ kind: 'agent', text: '# First\n\n**More**' }], usage: {} } });
   await flushPromises();
+  expect(wrapper.get('.message.agent h1').text()).toBe('First');
   expect(element.scrollTop).toBe(100);
   await wrapper.get('.jump-latest').trigger('click');
   expect(element.scrollTop).toBe(1200);

@@ -1,6 +1,7 @@
 <script setup>
 import { computed, nextTick, ref, watch } from 'vue';
 import Button from 'openvue/button';
+import MarkdownMessage from './MarkdownMessage.vue';
 const props = defineProps({ state: { type: Object, required: true } });
 const viewport = ref();
 const following = ref(true);
@@ -47,7 +48,8 @@ watch(() => props.state, async (state, previous) => {
         <details v-if="line.kind === 'tool'" class="tool-message"><summary>{{ line.title || 'Tool activity' }} <span v-if="line.status">· {{ line.status }}</span></summary><pre v-if="line.input">{{ line.input }}</pre><pre v-if="line.text">{{ line.text }}</pre><p v-else class="muted">No output reported</p></details>
         <article v-else class="message" :class="line.kind">
           <div class="message-speaker">{{ line.kind === 'user' ? 'You' : line.kind === 'agent' ? 'Agent' : 'Session notice' }}</div>
-          <div class="message-text">{{ line.text }}</div>
+          <MarkdownMessage v-if="line.kind === 'user' || line.kind === 'agent'" :text="line.text" />
+          <div v-else class="message-text">{{ line.text }}</div>
         </article>
       </template>
       <details v-if="state.session" class="activity-panel" open>

@@ -229,12 +229,6 @@ async fn assert_blocked_admission(
         .await
         .is_err()
     );
-    assert!(
-        cx.send_request(v2::CloseSessionRequest::new(id.clone()).meta(meta.clone()))
-            .block_task()
-            .await
-            .is_err()
-    );
     let listed = cx
         .send_request(v2::ListSessionsRequest::new())
         .block_task()
@@ -997,6 +991,282 @@ async fn legacy_modes_use_the_native_setter_and_reconcile_acknowledgements_and_o
                 assert!(cx.send_request(request).block_task().await.is_err());
                 Ok::<_, Error>(())
             })).await.unwrap().unwrap();
+            server.abort();
+        }
+    }
+}
+
+#[tokio::test]
+async fn close_cancels_native_and_legacy_configuration_requests_on_both_transports() {
+    for (version, legacy) in [
+        (AgentVersion::V2, false),
+        (AgentVersion::V1, false),
+        (AgentVersion::V1, true),
+    ] {
+        for transport in ["ws", "http"] {
+            let command = format!(
+                "{}{}",
+                env!("CARGO_BIN_EXE_hive-test-agent"),
+                if version == AgentVersion::V1 {
+                    " v1"
+                } else {
+                    ""
+                }
+            );
+            let mut config = config_with_agent("mock", &command, version);
+            let profile = config.agents.get_mut("mock").unwrap();
+            profile
+                .env
+                .insert("HIVE_MOCK_HOLD_CONFIG".into(), "1".into());
+            if legacy {
+                profile.env.insert("HIVE_MOCK_MODES".into(), "1".into());
+            }
+            let (address, server) = start_gateway(config).await;
+            let (tx, mut updates) = mpsc::unbounded_channel();
+            timeout(
+                Duration::from_secs(15),
+                Client
+                    .v2()
+                    .on_receive_notification(
+                        async move |update: v2::UpdateSessionNotification,
+                                    _: V2ConnectionTo<Agent>| {
+                            tx.send(update).map_err(Error::into_internal_error)
+                        },
+                        agent_client_protocol::on_receive_notification!(),
+                    )
+                    .connect_with(
+                        HttpClient::new(format!("{transport}://{address}")).unwrap(),
+                        async move |cx| {
+                            cx.send_request(v2::InitializeRequest::new(
+                                ProtocolVersion::V2,
+                                v2::Implementation::new("config-close", "1"),
+                            ))
+                            .block_task()
+                            .await?;
+                            let opened = cx
+                                .send_request(v2::NewSessionRequest::new(
+                                    std::env::current_dir().unwrap(),
+                                ))
+                                .block_task()
+                                .await?;
+                            let setter = cx
+                                .send_request(
+                                    v2::SetSessionConfigOptionRequest::new(
+                                        opened.session_id.clone(),
+                                        v2::SessionConfigId::new(if legacy {
+                                            "_hive_legacy_mode"
+                                        } else {
+                                            "model"
+                                        }),
+                                        v2::SessionConfigOptionValue::Id {
+                                            value: v2::SessionConfigValueId::new(if legacy {
+                                                "plan"
+                                            } else {
+                                                "careful"
+                                            }),
+                                        },
+                                    )
+                                    .meta(opened.meta.clone()),
+                                )
+                                .block_task();
+                            loop {
+                                if matches!(
+                                    updates.recv().await.unwrap().update,
+                                    v2::SessionUpdate::ConfigOptionUpdate(_)
+                                ) {
+                                    break;
+                                }
+                            }
+                            cx.send_request(
+                                v2::CloseSessionRequest::new(opened.session_id.clone())
+                                    .meta(opened.meta),
+                            )
+                            .block_task()
+                            .await?;
+                            assert!(setter.await.is_err());
+                            assert!(
+                                cx.send_request(v2::ListSessionsRequest::new())
+                                    .block_task()
+                                    .await?
+                                    .sessions
+                                    .is_empty()
+                            );
+                            Ok::<_, Error>(())
+                        },
+                    ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            server.abort();
+        }
+    }
+}
+
+#[tokio::test]
+async fn active_close_orders_final_updates_and_preserves_insertion_outcomes_on_both_transports() {
+    for version in [AgentVersion::V1, AgentVersion::V2] {
+        for transport in ["ws", "http"] {
+            let command = format!(
+                "{}{}",
+                env!("CARGO_BIN_EXE_hive-test-agent"),
+                if version == AgentVersion::V1 {
+                    " v1"
+                } else {
+                    ""
+                }
+            );
+            let (address, server) =
+                start_gateway(config_with_agent("mock", &command, version)).await;
+            let scenarios: &[(&str, &str)] = if version == AgentVersion::V1 {
+                &[
+                    ("wait-for-cancel", "cancelled"),
+                    ("wait-for-cancel cancel-end-turn", "end_turn"),
+                    ("wait-for-cancel cancel-error", "_v1_error"),
+                ]
+            } else {
+                &[
+                    ("close-running", "cancelled"),
+                    ("close-before-insertion", "cancelled"),
+                    ("close-after-insertion", "cancelled"),
+                    ("close-failure", "cancelled"),
+                    ("close-after-insertion-failure", "cancelled"),
+                ]
+            };
+            for &(text, expected) in scenarios {
+                let (tx, mut updates) = mpsc::unbounded_channel();
+                let marker = tx.clone();
+                timeout(
+                    Duration::from_secs(15),
+                    Client
+                        .v2()
+                        .on_receive_notification(
+                            async move |update: v2::UpdateSessionNotification,
+                                        _: V2ConnectionTo<Agent>| {
+                                tx.send(Some(update)).map_err(Error::into_internal_error)
+                            },
+                            agent_client_protocol::on_receive_notification!(),
+                        )
+                        .connect_with(
+                            HttpClient::new(format!("{transport}://{address}")).unwrap(),
+                            async move |cx| {
+                                cx.send_request(v2::InitializeRequest::new(
+                                    ProtocolVersion::V2,
+                                    v2::Implementation::new("close-test", "1"),
+                                ))
+                                .block_task()
+                                .await?;
+                                let opened = cx
+                                    .send_request(v2::NewSessionRequest::new(
+                                        std::env::current_dir().unwrap(),
+                                    ))
+                                    .block_task()
+                                    .await?;
+                                let request = v2::PromptRequest::new(
+                                    opened.session_id.clone(),
+                                    vec![text.into()],
+                                )
+                                .meta(controlled(&opened.meta, "one-dispatch"));
+                                let prompt = cx.send_request(request.clone()).block_task();
+                                let duplicate = cx.send_request(request).block_task();
+                                let mut users = 0;
+                                loop {
+                                    let event = updates.recv().await.unwrap().unwrap();
+                                    let value = serde_json::to_value(event.update).unwrap();
+                                    users += usize::from(value["sessionUpdate"] == "user_message");
+                                    let ready = if version == AgentVersion::V1 {
+                                        value["content"]["text"] == "ready-for-cancel"
+                                    } else if text == "close-before-insertion" {
+                                        value["state"] == "requires_action"
+                                    } else {
+                                        value["state"] == "running"
+                                    };
+                                    if ready {
+                                        break;
+                                    }
+                                }
+                                let close = v2::CloseSessionRequest::new(opened.session_id.clone())
+                                    .meta(opened.meta.clone());
+                                let mut stale = opened.meta.clone().unwrap();
+                                stale["hive"]["generation"] = serde_json::json!(0);
+                                assert!(
+                                    cx.send_request(
+                                        v2::CloseSessionRequest::new(opened.session_id.clone())
+                                            .meta(stale)
+                                    )
+                                    .block_task()
+                                    .await
+                                    .is_err()
+                                );
+                                if text.ends_with("failure") {
+                                    assert!(
+                                        cx.send_request(close.clone()).block_task().await.is_err()
+                                    );
+                                }
+                                let (done, response) = oneshot::channel();
+                                cx.prepare_request(close).on_receiving_result(
+                                    async move |result| {
+                                        // Ordered response marker makes eventual delivery insufficient for this assertion.
+                                        marker.send(None).unwrap();
+                                        let _ = done.send(result);
+                                        Ok(())
+                                    },
+                                )?;
+                                let result = response.await.unwrap();
+                                assert_eq!(result.is_ok(), text != "wait-for-cancel cancel-error");
+                                let mut final_text = false;
+                                let mut idle = 0;
+                                while let Some(event) = updates.recv().await.unwrap() {
+                                    let value = serde_json::to_value(event.update).unwrap();
+                                    users += usize::from(value["sessionUpdate"] == "user_message");
+                                    if value["content"]["text"] == "final-before-close" {
+                                        final_text = true;
+                                    }
+                                    if value["state"] == "idle" {
+                                        assert!(final_text, "final update must precede idle");
+                                        assert_eq!(value["stopReason"], expected);
+                                        idle += 1;
+                                    }
+                                }
+                                let first = prompt.await;
+                                let second = duplicate.await;
+                                assert_eq!(idle, 1);
+                                if text == "close-before-insertion" {
+                                    assert_eq!(
+                                        first.unwrap_err().code,
+                                        Error::request_cancelled().code
+                                    );
+                                    assert_eq!(
+                                        second.unwrap_err().code,
+                                        Error::request_cancelled().code
+                                    );
+                                    assert_eq!(users, 0);
+                                } else {
+                                    assert_eq!(first?.message_id, second?.message_id);
+                                    assert_eq!(
+                                        users, 1,
+                                        "a duplicate key must not insert a second message"
+                                    );
+                                }
+                                let listed = cx
+                                    .send_request(v2::ListSessionsRequest::new())
+                                    .block_task()
+                                    .await?;
+                                assert_eq!(
+                                    listed
+                                        .sessions
+                                        .iter()
+                                        .any(|entry| entry.session_id == opened.session_id),
+                                    text == "wait-for-cancel cancel-error"
+                                );
+                                Ok::<_, Error>(())
+                            },
+                        ),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            }
             server.abort();
         }
     }

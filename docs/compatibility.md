@@ -110,7 +110,7 @@ Sources: [v1 initialization][v1-init], [v2 initialization][v2-init],
 | v1 `session/load` ([v1 setup][v1-setup]) | 🔀 A | Preferred restoration method when advertised; replays retained history | Used internally after restart; upstream equivalent is v2 resume, not load | Both attach through Hive resume | `earlier_conversations_restore_once_under_the_original_identity_for_both_acp_versions` in [gateway tests][gateway-tests] |
 | `session/resume`: live attachment and restart ([v1][v1-setup], [v2][v2-setup]) | 🟡 P | V1 load preferred, resume-only has no earlier history; v2 restores saved identity with `start` | Live worker attachment is broker-owned; never silently creates a replacement; known-state barrier precedes response | Both attach/reconnect with Hive control metadata | [Gateway tests][gateway-tests]; [replay details](#replay-cursors) |
 | Current `state_update` after replay, before resume response ([v2 setup][v2-setup]) | 🟡 P | Retains running/idle/requires-action, including restoration evidence | Fresh sequenced barrier after replay for known state, even without replay; unknown attachment succeeds without inventing idle or emitting a barrier | Both consume consistent Hive response state; generic v2 clients receive known-state barriers | `every_resume_replay_mode_ends_with_current_state_before_the_response_on_both_transports` in [gateway tests][gateway-tests]; [unknown-state exception](#replay-cursors) |
-| `session/close`, active-work cancellation ([v1][v1-setup], [v2][v2-setup]) | 🟡 P | V1 worker disconnects without close RPC; v2 sends downstream close | Owner-only; rejects running/blocked/configuring work instead of v2's required cancellation | Current workflow cancels/waits first | [Gateway][daemon]; [#61](https://github.com/noirbizarre/hive/issues/61) |
+| `session/close`, active-work cancellation ([v1][v1-setup], [v2][v2-setup]) | ✅ S | V1 cancels and waits for completion before disconnecting; v2 forwards close concurrently with pending requests | Owner-only; withdraws interactions, cancels configuration and orders final updates/idle before success | Clients can cancel separately; no close UI | [Close lifecycle](#mutation-ownership-and-idempotency); [gateway tests][gateway-tests] |
 | `session/delete` and delete capability ([v1][v1-delete], [v2][v2-delete]) | ❌ U | No downstream delete forwarding | Not advertised; close is not deletion | No delete operation | [Gateway handlers][daemon] |
 | Additional workspace directories ([v1][v1-setup], [v2][v2-setup]) | 🟡 P | V1 rejects; native v2 new-session roots retained | Saved roots reused for autonomous recovery; incoming upstream resume roots **not applied**; optional support not advertised | No additional-root composer | [Workers/broker][daemon]; [persistence][persistence] |
 
@@ -215,7 +215,7 @@ capability would make Hive support it. `_meta` on marker objects is metadata, no
 | V1 client `fs.readTextFile`, `.writeTextFile`; `terminal`; `auth.terminal` | **❌ U** not advertised or implemented by the adapter. |
 | V1 client `session.compaction`, `.notices`, `.configOptions.boolean` | **🟡 P** not advertised; compaction/notices dropped, boolean conversion exists without negotiated marker. |
 | V1 client `elicitation.form`, `.url` | **🟡 P** handlers exist without advertising these modes in downstream v1 initialization. |
-| V2 agent `session` | **🟡 P** advertised by Hive; baseline surface exists with close/resume deviations identified above. |
+| V2 agent `session` | **🟡 P** advertised by Hive; baseline surface exists with resume limitations identified above. |
 | V2 agent `session.prompt.image`, `.audio`, `.embeddedContext` | **🟡 P** typed native forwarding, not advertised upstream; no rich built-in composer. Text/resource links have no optional prompt marker. |
 | V2 agent `session.mcp.stdio`, `.http`; `session.additionalDirectories` | **🟡 P** native new-session declarations/roots retained and reused for recovery, incoming upstream resume values ignored; support not advertised. |
 | V2 agent `session.delete`; `auth` and `authMethods` | **❌ U** deletion/login/logout unavailable. `auth` alone is not the login capability; nonempty `authMethods` enables both auth methods. |
@@ -693,8 +693,27 @@ The HTTP catalog and its SSE invalidation feed are documented in
 [Hive's operational API](hive-api.md#session-catalog). ACP `session/list` and
 HTTP snapshots derive their fields from the same broker.
 
-A close is explicit and rejects running, blocked, or configuring work; automatic
-active-close cancellation remains tracked in [#61](https://github.com/noirbizarre/hive/issues/61).
+A close is explicit and admits running, blocked, or configuring work. It withdraws
+pending permissions and elicitation routes, fences new work and takeover, and
+waits for final updates and terminal idle before reporting successful cancellation.
+Native ACPv2 close supplies the downstream ordering barrier; the v1 adapter sends
+cancel and publishes idle from the actual turn completion before detaching.
+A normal completion that wins the cancellation race keeps its real stop reason;
+closing an already idle session adds no synthetic idle. Downstream failure is a
+close error, not proof of cancellation; recoverable close errors retain the worker
+and release the closing fence so the owner can inspect state and retry.
+
+Pending prompt acknowledgements are insertion-aware: an inserted message retains
+its successful `messageId`, while insertion prevented by close returns
+request-cancelled (`-32800`). All same-key waiters share that result without a
+second dispatch. Downstream prompt responses can follow the downstream close
+response; Hive retains the connection to collect them before releasing it.
+Cancelled journal outcomes survive restart like successful acknowledgements.
+These paths are covered over both upstream transports by
+`active_close_orders_final_updates_and_preserves_insertion_outcomes_on_both_transports`,
+`close_cancels_native_and_legacy_configuration_requests_on_both_transports`, and the
+permission/form/URL close regressions in [gateway tests][gateway-tests].
+
 Client detach does not close the session or cancel the agent. A second distinct
 prompt or configuration change is rejected during running or `requires_action`
 foreground work (not merely until its prompt response), including blocked-first

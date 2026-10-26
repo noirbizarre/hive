@@ -82,6 +82,9 @@ struct Data {
     script: Script,
     counter: u64,
     v2_log: Vec<Value>,
+    fail_abort: bool,
+    hold_abort: bool,
+    stale_idle_on_abort: bool,
 }
 
 struct Inner {
@@ -111,6 +114,9 @@ pub async fn start(options: Options) -> (Fake, String) {
             script: Script::Reply("done".into()),
             counter: 0,
             v2_log: Vec::new(),
+            fail_abort: false,
+            hold_abort: false,
+            stale_idle_on_abort: false,
         }),
         v1_events,
         v2_events,
@@ -183,6 +189,18 @@ impl Fake {
 
     pub fn script(&self, script: Script) {
         self.state().script = script;
+    }
+
+    pub fn fail_abort(&self, fail: bool) {
+        self.state().fail_abort = fail;
+    }
+
+    pub fn hold_abort(&self, hold: bool) {
+        self.state().hold_abort = hold;
+    }
+
+    pub fn stale_idle_on_abort(&self) {
+        self.state().stale_idle_on_abort = true;
     }
 
     pub fn add_session(&self, id: &str, title: &str, directory: &str) {
@@ -595,12 +613,22 @@ async fn prompt_async(
     StatusCode::NO_CONTENT
 }
 
-async fn abort(State(fake): State<Fake>, Path(id): Path<String>) -> Json<bool> {
+async fn abort(State(fake): State<Fake>, Path(id): Path<String>) -> Response {
     fake.log(format!("POST /session/{id}/abort"));
-    fake.state().busy.remove(&id);
-    fake.emit(status_event(&id, "idle"));
-    fake.emit(json!({"type": "session.idle", "properties": {"sessionID": id}}));
-    Json(true)
+    if fake.state().fail_abort {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    if !fake.state().hold_abort {
+        if fake.state().stale_idle_on_abort {
+            // Queue both old terminal events ahead of the current turn's first busy event.
+            fake.emit(status_event(&id, "idle"));
+            fake.emit(json!({"type":"session.idle","properties":{"sessionID":id}}));
+            fake.emit(status_event(&id, "busy"));
+        }
+        // Final text and terminal events deliberately precede the HTTP response on another channel.
+        fake.reply(&id, fake.next(), "final-before-close").await;
+    }
+    Json(true).into_response()
 }
 
 async fn event_stream(State(fake): State<Fake>) -> Response {
@@ -731,7 +759,17 @@ async fn v2_prompt(
 
 async fn v2_interrupt(State(fake): State<Fake>, Path(id): Path<String>) -> StatusCode {
     fake.log(format!("POST /api/session/{id}/interrupt"));
-    fake.state().busy.remove(&id);
+    if fake.state().fail_abort {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    }
+    if !fake.state().hold_abort {
+        fake.v2_push("session.next.text.ended", json!({"sessionID":id,"assistantMessageID":"msg_abort","textID":"t1","text":"final-before-close"}));
+        fake.state().busy.remove(&id);
+        fake.v2_push(
+            "session.next.step.ended",
+            json!({"sessionID":id,"assistantMessageID":"msg_abort","finish":"stop"}),
+        );
+    }
     StatusCode::NO_CONTENT
 }
 

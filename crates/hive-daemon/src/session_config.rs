@@ -216,6 +216,26 @@ pub(super) struct Change {
     pub control: Arc<Mutex<Control>>,
 }
 
+pub(super) struct Pending {
+    cancellation: agent_client_protocol::RequestCancellationHandle,
+    done: oneshot::Receiver<()>,
+}
+
+impl Pending {
+    pub fn outstanding(&mut self) -> bool {
+        matches!(
+            self.done.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        )
+    }
+
+    pub async fn cancel(self) {
+        // Keep the ordered callback alive so cancellation cannot discard an authoritative result.
+        let _ = self.cancellation.cancel();
+        let _ = self.done.await;
+    }
+}
+
 impl Drop for Change {
     fn drop(&mut self) {
         // A finished guard must not release twice: the caller may already have reserved its next edit.
@@ -238,8 +258,9 @@ impl Change {
         ) -> agent_client_protocol::Result<Vec<v2::SessionConfigOption>>
         + Send
         + 'static,
-    ) -> agent_client_protocol::Result<oneshot::Receiver<()>> {
+    ) -> agent_client_protocol::Result<Pending> {
         let (done, received) = oneshot::channel();
+        let cancellation = request.cancellation_handle();
         // Commit at the wire response boundary: later notifications must not overtake task wakeup and be rolled back.
         request.on_receiving_result(async move |result| {
             self.finish_with(&id, |state| {
@@ -250,7 +271,10 @@ impl Change {
             let _ = done.send(());
             Ok(())
         })?;
-        Ok(received)
+        Ok(Pending {
+            cancellation,
+            done: received,
+        })
     }
 
     pub fn finish(

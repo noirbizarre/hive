@@ -20,8 +20,28 @@ async fn fixture(
                 .on_receive_request(async |request: v2::InitializeRequest, responder: Responder<v2::InitializeResponse>, _: V2ConnectionTo<Client>| {
                     responder.respond(v2::InitializeResponse::new(request.protocol_version, v2::Implementation::new("interactions", "1")).capabilities(v2::AgentCapabilities::new().session(v2::SessionCapabilities::new())))
                 }, agent_client_protocol::on_receive_request!())
-                .on_receive_request(async |_: v2::NewSessionRequest, responder: Responder<v2::NewSessionResponse>, _: V2ConnectionTo<Client>| {
-                    responder.respond(v2::NewSessionResponse::new(v2::SessionId::new("native")))
+                .on_receive_request(async move |_: v2::NewSessionRequest, responder: Responder<v2::NewSessionResponse>, _: V2ConnectionTo<Client>| {
+                    let mut response = v2::NewSessionResponse::new(v2::SessionId::new("native"));
+                    if mode == "config" {
+                        response = response.config_options(serde_json::from_value(json!([{"configId":"model","name":"Model","type":"select","currentValue":"fast","options":[{"value":"fast","name":"Fast"},{"value":"slow","name":"Slow"}]}])).unwrap());
+                    }
+                    responder.respond(response)
+                }, agent_client_protocol::on_receive_request!())
+                .on_receive_request(async |request: v2::CloseSessionRequest, responder: Responder<v2::CloseSessionResponse>, cx: V2ConnectionTo<Client>| {
+                    cx.send_notification(v2::UpdateSessionNotification::new(request.session_id, v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(v2::IdleStateUpdate::new().stop_reason(v2::StopReason::Cancelled)))))?;
+                    responder.respond(v2::CloseSessionResponse::new())
+                }, agent_client_protocol::on_receive_request!())
+                .on_receive_request({
+                    let report = report.clone();
+                    async move |_: v2::SetSessionConfigOptionRequest, responder: Responder<v2::SetSessionConfigOptionResponse>, cx: V2ConnectionTo<Client>| {
+                        report.send(json!("config-started")).unwrap();
+                        let report = report.clone();
+                        cx.spawn(async move {
+                            responder.cancellation().cancelled().await;
+                            report.send(json!("config-cancelled")).unwrap();
+                            responder.respond_with_error(Error::request_cancelled())
+                        })
+                    }
                 }, agent_client_protocol::on_receive_request!())
                 .on_receive_request(async move |request: v2::PromptRequest, responder: Responder<v2::PromptResponse>, cx: V2ConnectionTo<Client>| {
                     let report = report.clone();
@@ -37,14 +57,14 @@ async fn fixture(
                                 let (first, second) = tokio::join!(peer.send_request(permission("first")).block_task(), peer.send_request(permission("second")).block_task());
                                 json!([first.unwrap(), second.unwrap()])
                             }
-                            "cancel" => json!(peer.send_request(permission("cancel me")).block_task().await.unwrap()),
-                            "request" | "unsupported" => {
-                                let scope = if mode == "request" { v2::ElicitationRequestScope::new(responder.id().clone()).into() }
+                            "cancel" | "close-permission" => json!(peer.send_request(permission("cancel me")).block_task().await.unwrap()),
+                            "request" | "unsupported" | "close-form" => {
+                                let scope = if mode == "request" || mode == "close-form" { v2::ElicitationRequestScope::new(responder.id().clone()).into() }
                                     else { v2::ElicitationScope::from(v2::ElicitationSessionScope::new(request.session_id.clone())) };
                                 let schema = serde_json::from_value(json!({"type":"object","properties":{"approved":{"type":"boolean"}},"required":["approved"]})).unwrap();
                                 json!(peer.send_request(v2::CreateElicitationRequest::new(v2::ElicitationFormMode::new(scope, schema), "Approve?")).block_task().await.unwrap())
                             }
-                            "url-early" | "url-late" => {
+                            "url-early" | "url-late" | "close-url" => {
                                 let pending = peer.send_request(v2::CreateElicitationRequest::new(v2::ElicitationUrlMode::new(v2::ElicitationSessionScope::new(request.session_id.clone()), "shared-id", "https://example.com/auth"), "Authenticate")).block_task();
                                 let completion: v2::CompleteElicitationNotification = serde_json::from_value(json!({"elicitationId":"shared-id","_meta":{"future":{"keep":true}}})).unwrap();
                                 if mode == "url-early" { peer.send_notification(completion.clone())?; }
@@ -56,6 +76,7 @@ async fn fixture(
                             _ => unreachable!(),
                         };
                         report.send(result).unwrap();
+                        if mode.starts_with("close-") { return responder.respond_with_error(Error::request_cancelled()); }
                         responder.respond(v2::PromptResponse::new(v2::MessageId::new("ack")))
                     })
                 }, agent_client_protocol::on_receive_request!())
@@ -95,6 +116,122 @@ async fn initialize(
     cx.send_request(v2::NewSessionRequest::new(std::env::current_dir().unwrap()))
         .block_task()
         .await
+}
+
+#[tokio::test]
+async fn close_withdraws_permissions_forms_and_urls_before_pending_insertion_on_both_transports() {
+    for mode in ["close-permission", "close-form", "close-url"] {
+        for transport in ["ws", "http"] {
+            let (address, gateway, agent, mut reports) = fixture(mode).await;
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let forms = tx.clone();
+            timeout(
+                Duration::from_secs(10),
+                Client
+                    .v2()
+                    .on_receive_request(
+                        async move |_: v2::RequestPermissionRequest,
+                                    responder: Responder<v2::RequestPermissionResponse>,
+                                    cx: V2ConnectionTo<Agent>| {
+                            tx.send(responder.cancellation()).unwrap();
+                            cx.spawn(async move {
+                                responder.cancellation().cancelled().await;
+                                responder.respond_with_error(Error::request_cancelled())
+                            })
+                        },
+                        agent_client_protocol::on_receive_request!(),
+                    )
+                    .on_receive_request(
+                        async move |_: v2::CreateElicitationRequest,
+                                    responder: Responder<v2::CreateElicitationResponse>,
+                                    cx: V2ConnectionTo<Agent>| {
+                            forms.send(responder.cancellation()).unwrap();
+                            cx.spawn(async move {
+                                responder.cancellation().cancelled().await;
+                                responder.respond_with_error(Error::request_cancelled())
+                            })
+                        },
+                        agent_client_protocol::on_receive_request!(),
+                    )
+                    .connect_with(
+                        HttpClient::new(format!("{transport}://{address}")).unwrap(),
+                        async move |cx| {
+                            let opened = initialize(&cx, true).await?;
+                            let prompt = cx
+                                .send_request(
+                                    v2::PromptRequest::new(
+                                        opened.session_id.clone(),
+                                        vec!["go".into()],
+                                    )
+                                    .meta(controlled(&opened.meta, "close")),
+                                )
+                                .block_task();
+                            let cancellation = rx.recv().await.unwrap();
+                            cx.send_request(
+                                v2::CloseSessionRequest::new(opened.session_id).meta(opened.meta),
+                            )
+                            .block_task()
+                            .await?;
+                            cancellation.cancelled().await;
+                            assert_eq!(
+                                prompt.await.unwrap_err().code,
+                                Error::request_cancelled().code
+                            );
+                            let result = reports.recv().await.unwrap();
+                            assert!(result.to_string().contains("cancel"), "{mode}: {result}");
+                            Ok::<_, Error>(())
+                        },
+                    ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            gateway.abort();
+            agent.abort();
+        }
+    }
+}
+
+#[tokio::test]
+async fn close_cancels_a_pending_configuration_without_waiting_for_the_setter_on_both_transports() {
+    for transport in ["ws", "http"] {
+        let (address, gateway, agent, mut reports) = fixture("config").await;
+        timeout(
+            Duration::from_secs(10),
+            Client.v2().connect_with(
+                HttpClient::new(format!("{transport}://{address}")).unwrap(),
+                async move |cx| {
+                    let opened = initialize(&cx, false).await?;
+                    let setter = cx
+                        .send_request(
+                            v2::SetSessionConfigOptionRequest::new(
+                                opened.session_id.clone(),
+                                v2::SessionConfigId::new("model"),
+                                v2::SessionConfigOptionValue::Id {
+                                    value: v2::SessionConfigValueId::new("slow"),
+                                },
+                            )
+                            .meta(opened.meta.clone()),
+                        )
+                        .block_task();
+                    assert_eq!(reports.recv().await.unwrap(), "config-started");
+                    cx.send_request(
+                        v2::CloseSessionRequest::new(opened.session_id).meta(opened.meta),
+                    )
+                    .block_task()
+                    .await?;
+                    assert!(setter.await.is_err());
+                    assert_eq!(reports.recv().await.unwrap(), "config-cancelled");
+                    Ok::<_, Error>(())
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        gateway.abort();
+        agent.abort();
+    }
 }
 
 #[tokio::test]

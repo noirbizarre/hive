@@ -26,6 +26,12 @@ struct State {
     // Pending responders are process-local; restart fixtures must not persist transport handles.
     #[serde(skip)]
     pending_v1: HashMap<String, (Responder<v1::PromptResponse>, String)>,
+    #[serde(skip)]
+    pending_v2: HashMap<v2::SessionId, (Responder<v2::PromptResponse>, Option<v2::MessageId>)>,
+    #[serde(skip)]
+    active_v2: std::collections::HashSet<v2::SessionId>,
+    #[serde(skip)]
+    fail_close: std::collections::HashSet<v2::SessionId>,
 }
 
 fn load() -> State {
@@ -381,6 +387,13 @@ async fn main() -> agent_client_protocol::Result<()> {
                         save(&state)?;
                         session_options(&state, &request.session_id.to_string())
                     };
+                    if std::env::var_os("HIVE_MOCK_HOLD_CONFIG").is_some() {
+                        notify(&cx, &request.session_id, v2::SessionUpdate::ConfigOptionUpdate(v2::ConfigOptionUpdate::new(options.clone())))?;
+                        return cx.spawn(async move {
+                            responder.cancellation().cancelled().await;
+                            responder.respond_with_error(Error::request_cancelled())
+                        });
+                    }
                     if std::env::var_os("HIVE_MOCK_PAUSE_CONFIG").is_some() {
                         notify(
                             &cx,
@@ -440,14 +453,34 @@ async fn main() -> agent_client_protocol::Result<()> {
                 let state = state.clone();
                 async move |request: v2::CloseSessionRequest,
                             responder: Responder<v2::CloseSessionResponse>,
-                            _cx: V2ConnectionTo<Client>| {
+                             cx: V2ConnectionTo<Client>| {
                     let mut state = state.lock().map_err(|_| Error::internal_error())?;
+                    if state.fail_close.remove(&request.session_id) {
+                        return responder.respond_with_error(invalid("synthetic close failure; retry close"));
+                    }
+                    if state.active_v2.remove(&request.session_id) {
+                        notify(&cx, &request.session_id, v2::SessionUpdate::AgentMessageChunk(
+                            v2::ContentChunk::new("final-before-close".into(), v2::MessageId::new("close-final")),
+                        ))?;
+                        notify(&cx, &request.session_id, v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(
+                            v2::IdleStateUpdate::new().stop_reason(v2::StopReason::Cancelled),
+                        )))?;
+                    }
+                    let pending = state.pending_v2.remove(&request.session_id);
                     state
                         .sessions
                         .remove(&request.session_id)
                         .ok_or_else(|| invalid("unknown session"))?;
                     save(&state)?;
-                    responder.respond(v2::CloseSessionResponse::new())
+                    responder.respond(v2::CloseSessionResponse::new())?;
+                    // The pinned contract permits the insertion acknowledgement after the close response.
+                    if let Some((pending, inserted)) = pending {
+                        match inserted {
+                            Some(id) => pending.respond(v2::PromptResponse::new(id))?,
+                            None => pending.respond_with_error(Error::request_cancelled())?,
+                        }
+                    }
+                    Ok(())
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -486,7 +519,20 @@ async fn main() -> agent_client_protocol::Result<()> {
                             serde_json::json!("acknowledgement metadata sentinel"),
                         )]));
                     }
-                    responder.respond(acknowledgement)?;
+                    if text == "close-before-insertion" {
+                        {
+                            let mut state = state.lock().map_err(|_| Error::internal_error())?;
+                            state.active_v2.insert(request.session_id.clone());
+                            state.pending_v2.insert(request.session_id.clone(), (responder, None));
+                        }
+                        notify(&cx, &request.session_id, v2::SessionUpdate::StateUpdate(v2::StateUpdate::RequiresAction(v2::RequiresActionStateUpdate::new())))?;
+                        return Ok(());
+                    }
+                    if text.starts_with("close-after-insertion") {
+                        state.lock().map_err(|_| Error::internal_error())?.pending_v2.insert(request.session_id.clone(), (responder, Some(user_id.clone())));
+                    } else {
+                        responder.respond(acknowledgement)?;
+                    }
                     let user = v2::SessionUpdate::UserMessage(
                         v2::UserMessage::new(user_id).content(request.prompt),
                     );
@@ -498,6 +544,12 @@ async fn main() -> agent_client_protocol::Result<()> {
                             v2::RunningStateUpdate::new(),
                         )),
                     )?;
+                    if text.starts_with("close-") {
+                        let mut state = state.lock().map_err(|_| Error::internal_error())?;
+                        state.active_v2.insert(request.session_id.clone());
+                        if text.ends_with("failure") { state.fail_close.insert(request.session_id.clone()); }
+                        return Ok(());
+                    }
                     if let Some(status) = text.strip_prefix("resume-state-") {
                         // Hold an exact foreground state without timers or an automatic idle.
                         let update = serde_json::from_value(serde_json::json!({
@@ -841,6 +893,18 @@ async fn serve_v1() -> agent_client_protocol::Result<()> {
                         save(&state)?;
                         v1_options(session_options(&state, &request.session_id.to_string()))
                     };
+                    if std::env::var_os("HIVE_MOCK_HOLD_CONFIG").is_some() {
+                        cx.send_notification(v1::SessionNotification::new(
+                            request.session_id.clone(),
+                            v1::SessionUpdate::ConfigOptionUpdate(v1::ConfigOptionUpdate::new(
+                                options.clone(),
+                            )),
+                        ))?;
+                        return cx.spawn(async move {
+                            responder.cancellation().cancelled().await;
+                            responder.respond_with_error(Error::request_cancelled())
+                        });
+                    }
                     if std::env::var_os("HIVE_MOCK_PAUSE_CONFIG").is_some() {
                         // A standard update crosses the compatibility adapter without requiring a test-only gateway extension.
                         cx.send_notification(v1::SessionNotification::new(
@@ -911,6 +975,19 @@ async fn serve_v1() -> agent_client_protocol::Result<()> {
                         .modes
                         .insert(request.session_id.to_string(), current.clone());
                     save(&state)?;
+                    if std::env::var_os("HIVE_MOCK_HOLD_CONFIG").is_some() {
+                        drop(state);
+                        cx.send_notification(v1::SessionNotification::new(
+                            request.session_id,
+                            v1::SessionUpdate::CurrentModeUpdate(v1::CurrentModeUpdate::new(
+                                current,
+                            )),
+                        ))?;
+                        return cx.spawn(async move {
+                            responder.cancellation().cancelled().await;
+                            responder.respond_with_error(Error::request_cancelled())
+                        });
+                    }
                     if std::env::var("HIVE_MOCK_MODES").as_deref() == Ok("notify") {
                         cx.send_notification(v1::SessionNotification::new(
                             request.session_id,
@@ -1023,13 +1100,19 @@ async fn serve_v1() -> agent_client_protocol::Result<()> {
             {
                 let state = state.clone();
                 async move |request: v1::CancelNotification,
-                            _cx: agent_client_protocol::ConnectionTo<Client>| {
+                            cx: agent_client_protocol::ConnectionTo<Client>| {
                     let pending = state
                         .lock()
                         .map_err(|_| Error::internal_error())?
                         .pending_v1
                         .remove(&request.session_id.to_string());
                     if let Some((responder, text)) = pending {
+                        cx.send_notification(v1::SessionNotification::new(
+                            request.session_id.clone(),
+                            v1::SessionUpdate::AgentMessageChunk(v1::ContentChunk::new(
+                                "final-before-close".into(),
+                            )),
+                        ))?;
                         if text.contains("cancel-error") {
                             responder.respond_with_error(
                                 Error::internal_error().data("sk-must-not-leak"),

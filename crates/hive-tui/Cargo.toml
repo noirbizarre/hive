@@ -25,3 +25,6 @@ arboard = { workspace = true }
 tempfile = { workspace = true }
 shell-words = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }

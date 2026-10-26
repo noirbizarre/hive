@@ -508,4 +508,28 @@ mod tests {
     fn oversized_imports_are_rejected_before_modifying_the_draft() {
         assert!(import(&"x".repeat(MAX_IMPORT_BYTES + 1)).is_err());
     }
+
+    #[test]
+    fn dragging_across_wide_prompt_characters_selects_whole_graphemes_and_delete_replaces_them() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mut text = "a界bc".to_owned();
+        let mut editor = PromptEditor::default();
+        editor.prepare(&text, Rect::new(3, 2, 10, 2));
+        let mouse = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(editor.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 4, 2)));
+        assert!(editor.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 7, 2)));
+        assert_eq!(editor.selected().as_deref(), Some("界b"));
+        assert!(editor.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 1, 8)));
+        assert!(!editor.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 9, 2)));
+        editor.key(
+            &mut text,
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+        );
+        assert_eq!(text, "ac");
+    }
 }

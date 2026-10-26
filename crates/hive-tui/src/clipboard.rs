@@ -44,24 +44,37 @@ pub struct Clipboard {
 
 impl Clipboard {
     pub fn new() -> Self {
-        let (requests, receiver) = std::sync::mpsc::channel::<Request>();
-        let (sender, completions) = mpsc::unbounded_channel();
-        std::thread::spawn(move || {
+        Self::worker(|| {
             let mut clipboard = None;
-            while let Ok(request) = receiver.recv() {
-                let result = (|| {
+            move |operation: &Operation| {
+                (|| {
                     if clipboard.is_none() {
                         clipboard = Some(arboard::Clipboard::new()?);
                     }
                     let clipboard = clipboard.as_mut().expect("clipboard initialized");
-                    match &request.operation {
+                    match operation {
                         Operation::Copy(text) | Operation::Cut(text) => {
                             clipboard.set_text(text.clone()).map(|()| None)
                         }
                         Operation::Paste => clipboard.get_text().map(Some),
                     }
                 })()
-                .map_err(|error: arboard::Error| ClipboardError::Backend(error.to_string()));
+                .map_err(|error: arboard::Error| ClipboardError::Backend(error.to_string()))
+            }
+        })
+    }
+
+    fn worker<F>(make: impl FnOnce() -> F + Send + 'static) -> Self
+    where
+        F: FnMut(&Operation) -> Result<Option<String>, ClipboardError>,
+    {
+        let (requests, receiver) = std::sync::mpsc::channel::<Request>();
+        let (sender, completions) = mpsc::unbounded_channel();
+        std::thread::spawn(move || {
+            // Initialize inside the owner thread; native handles need not be transferable between threads.
+            let mut apply = make();
+            while let Ok(request) = receiver.recv() {
+                let result = apply(&request.operation);
                 if sender.send(Completion { request, result }).is_err() {
                     break;
                 }
@@ -225,6 +238,92 @@ mod tests {
             command(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT)),
             Some('v')
         );
+    }
+
+    #[tokio::test]
+    async fn successful_worker_completions_copy_cut_and_replace_the_captured_selection() {
+        let mut clipboard = Clipboard::worker(|| {
+            let mut stored = None;
+            move |operation: &Operation| match operation {
+                Operation::Copy(text) | Operation::Cut(text) => {
+                    stored = Some(text.clone());
+                    Ok(None)
+                }
+                Operation::Paste => Ok(stored.clone()),
+            }
+        });
+        let mut app = crate::ui::App {
+            input: "keep this".into(),
+            ..Default::default()
+        };
+        app.editor.key(
+            &mut app.input,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+        );
+        clipboard
+            .requests
+            .send(request(&app, Operation::Copy(app.input.clone())))
+            .unwrap();
+        complete(&mut app, clipboard.completions.recv().await.unwrap());
+        assert_eq!(app.input, "keep this");
+        assert_eq!(app.status, "Selection copied");
+        clipboard
+            .requests
+            .send(request(&app, Operation::Cut(app.input.clone())))
+            .unwrap();
+        complete(&mut app, clipboard.completions.recv().await.unwrap());
+        assert!(app.input.is_empty());
+        clipboard
+            .requests
+            .send(request(&app, Operation::Paste))
+            .unwrap();
+        complete(&mut app, clipboard.completions.recv().await.unwrap());
+        assert_eq!(app.input, "keep this");
+    }
+
+    #[test]
+    fn pasted_form_and_search_text_stays_in_the_captured_modal_without_submitting() {
+        let mut app = crate::ui::App {
+            input: "answer ".into(),
+            dialog: Some("field one".into()),
+            ..Default::default()
+        };
+        let mut pending = request(&app, Operation::Paste);
+        pending.target = Target::Question("field one".into());
+        complete(
+            &mut app,
+            Completion {
+                request: pending,
+                result: Ok(Some("one\r\ntwo".into())),
+            },
+        );
+        assert_eq!(app.input, "answer one two");
+        assert!(app.dialog.is_some());
+        assert!(app.pending.is_empty());
+        let mut pending = request(&app, Operation::Paste);
+        pending.target = Target::Question("field one".into());
+        app.dialog = Some("field two".into());
+        complete(
+            &mut app,
+            Completion {
+                request: pending,
+                result: Ok(Some("stale".into())),
+            },
+        );
+        assert_eq!(app.input, "answer one two");
+        app.dialog = None;
+        app.picker = Some(crate::picker::Picker::new("session".into(), vec![]));
+        let mut pending = request(&app, Operation::Paste);
+        pending.target = Target::Picker(String::new());
+        complete(
+            &mut app,
+            Completion {
+                request: pending,
+                result: Ok(Some("model\nname".into())),
+            },
+        );
+        assert_eq!(app.picker.as_ref().unwrap().query, "model name");
+        assert!(app.pending.is_empty());
     }
 
     #[test]

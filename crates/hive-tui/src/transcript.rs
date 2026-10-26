@@ -918,4 +918,27 @@ mod tests {
             .unwrap();
         assert_eq!(view.cache[0].width, 10);
     }
+
+    #[test]
+    fn edge_scrolling_extends_selection_across_messages_and_stops_on_release() {
+        let mut conversation = Conversation::default();
+        for index in 0..10 {
+            conversation.push_notice(format!("Entry {index}"));
+        }
+        let mut view = Transcript::default();
+        let mut terminal = Terminal::new(TestBackend::new(20, 4)).unwrap();
+        draw(&mut view, &conversation, &mut terminal);
+        view.boundary(false);
+        draw(&mut view, &conversation, &mut terminal);
+        view.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 0));
+        view.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 6, 19));
+        assert_eq!(view.top, Some(0));
+        assert!(view.autoscroll());
+        assert!(view.autoscroll());
+        assert_eq!(view.top, Some(2));
+        let selected = view.selected_text().unwrap();
+        assert!(selected.starts_with("Entry 0\n\nEntry 1"), "{selected:?}");
+        view.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 6, 19));
+        assert!(!view.autoscroll());
+    }
 }

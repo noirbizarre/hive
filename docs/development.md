@@ -42,7 +42,10 @@ the [browser smoke checklist](guides/web.md#browser-smoke-checklist) for visual 
 ## Local runtime
 
 For the TUI, `cargo test -p hive-tui` covers editing, selection, clipboard result
-routing, and protocol interactions. On Unix, run
+routing, and protocol interactions. On Unix it also runs controlling-PTY tests
+through Python 3, exercising the real event loop, queued agent questions during
+external editing, reconnects, and terminal restoration. The subprocess reuses the
+instrumented test executable so these paths contribute to CI coverage. Run
 `python3 crates/hive-tui/tests/terminal.py` from the repository root for the
 opt-in controlling-PTY smoke test. It checks cursor visibility, bracketed paste,
 exclusive editor handoff, and restoration after editor failure without opening

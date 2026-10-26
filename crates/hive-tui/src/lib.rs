@@ -12,6 +12,9 @@ mod ui;
 #[cfg(test)]
 mod interaction_tests;
 
+#[cfg(all(test, unix))]
+mod terminal_tests;
+
 use std::{
     collections::{BTreeMap, VecDeque},
     time::Duration,

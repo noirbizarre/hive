@@ -15,11 +15,11 @@ import time
 def main():
     pid, master = pty.fork()
     if pid == 0:
-        os.execvp("cargo", [
-            "cargo", "test", "-p", "hive-tui",
-            "tests::a_real_terminal_can_be_handed_to_a_child_and_restored_after_failure",
-            "--", "--ignored", "--exact", "--nocapture",
-        ])
+        test = "tests::a_real_terminal_can_be_handed_to_a_child_and_restored_after_failure"
+        # CI passes its already instrumented executable; manual runs may build through Cargo.
+        command = ([sys.argv[1], test, "--ignored", "--exact", "--nocapture"] if len(sys.argv) > 1
+                   else ["cargo", "test", "-p", "hive-tui", test, "--", "--ignored", "--exact", "--nocapture"])
+        os.execvp(command[0], command)
 
     fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
     original = termios.tcgetattr(master)

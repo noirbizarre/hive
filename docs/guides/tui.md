@@ -27,6 +27,7 @@ so the same sessions are available in the Web UI and other ACP clients.
 | `Ctrl-B` | Return to the previously visited session |
 | `Ctrl-T` | Take pilot control |
 | `Ctrl-P` | Open/close the provider/model configuration picker |
+| `Ctrl-G` | Open/close the other session settings picker |
 | `Ctrl-H` | Relinquish control while observing |
 | Enter in composer | Send the typed prompt |
 | `Alt-Enter` | Insert a newline without sending |
@@ -46,7 +47,7 @@ so the same sessions are available in the Web UI and other ACP clients.
 | `Ctrl-C` | Cancel foreground work |
 | `Ctrl-R` | Accept live-only attachment after a history gap |
 | `Ctrl-Y` | Acknowledge interrupted work and take control |
-| Esc | Close the model picker, or quit outside dialogs |
+| Esc | Close a configuration picker, or quit outside dialogs |
 | `Ctrl-Q` | Quit without closing the session (outside agent questions) |
 
 Recovery acknowledgement requires checking the downstream state first. See
@@ -62,7 +63,7 @@ draft separately from the answer.
 
 Use `Alt-Enter` to add a newline and Enter to send. Bracketed paste and `Alt-V`
 insert multiline text as one edit: pasted newlines never send a prompt or
-confirm an agent question. Pasting into a form text field or model search
+confirm an agent question. Pasting into a form text field or configuration search
 replaces newlines with spaces; permission choices do not accept pasted input.
 Pastes and external-editor imports are limited to 8 MiB per operation.
 
@@ -109,8 +110,9 @@ the terminal and cursor before accepting input again.
 
 ## Choose a provider and model
 
-Create a session with `Ctrl-N`, then press `Ctrl-P` before sending a prompt.
-The modal lists the agent's advertised configuration choices, grouped by
+Create a session with `Ctrl-N`, then press `Ctrl-P` to choose a model, before
+the first prompt or between later turns.
+The modal lists the agent's advertised model choices, grouped by
 provider when available; `*` marks current values. Type to fuzzy-search provider
 and model names. Use arrows or Page Up/Down to navigate and Enter to apply a
 choice. Successful changes close the modal; errors keep the search open for
@@ -123,6 +125,25 @@ selection configures that agent. Take control with `Ctrl-T` before editing an
 observed session, and wait for foreground work to finish. Unsupported backends
 display an explanation. Model configuration for the OpenCode server adapter
 currently stays in OpenCode itself.
+
+## Change session settings
+
+Press `Ctrl-G` for **Session settings**. This separate searchable picker contains
+the agent's other advertised selections: for example OpenCode's Session Mode,
+Claude's permission mode, Codex's collaboration mode, or Pi's thinking level.
+Use Enter to apply, and Esc or `Ctrl-G` to close. Model selection keeps its
+dedicated `Ctrl-P` picker.
+
+Settings remain changeable throughout the session while you control an idle
+agent. The heading shows confirmed current selections, also for observers.
+Changes reported by the agent or made through another Hive client refresh these
+values. Failed changes keep the picker open and do not claim a successful
+selection. Reconnect uses the current snapshot without resending an uncertain
+change; restart rediscovers settings from the original agent session.
+
+Mode is agent-dependent: a selected Plan mode is separate from a plan in the
+transcript or an agent's configured default. Unsupported or empty catalogs
+cannot submit changes. See [session configuration compatibility](../acp-compatibility.md#session-modes-and-agent-settings).
 
 ## Answer agent questions
 

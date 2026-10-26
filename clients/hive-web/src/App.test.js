@@ -126,6 +126,34 @@ test('a fresh session configures grouped models before its first prompt and gate
   expect(wrapper.get('#send').element.disabled).toBe(true);
 });
 
+test('live session settings preserve distinct modes authoritative values and empty catalogs', async () => {
+  const mode = { configId: 'mode', category: 'mode', name: 'Approval preset', type: 'select', currentValue: 'default', options: [{ value: 'default', name: 'Default' }, { value: 'plan', name: 'Plan' }] };
+  const collaboration = { ...mode, configId: 'collaboration_mode', category: 'collaboration_mode', name: 'Collaboration mode' };
+  const configOptions = [...options, mode, collaboration, { ...mode, configId: 'empty', name: 'Unavailable mode', options: [] }];
+  const { client, publish } = application({ session, role: 'pilot', configOptions, lines: [{ kind: 'agent', text: 'Completed turn' }] });
+  await flushPromises();
+  const select = id => wrapper.findAllComponents(Select).find(item => item.props('inputId') === `config-${id}`);
+  expect(wrapper.text()).toContain('Provider / Model');
+  expect(wrapper.text()).toContain('Approval preset');
+  expect(wrapper.text()).toContain('Collaboration mode');
+  expect(select('empty').props('disabled')).toBe(true);
+  expect(select('collaboration_mode').props('disabled')).toBe(false);
+  client.configure.mockRejectedValueOnce(new Error('Agent rejected configuration'));
+  // Exercise the component's real internal selection, not just an emitted event: it optimistically stores Plan.
+  await wrapper.get('#config-collaboration_mode').trigger('click'); await flushPromises();
+  document.body.querySelector('[role="option"][aria-label="Plan"]').dispatchEvent(new MouseEvent('mousedown', { bubbles: true })); await flushPromises();
+  expect(client.configure).toHaveBeenCalledWith('collaboration_mode', 'plan');
+  expect(wrapper.text()).toContain('Agent rejected configuration');
+  expect(select('collaboration_mode').props('modelValue')).toBe('default');
+  expect(wrapper.get('#config-collaboration_mode').text()).toBe('Default');
+  publish({ configOptions: configOptions.map(option => option.configId === 'collaboration_mode' ? { ...option, currentValue: 'plan' } : option) }); await nextTick();
+  expect(select('collaboration_mode').props('modelValue')).toBe('plan');
+  expect(select('mode').props('modelValue')).toBe('default');
+  publish({ role: 'observer' }); await nextTick();
+  expect(select('collaboration_mode').props('disabled')).toBe(true);
+  expect(select('collaboration_mode').props('modelValue')).toBe('plan');
+});
+
 test('deep links and catalog revisions preserve selection focus and recent ordering', async () => {
   history.replaceState(null, '', '/ui?session=hive-tui');
   items.push({ ...session, sessionId: 'second', title: 'Second session' });

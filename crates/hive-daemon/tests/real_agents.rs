@@ -32,6 +32,8 @@ fn launch(id: &str, prefix: &str) -> (String, Vec<String>) {
         });
     let (default_command, default_args): (&str, &[&str]) = match id {
         "opencode" => ("opencode", &["acp"]),
+        "claude" => ("claude-agent-acp", &[]),
+        "codex" => ("codex-acp", &[]),
         // Prefer an installed adapter; otherwise let npx fetch it, as the adapter's README does.
         _ if hive_daemon::compat::check_launch("pi-acp", &[]).is_ok() => ("pi-acp", &[]),
         _ => ("npx", &["-y", "pi-acp"]),
@@ -234,6 +236,10 @@ async fn turn(
 }
 
 async fn run(installation: Installation) -> Result<(), String> {
+    run_probe(installation, false).await
+}
+
+async fn run_probe(installation: Installation, configuration: bool) -> Result<(), String> {
     let profile = Profile {
         name: None,
         command: Some(installation.command),
@@ -268,7 +274,13 @@ async fn run(installation: Installation) -> Result<(), String> {
         .into_future(),
     );
     // Isolate probe panics so even malformed agent replies cannot bypass worker cleanup.
-    let mut flow = tokio::spawn(lifecycle(address, installation.id));
+    let mut flow = tokio::spawn(async move {
+        if configuration {
+            configuration_lifecycle(address, installation.id).await
+        } else {
+            lifecycle(address, installation.id).await
+        }
+    });
     let result = timeout(Duration::from_secs(300), &mut flow).await;
     if result.is_err() {
         flow.abort();
@@ -283,6 +295,53 @@ async fn run(installation: Installation) -> Result<(), String> {
         }
         Err(_) => {
             Err("real-agent lifecycle timed out; check credentials or model availability".into())
+        }
+    }
+}
+
+async fn configuration_lifecycle(address: SocketAddr, id: &str) -> Result<(), String> {
+    let cwd = workspace(id)?;
+    Client.v2().connect_with(HttpClient::new(format!("ws://{address}")).map_err(|_| "invalid WS URL")?, async move |cx| {
+        cx.send_request(v2::InitializeRequest::new(ProtocolVersion::V2, v2::Implementation::new("configuration-probe", "1"))).block_task().await?;
+        let opened = cx.send_request(v2::NewSessionRequest::new(cwd.clone())).block_task().await?;
+        let requested = std::env::var(format!("HIVE_REAL_{}_CONFIG_ID", id.to_ascii_uppercase())).ok();
+        let option = opened.config_options.iter().find(|option| {
+            let value = serde_json::to_value(option).unwrap_or_default();
+            value["type"] == "select" && requested.as_ref().map_or_else(
+                || value["category"] == "mode" || value["category"] == "thought_level" || value["category"] == "collaboration_mode",
+                |config| option.config_id.to_string() == *config,
+            )
+        }).ok_or_else(|| diagnostic("no advertised session setting; inspect adapter capabilities"))?;
+        let value = serde_json::to_value(option).map_err(Error::into_internal_error)?;
+        let original = value["currentValue"].as_str().ok_or_else(Error::invalid_params)?;
+        let choices: Vec<_> = value["options"].as_array().into_iter().flatten().flat_map(|choice| {
+            choice["options"].as_array().map_or_else(|| vec![choice], |items| items.iter().collect())
+        }).collect();
+        let target = choices.iter().filter_map(|choice| choice["value"].as_str()).find(|choice| *choice != original)
+            .ok_or_else(|| diagnostic("no alternate advertised setting value"))?;
+        let setter = |value: &str| v2::SetSessionConfigOptionRequest::new(opened.session_id.clone(), option.config_id.clone(), v2::SessionConfigOptionValue::Id { value: v2::SessionConfigValueId::new(value.to_owned()) }).meta(opened.meta.clone());
+        let changed = cx.send_request(setter(target)).block_task().await;
+        // Attempt restoration even if the first acknowledgement failed: the remote side may have applied it.
+        let restored = cx.send_request(setter(original)).block_task().await?;
+        let changed = changed?;
+        let current = |options: &[v2::SessionConfigOption]| options.iter().find(|item| item.config_id == option.config_id)
+            .and_then(|item| serde_json::to_value(item).ok()).and_then(|item| item["currentValue"].as_str().map(str::to_owned));
+        if current(&changed.config_options).as_deref() != Some(target) || current(&restored.config_options).as_deref() != Some(original) {
+            return Err(diagnostic("agent did not confirm changed and restored settings"));
+        }
+        let attached = cx.send_request(v2::ResumeSessionRequest::new(opened.session_id, cwd)).block_task().await?;
+        if current(&attached.config_options).as_deref() != Some(original) { return Err(diagnostic("reattachment did not retain restored setting")); }
+        eprintln!("CONFIG agent={id} config={} changed=true restored=true reattached=true inference=false", option.config_id);
+        Ok::<_, Error>(())
+    }).await.map_err(|error| format!("configuration probe failed (code {:?}); inspect adapter configuration and logs", error.code))
+}
+
+#[tokio::test]
+#[ignore = "requires explicit HIVE_REAL_<AGENT>=1 and an authenticated installed adapter"]
+async fn real_agent_settings_can_change_and_restore_without_inference() {
+    for id in ["opencode", "claude", "codex", "pi"] {
+        if let Some(installation) = installation(id).await {
+            run_probe(installation, true).await.unwrap();
         }
     }
 }

@@ -774,7 +774,7 @@ async fn handle_key(
         let picker = app.picker.as_mut().unwrap();
         picker.refresh(choices);
         match (key.code, ctrl) {
-            (KeyCode::Esc, _) | (KeyCode::Char('p'), true) => app.picker = None,
+            (KeyCode::Esc, _) | (KeyCode::Char('p' | 'g'), true) => app.picker = None,
             (KeyCode::Char('q'), true) => return true,
             (KeyCode::Up, _) => picker.navigate(-1),
             (KeyCode::Down, _) => picker.navigate(1),
@@ -825,15 +825,22 @@ async fn handle_key(
             }
         }
         // Ctrl-M aliases Enter in terminals; Ctrl-P remains distinguishable for the model picker.
-        (KeyCode::Char('p'), true) => {
+        (KeyCode::Char('p' | 'g'), true) => {
             app.editor.cancel_drag();
             if let Some(view) = app.transcript() {
                 view.clear_selection();
             }
             if let Some(id) = app.active.clone() {
-                app.picker = Some(picker::Picker::new(id, app.config_choices()));
+                let kind = if key.code == KeyCode::Char('g') {
+                    picker::Kind::Settings
+                } else {
+                    picker::Kind::Model
+                };
+                let mut picker = picker::Picker::new(id, app.choices_for(kind));
+                picker.kind = kind;
+                app.picker = Some(picker);
             } else {
-                app.status = "Open a session before choosing a model".into();
+                app.status = "Open a session before changing configuration".into();
             }
         }
         (KeyCode::Esc, _) | (KeyCode::Char('q'), true) => return true,
@@ -1140,7 +1147,7 @@ fn apply_configuration(cx: &V2ConnectionTo<Agent>, app: &mut App) {
             .as_ref()
             .is_some_and(|id| app.pending.contains_key(id))
     {
-        app.status = "Take control of an idle session before changing its model".into();
+        app.status = "Take control of an idle session before changing its configuration".into();
         if let Some(picker) = app.picker.as_mut() {
             picker.message.clone_from(&app.status);
         }
@@ -1517,7 +1524,7 @@ async fn run_with_clipboard(
                              Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
                                  app.configuration = None;
                                  let id = app.active.clone().unwrap_or_default();
-                                  configuration_result(&mut app, id, Err("Configuration interrupted; reopen the session to inspect its current model".into()));
+                                  configuration_result(&mut app, id, Err("Configuration interrupted; reopen the session to inspect its current settings".into()));
                                   dirty = true;
                              }
                             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}

@@ -87,6 +87,27 @@ instant navigation as well as a full page load.
 
 ## Real-agent compatibility probes
 
+### Session settings without inference
+
+The ignored settings probe creates a session, changes one advertised setting,
+restores its original value, and verifies it on reattachment without sending a
+prompt. Use an installed, authenticated adapter and an existing workspace:
+
+```sh
+HIVE_REAL_OPENCODE=1 HIVE_REAL_OPENCODE_WIRE=v1 \
+  cargo test -p hive-daemon --test real_agents \
+  real_agent_settings_can_change_and_restore_without_inference -- --ignored --exact --nocapture
+```
+
+The same probe accepts `HIVE_REAL_CLAUDE=1`, `HIVE_REAL_CODEX=1`, or
+`HIVE_REAL_PI=1`, with installed `claude-agent-acp`, `codex-acp`, or `pi-acp`.
+Set `HIVE_REAL_<AGENT>_CONFIG_ID` to select a specific advertised option, such as
+Codex's `collaboration_mode`. Otherwise it chooses the first mode, thinking, or
+collaboration selector. The probe prints `PROBE` version evidence and a `CONFIG`
+summary. Keep source-inspected support separate from completed runtime probes.
+
+### Prompt and lifecycle probes
+
 The mock gateway test (`cargo test -p hive-daemon --test gateway`) is the
 deterministic CI baseline. CLI lifecycle and status checks live in
 `cargo test -p hive-cli --test daemon`. `crates/hive-daemon/tests/real_agents.rs` contains

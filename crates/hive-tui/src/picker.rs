@@ -6,7 +6,15 @@ use ratatui::widgets::ListState;
 
 pub type Choice = (String, String, String);
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Kind {
+    #[default]
+    Model,
+    Settings,
+}
+
 pub struct Picker {
+    pub kind: Kind,
     pub session: String,
     pub query: String,
     pub list: ListState,
@@ -21,6 +29,7 @@ impl Picker {
     pub fn new(session: String, choices: Vec<Choice>) -> Self {
         let selected = choices.iter().position(|choice| choice.2.ends_with(" *"));
         let mut picker = Self {
+            kind: Kind::Model,
             session,
             query: String::new(),
             list: ListState::default().with_selected(selected),

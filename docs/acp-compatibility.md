@@ -37,7 +37,53 @@ idle sessions owned by the caller. ACPv1 option/group identities and setter
 values are translated to ACPv2. Response `_meta.hive.configSeq` marks the
 snapshot boundary so older replay cannot undo current selections. Support is
 covered by v1/v2 mocks; actual choices depend on the downstream agent.
-The native OpenCode server adapter does not expose model configuration.
+The native OpenCode server adapter does not expose session configuration.
+
+### Session modes and agent settings
+
+Hive prefers usable native `configOptions` as a complete surface, preserving
+names, values, grouping, ordering, descriptions, and unknown categories.
+Selections use the advertised config ID through `session/set_config_option`.
+When no usable native configuration is available, ACPv1 `modes` become a
+mode-category configuration selector whose setter calls native
+`session/set_mode`. Legacy `current_mode_update` notifications refresh that
+selector. Native configuration takes precedence to prevent duplicate controls.
+
+All settings, including model, remain changeable after startup by the pilot of
+an idle session. TUI `Ctrl-P` selects models; `Ctrl-G` selects other settings.
+Both clients display confirmed current values. An empty legacy acknowledgement
+confirms the requested selection only if no newer agent observation superseded
+it. Failed changes do not invent a successful selection. Attachments use the
+current sequenced snapshot; restart rediscovers settings from the saved agent
+session instead of applying a Hive default. Plans and activity never determine
+the selected mode.
+
+Source-inspected compatibility on 2026-10-26 (runtime verification is recorded
+separately below):
+
+| Adapter/source version | Advertised settings | Meaning |
+| --- | --- | --- |
+| [OpenCode 1.19.4](https://github.com/anomalyco/opencode/blob/v1.19.4/packages/opencode/src/acp/config-option.ts) | `mode`, category `mode` | Primary agent, including Build/Plan and custom agents |
+| [Claude agent ACP 0.96.0](https://github.com/agentclientprotocol/claude-agent-acp/blob/f6958db1ee8d3e9ead6767a3a294f98b9a21adb9/src/session-mode.ts) | `mode`, category `mode` | Permission mode, including Plan; available choices depend on runtime settings |
+| [Codex ACP 2.2.2](https://github.com/agentclientprotocol/codex-acp/blob/51005a6e11fd2cb7caa2d27fcfdd5ad0fbf41027/src/CollaborationModeConfig.ts) | `mode` and `collaboration_mode` | Independent approval/sandbox preset and Default/Plan collaboration selector |
+| [Pi ACP 0.0.34](https://github.com/svkozak/pi-acp/blob/04d0a15d6bb42bb65cce5c9caedcdcb2cdcb6905/src/acp/agent.ts) | `model` and `thought_level` | Provider/model and reasoning effort; legacy modes duplicate thinking level |
+
+Hive forwards reported configuration changes to every attached subscriber,
+including changes initiated by another Hive client. Visibility of changes made
+outside Hive depends on the adapter emitting updates: OpenCode 1.19.4 and
+Codex's direct setters return configuration snapshots without notification
+echoes; later OpenCode source and agent-driven Codex transitions report updates.
+Hive cannot infer an unreported external change. Configuration setter responses
+still update all Hive clients. These source findings do not upgrade the retained
+live-agent matrix below.
+
+Runtime settings evidence, 2026-10-26: the ignored
+`real_agent_settings_can_change_and_restore_without_inference` probe passed
+against installed OpenCode **1.19.4**, `opencode acp`, downstream ACPv1, upstream
+WebSocket. It discovered Session Mode, changed and restored an advertised value,
+and confirmed the restored selection on attachment without inference. This
+verifies that settings path only; it does not establish prompt behavior,
+arbitrary external-change notifications, or other adapters' live support.
 
 Post-admission ACPv1 prompt failures produce a sequenced `_hive_error` update
 before idle. Its version, source, operation, stable diagnostic code, message

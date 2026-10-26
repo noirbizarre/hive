@@ -83,6 +83,14 @@ pub struct App {
 
 impl App {
     pub fn config_choices(&self) -> Vec<(String, String, String)> {
+        self.choices_for(
+            self.picker
+                .as_ref()
+                .map_or(crate::picker::Kind::Model, |p| p.kind),
+        )
+    }
+
+    pub fn choices_for(&self, kind: crate::picker::Kind) -> Vec<(String, String, String)> {
         let mut choices = Vec::new();
         for option in self
             .conversation()
@@ -90,6 +98,9 @@ impl App {
             .flat_map(|state| &state.config_options)
         {
             let value = serde_json::to_value(option).unwrap_or_default();
+            if (value["category"] == "model") != (kind == crate::picker::Kind::Model) {
+                continue;
+            }
             if value["type"] != "select" {
                 continue;
             }
@@ -128,6 +139,34 @@ impl App {
             }
         }
         choices
+    }
+
+    fn config_summary(&self) -> String {
+        self.conversation()
+            .into_iter()
+            .flat_map(|state| &state.config_options)
+            .filter_map(|option| {
+                let value = serde_json::to_value(option).ok()?;
+                if value["type"] != "select" {
+                    return None;
+                }
+                let current = value["currentValue"].as_str()?;
+                let label = value["options"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|choice| {
+                        choice["options"]
+                            .as_array()
+                            .map_or_else(|| vec![choice], |items| items.iter().collect())
+                    })
+                    .find(|choice| choice["value"] == current)
+                    .and_then(|choice| choice["name"].as_str())
+                    .unwrap_or(current);
+                Some(format!("{}: {}", option.name, label))
+            })
+            .collect::<Vec<_>>()
+            .join(" · ")
     }
 
     pub fn toggle_sessions(&mut self) -> bool {
@@ -278,13 +317,26 @@ impl App {
             return;
         }
         let choices = self.config_choices();
+        let settings = self
+            .picker
+            .as_ref()
+            .is_some_and(|p| p.kind == crate::picker::Kind::Settings);
         // An advertised selector still supports selection when its catalog is empty.
         let supports_selection = self
             .conversation()
             .into_iter()
             .flat_map(|state| &state.config_options)
-            .any(|option| serde_json::to_value(option).unwrap_or_default()["type"] == "select");
-        let empty_message = if !supports_selection {
+            .any(|option| {
+                let value = serde_json::to_value(option).unwrap_or_default();
+                value["type"] == "select" && (value["category"] == "model") != settings
+            });
+        let empty_message = if settings && !supports_selection {
+            "This backend does not expose session settings."
+        } else if settings && choices.is_empty() {
+            "No setting choices available."
+        } else if settings {
+            "No matching settings."
+        } else if !supports_selection {
             "This backend does not expose model selection."
         } else if choices.is_empty() {
             "No models available."
@@ -315,7 +367,11 @@ impl App {
         frame.render_widget(Clear, area);
         let block = Block::default()
             .borders(Borders::ALL)
-            .title(" Provider / Model ")
+            .title(if settings {
+                " Session settings "
+            } else {
+                " Provider / Model "
+            })
             .style(theme.text());
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -376,14 +432,10 @@ impl App {
                 Span::styled(title, theme.text()),
             ]),
             Line::styled(
-                self.config_choices()
-                    .iter()
-                    .filter(|(_, _, label)| label.ends_with(" *"))
-                    .map(|(_, _, label)| {
-                        format!("  {} · Ctrl-P configure", label.trim_end_matches(" *"))
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" · "),
+                format!(
+                    "  {} · Ctrl-P model · Ctrl-G settings",
+                    self.config_summary()
+                ),
                 theme.muted(),
             ),
         ];
@@ -1188,7 +1240,7 @@ mod tests {
         app.input = "draft underneath".into();
         app.conversations.entry("session".into()).or_default().config_options =
             serde_json::from_value(serde_json::json!([{
-                "configId": "model", "name": "Model", "type": "select", "currentValue": "0",
+                "configId": "model", "name": "Model", "category": "model", "type": "select", "currentValue": "0",
                 "options": (0..60).map(|i| serde_json::json!({"value": i.to_string(), "name": format!("Model {i}")})).collect::<Vec<_>>()
             }])).unwrap();
         app.picker = Some(Picker::new("session".into(), app.config_choices()));
@@ -1211,6 +1263,21 @@ mod tests {
     }
 
     #[test]
+    fn current_settings_remain_visible_when_the_agent_removes_the_selected_choice() {
+        let mut app = App::default();
+        app.select_session("session".into());
+        app.conversations.entry("session".into()).or_default().config_options = serde_json::from_value(serde_json::json!([
+            {"configId":"model","name":"Model","category":"model","type":"select","currentValue":"fast","options":[{"value":"fast","name":"Fast"},{"value":"other","name":"Other model"}]},
+            {"configId":"mode","name":"Mode","category":"mode","type":"select","currentValue":"removed-mode","options":[]}
+        ])).unwrap();
+        assert_eq!(app.config_summary(), "Model: Fast · Mode: removed-mode");
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        terminal.draw(|frame| app.show(frame)).unwrap();
+        assert!(screen(&terminal).contains("Mode: removed-mode"));
+        assert!(!screen(&terminal).contains("Other model"));
+    }
+
+    #[test]
     fn an_advertised_empty_model_selector_reports_no_models_available() {
         for options in [
             serde_json::json!([]),
@@ -1222,7 +1289,7 @@ mod tests {
                 .entry("session".into())
                 .or_default()
                 .config_options = serde_json::from_value(serde_json::json!([{
-                "configId": "model", "name": "Model", "type": "select",
+                "configId": "model", "name": "Model", "category": "model", "type": "select",
                 "currentValue": "", "options": options
             }]))
             .unwrap();
@@ -1244,7 +1311,7 @@ mod tests {
             .entry("session".into())
             .or_default()
             .config_options = serde_json::from_value(serde_json::json!([{
-            "configId": "model", "name": "Model", "type": "select",
+            "configId": "model", "name": "Model", "category": "model", "type": "select",
             "currentValue": "fast", "options": [{ "value": "fast", "name": "Fast" }]
         }]))
         .unwrap();

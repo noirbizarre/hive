@@ -31,6 +31,8 @@ nav = [
   { "Configuration" = "configuration.md" },
   { "Agent integrations" = [
     { "OpenCode" = "agents/opencode.md" },
+    { "Claude Code" = "agents/claude.md" },
+    { "Codex" = "agents/codex.md" },
     { "Pi" = "agents/pi.md" },
   ] },
   { "Operations" = [

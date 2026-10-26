@@ -2,12 +2,13 @@
 
 This is the protocol and verification reference. For setup, start with
 [getting started](getting-started.md), [configuration](configuration.md), or
-the [OpenCode](agents/opencode.md) and [Pi](agents/pi.md) guides.
+the [OpenCode](agents/opencode.md), [Claude Code](agents/claude.md),
+[Codex](agents/codex.md), and [Pi](agents/pi.md) guides.
 
 ## Audit baseline
 
-Audited **2026-10-25**, against Hive commit
-[`1d5648d`](https://github.com/noirbizarre/hive/tree/1d5648d8d4ea8522ea06b52b607f82af10899f69).
+Audited **2026-10-25**, with a behavioral refresh on **2026-10-26** against Hive commit
+[`a3bd217`](https://github.com/noirbizarre/hive/tree/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9).
 The matrix inventories the specification shipped with Hive's current dependencies,
 including features Hive does not implement. It is not a declaration of full ACP conformance.
 
@@ -90,7 +91,7 @@ Sources: [v1 prompt turns][v1-prompt], [v2 prompt lifecycle][v2-prompt],
 | `session/prompt`, acceptance versus completion ([v1][v1-prompt], [v2][v2-prompt]) | 🟡 P | V1 completion adapted into asynchronous running/idle; native v2 returns insertion `messageId` | Acknowledgement is not completion; ownership/idempotency and running-work admission implemented, but blocked-first admission is incomplete | Both consume state, not just response; blocked-state busy handling incomplete | [Gateway tests][gateway-tests]; [ownership](#mutation-ownership-and-idempotency); [#65](https://github.com/noirbizarre/hive/issues/65) |
 | `state_update`: `running`, `idle`, `requires_action`; background updates ([v2 lifecycle][v2-prompt]) | 🟡 P | V1 synthesizes running/idle; v2 relays all native states | Activity records `requires_action`, but live admission boolean ignores it and restoration treats it as not running; late tools do not reopen foreground | Both running booleans only track running/idle; normalized blocked activity is separate | [Activity][activity]; [workers][daemon]; [#65](https://github.com/noirbizarre/hive/issues/65); resume barrier [#63](https://github.com/noirbizarre/hive/issues/63) |
 | Stop reasons: end-turn, limits, refusal, cancellation, v2 error ([v1][v1-prompt], [v2][v2-prompt]) | 🟡 P | V1 `end_turn` maps exactly; other successful stop reasons become `_v1_stop`; v2 keeps typed reason | Native reason/error relayed but not retained as a materialized failure entry; controlled v1 error extension before idle | Both show Hive failures, but neither surfaces native idle/error details; TUI shows native cancellation | [Worker prompt handling][daemon]; [#66](https://github.com/noirbizarre/hive/issues/66) |
-| Text blocks; `user_message_chunk`, `agent_message_chunk` ([v1][v1-content], [v2][v2-content]) | ✅ S | V1 synthetic IDs, live user echo suppressed; v2 native IDs/chunks | Relayed; transcript coalesces compatible text chunks in first-appearance order | Both compose/render text streams | [Transcript][transcript]; [TUI state][tui-state]; [Web reducer tests][web-tests] |
+| Text blocks; `user_message_chunk`, `agent_message_chunk` ([v1][v1-content], [v2][v2-content]) | ✅ S | V1 synthetic IDs, live user echo suppressed; v2 native IDs/chunks | Relayed; transcript coalesces compatible text chunks in first-appearance order | Both compose/render text streams; Web renders user/agent discussion Markdown, including accumulated chunks | [Transcript][transcript]; [TUI state][tui-state]; [Web reducer tests][web-tests]; [Markdown tests][web-markdown-tests] |
 | `user_message`, `agent_message`, `agent_thought`: whole-message upserts and null/omission ([v2 schema][v2-schema]) | 🟡 P | V1 has no whole-message identity API; v2 typed updates accepted | Transcript correctly replaces arrays, retains omission, clears null | Web omission erases content; TUI null fails to clear; concrete text replacement works | `full_message_patches_replace_content_without_reordering_or_erasing_omitted_fields` in [transcript][transcript]; [#60](https://github.com/noirbizarre/hive/issues/60) |
 | `agent_thought_chunk` ([v1][v1-prompt], [v2][v2-prompt]) | 🟡 P | V1 adapter drops thoughts; v2 relays | Native thoughts materialized with a separate message namespace | Both render native thought text | [V1 match][daemon]; [TUI][tui-state]; [Web][web-client] |
 | Image and audio blocks / prompt capabilities ([v1][v1-content], [v2][v2-content]) | 🟡 P | V1 prompts rejected; native v2 typed fields retained | Image/audio capabilities not advertised upstream; relay is not supported media negotiation | Text-only composers; placeholders for full-message media; Web non-text chunks have no visible text | [Workers][daemon]; [TUI][tui-state]; [Web][web-client] |
@@ -124,10 +125,10 @@ Sources: [v1 tool calls][v1-tools], [v2 tool calls][v2-tools],
 
 | Feature / specification | Status | Ingestion: v1 / v2 | Daemon / client API | TUI / Web | Evidence / gap |
 | --- | --- | --- | --- | --- | --- |
-| `configOptions`, `config_option_update`, `session/set_config_option`: select/grouped choices ([v1][v1-config], [v2][v2-config]) | 🔀 A | V1 IDs/groups/setters translated; native v2 delegated | Agent-advertised options validated; idle owner-only setter; current snapshot fenced against old replay | Both edit flat/grouped selects, including model options when agent exposes them | `model_choices_survive_translation_setters_rejection_and_observer_attachment` in [gateway tests][gateway-tests]; [config adapter][config] |
+| `configOptions`, `config_option_update`, `session/set_config_option`: select/grouped choices ([v1][v1-config], [v2][v2-config]) | 🔀 A | V1 IDs/groups/setters translated; native v2 delegated | Advertised options validated; idle owner-only setter; confirmed responses publish to subscribers without requiring an echo; newer observations win | TUI `Ctrl-P` selects models, `Ctrl-G` other settings; Web exposes separate selects | `native_modes_and_collaboration_settings_remain_independent_and_change_between_turns` in [gateway tests][gateway-tests]; [config adapter][config] |
 | Boolean config options ([v1][v1-config], [v2][v2-config]) | 🟡 P | Typed translation/setters implemented; v1 boolean client marker not advertised | Advertised boolean values accepted; no blanket unknown-kind setter support | Both cache options but only offer select controls | [Config adapter][config]; [TUI picker][tui-ui]; [Web UI][web-ui] |
-| Categories `mode`, `model`, `model_config`, `thought_level`; dependent config replacement ([v1][v1-config], [v2][v2-config]) | 🔀 A | Agent-defined category/choices retained | Full authoritative config set replaces snapshot; category is a UX hint, not an independent API | Select options exposed; no guarantee of specialized controls per category | [Config adapter][config]; [gateway tests][gateway-tests] |
-| V1 modes, `session/set_mode`, `current_mode_update` ([session modes][v1-modes]) | ❌ U | Initial mode state not translated; updates dropped; setter not forwarded | Dedicated modes removed in v2; supported alternative only when agent supplies config options | No legacy-mode selector | [V1 worker][daemon] |
+| Categories `mode`, `model`, `model_config`, `thought_level`; dependent config replacement ([v1][v1-config], [v2][v2-config]) | 🔀 A | Agent-defined category/choices retained; usable native configuration takes precedence as a complete surface | Full authoritative config set replaces snapshot and can remove choices; mode and collaboration mode remain independent | Select options exposed; unknown categories preserved, not collapsed into one mode control | [Config adapter][config]; [gateway tests][gateway-tests] |
+| V1 modes, `session/set_mode`, `current_mode_update` ([session modes][v1-modes]) | 🔀 A | Without usable native config, translate discovered modes into `_hive_legacy_mode`; consume updates and call native setter | Exposed upstream through `session/set_config_option`; confirmed snapshots sequenced; restart rediscovers settings from original session | TUI `Ctrl-G` and Web settings expose fallback selector; idle pilot only | `legacy_modes_use_the_native_setter_and_reconcile_acknowledgements_and_observers` and `modes_are_rediscovered_from_the_original_session_after_daemon_restart` in [gateway tests][gateway-tests] |
 | `available_commands_update`, initial available commands; slash-command text input ([v1][v1-commands], [v2][v2-commands]) | 🟡 P | V1 discovery dropped; native v2 update/new-response typed fields relayed | No retained current-command snapshot on broker resume; slash text still ordinary prompt content | Neither provides protocol command discovery/completion | [Workers/broker][daemon]; [client reducers][web-client] |
 | `session_info_update`: title and last-activity timestamp ([v1 schema][v1-schema], [v2 schema][v2-schema]) | 🟡 P | V1 drops; native v2 relays | Does not become a standard-info snapshot; Hive catalog summaries are a separate broker surface | Neither consumes standard session-info updates | [Workers][daemon]; [session catalog](hive-api.md#session-catalog) |
 | `usage_update`: context used/size, cumulative cost ([v1 schema][v1-schema], [v2 schema][v2-schema]) | 🔀 A | V1 consumed for accounting, not raw proxy; native v2 relayed and consumed | Hive aggregates through `_hive_usage`; context gauge is not billable-token usage | Both show available aggregates; missing data stays unknown | [Usage details](#token-usage-and-costs); [gateway tests][gateway-tests] |
@@ -406,8 +407,8 @@ upgrading an agent or adapter and record results with its product version and tr
 | --- | --- | --- | --- | --- | --- |
 | Pi 1.3.0 via external `pi-acp` 0.0.34 (see [Pi](#pi)) | `pi-acp` or `npx -y pi-acp`, stdio. Pi itself has no ACP entrypoint | v1 negotiated (2026-10-23); a v2 `initialize` is answered with v1 | ❔ Unverified (only `initialize` is verified) | Adapter advertises `loadSession` via its own session map; ACP attachment unverified; Hive adoption is [#6](https://github.com/noirbizarre/hive/issues/6) | ❔ Unverified with Pi (guaranteed with mock) |
 | OpenCode 1.18.35 (local CLI inspection) | `opencode acp`, stdio documented and command present | v1 documented; v2 unverified | ❔ Unverified | Native `session list` and `run --session` available; ACP load unverified | ❔ Unverified with OpenCode (guaranteed with mock) |
-| Claude Code 2.1.310 (local CLI available, 2026-10-25); ACP adapter not found on `PATH` | External [`claude-agent-acp`][claude-acp] / `@agentclientprotocol/claude-agent-acp`, stdio, backed by the Claude Agent SDK | Upstream documents v1 and draft v2; local adapter/version negotiation ❔ unverified | ❔ Unverified | Native `claude --resume` exists; ACP load/resume and Hive adoption ❔ unverified | ❔ Unverified |
-| Codex CLI 0.164.0 (local CLI available, 2026-10-25); ACP adapter not found on `PATH` | External [`codex-acp`][codex-acp] / `@agentclientprotocol/codex-acp`, stdio, backed by Codex App Server | ❔ Unverified; record the selected adapter version and `initialize` result | ❔ Unverified | Native `codex resume` exists; ACP load/resume and Hive adoption ❔ unverified | ❔ Unverified |
+| Claude Code 2.1.310 (local CLI available, 2026-10-25); ACP adapter not found on `PATH` | External [`claude-agent-acp`][claude-acp] / `@agentclientprotocol/claude-agent-acp`, stdio, backed by the Claude Agent SDK; [setup](agents/claude.md) | Upstream documents v1 and draft v2; local adapter/version negotiation ❔ unverified | ❔ Unverified | Native `claude --resume` exists; ACP load/resume and Hive adoption ❔ unverified | ❔ Unverified |
+| Codex CLI 0.164.0 (local CLI available, 2026-10-25); ACP adapter not found on `PATH` | External [`codex-acp`][codex-acp] / `@agentclientprotocol/codex-acp`, stdio, backed by Codex App Server; [setup](agents/codex.md) | ❔ Unverified; record the selected adapter version and `initialize` result | ❔ Unverified | Native `codex resume` exists; ACP load/resume and Hive adoption ❔ unverified | ❔ Unverified |
 
 | Product/version | Text prompt | Streaming events/idle | Tool calls/results | Permissions | User-input requests | Cancellation | Active client disconnect |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -1274,22 +1275,23 @@ Unsupported workflows:
 [v2-ext]: https://github.com/agentclientprotocol/agent-client-protocol/blob/e2d83349bc9e28a4059ea3acefa1c91c966f74e2/docs/protocol/v2/extensibility.mdx
 [v1-transports]: https://github.com/agentclientprotocol/agent-client-protocol/blob/e2d83349bc9e28a4059ea3acefa1c91c966f74e2/docs/protocol/v1/transports.mdx
 [v2-transports]: https://github.com/agentclientprotocol/agent-client-protocol/blob/e2d83349bc9e28a4059ea3acefa1c91c966f74e2/docs/protocol/v2/transports.mdx
-[manifest]: https://github.com/noirbizarre/hive/blob/1d5648d8d4ea8522ea06b52b607f82af10899f69/Cargo.toml
-[daemon]: https://github.com/noirbizarre/hive/blob/1d5648d8d4ea8522ea06b52b607f82af10899f69/crates/hive-daemon/src/lib.rs
-[transcript]: https://github.com/noirbizarre/hive/blob/1d5648d8d4ea8522ea06b52b607f82af10899f69/crates/hive-daemon/src/transcript.rs
-[plans]: https://github.com/noirbizarre/hive/blob/1d5648d8d4ea8522ea06b52b607f82af10899f69/crates/hive-daemon/src/plans.rs
-[activity]: https://github.com/noirbizarre/hive/blob/1d5648d8d4ea8522ea06b52b607f82af10899f69/crates/hive-daemon/src/activity.rs
-[interactions]: https://github.com/noirbizarre/hive/blob/1d5648d8d4ea8522ea06b52b607f82af10899f69/crates/hive-daemon/src/interactions.rs
-[config]: https://github.com/noirbizarre/hive/blob/1d5648d8d4ea8522ea06b52b607f82af10899f69/crates/hive-daemon/src/session_config.rs
-[journal]: https://github.com/noirbizarre/hive/blob/1d5648d8d4ea8522ea06b52b607f82af10899f69/crates/hive-daemon/src/prompt_journal.rs
-[persistence]: https://github.com/noirbizarre/hive/blob/1d5648d8d4ea8522ea06b52b607f82af10899f69/crates/hive-daemon/src/persistence.rs
-[gateway-tests]: https://github.com/noirbizarre/hive/blob/1d5648d8d4ea8522ea06b52b607f82af10899f69/crates/hive-daemon/tests/gateway.rs
-[compat-tests]: https://github.com/noirbizarre/hive/blob/1d5648d8d4ea8522ea06b52b607f82af10899f69/crates/hive-daemon/tests/compat.rs
-[tui-state]: https://github.com/noirbizarre/hive/blob/1d5648d8d4ea8522ea06b52b607f82af10899f69/crates/hive-tui/src/state.rs
-[tui-ui]: https://github.com/noirbizarre/hive/blob/1d5648d8d4ea8522ea06b52b607f82af10899f69/crates/hive-tui/src/ui.rs
-[tui-transcript]: https://github.com/noirbizarre/hive/blob/1d5648d8d4ea8522ea06b52b607f82af10899f69/crates/hive-tui/src/transcript.rs
-[tui-interactions]: https://github.com/noirbizarre/hive/blob/1d5648d8d4ea8522ea06b52b607f82af10899f69/crates/hive-tui/src/interaction_tests.rs
-[web-client]: https://github.com/noirbizarre/hive/blob/1d5648d8d4ea8522ea06b52b607f82af10899f69/clients/hive-web/src/client.js
-[web-ui]: https://github.com/noirbizarre/hive/blob/1d5648d8d4ea8522ea06b52b607f82af10899f69/clients/hive-web/src/App.vue
-[web-tests]: https://github.com/noirbizarre/hive/blob/1d5648d8d4ea8522ea06b52b607f82af10899f69/clients/hive-web/app.test.js
-[web-component-tests]: https://github.com/noirbizarre/hive/blob/1d5648d8d4ea8522ea06b52b607f82af10899f69/clients/hive-web/src/App.test.js
+[manifest]: https://github.com/noirbizarre/hive/blob/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9/Cargo.toml
+[daemon]: https://github.com/noirbizarre/hive/blob/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9/crates/hive-daemon/src/lib.rs
+[transcript]: https://github.com/noirbizarre/hive/blob/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9/crates/hive-daemon/src/transcript.rs
+[plans]: https://github.com/noirbizarre/hive/blob/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9/crates/hive-daemon/src/plans.rs
+[activity]: https://github.com/noirbizarre/hive/blob/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9/crates/hive-daemon/src/activity.rs
+[interactions]: https://github.com/noirbizarre/hive/blob/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9/crates/hive-daemon/src/interactions.rs
+[config]: https://github.com/noirbizarre/hive/blob/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9/crates/hive-daemon/src/session_config.rs
+[journal]: https://github.com/noirbizarre/hive/blob/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9/crates/hive-daemon/src/prompt_journal.rs
+[persistence]: https://github.com/noirbizarre/hive/blob/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9/crates/hive-daemon/src/persistence.rs
+[gateway-tests]: https://github.com/noirbizarre/hive/blob/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9/crates/hive-daemon/tests/gateway.rs
+[compat-tests]: https://github.com/noirbizarre/hive/blob/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9/crates/hive-daemon/tests/compat.rs
+[tui-state]: https://github.com/noirbizarre/hive/blob/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9/crates/hive-tui/src/state.rs
+[tui-ui]: https://github.com/noirbizarre/hive/blob/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9/crates/hive-tui/src/ui.rs
+[tui-transcript]: https://github.com/noirbizarre/hive/blob/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9/crates/hive-tui/src/transcript.rs
+[tui-interactions]: https://github.com/noirbizarre/hive/blob/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9/crates/hive-tui/src/interaction_tests.rs
+[web-client]: https://github.com/noirbizarre/hive/blob/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9/clients/hive-web/src/client.js
+[web-ui]: https://github.com/noirbizarre/hive/blob/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9/clients/hive-web/src/App.vue
+[web-tests]: https://github.com/noirbizarre/hive/blob/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9/clients/hive-web/app.test.js
+[web-component-tests]: https://github.com/noirbizarre/hive/blob/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9/clients/hive-web/src/App.test.js
+[web-markdown-tests]: https://github.com/noirbizarre/hive/blob/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9/clients/hive-web/src/MarkdownMessage.test.js

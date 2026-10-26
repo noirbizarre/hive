@@ -152,6 +152,10 @@ refuses its own prompts while that work is active. This is detection, not
 mutual exclusion across all OpenCode clients.
 
 Closing the Hive session detaches Hive without deleting the native conversation.
+If work is active, Hive aborts it and waits for terminal stream updates before
+reporting close success. HTTP abort acceptance alone does not complete close;
+abort errors or unconfirmed termination fail close so the owner can inspect the
+native session. Ordinary client detach leaves native work running.
 Recovery preserves the original native ID and API flavor. A missing native
 session is reported lost rather than replaced.
 

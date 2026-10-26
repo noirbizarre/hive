@@ -172,6 +172,22 @@ pub(super) fn invalidate(state: &mut Control) {
     state.changed.send_modify(|_| {});
 }
 
+pub(super) async fn settled(control: &Mutex<Control>) {
+    let mut changed = match control.lock() {
+        Ok(state) => state.changed.subscribe(),
+        Err(_) => return,
+    };
+    // Closing fences registration, so zero is stable and all client-side pending requests have unwound.
+    while control
+        .lock()
+        .is_ok_and(|state| state.pending_interactions != 0)
+    {
+        if changed.changed().await.is_err() {
+            break;
+        }
+    }
+}
+
 struct Pending(Arc<Mutex<Control>>);
 
 struct UrlDecision {
@@ -214,6 +230,10 @@ impl Drop for Pending {
     fn drop(&mut self) {
         if let Ok(mut state) = self.0.lock() {
             state.pending_interactions -= 1;
+            // Ordinary completion must not wake and reoffer unrelated decisions.
+            if state.closing {
+                state.changed.send_modify(|_| {});
+            }
         }
     }
 }

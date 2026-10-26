@@ -1,5 +1,6 @@
 //! Request identity and delivery outcomes, deliberately independent of agent-owned history.
 
+use crate::PromptFailure;
 use agent_client_protocol::schema::v2;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -97,22 +98,24 @@ pub enum Outcome {
         message_id: v2::MessageId,
     },
     Failed {},
+    Cancelled {},
 }
 
 impl Outcome {
-    pub fn recorded(result: &Result<v2::PromptResponse, String>) -> Self {
+    pub fn recorded(result: &Result<v2::PromptResponse, PromptFailure>) -> Self {
         match result {
             Ok(response) => Self::Acknowledged {
                 message_id: response.message_id.clone(),
             },
-            Err(_) => Self::Failed {},
+            Err(PromptFailure::Cancelled) => Self::Cancelled {},
+            Err(PromptFailure::Failed(_)) => Self::Failed {},
         }
     }
 
     pub fn legacy(value: &str) -> Result<Self, JournalError> {
         let result: Result<v2::PromptResponse, String> =
             serde_json::from_str(value).map_err(|_| JournalError::Outcome)?;
-        Ok(Self::recorded(&result))
+        Ok(Self::recorded(&result.map_err(PromptFailure::from)))
     }
 
     pub fn decode(value: &str) -> Result<Self, JournalError> {
@@ -123,9 +126,10 @@ impl Outcome {
         serde_json::to_string(self).map_err(|_| JournalError::Outcome)
     }
 
-    pub fn into_response(self) -> Result<v2::PromptResponse, String> {
+    pub fn into_response(self) -> Result<v2::PromptResponse, PromptFailure> {
         match self {
             Self::Acknowledged { message_id } => Ok(v2::PromptResponse::new(message_id)),
+            Self::Cancelled {} => Err(PromptFailure::Cancelled),
             Self::Failed {} => Err("prompt previously failed; this key will not be sent again; inspect agent state before submitting new work with a new key".into()),
         }
     }
@@ -135,6 +139,17 @@ impl Outcome {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn cancellation_survives_durable_replay_without_becoming_a_generic_failure() {
+        let outcome = Outcome::recorded(&Err(PromptFailure::Cancelled));
+        assert!(matches!(
+            Outcome::decode(&outcome.encode().unwrap())
+                .unwrap()
+                .into_response(),
+            Err(PromptFailure::Cancelled)
+        ));
+    }
 
     fn fingerprint(value: Value) -> Fingerprint {
         Fingerprint::legacy(&value.to_string()).unwrap()
@@ -254,6 +269,7 @@ mod tests {
             !failed
                 .into_response()
                 .unwrap_err()
+                .to_string()
                 .contains("private downstream")
         );
         assert!(Outcome::decode(r#"{"status":"failed","payload":"unexpected"}"#).is_err());

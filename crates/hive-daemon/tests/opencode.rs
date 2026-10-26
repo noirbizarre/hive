@@ -666,6 +666,254 @@ async fn a_hive_created_session_is_a_real_native_session_whose_reply_streams_bac
 }
 
 #[tokio::test]
+async fn active_close_waits_for_final_events_and_detaches_without_deleting_native_history() {
+    let (fake, url) = fake_opencode::start(Options::default()).await;
+    fake.script(Script::Hold);
+    let (_broker, address) = start(config(&url)).await;
+    connect(address, Pilot::default(), async |cx, mut updates| {
+        let opened = cx.send_request(new_request()).block_task().await?;
+        let id = opened.session_id.clone();
+        cx.send_request(prompt(&id, &opened.meta, "k1", "long task"))
+            .block_task()
+            .await?;
+        until(&mut updates, &id, is_running).await;
+        cx.send_request(v2::CloseSessionRequest::new(id).meta(opened.meta))
+            .block_task()
+            .await?;
+        let mut final_events = Vec::new();
+        while let Ok(event) = updates.try_recv() {
+            final_events.push(event.update);
+        }
+        assert_eq!(agent_text(&final_events), "final-before-close");
+        let idle: Vec<_> = final_events.iter().filter(|event| is_idle(event)).collect();
+        assert_eq!(
+            idle.len(),
+            1,
+            "terminal idle must arrive before close succeeds"
+        );
+        assert_eq!(
+            serde_json::to_value(idle[0]).unwrap()["stopReason"],
+            "cancelled"
+        );
+        assert!(
+            catalog(address).await["sessions"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let adopted = cx
+            .send_request(adopt_request("ses_new1"))
+            .block_task()
+            .await?;
+        assert_ne!(adopted.session_id, opened.session_id);
+        Ok(())
+    })
+    .await;
+    assert_eq!(fake.exact("POST /session/ses_new1/abort"), 1);
+    assert_eq!(fake.exact("POST /session"), 1);
+    assert_eq!(fake.count("DELETE "), 0);
+}
+
+#[tokio::test]
+async fn preview_active_close_confirms_idle_after_terminal_events_and_preserves_the_native_session()
+{
+    let (fake, url) = fake_opencode::start(Options {
+        v1: false,
+        v2: true,
+        ..Options::default()
+    })
+    .await;
+    fake.script(Script::Hold);
+    let (_broker, address) = start(config(&url)).await;
+    connect(address, Pilot::default(), async |cx, mut updates| {
+        let opened = cx.send_request(new_request()).block_task().await?;
+        cx.send_request(prompt(&opened.session_id, &opened.meta, "k1", "long task"))
+            .block_task()
+            .await?;
+        until(&mut updates, &opened.session_id, is_running).await;
+        cx.send_request(v2::CloseSessionRequest::new(opened.session_id).meta(opened.meta))
+            .block_task()
+            .await?;
+        let mut final_events = Vec::new();
+        while let Ok(event) = updates.try_recv() {
+            final_events.push(event.update);
+        }
+        assert_eq!(agent_text(&final_events), "final-before-close");
+        let idle: Vec<_> = final_events.iter().filter(|event| is_idle(event)).collect();
+        assert_eq!(idle.len(), 1);
+        assert_eq!(
+            serde_json::to_value(idle[0]).unwrap()["stopReason"],
+            "cancelled"
+        );
+        cx.send_request(adopt_request("ses_v2new1"))
+            .block_task()
+            .await?;
+        Ok(())
+    })
+    .await;
+    assert_eq!(fake.exact("POST /api/session/ses_v2new1/interrupt"), 1);
+    assert_eq!(fake.exact("POST /api/session"), 1);
+    assert_eq!(fake.count("DELETE "), 0);
+}
+
+#[tokio::test]
+async fn stale_idle_queued_before_the_current_turn_cannot_complete_its_close() {
+    let (fake, url) = fake_opencode::start(Options::default()).await;
+    fake.script(Script::Silent);
+    fake.stale_idle_on_abort();
+    let (_broker, address) = start(config(&url)).await;
+    connect(address, Pilot::default(), async |cx, mut updates| {
+        let opened = cx.send_request(new_request()).block_task().await?;
+        cx.send_request(prompt(&opened.session_id, &opened.meta, "k1", "long task"))
+            .block_task()
+            .await?;
+        cx.send_request(v2::CloseSessionRequest::new(opened.session_id).meta(opened.meta))
+            .block_task()
+            .await?;
+        let mut final_events = Vec::new();
+        while let Ok(event) = updates.try_recv() {
+            final_events.push(event.update);
+        }
+        assert_eq!(agent_text(&final_events), "final-before-close");
+        let idle: Vec<_> = final_events.iter().filter(|event| is_idle(event)).collect();
+        assert_eq!(
+            idle.len(),
+            1,
+            "old idle must not publish a premature completion"
+        );
+        assert_eq!(
+            serde_json::to_value(idle[0]).unwrap()["stopReason"],
+            "cancelled"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_failed_native_abort_keeps_the_session_available_for_close_retry() {
+    let (fake, url) = fake_opencode::start(Options::default()).await;
+    fake.script(Script::Hold);
+    fake.fail_abort(true);
+    let (_broker, address) = start(config(&url)).await;
+    connect(address, Pilot::default(), async |cx, mut updates| {
+        let opened = cx.send_request(new_request()).block_task().await?;
+        cx.send_request(prompt(&opened.session_id, &opened.meta, "k1", "long task"))
+            .block_task()
+            .await?;
+        until(&mut updates, &opened.session_id, is_running).await;
+        let close = v2::CloseSessionRequest::new(opened.session_id.clone()).meta(opened.meta);
+        assert!(cx.send_request(close.clone()).block_task().await.is_err());
+        assert_eq!(
+            catalog(address).await["sessions"].as_array().unwrap().len(),
+            1
+        );
+        fake.fail_abort(false);
+        cx.send_request(close).block_task().await?;
+        Ok(())
+    })
+    .await;
+    assert_eq!(fake.exact("POST /session/ses_new1/abort"), 2);
+}
+
+#[tokio::test]
+async fn abort_acceptance_does_not_complete_close_before_a_terminal_stream_event() {
+    let (fake, url) = fake_opencode::start(Options::default()).await;
+    fake.script(Script::Hold);
+    fake.hold_abort(true);
+    let (_broker, address) = start(config(&url)).await;
+    connect(address, Pilot::default(), async |cx, mut updates| {
+        let opened = cx.send_request(new_request()).block_task().await?;
+        cx.send_request(prompt(&opened.session_id, &opened.meta, "k1", "long task"))
+            .block_task()
+            .await?;
+        until(&mut updates, &opened.session_id, is_running).await;
+        let (done, mut response) = tokio::sync::oneshot::channel();
+        cx.prepare_request(
+            v2::CloseSessionRequest::new(opened.session_id.clone()).meta(opened.meta.clone()),
+        )
+        .on_receiving_result(async move |result| {
+            let _ = done.send(result);
+            Ok(())
+        })?;
+        while fake.exact("POST /session/ses_new1/abort") == 0 {
+            tokio::task::yield_now().await;
+        }
+        assert!(matches!(
+            response.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(
+            cx.send_request(v2::ResumeSessionRequest::new(
+                opened.session_id.clone(),
+                std::env::current_dir().unwrap()
+            ))
+            .block_task()
+            .await
+            .is_err()
+        );
+        assert!(
+            cx.send_request(prompt(
+                &opened.session_id,
+                &opened.meta,
+                "fenced",
+                "must not dispatch"
+            ))
+            .block_task()
+            .await
+            .is_err()
+        );
+        assert!(
+            cx.send_request(v2::CloseSessionRequest::new(opened.session_id).meta(opened.meta))
+                .block_task()
+                .await
+                .is_err()
+        );
+        fake.external_turn_end("ses_new1");
+        response.await.unwrap()?;
+        Ok(())
+    })
+    .await;
+    assert_eq!(fake.prompts(), ["long task"]);
+}
+
+#[tokio::test]
+async fn losing_the_native_event_stream_during_close_reports_unconfirmed_termination() {
+    let (fake, url) = fake_opencode::start(Options::default()).await;
+    fake.script(Script::Hold);
+    fake.hold_abort(true);
+    let (_broker, address) = start(config(&url)).await;
+    connect(address, Pilot::default(), async |cx, mut updates| {
+        let opened = cx.send_request(new_request()).block_task().await?;
+        cx.send_request(prompt(&opened.session_id, &opened.meta, "k1", "long task"))
+            .block_task()
+            .await?;
+        until(&mut updates, &opened.session_id, is_running).await;
+        let close = cx
+            .send_request(v2::CloseSessionRequest::new(opened.session_id).meta(opened.meta))
+            .block_task();
+        while fake.exact("POST /session/ses_new1/abort") == 0 {
+            tokio::task::yield_now().await;
+        }
+        fake.kill_streams();
+        let error = close.await.unwrap_err();
+        assert!(
+            error
+                .data
+                .unwrap()
+                .to_string()
+                .contains("termination was confirmed")
+        );
+        assert_eq!(
+            catalog(address).await["sessions"].as_array().unwrap().len(),
+            1
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn cancel_aborts_the_native_turn() {
     let (fake, url) = fake_opencode::start(Options::default()).await;
     fake.script(Script::Hold);

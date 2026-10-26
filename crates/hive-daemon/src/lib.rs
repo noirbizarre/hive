@@ -213,8 +213,37 @@ struct NativeMeta {
 
 struct PromptRecord {
     fingerprint: prompt_journal::Fingerprint,
-    result: Option<Result<v2::PromptResponse, String>>,
-    waiters: Vec<oneshot::Sender<Result<v2::PromptResponse, String>>>,
+    result: Option<Result<v2::PromptResponse, PromptFailure>>,
+    waiters: Vec<oneshot::Sender<Result<v2::PromptResponse, PromptFailure>>>,
+}
+
+#[derive(Clone, Debug, thiserror::Error)]
+pub(crate) enum PromptFailure {
+    #[error("prompt cancelled before insertion")]
+    Cancelled,
+    #[error("{0}")]
+    Failed(String),
+}
+
+impl From<String> for PromptFailure {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
+}
+
+impl From<&str> for PromptFailure {
+    fn from(message: &str) -> Self {
+        Self::Failed(message.into())
+    }
+}
+
+impl PromptFailure {
+    fn wire(self) -> Error {
+        match self {
+            Self::Cancelled => Error::request_cancelled(),
+            Self::Failed(message) => Error::internal_error().data(message),
+        }
+    }
 }
 
 enum Command {
@@ -494,7 +523,15 @@ impl Control {
         }
     }
 
-    fn finish(&mut self, key: &str, result: Result<v2::PromptResponse, String>) {
+    fn finish(&mut self, key: &str, result: Result<v2::PromptResponse, PromptFailure>) {
+        // Late shutdown failures must not overwrite an insertion already acknowledged.
+        if self
+            .prompts
+            .get(key)
+            .is_some_and(|record| record.result.is_some())
+        {
+            return;
+        }
         if result.is_err()
             && self
                 .foreground_reservation
@@ -1163,7 +1200,8 @@ impl Broker {
         client_id: &str,
         mut request: v2::PromptRequest,
         mut parent: interactions::Parent,
-    ) -> agent_client_protocol::Result<oneshot::Receiver<Result<v2::PromptResponse, String>>> {
+    ) -> agent_client_protocol::Result<oneshot::Receiver<Result<v2::PromptResponse, PromptFailure>>>
+    {
         let entry = self.entry(&request.session_id)?;
         let mut state = entry.control.lock().map_err(|_| Error::internal_error())?;
         state.owner(client_id, request.meta.as_ref())?;
@@ -2257,8 +2295,19 @@ fn current(control: &Mutex<Control>, generation: u64) -> bool {
         .is_ok_and(|state| state.generation == generation)
 }
 
-fn complete(control: &Mutex<Control>, key: &str, result: Result<v2::PromptResponse, String>) {
+fn complete(
+    control: &Mutex<Control>,
+    key: &str,
+    result: Result<v2::PromptResponse, PromptFailure>,
+) {
     if let Ok(mut state) = control.lock() {
+        if state
+            .prompts
+            .get(key)
+            .is_some_and(|record| record.result.is_some())
+        {
+            return;
+        }
         if let (Some(store), Some(record)) = (state.store.clone(), state.record.clone())
             && let Ok(record) = record.lock()
         {
@@ -2485,12 +2534,19 @@ async fn run_agent(
             }
             let _ = ready.send(Ok((opened, downstream_id.to_string())));
             if active.await.is_err() { return Ok(()); }
+            let mut configuration = Vec::<session_config::Pending>::new();
             while let Some(command) = rx.recv().await {
+                configuration.retain_mut(session_config::Pending::outstanding);
                 match command {
                     Command::Configure(mut change) => {
                         change.request.session_id = downstream_id.clone();
                         let pending = {
                             let state = control.lock().map_err(|_| Error::internal_error())?;
+                            if state.closing {
+                                drop(state);
+                                change.finish(&hive_id, Err(Error::request_cancelled()));
+                                continue;
+                            }
                             if state.generation != change.generation {
                                 drop(state);
                                 change.finish(&hive_id, Err(Error::invalid_request().data("controller was superseded; take control before changing configuration")));
@@ -2500,12 +2556,18 @@ async fn run_agent(
                             let request = cx.prepare_request(change.request.clone());
                             change.dispatch(request, hive_id.clone(), |_, response| Ok(response.config_options))?
                         };
-                        let _ = pending.await;
+                        configuration.push(pending);
                     }
                     Command::Prompt(mut request, generation, key) => {
                         request.session_id = downstream_id.clone();
                         let prompt = {
                             let mut state = control.lock().expect("session state is not poisoned");
+                            if state.closing {
+                                state.rollback_foreground(&key);
+                                drop(state);
+                                complete(&control, &key, Err(PromptFailure::Cancelled));
+                                continue;
+                            }
                             if state.generation != generation {
                                 state.rollback_foreground(&key);
                                 drop(state);
@@ -2522,6 +2584,7 @@ async fn run_agent(
                         };
                         let (prompt, _mapping) = prompt;
                         tokio::pin!(prompt);
+                        let mut closing = None;
                         let result = loop {
                             tokio::select! {
                                 result = &mut prompt => break result,
@@ -2530,14 +2593,35 @@ async fn run_agent(
                                     Some(Command::Cancel(_)) => {}
                                     Some(Command::Configure(change)) => change.finish(&hive_id, Err(session_config::failed())),
                                     Some(Command::Prompt(_, _, key)) => { complete(&control, &key, Err("session already has foreground work".into())); }
-                                    Some(Command::Close(_, reply)) => {
-                                        let _ = reply.send(Err("cancel active work before closing".into()));
+                                    Some(Command::Close(generation, reply)) => {
+                                        if generation != 0 && !current(&control, generation) {
+                                            let _ = reply.send(Err("controller was superseded; resume before closing".into()));
+                                            continue;
+                                        }
+                                        // Close must reach the peer before waiting for an insertion it may cancel.
+                                        let result = cx.send_request(v2::CloseSessionRequest::new(downstream_id.clone()))
+                                            .block_task().await.map(|_| ())
+                                            .map_err(|_| "agent close failed; check its availability".to_string());
+                                        if result.is_ok() {
+                                            closing = Some(reply);
+                                        } else {
+                                            let _ = reply.send(result);
+                                        }
                                     }
                                     None => return Ok(()),
                                 }
                             }
-                        }.map_err(|_| "agent prompt failed; check its availability".to_string());
+                        }.map_err(|error| if error.code == Error::request_cancelled().code {
+                            PromptFailure::Cancelled
+                        } else {
+                            PromptFailure::from("agent prompt failed; check its availability")
+                        });
                         complete(&control, &key, result);
+                        if let Some(reply) = closing {
+                            // A peer may acknowledge close before replying to the pending prompt.
+                            let _ = reply.send(Ok(()));
+                            break;
+                        }
                     }
                     Command::Cancel(epoch) => {
                         if epoch == 0 || current(&control, epoch) {
@@ -2549,14 +2633,18 @@ async fn run_agent(
                             let _ = reply.send(Err("controller was superseded; resume before closing".into()));
                             continue;
                         }
-                        let result = cx
+                        let close = cx
                             .send_request(v2::CloseSessionRequest::new(downstream_id.clone()))
-                            .block_task()
-                            .await
+                            .block_task();
+                        for pending in configuration.drain(..) {
+                            pending.cancel().await;
+                        }
+                        let result = close.await
                             .map(|_| ())
                             .map_err(|_| "agent close failed; check its availability".to_string());
+                        let closed = result.is_ok();
                         let _ = reply.send(result);
-                        break;
+                        if closed { break; }
                     }
                 }
             }
@@ -2569,6 +2657,44 @@ async fn run_agent(
 }
 
 /// ACPv1 prompt completion is a response, unlike v2's independent idle update.
+fn finish_v1_prompt(
+    control: &Arc<Mutex<Control>>,
+    hive_id: &v2::SessionId,
+    result: agent_client_protocol::Result<v1::PromptResponse>,
+) -> bool {
+    let completed = result.is_ok();
+    let (stop, tokens) = match result {
+        Ok(response) => (v1_stop_reason(response.stop_reason), response.usage),
+        Err(error) => {
+            tracing::warn!(code = ?error.code, "v1 prompt failed");
+            // Insertion already succeeded: report late failure as an event, never a second acknowledgement.
+            let failure =
+                hive_protocol::AgentFailure::classify(&error.data.unwrap_or_default().to_string());
+            let _ = forward(control, hive_id, failure.update("acp-v1"));
+            (
+                v2::StopReason::Other(v2::OtherStopReason::new("_v1_error", Default::default())),
+                None,
+            )
+        }
+    };
+    let usage = tokens.map(|usage| {
+        v2::Usage::new(usage.total_tokens, usage.input_tokens, usage.output_tokens)
+            .thought_tokens(usage.thought_tokens)
+            .cached_read_tokens(usage.cached_read_tokens)
+            .cached_write_tokens(usage.cached_write_tokens)
+    });
+    let published = forward(
+        control,
+        hive_id,
+        v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(
+            v2::IdleStateUpdate::new().stop_reason(stop).usage(usage),
+        )),
+    )
+    .is_ok();
+    schedule_price(control.clone(), hive_id.clone());
+    completed && published
+}
+
 async fn run_v1_agent(
     provider: Profile,
     request: v2::NewSessionRequest,
@@ -2828,7 +2954,9 @@ async fn run_v1_agent(
             }
             let _ = ready.send(Ok((v2::NewSessionResponse::new(hive_id.clone()).config_options(options), downstream_id.to_string())));
             if active.await.is_err() { return Ok(()); }
+            let mut configuration = Vec::<session_config::Pending>::new();
             while let Some(command) = rx.recv().await {
+                configuration.retain_mut(session_config::Pending::outstanding);
                 match command {
                     Command::Configure(change) => {
                         let legacy = control.lock().map_err(|_| Error::internal_error())?.legacy_config.route(&change.request);
@@ -2840,6 +2968,11 @@ async fn run_v1_agent(
                             let mode = v1::SessionModeId::new(value.to_string());
                             let pending = {
                                 let state = control.lock().map_err(|_| Error::internal_error())?;
+                                if state.closing {
+                                    drop(state);
+                                    change.finish(&hive_id, Err(Error::request_cancelled()));
+                                    continue;
+                                }
                                 if state.generation != change.generation {
                                     drop(state);
                                     change.finish(&hive_id, Err(Error::invalid_request().data("controller was superseded; take control before changing configuration")));
@@ -2853,12 +2986,17 @@ async fn run_v1_agent(
                                 let request = cx.prepare_request(v1::SetSessionModeRequest::new(downstream_id.clone(), mode.clone()).meta(change.request.meta.clone()));
                                 change.dispatch(request, hive_id.clone(), move |state, _| state.legacy_config.acknowledge(revision, mode))?
                             };
-                            let _ = pending.await;
+                            configuration.push(pending);
                             continue;
                         }
                         let request = session_config::to_v1(&change.request, &downstream_id)?;
                         let pending = {
                             let state = control.lock().map_err(|_| Error::internal_error())?;
+                            if state.closing {
+                                drop(state);
+                                change.finish(&hive_id, Err(Error::request_cancelled()));
+                                continue;
+                            }
                             if state.generation != change.generation {
                                 drop(state);
                                 change.finish(&hive_id, Err(Error::invalid_request().data("controller was superseded; take control before changing configuration")));
@@ -2868,14 +3006,9 @@ async fn run_v1_agent(
                                 state.legacy_config.discover(session_config::Discovery::v1(Some(response.config_options), None)?)
                             })?
                         };
-                        let _ = pending.await;
+                        configuration.push(pending);
                     }
                     Command::Prompt(request, generation, key) => {
-                        if !current(&control, generation) {
-                            if let Ok(mut state) = control.lock() { state.rollback_foreground(&key); }
-                            complete(&control, &key, Err("controller was superseded before prompt dispatch; resume with a new key".into()));
-                            continue;
-                        }
                         let id = v2::MessageId::new(format!("hive-v1-{}", uuid::Uuid::new_v4()));
                         let blocks = request
                             .prompt
@@ -2892,61 +3025,63 @@ async fn run_v1_agent(
                             complete(&control, &key, Err("unsupported v2 prompt content for v1 agent".into()));
                             continue;
                         };
-                        if let Ok(mut current) = message_id.lock() { *current = Some(v2::MessageId::new(format!("v1-agent-{}", uuid::Uuid::new_v4()))); }
-                        // Acknowledgement precedes v1 turn completion; the task then emits idle.
-                        complete(&control, &key, Ok(v2::PromptResponse::new(id.clone())));
-                        let user = v2::SessionUpdate::UserMessage(
-                            v2::UserMessage::new(id).content(request.prompt),
-                        );
-                        let _ = forward(&control, &hive_id, user);
-                        let _ = forward(
-                            &control,
-                            &hive_id,
-                            v2::SessionUpdate::StateUpdate(v2::StateUpdate::Running(
+                        let (done, response) = oneshot::channel();
+                        {
+                            let mut state = control.lock().map_err(|_| Error::internal_error())?;
+                            // Insertion and dispatch share the admission lock: close or takeover must win before both or after both.
+                            if state.closing || state.generation != generation {
+                                let failure = if state.closing { PromptFailure::Cancelled } else { "controller was superseded before prompt dispatch; resume with a new key".into() };
+                                state.rollback_foreground(&key);
+                                drop(state);
+                                complete(&control, &key, Err(failure));
+                                continue;
+                            }
+                            if let Ok(mut current) = message_id.lock() { *current = Some(v2::MessageId::new(format!("v1-agent-{}", uuid::Uuid::new_v4()))); }
+                            forward_locked(&mut state, &hive_id, Some(v2::SessionUpdate::UserMessage(
+                                v2::UserMessage::new(id.clone()).content(request.prompt),
+                            )))?;
+                            forward_locked(&mut state, &hive_id, Some(v2::SessionUpdate::StateUpdate(v2::StateUpdate::Running(
                                 v2::RunningStateUpdate::new(),
-                            )),
-                        );
-                        let response = cx.send_request(v1::PromptRequest::new(downstream_id.clone(), blocks)).block_task();
+                            ))))?;
+                            let completion_control = control.clone();
+                            let completion_id = hive_id.clone();
+                            // Reduce at the wire boundary so no later notification can overtake terminal idle.
+                            cx.prepare_request(v1::PromptRequest::new(downstream_id.clone(), blocks))
+                                .on_receiving_result(async move |result| {
+                                    let _ = done.send(finish_v1_prompt(&completion_control, &completion_id, result));
+                                    Ok(())
+                                })?;
+                        }
+                        complete(&control, &key, Ok(v2::PromptResponse::new(id)));
                         tokio::pin!(response);
+                        let mut closing = None;
                         // V1 prompt waits for completion, so cancellation must remain live on the other lane.
-                        let result = loop {
+                        let completed = loop {
                             tokio::select! {
-                                result = &mut response => break result,
+                                // Publishing idle in the ordered callback can already admit the next prompt.
+                                biased;
+                                result = &mut response => break result.unwrap_or(false),
                                 command = rx.recv() => match command {
                                      Some(Command::Cancel(epoch)) if epoch == 0 || current(&control, epoch) => { let _ = cx.send_notification(v1::CancelNotification::new(downstream_id.clone())); }
                                      Some(Command::Cancel(_)) => {}
                                      Some(Command::Configure(change)) => change.finish(&hive_id, Err(session_config::failed())),
                                      Some(Command::Prompt(_, _, key)) => { complete(&control, &key, Err("session already has foreground work".into())); }
-                                     Some(Command::Close(_, reply)) => { let _ = reply.send(Err("cancel active work before closing".into())); }
-                                    None => break Err(Error::internal_error().data("client disconnected")),
+                                     Some(Command::Close(generation, reply)) => {
+                                         if generation != 0 && !current(&control, generation) {
+                                             let _ = reply.send(Err("controller was superseded; resume before closing".into()));
+                                         } else {
+                                             let _ = cx.send_notification(v1::CancelNotification::new(downstream_id.clone()));
+                                             closing = Some(reply);
+                                         }
+                                     }
+                                    None => break false,
                                 }
                             }
                         };
-                        let (stop, tokens) = match result {
-                            Ok(response) => (v1_stop_reason(response.stop_reason), response.usage),
-                            Err(error) => {
-                                tracing::warn!(code = ?error.code, "v1 prompt failed");
-                                // Admission already succeeded: a replayable event carries late failure, not a second RPC response.
-                                let failure = hive_protocol::AgentFailure::classify(&error.data.unwrap_or_default().to_string());
-                                let _ = forward(&control, &hive_id, failure.update("acp-v1"));
-                                (v2::StopReason::Other(v2::OtherStopReason::new(
-                                    "_v1_error",
-                                    Default::default(),
-                                )), None)
-                            }
-                        };
-                        let usage = tokens.map(|usage| v2::Usage::new(usage.total_tokens, usage.input_tokens, usage.output_tokens)
-                            .thought_tokens(usage.thought_tokens)
-                            .cached_read_tokens(usage.cached_read_tokens)
-                            .cached_write_tokens(usage.cached_write_tokens));
-                        let _ = forward(
-                            &control,
-                            &hive_id,
-                            v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(
-                                v2::IdleStateUpdate::new().stop_reason(stop).usage(usage),
-                            )),
-                        );
-                        schedule_price(control.clone(), hive_id.clone());
+                        if let Some(reply) = closing {
+                            let _ = reply.send(if completed { Ok(()) } else { Err("agent failed while cancelling the turn; inspect its state before retrying close".into()) });
+                            if completed { break; }
+                        }
                     }
                     Command::Cancel(epoch) => {
                         if epoch == 0 || current(&control, epoch) {
@@ -2957,6 +3092,9 @@ async fn run_v1_agent(
                         if generation != 0 && !current(&control, generation) {
                             let _ = reply.send(Err("controller was superseded; resume before closing".into()));
                             continue;
+                        }
+                        for pending in configuration.drain(..) {
+                            pending.cancel().await;
                         }
                         let _ = reply.send(Ok(()));
                         break;
@@ -3266,7 +3404,7 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
                         let result = match received.await {
                             Ok(Ok(response)) => responder.respond(response),
                             Ok(Err(error)) => {
-                                responder.respond_with_error(Error::internal_error().data(error))
+                                responder.respond_with_error(error.wire())
                             }
                             Err(_) => responder.respond_with_error(
                                 Error::internal_error().data("agent disconnected during prompt"),
@@ -3370,10 +3508,10 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
                         let mut state =
                             entry.control.lock().map_err(|_| Error::internal_error())?;
                         state.owner(&client_id, request.meta.as_ref())?;
-                        if state.busy() || state.closing || state.configuring {
+                        if state.closing {
                             return responder.respond_with_error(
                                 Error::invalid_request()
-                                    .data("cancel active work and wait for idle before closing"),
+                                    .data("session close is already in progress"),
                             );
                         }
                         // Prevent takeover while a close has been admitted but not completed.
@@ -3395,6 +3533,7 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
                     cx.spawn(async move {
                         match received.await {
                             Ok(Ok(())) => {
+                                interactions::settled(&entry.control).await;
                                 if let Some(store) = &broker.store {
                                     store
                                         .remove(&request.session_id.to_string())
@@ -3412,13 +3551,17 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
                                     .bindings.remove(&request.session_id.to_string());
                                 responder.respond(v2::CloseSessionResponse::new())
                             }
-                            _ => {
+                            failure => {
+                                let message = match failure {
+                                    Ok(Err(message)) => message,
+                                    _ => "agent disconnected during close; reopen the session to inspect its state".into(),
+                                };
                                 if let Ok(mut state) = entry.control.lock() {
                                     state.closing = false;
                                     state.notify();
                                 }
                                 responder.respond_with_error(
-                                    Error::internal_error().data("agent could not close session"),
+                                    Error::internal_error().data(message),
                                 )
                             }
                         }

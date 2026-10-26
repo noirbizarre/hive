@@ -13,7 +13,7 @@ use std::{
 
 use agent_client_protocol::schema::v2;
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use super::{
     api::{self, Flavor, Native},
@@ -74,6 +74,13 @@ struct Worker {
     /// already `running` in the control state, so nothing else would announce it.
     announced: bool,
     pending: Arc<Mutex<HashMap<String, AbortOnDrop>>>,
+    closing: Option<Closing>,
+}
+
+struct Closing {
+    reply: oneshot::Sender<Result<(), String>>,
+    started: Instant,
+    result: Option<Result<(), String>>,
 }
 
 pub(crate) async fn run_opencode_agent(
@@ -241,6 +248,7 @@ pub(crate) async fn run_opencode_agent(
         failure: None,
         announced: false,
         pending: Arc::new(Mutex::new(HashMap::new())),
+        closing: None,
     };
     if started_busy {
         // The native session was mid-turn when Hive attached: surface it as external work.
@@ -260,7 +268,12 @@ pub(crate) async fn run_opencode_agent(
                     let mapped = worker.mapper.event(&event);
                     worker.events(mapped).await;
                 }
-                Some(Stream::Dropped) => worker.connection("lost"),
+                Some(Stream::Dropped) => {
+                    worker.connection("lost");
+                    if let Some(closing) = &mut worker.closing {
+                        closing.result = Some(Err("OpenCode event stream disconnected before termination was confirmed; inspect the native session and retry close".into()));
+                    }
+                }
                 Some(Stream::Reconnected) => {
                     worker.connection("restored");
                     worker.reconcile().await;
@@ -271,6 +284,10 @@ pub(crate) async fn run_opencode_agent(
                 }
             },
             _ = tick.tick() => worker.poll().await,
+        }
+        // Finish the complete mapped event batch before releasing the upstream close response.
+        if worker.settle_close() {
+            break;
         }
     }
 }
@@ -362,7 +379,12 @@ impl Worker {
                 false
             }
             Command::Prompt(request, generation, key) => {
-                if !current(&self.control, generation) {
+                if self.control.lock().is_ok_and(|state| state.closing) {
+                    if let Ok(mut state) = self.control.lock() {
+                        state.rollback_foreground(&key);
+                    }
+                    complete(&self.control, &key, Err(crate::PromptFailure::Cancelled));
+                } else if !current(&self.control, generation) {
                     if let Ok(mut state) = self.control.lock() {
                         state.rollback_foreground(&key);
                     }
@@ -397,7 +419,7 @@ impl Worker {
                         }
                         Err(error) => {
                             tracing::warn!(code = error.code(), "OpenCode prompt failed");
-                            complete(&self.control, &key, Err(error.wire()));
+                            complete(&self.control, &key, Err(error.wire().into()));
                         }
                     }
                 }
@@ -413,13 +435,25 @@ impl Worker {
                 false
             }
             Command::Close(generation, reply) => {
-                if self.turn.is_some() {
-                    let _ = reply.send(Err("cancel active work before closing".into()));
-                    false
-                } else if generation != 0 && !current(&self.control, generation) {
+                if generation != 0 && !current(&self.control, generation) {
                     let _ = reply.send(Err(
                         "controller was superseded; resume before closing".into()
                     ));
+                    false
+                } else if self.turn.is_some() || self.native_busy {
+                    match self.native.abort().await {
+                        Ok(()) => {
+                            // HTTP acceptance is not an SSE barrier: keep receiving final updates through terminal idle.
+                            self.closing = Some(Closing {
+                                reply,
+                                started: Instant::now(),
+                                result: None,
+                            });
+                        }
+                        Err(error) => {
+                            let _ = reply.send(Err(error.wire()));
+                        }
+                    }
                     false
                 } else {
                     // Closing detaches Hive. It never deletes the native session, so the
@@ -431,6 +465,22 @@ impl Worker {
         }
     }
 
+    fn settle_close(&mut self) -> bool {
+        if let Some(closing) = &mut self.closing {
+            if closing.result.is_none() && closing.started.elapsed() >= STREAM_BUDGET {
+                closing.result = Some(Err("OpenCode did not confirm termination; inspect the native session and retry close".into()));
+            }
+            if let Some(result) = closing.result.take() {
+                let closed = result.is_ok();
+                if let Some(closing) = self.closing.take() {
+                    let _ = closing.reply.send(result);
+                }
+                return closed;
+            }
+        }
+        false
+    }
+
     async fn events(&mut self, mapped: Vec<Mapped>) {
         let mut check = false;
         for item in mapped {
@@ -438,7 +488,28 @@ impl Worker {
             self.apply(item);
         }
         if check {
-            self.poll().await;
+            if self.closing.is_some() {
+                // Preview step completion is not necessarily turn completion: confirm status only
+                // after its stream boundary, never from an independent timer ahead of final updates.
+                if self.native.flavor == Flavor::V2
+                    && self.turn.as_ref().is_none_or(|turn| turn.seen_busy)
+                {
+                    match self.native.busy().await {
+                        Ok(false) => {
+                            self.native_busy = false;
+                            self.finish();
+                        }
+                        Ok(true) => {}
+                        Err(error) => {
+                            if let Some(closing) = &mut self.closing {
+                                closing.result = Some(Err(error.wire()));
+                            }
+                        }
+                    }
+                }
+            } else {
+                self.poll().await;
+            }
         }
     }
 
@@ -514,9 +585,21 @@ impl Worker {
                 "_opencode_error",
                 Default::default(),
             ))
+        } else if self.closing.is_some() {
+            v2::StopReason::Cancelled
         } else {
             v2::StopReason::EndTurn
         };
+        if let Some(closing) = &mut self.closing {
+            closing.result = Some(if self.failure.is_some() {
+                Err(
+                    "OpenCode failed while closing; inspect the native session before retrying"
+                        .into(),
+                )
+            } else {
+                Ok(())
+            });
+        }
         self.turn = None;
         self.failure = None;
         self.announced = false;
@@ -554,6 +637,10 @@ impl Worker {
     }
 
     async fn poll(&mut self) {
+        // Status and SSE use different channels: polling idle cannot prove that final stream updates arrived.
+        if self.closing.is_some() {
+            return;
+        }
         // A failed read is not evidence of anything; the event stream reports connection loss.
         let Ok(busy) = self.native.busy().await else {
             return;

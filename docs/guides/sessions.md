@@ -44,14 +44,15 @@ relinquishes control while continuing to observe.
 | Send a prompt | Starts work when the pilot owns an idle, usable session |
 | Cancel | Asks the agent to stop foreground work |
 | Detach / quit client | Leaves the downstream session and work running |
-| Close session | Explicit protocol operation removing Hive's record, currently refused when Hive marks work running/configuring |
+| Close session | Explicit protocol operation removing Hive's record, currently refused while work is running, blocked, or configuring |
 | Stop daemon | Ends its workers/connections and preserves recovery records |
 
 A prompt response acknowledges acceptance. Wait for the agent's idle state to
 know foreground work ended. A second distinct prompt is refused while work is
-marked running. Blocked-first/restored `requires_action` handling is incomplete;
-see the [compatibility matrix](../compatibility.md#prompts-messages-state-and-content)
-for that admission limitation and the active-close deviation from standard ACPv2.
+running or blocked in `requires_action`, including blocked-first and restored
+work. Both clients keep prompt/configuration actions unavailable and cancellation
+available while blocked. See the [compatibility matrix](../compatibility.md#initialization-authentication-and-sessions)
+for the active-close deviation from standard ACPv2.
 Hive's CLI does not provide a session-close subcommand.
 
 ## Reconnect and missing history

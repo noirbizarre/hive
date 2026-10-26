@@ -546,7 +546,7 @@ impl App {
                             .map_or(String::new(), |reason| format!(" · {reason}")),
                         attention
                     ),
-                    if info.activity == "running"
+                    if matches!(info.activity.as_str(), "running" | "requires_action")
                         || !attention.is_empty()
                         || info.recovery.as_deref() == Some("recovery_required")
                     {

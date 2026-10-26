@@ -100,6 +100,26 @@ test('pending UI actions pause their animation for input and stopping preserves 
   expect(wrapper.find('.configuration-bar .activity-spinner').exists()).toBe(false);
 });
 
+test('blocked foreground disables sending and configuration while keeping stop available', async () => {
+  const { client, publish } = application({ session, role: 'pilot', running: true,
+    activity: { foreground: 'requires_action' }, configOptions: options });
+  await flushPromises();
+  await wrapper.get('#composer').setValue('Next question');
+  expect(wrapper.get('#send').element.disabled).toBe(true);
+  const model = wrapper.findAllComponents(Select).find(item => item.props('inputId') === 'config-model');
+  expect(model.props('disabled')).toBe(true);
+  expect(wrapper.get('#cancel').element.disabled).toBe(false);
+  expect(wrapper.get('#composer-help').text()).toContain('waiting for action');
+  expect(wrapper.findAll('.activity-spinner')).toHaveLength(0);
+  await wrapper.get('#cancel').trigger('click');
+  expect(client.cancel).toHaveBeenCalledOnce();
+  publish({ running: false, activity: { foreground: 'idle' } });
+  await nextTick();
+  expect(wrapper.get('#send').element.disabled).toBe(false);
+  expect(model.props('disabled')).toBe(false);
+  expect(wrapper.get('#cancel').element.disabled).toBe(true);
+});
+
 test('plans show known support before observation and render native content once in source order', async () => {
   const state = { session, lines: [], planSnapshot: { version: 1, authoritative: true, support: 'supported', observation: 'not_observed', plans: {} } };
   render(TranscriptView, { state });

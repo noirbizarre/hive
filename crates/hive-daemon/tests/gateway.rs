@@ -33,6 +33,222 @@ async fn summaries(address: SocketAddr) -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn blocked_foreground_reserves_admission_until_idle_on_both_transports() {
+    for mode in ["blocked-first", "running"] {
+        let mut config = config_with_agent(
+            "mock",
+            env!("CARGO_BIN_EXE_hive-test-agent"),
+            AgentVersion::V2,
+        );
+        config
+            .agents
+            .get_mut("mock")
+            .unwrap()
+            .env
+            .insert("HIVE_MOCK_FOREGROUND".into(), mode.into());
+        let (address, server) = start_gateway(config).await;
+        for scheme in ["ws", "http"] {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            timeout(
+                Duration::from_secs(15),
+                Client
+                    .v2()
+                    .on_receive_notification(
+                        async move |update: v2::UpdateSessionNotification,
+                                    _: V2ConnectionTo<Agent>| {
+                            tx.send(update).map_err(Error::into_internal_error)
+                        },
+                        agent_client_protocol::on_receive_notification!(),
+                    )
+                    .connect_with(
+                        HttpClient::new(format!("{scheme}://{address}")).unwrap(),
+                        async move |cx| {
+                            cx.send_request(v2::InitializeRequest::new(
+                                ProtocolVersion::V2,
+                                v2::Implementation::new("blocked-test", "1"),
+                            ))
+                            .block_task()
+                            .await?;
+                            let cwd = std::env::current_dir().unwrap();
+                            let opened = cx
+                                .send_request(v2::NewSessionRequest::new(cwd.clone()))
+                                .block_task()
+                                .await?;
+                            let id = opened.session_id;
+                            cx.send_request(
+                                v2::SetSessionConfigOptionRequest::new(
+                                    id.clone(),
+                                    v2::SessionConfigId::new("model"),
+                                    v2::SessionConfigOptionValue::Id {
+                                        value: v2::SessionConfigValueId::new("fast"),
+                                    },
+                                )
+                                .meta(opened.meta),
+                            )
+                            .block_task()
+                            .await?;
+                            let mut states = Vec::new();
+                            loop {
+                                let event = rx.recv().await.ok_or_else(Error::internal_error)?;
+                                if let v2::SessionUpdate::StateUpdate(status) = &event.update {
+                                    states.push(
+                                        serde_json::to_value(status).unwrap()["state"]
+                                            .as_str()
+                                            .unwrap()
+                                            .to_owned(),
+                                    );
+                                }
+                                let value = serde_json::to_value(event.update).unwrap();
+                                if value["sessionUpdate"] == "_hive_activity"
+                                    && value["state"]["state"] == "requires_action"
+                                {
+                                    break;
+                                }
+                            }
+                            assert_eq!(
+                                states,
+                                if mode == "running" {
+                                    vec!["running", "requires_action"]
+                                } else {
+                                    vec!["requires_action"]
+                                }
+                            );
+                            let attached = cx
+                                .send_request(v2::ResumeSessionRequest::new(id.clone(), cwd))
+                                .block_task()
+                                .await?;
+                            assert_blocked_admission(&cx, &id, &attached.meta).await?;
+                            let catalog = summaries(address).await;
+                            assert_eq!(
+                                catalog["sessions"]
+                                    .as_array()
+                                    .unwrap()
+                                    .iter()
+                                    .find(|entry| entry["sessionId"] == id.to_string())
+                                    .unwrap()["activity"],
+                                "requires_action"
+                            );
+                            cx.send_notification(
+                                v2::CancelSessionNotification::new(id.clone())
+                                    .meta(attached.meta.clone()),
+                            )?;
+                            loop {
+                                let event = rx.recv().await.ok_or_else(Error::internal_error)?;
+                                let value = serde_json::to_value(event.update).unwrap();
+                                if value["sessionUpdate"] == "_hive_activity"
+                                    && value["state"]["state"] == "idle"
+                                {
+                                    break;
+                                }
+                            }
+                            cx.send_request(
+                                v2::SetSessionConfigOptionRequest::new(
+                                    id.clone(),
+                                    v2::SessionConfigId::new("model"),
+                                    v2::SessionConfigOptionValue::Id {
+                                        value: v2::SessionConfigValueId::new("careful"),
+                                    },
+                                )
+                                .meta(attached.meta.clone()),
+                            )
+                            .block_task()
+                            .await?;
+                            let request = || {
+                                v2::PromptRequest::new(
+                                    id.clone(),
+                                    vec!["resume-state-requires_action".into()],
+                                )
+                                .meta(controlled(&attached.meta, "accepted"))
+                            };
+                            let ack = cx.send_request(request()).block_task().await?;
+                            loop {
+                                let event = rx.recv().await.ok_or_else(Error::internal_error)?;
+                                let value = serde_json::to_value(event.update).unwrap();
+                                if value["sessionUpdate"] == "_hive_activity"
+                                    && value["state"]["state"] == "requires_action"
+                                {
+                                    break;
+                                }
+                            }
+                            assert_eq!(
+                                cx.send_request(request()).block_task().await?.message_id,
+                                ack.message_id
+                            );
+                            assert_blocked_admission(&cx, &id, &attached.meta).await?;
+                            Ok::<_, Error>(())
+                        },
+                    ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        }
+        server.abort();
+    }
+}
+
+async fn assert_blocked_admission(
+    cx: &V2ConnectionTo<Agent>,
+    id: &v2::SessionId,
+    meta: &Option<v2::Meta>,
+) -> Result<(), Error> {
+    let hive = &meta.as_ref().unwrap()["hive"];
+    assert_eq!(hive["running"], true);
+    assert_eq!(hive["activitySnapshot"]["foreground"], "requires_action");
+    assert_ne!(
+        hive["recoveryRequired"], true,
+        "recovery must not mask foreground admission"
+    );
+    let error = cx
+        .send_request(
+            v2::PromptRequest::new(id.clone(), vec!["must not dispatch".into()])
+                .meta(controlled(meta, "rejected")),
+        )
+        .block_task()
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .data
+            .unwrap()
+            .to_string()
+            .contains("active foreground")
+    );
+    assert!(
+        cx.send_request(
+            v2::SetSessionConfigOptionRequest::new(
+                id.clone(),
+                v2::SessionConfigId::new("model"),
+                v2::SessionConfigOptionValue::Id {
+                    value: v2::SessionConfigValueId::new("careful")
+                }
+            )
+            .meta(meta.clone())
+        )
+        .block_task()
+        .await
+        .is_err()
+    );
+    assert!(
+        cx.send_request(v2::CloseSessionRequest::new(id.clone()).meta(meta.clone()))
+            .block_task()
+            .await
+            .is_err()
+    );
+    let listed = cx
+        .send_request(v2::ListSessionsRequest::new())
+        .block_task()
+        .await?;
+    let entry = listed
+        .sessions
+        .iter()
+        .find(|entry| entry.session_id == *id)
+        .unwrap();
+    assert_eq!(entry.meta.as_ref().unwrap()["hive"]["running"], true);
+    Ok(())
+}
+
+#[tokio::test]
 async fn every_resume_replay_mode_ends_with_current_state_before_the_response_on_both_transports() {
     let config = config_with_agent(
         "mock",
@@ -1779,6 +1995,18 @@ async fn gateway_negotiation_errors_and_future_versions_match_the_draft_over_bot
 }
 
 #[test]
+fn restored_blocked_sessions_reject_new_work_on_both_transports() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let base = runtime.block_on(restore_conversation(AgentVersion::V2, "blocked"));
+    // Release connection watchers before removing SQLite fixtures on Windows.
+    drop(runtime);
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[test]
 fn earlier_conversations_restore_once_under_the_original_identity_for_both_acp_versions() {
     for (version, mode) in [
         (AgentVersion::V1, "both"),
@@ -2070,6 +2298,41 @@ async fn restore_conversation(version: AgentVersion, mode: &str) -> std::path::P
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
     let catalog = summaries(address).await;
     assert_eq!(catalog["sessions"][0]["sessionId"], id.to_string());
+    if mode == "blocked" {
+        assert_eq!(catalog["sessions"][0]["activity"], "requires_action");
+        for scheme in ["ws", "http"] {
+            Client
+                .v2()
+                .connect_with(
+                    HttpClient::new(format!("{scheme}://{address}")).unwrap(),
+                    async |cx| {
+                        cx.send_request(v2::InitializeRequest::new(
+                            ProtocolVersion::V2,
+                            v2::Implementation::new("restored-blocked-test", "1"),
+                        ))
+                        .block_task()
+                        .await?;
+                        let mut request = v2::ResumeSessionRequest::new(
+                            id.clone(),
+                            std::env::current_dir().unwrap(),
+                        );
+                        // A preceding transport may already have acknowledged recovery.
+                        if summaries(address).await["sessions"][0]["recovery"]
+                            == "recovery_required"
+                        {
+                            request = request.meta(v2::Meta::from_iter([(
+                                "hive".into(),
+                                serde_json::json!({"recoveryAction":"acknowledge"}),
+                            )]));
+                        }
+                        let attached = cx.send_request(request).block_task().await?;
+                        assert_blocked_admission(&cx, &id, &attached.meta).await
+                    },
+                )
+                .await
+                .unwrap();
+        }
+    }
     if mode == "both" {
         Client
             .v2()

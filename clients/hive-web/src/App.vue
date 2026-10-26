@@ -30,7 +30,8 @@ const blocked = computed(() => !state.value.connected ? 'Waiting for the daemon 
   : state.value.recoveryRequired ? 'Inspect agent state and acknowledge recovery first'
   : state.value.uncertain ? 'Retry the unacknowledged prompt first'
   : !state.value.session ? 'Create a session before sending'
-  : state.value.running ? 'Agent is working — wait or stop it'
+   : state.value.running ? (state.value.activity?.foreground === 'requires_action'
+     ? 'Agent is waiting for action — respond or stop it' : 'Agent is working — wait or stop it')
   : !pilot.value ? 'Start typing or take control to continue' : '');
 const configDisabled = computed(() => !pilot.value || busy.value || state.value.running || state.value.recoveryRequired || Boolean(state.value.uncertain));
 const interactionKey = computed(() => JSON.stringify([state.value.interaction?.id, state.value.interaction?.epoch, state.value.interaction?.generation]));

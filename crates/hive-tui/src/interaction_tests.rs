@@ -281,6 +281,57 @@ async fn editing_and_session_switches_preserve_unicode_carets_without_submitting
 }
 
 #[tokio::test]
+async fn restored_blocked_foreground_prevents_prompt_and_configuration_but_can_be_cancelled() {
+    connected(async |cx| {
+        let mut app = App {
+            connected: true,
+            ..App::default()
+        };
+        app.select_session("hive-test".into());
+        let state = app.conversations.entry("hive-test".into()).or_default();
+        state.generation = 1;
+        state.snapshot(&json!({"version":1,"seq":0,"foreground":"requires_action"}));
+        app.owner = Some(
+            [(
+                "hive".into(),
+                json!({"role":"pilot","generation":1,"token":"test"}),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        app.input = "keep this draft".into();
+        press(&cx, &mut app, &mut None, KeyCode::Enter).await;
+        assert!(app.pending.is_empty());
+        assert_eq!(app.input, "keep this draft");
+        apply_configuration(&cx, &mut app);
+        assert!(app.configuration.is_none());
+        assert!(app.status.contains("idle session"));
+        key(
+            &cx,
+            &mut app,
+            &mut None,
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )
+        .await;
+        assert!(app.stopping.is_some());
+        assert!(
+            app.conversation().unwrap().running,
+            "cancellation must wait for authoritative idle"
+        );
+        app.conversations
+            .get_mut("hive-test")
+            .unwrap()
+            .snapshot(&json!({"version":1,"seq":1,"foreground":"idle"}));
+        app.input = "next question".into();
+        press(&cx, &mut app, &mut None, KeyCode::Enter).await;
+        assert!(!app.pending.is_empty());
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn submitted_prompts_wait_for_the_authoritative_echo_and_identical_prompts_stay_distinct() {
     connected(async |cx| {
         let mut app = App {

@@ -172,12 +172,10 @@ struct Control {
     history_status: TranscriptStatus,
     require_history_state: bool,
     expected_history: bool,
-    running: bool,
-    activity_known: bool,
-    // A resume barrier must preserve requires-action, not infer idle from the admission boolean.
+    // Admission and resume barriers share native evidence so blocked work can never appear idle.
     current_state: Option<v2::StateUpdate>,
     // Only the matching undispatched prompt may restore its previous foreground evidence.
-    foreground_reservation: Option<(String, bool, bool)>,
+    foreground_reservation: Option<String>,
     title: Option<String>,
     last_activity_at: Option<u64>,
     catalog: watch::Sender<u64>,
@@ -270,8 +268,6 @@ impl Control {
             },
             require_history_state: false,
             expected_history: !record.usage.turns.is_empty(),
-            running: false,
-            activity_known: false,
             current_state: None,
             foreground_reservation: None,
             title: record.title.clone(),
@@ -337,8 +333,6 @@ impl Control {
             },
             require_history_state: false,
             expected_history: false,
-            running: false,
-            activity_known: false,
             current_state: None,
             foreground_reservation: None,
             title: None,
@@ -374,7 +368,7 @@ impl Control {
         activity["seq"] = self.next_seq.saturating_sub(1).into();
         let mut hive = serde_json::json!({
             "generation": self.generation, "nextSeq": self.next_seq,
-            "running": matches!(foreground, "running" | "requires_action"), "pilot": self.pilot.is_some(),
+            "running": self.busy(), "pilot": self.pilot.is_some(),
             "activitySnapshot": activity,
             "planSnapshot": self.plans.snapshot(self.next_seq.saturating_sub(1)),
             "usageSnapshot": self.usage.summary(),
@@ -407,7 +401,7 @@ impl Control {
                 "agent resumed without retained conversation messages"
             );
         }
-        if self.require_history_state && !self.activity_known {
+        if self.require_history_state && self.foreground() == "unknown" {
             self.history_status.warn(WarningCode::StateMissing);
             tracing::warn!(
                 diagnostic_code = "hive::transcript::state_missing",
@@ -445,6 +439,11 @@ impl Control {
                 .data("stale or missing Hive controller; resume the session to take control"));
         }
         Ok(())
+    }
+
+    fn busy(&self) -> bool {
+        // Blocked work remains busy even without a preceding Running event.
+        matches!(self.foreground(), "running" | "requires_action")
     }
 
     fn foreground(&self) -> &'static str {
@@ -487,14 +486,10 @@ impl Control {
         if self
             .foreground_reservation
             .as_ref()
-            .is_some_and(|(reserved, _, _)| reserved == key)
+            .is_some_and(|reserved| reserved == key)
         {
-            let (_, running, known) = self
-                .foreground_reservation
-                .take()
-                .expect("matching reservation");
-            self.running = running;
-            self.activity_known = known;
+            // Native evidence is retained while reserved, so rollback needs no second state copy.
+            self.foreground_reservation = None;
             self.notify();
         }
     }
@@ -504,13 +499,11 @@ impl Control {
             && self
                 .foreground_reservation
                 .as_ref()
-                .is_some_and(|(reserved, _, _)| reserved == key)
+                .is_some_and(|reserved| reserved == key)
         {
             // A failed native RPC may have started work; only a later state can resolve it.
             self.foreground_reservation = None;
             self.current_state = None;
-            self.activity_known = false;
-            self.running = false;
             self.notify();
         }
         if let Some(record) = self.prompts.get_mut(key) {
@@ -583,13 +576,7 @@ impl SessionSummary {
             lifecycle: if state.closing { "closing" } else { "active" },
             recovery: if state.recovery_required { "recovery_required" } else if state.reattached { "reattached" } else { "active" },
             recovery_reason: state.recovery_required.then(|| "A prompt may have been interrupted; inspect agent state and explicitly acknowledge recovery before sending new work".into()),
-            activity: if !state.activity_known {
-                "unknown"
-            } else if state.running {
-                "running"
-            } else {
-                "idle"
-            },
+            activity: state.foreground(),
             last_activity_at: state.last_activity_at,
             control_owner: state.pilot.clone(),
             generation: state.generation,
@@ -1239,16 +1226,14 @@ impl Broker {
             // Say *why* it is busy: the generic message would send users hunting for a Hive prompt.
             return Err(opencode::error::OpencodeError::ExternallyControlled.to_acp());
         }
-        if state.running || state.closing || state.configuring {
+        if state.busy() || state.closing || state.configuring {
             return Err(Error::invalid_request().data(
                 "session has active foreground work; wait for idle or cancel before prompting",
             ));
         }
         // Reserving under the ownership lock prevents two simultaneous prompts from both starting.
         let previous_time = state.last_activity_at;
-        state.foreground_reservation = Some((key.clone(), state.running, state.activity_known));
-        state.running = true;
-        state.activity_known = true;
+        state.foreground_reservation = Some(key.clone());
         record_activity(&mut state);
         let title = state
             .title
@@ -2091,8 +2076,6 @@ fn forward_locked(
             v2::SessionUpdate::StateUpdate(status) => {
                 state.observe_state(status);
                 state.activity.v2(&update);
-                state.running = matches!(status, v2::StateUpdate::Running(_));
-                state.activity_known = true;
             }
             v2::SessionUpdate::ConfigOptionUpdate(options) => {
                 state.config_options = options.config_options.clone();
@@ -2148,24 +2131,14 @@ fn forward_locked(
     };
     if let v2::SessionUpdate::StateUpdate(status) = &update {
         state.observe_state(status);
-        match status {
-            v2::StateUpdate::Running(_) => {
-                state.running = true;
-                state.activity_known = true;
-            }
-            v2::StateUpdate::Idle(_) => {
-                state.running = false;
-                state.activity_known = true;
-                if let (Some(store), Some(record)) = (&state.store, &state.record)
-                    && !state.recovery_required
-                    && state.prompts.values().all(|prompt| prompt.result.is_some())
-                {
-                    let mut record = record.lock().map_err(|_| Error::internal_error())?;
-                    record.uncertain = false;
-                    store.save(&record).map_err(storage_error)?;
-                }
-            }
-            _ => {}
+        if matches!(status, v2::StateUpdate::Idle(_))
+            && let (Some(store), Some(record)) = (&state.store, &state.record)
+            && !state.recovery_required
+            && state.prompts.values().all(|prompt| prompt.result.is_some())
+        {
+            let mut record = record.lock().map_err(|_| Error::internal_error())?;
+            record.uncertain = false;
+            store.save(&record).map_err(storage_error)?;
         }
     }
     publish_locked(state, id, update.clone())?;
@@ -2466,7 +2439,6 @@ async fn run_agent(
             let (opened, downstream_id) = if let Some(id) = recovering {
                 if let Ok(mut state) = control.lock() {
                     // Only this resume's state update can satisfy its response barrier.
-                    state.activity_known = false;
                     state.current_state = None;
                     state.foreground_reservation = None;
                     state.require_history_state = true;
@@ -3321,7 +3293,7 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
                             let mut meta = v2::Meta::new();
                             let mut hive = serde_json::to_value(&summary)
                                 .map_err(Error::into_internal_error)?;
-                            hive["running"] = serde_json::json!(summary.activity == "running");
+                            hive["running"] = serde_json::json!(matches!(summary.activity, "running" | "requires_action"));
                             hive["pilot"] = serde_json::json!(summary.control_owner.is_some());
                             meta.insert("hive".into(), hive);
                             Ok(v2::SessionInfo::new(
@@ -3362,7 +3334,7 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
                     let (reply, received) = oneshot::channel();
                     let mut state = entry.control.lock().map_err(|_| Error::internal_error())?;
                     state.owner(&client_id, request.meta.as_ref())?;
-                    if state.running || state.closing || state.configuring || state.recovery_required || state.external_activity {
+                    if state.busy() || state.closing || state.configuring || state.recovery_required || state.external_activity {
                         return responder.respond_with_error(Error::invalid_request().data("wait for idle and resolve recovery before changing configuration"));
                     }
                     if !session_config::advertised(&state.config_options, &request) {
@@ -3398,7 +3370,7 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
                         let mut state =
                             entry.control.lock().map_err(|_| Error::internal_error())?;
                         state.owner(&client_id, request.meta.as_ref())?;
-                        if state.running || state.closing || state.configuring {
+                        if state.busy() || state.closing || state.configuring {
                             return responder.respond_with_error(
                                 Error::invalid_request()
                                     .data("cancel active work and wait for idle before closing"),
@@ -3783,8 +3755,6 @@ mod control_tests {
             history_status: TranscriptStatus::default(),
             require_history_state: false,
             expected_history: false,
-            running: false,
-            activity_known: false,
             current_state: None,
             foreground_reservation: None,
             title: None,
@@ -3824,10 +3794,47 @@ mod control_tests {
         .unwrap();
         assert_eq!(state.resume_state(), Some(status));
         assert_eq!(state.activity.foreground, "requires_action");
+        assert!(state.busy());
         assert_eq!(state.metadata("test")["hive"]["running"], true);
         assert!(state.events.is_empty());
         assert_eq!(state.next_seq, 1);
         assert_eq!(state.last_activity_at, None);
+    }
+
+    #[tokio::test]
+    async fn live_and_restored_foreground_have_the_same_admission_without_prior_running() {
+        for hydrating in [false, true] {
+            let mut state = detached();
+            state.hydrating = hydrating;
+            assert_eq!(state.foreground(), "unknown");
+            for (status, busy) in [
+                ("requires_action", true),
+                ("idle", false),
+                ("running", true),
+                ("requires_action", true),
+                ("idle", false),
+                ("_future", false),
+            ] {
+                let update = serde_json::from_value(serde_json::json!({
+                    "sessionUpdate":"state_update", "state":status
+                }))
+                .unwrap();
+                forward_locked(&mut state, &v2::SessionId::new("session"), Some(update)).unwrap();
+                let foreground = if status == "_future" {
+                    "unknown"
+                } else {
+                    status
+                };
+                assert_eq!(state.busy(), busy, "{hydrating}/{status}");
+                assert_eq!(state.foreground(), foreground);
+                assert_eq!(state.activity.foreground, foreground);
+                assert_eq!(state.metadata("test")["hive"]["running"], busy);
+                assert_eq!(
+                    state.metadata("test")["hive"]["activitySnapshot"]["foreground"],
+                    foreground
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -3873,8 +3880,7 @@ mod control_tests {
         let mut state = detached();
         let idle = v2::StateUpdate::Idle(v2::IdleStateUpdate::new());
         state.observe_state(&idle);
-        state.foreground_reservation = Some(("prompt".into(), false, true));
-        state.running = true;
+        state.foreground_reservation = Some("prompt".into());
         assert!(matches!(
             state.resume_state(),
             Some(v2::StateUpdate::Running(_))
@@ -3887,9 +3893,9 @@ mod control_tests {
         assert_eq!(state.foreground(), "running");
         state.rollback_foreground("prompt");
         assert_eq!(state.resume_state(), Some(idle));
-        assert!(!state.running);
+        assert!(!state.busy());
 
-        state.foreground_reservation = Some(("prompt".into(), false, true));
+        state.foreground_reservation = Some("prompt".into());
         let requires_action = v2::StateUpdate::RequiresAction(v2::RequiresActionStateUpdate::new());
         state.observe_state(&requires_action);
         state.rollback_foreground("prompt");
@@ -3902,7 +3908,7 @@ mod control_tests {
         let mut state = detached();
         assert!(state.resume_state().is_none());
         state.observe_state(&v2::StateUpdate::Idle(v2::IdleStateUpdate::new()));
-        state.foreground_reservation = Some(("prompt".into(), false, true));
+        state.foreground_reservation = Some("prompt".into());
         state.finish("prompt", Err("uncertain dispatch".into()));
         assert!(state.resume_state().is_none());
         assert_eq!(state.foreground(), "unknown");
@@ -4139,7 +4145,7 @@ mod control_tests {
         .unwrap();
         forward_locked(&mut state, &id, Some(active("requires_action"))).unwrap();
         forward_locked(&mut state, &id, Some(failure.clone())).unwrap();
-        assert!(!state.running);
+        assert!(!state.busy());
         forward_locked(&mut state, &id, Some(failure.clone())).unwrap();
         let history = serde_json::to_value(state.transcript.updates().unwrap()).unwrap();
         assert_eq!(history.as_array().unwrap().len(), 1);
@@ -4418,7 +4424,7 @@ mod control_tests {
                 .unwrap()
                 .is_empty()
         );
-        assert!(!state.running);
+        assert!(!state.busy());
     }
 
     #[test]

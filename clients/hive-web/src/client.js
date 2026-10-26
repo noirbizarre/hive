@@ -21,13 +21,22 @@ export function conversation() {
   let gap = false;
   let activeThought;
 
+  function foreground(state) {
+    activity.foreground = ['running', 'requires_action', 'idle'].includes(state) ? state : 'unknown';
+    // Blocked work owns the foreground without implying that the agent is executing.
+    running = ['running', 'requires_action'].includes(activity.foreground);
+  }
+
   function finishThought() {
     if (activeThought) activeThought.active = false;
     activeThought = undefined;
   }
 
   function reconcile(snapshot) {
-    if (snapshot?.version === 1 && snapshot.seq >= activity.seq) activity = structuredClone(snapshot);
+    if (snapshot?.version === 1 && snapshot.seq >= activity.seq) {
+      activity = structuredClone(snapshot);
+      foreground(snapshot.foreground);
+    }
     gap = false;
   }
 
@@ -127,16 +136,16 @@ export function conversation() {
       reconcileConfig(update.configOptions, number);
     } else if (kind === '_hive_error' || kind === '_hive_opencode_error') {
       lines.push({ kind: 'notice', text: `${update.message || 'Agent failed'} — ${update.help || 'Check the agent provider credentials, model configuration and logs'}` });
-    } else if (kind === 'state_update') {
-      // Waiting for user action is active foreground work until the agent confirms idle.
-      if (update.state === 'running' || update.state === 'requires_action') running = true;
-      if (update.state === 'idle') running = false;
+    } else if (kind === 'state_update' && number >= activity.seq) {
+      // Older replay must not undo current foreground evidence from attachment metadata.
+      foreground(update.state);
+      activity.seq = number;
     } else if (kind === '_hive_control') {
       generation = update.generation;
       pilot = update.pilot;
       reconcileTranscript(update.transcript, number);
     } else if (kind === '_hive_activity' && number > activity.seq) {
-      if (update.kind === 'foreground') activity.foreground = update.state?.state || 'unknown';
+      if (update.kind === 'foreground') foreground(update.state?.state);
       if (update.kind === 'session') activity.session = update.status;
       for (const [type, id, value] of [['tools', update.toolCallId, update.tool],
         ['plans', update.planId, update.plan], ['tasks', update.taskId, update.task]]) {

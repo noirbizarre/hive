@@ -19,7 +19,6 @@ pub struct ConversationLine {
     pub revision: u64,
 }
 
-#[derive(Default)]
 pub struct Conversation {
     pub transcript_epoch: u64,
     pub lines_revision: u64,
@@ -47,7 +46,49 @@ pub struct Conversation {
     pub transcript_seq: u64,
 }
 
+impl Default for Conversation {
+    fn default() -> Self {
+        Self {
+            transcript_epoch: 0,
+            lines_revision: 0,
+            lines: Vec::new(),
+            messages: HashMap::new(),
+            tools: HashMap::new(),
+            seq: 0,
+            snapshot_through: None,
+            running: false,
+            foreground: "unknown".into(),
+            active_thought: None,
+            generation: 0,
+            pilot_present: false,
+            activity: serde_json::Value::Null,
+            activity_seq: 0,
+            plan_snapshot: serde_json::Value::Null,
+            plan_seq: 0,
+            plans_authoritative: false,
+            usage: serde_json::Value::Null,
+            usage_seq: 0,
+            gap: false,
+            config_options: Vec::new(),
+            config_seq: 0,
+            transcript: Default::default(),
+            transcript_seq: 0,
+        }
+    }
+}
+
 impl Conversation {
+    fn foreground(&mut self, state: &str) {
+        self.foreground = match state {
+            "running" | "requires_action" | "idle" => state,
+            _ => "unknown",
+        }
+        .into();
+        // Busy includes blocked work, whereas execution animation uses the exact foreground.
+        self.running = matches!(self.foreground.as_str(), "running" | "requires_action");
+        self.activity["foreground"] = serde_json::json!(self.foreground);
+    }
+
     pub fn transcript_snapshot(&mut self, value: &serde_json::Value, seq: u64) {
         // Resume metadata is newer than control events replayed from an earlier cursor.
         if seq >= self.transcript_seq
@@ -71,8 +112,8 @@ impl Conversation {
     pub fn snapshot(&mut self, value: &serde_json::Value) {
         let seq = value["seq"].as_u64().unwrap_or(0);
         if seq >= self.activity_seq && value["version"] == 1 {
-            self.foreground = value["foreground"].as_str().unwrap_or("unknown").into();
             self.activity = value.clone();
+            self.foreground(value["foreground"].as_str().unwrap_or("unknown"));
             self.activity_seq = seq;
         }
     }
@@ -325,22 +366,16 @@ impl Conversation {
                 self.active_thought = None;
                 self.tool(serde_json::to_value(chunk).unwrap_or_default(), true);
             }
-            v2::SessionUpdate::StateUpdate(v2::StateUpdate::Running(_)) => {
-                self.running = true;
-                self.foreground = "running".into();
-            }
-            // Blocked foreground work still needs a later idle confirmation, including cancellation.
-            v2::SessionUpdate::StateUpdate(v2::StateUpdate::RequiresAction(_)) => {
-                self.running = true;
-                self.foreground = "requires_action".into();
-            }
-            v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(idle)) => {
+            v2::SessionUpdate::StateUpdate(status) if seq >= self.activity_seq => {
                 let was_running = self.running;
-                self.running = false;
-                self.foreground = "idle".into();
-                self.active_thought = None;
-                if was_running && matches!(idle.stop_reason, Some(v2::StopReason::Cancelled)) {
-                    self.push_notice("Turn cancelled".into());
+                let value = serde_json::to_value(&status).unwrap_or_default();
+                self.foreground(value["state"].as_str().unwrap_or("unknown"));
+                self.activity_seq = seq;
+                if let v2::StateUpdate::Idle(idle) = status {
+                    self.active_thought = None;
+                    if was_running && matches!(idle.stop_reason, Some(v2::StopReason::Cancelled)) {
+                        self.push_notice("Turn cancelled".into());
+                    }
                 }
             }
             v2::SessionUpdate::Other(other)
@@ -377,9 +412,7 @@ impl Conversation {
                 if seq > self.activity_seq {
                     let kind = value["kind"].as_str().unwrap_or_default();
                     if kind == "foreground" {
-                        self.activity["foreground"] = value["state"]["state"].clone();
-                        self.foreground =
-                            value["state"]["state"].as_str().unwrap_or("unknown").into();
+                        self.foreground(value["state"]["state"].as_str().unwrap_or("unknown"));
                     }
                     if kind == "session" {
                         self.activity["session"] = value["status"].clone();
@@ -872,6 +905,55 @@ mod tests {
         assert!(conversation.apply(historical));
         assert!(conversation.running);
         assert_eq!(conversation.lines.len(), 1);
+    }
+
+    #[test]
+    fn blocked_foreground_is_busy_from_native_snapshots_and_activity_without_stale_replay() {
+        let mut conversation = Conversation::default();
+        assert_eq!(conversation.foreground, "unknown");
+        for (seq, state, busy) in [
+            (1, "requires_action", true),
+            (2, "running", true),
+            (3, "requires_action", true),
+            (4, "idle", false),
+        ] {
+            conversation.apply(event(
+                seq,
+                serde_json::from_value(serde_json::json!({
+                    "sessionUpdate":"state_update", "state":state
+                }))
+                .unwrap(),
+            ));
+            assert_eq!(conversation.running, busy);
+            assert_eq!(conversation.foreground, state);
+        }
+        conversation
+            .snapshot(&serde_json::json!({"version":1,"seq":10,"foreground":"requires_action"}));
+        assert!(conversation.running);
+        conversation.apply(event(
+            5,
+            v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(v2::IdleStateUpdate::new())),
+        ));
+        assert!(
+            conversation.running,
+            "old replay must not undo attachment evidence"
+        );
+        conversation.seq = 10;
+        conversation.apply(event(
+            11,
+            serde_json::from_value(serde_json::json!({
+                "sessionUpdate":"_hive_activity", "kind":"foreground", "state":{"state":"idle"}
+            }))
+            .unwrap(),
+        ));
+        assert!(!conversation.running);
+        conversation.apply(event(12, serde_json::from_value(serde_json::json!({
+            "sessionUpdate":"_hive_activity", "kind":"foreground", "state":{"state":"requires_action"}
+        })).unwrap()));
+        assert!(conversation.running);
+        conversation.snapshot(&serde_json::json!({"version":1,"seq":13,"foreground":"unknown"}));
+        assert!(!conversation.running);
+        assert_eq!(conversation.foreground, "unknown");
     }
 
     #[test]

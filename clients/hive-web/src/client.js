@@ -18,6 +18,12 @@ export function conversation() {
   let transcript;
   let transcriptSeq = 0;
   let gap = false;
+  let activeThought;
+
+  function finishThought() {
+    if (activeThought) activeThought.active = false;
+    activeThought = undefined;
+  }
 
   function reconcile(snapshot) {
     if (snapshot?.version === 1 && snapshot.seq >= activity.seq) activity = structuredClone(snapshot);
@@ -70,13 +76,20 @@ export function conversation() {
     if (!snapshot && seq && number !== seq + 1) { gap = true; return false; }
     const update = event.update;
     const kind = update.sessionUpdate;
+    // Only conversational output closes thinking; usage and other metadata can interleave chunks.
+    if ((['agent_message_chunk', 'agent_message', 'tool_call_update', 'tool_call_content_chunk', 'state_update'].includes(kind) || kind.startsWith('_hive_v1_tool')) &&
+      (kind !== 'state_update' || update.state === 'idle')) finishThought();
     if (kind === 'agent_message_chunk' || kind === 'user_message_chunk' || kind === 'agent_thought_chunk') {
       const speaker = kind.startsWith('agent_thought') ? 'thought' : kind.startsWith('agent') ? 'agent' : 'user';
-      upsert(messages, `${speaker}:${update.messageId}`, speaker, update.content?.text || '');
+      const key = `${speaker}:${update.messageId}`;
+      if (speaker === 'thought' && activeThought !== lines[messages.get(key)]) finishThought();
+      const line = upsert(messages, key, speaker, update.content?.text || '');
+      if (speaker === 'thought' && !snapshot) { line.active = true; activeThought = line; }
     } else if (kind === 'agent_message' || kind === 'user_message' || kind === 'agent_thought') {
       const speaker = kind === 'agent_thought' ? 'thought' : kind.startsWith('agent') ? 'agent' : 'user';
-      upsert(messages, `${speaker}:${update.messageId}`, speaker,
+      const line = upsert(messages, `${speaker}:${update.messageId}`, speaker,
         (update.content || []).map(block => block.text || `[${block.type || 'content'}]`).join('\n'), true);
+      if (speaker === 'thought') { line.active = false; if (activeThought === line) activeThought = undefined; }
     } else if (kind === 'tool_call_update' || kind === 'tool_call_content_chunk' || kind.startsWith('_hive_v1_tool')) {
       const tool = update.tool || update;
       const id = tool.toolCallId || 'tool';
@@ -129,7 +142,7 @@ export function conversation() {
     apply,
     restore(events, through) {
       // Snapshot entries are full upserts, not a contiguous subset of the live event log.
-      lines.length = 0; messages.clear(); tools.clear();
+      finishThought(); lines.length = 0; messages.clear(); tools.clear();
       for (const event of events) apply(event, true);
       seq = through; gap = false;
     },
@@ -225,13 +238,15 @@ export function connect(url, onChange = () => {}) {
   const readiness = new Set();
   let configuring = false;
   let creating = false;
+  let opening;
+  let stopping = false;
   let firstResolve;
   const initialized = new Promise(resolve => { firstResolve = resolve; });
 
   const snapshot = () => ({ connected, status, session: selected && { ...selected }, role: owner?.role || 'observer',
     generation: owner?.generation,
     running: history.runningNow, lines: history.lines, activity: history.activity, planSnapshot: history.planSnapshot, usage: history.usage, configOptions: history.configOptions, transcript: history.transcript,
-    configuring, creating, opening: Boolean(desired && desired.sessionId !== selected?.sessionId), pendingSession: desired?.sessionId, seq: history.seq, gap, interaction,
+    configuring, creating, stopping, opening: Boolean(opening || attaching), pendingSession: desired?.sessionId, seq: history.seq, gap, interaction,
     urlFlows: [...urlFlows.values()], uncertain: uncertain && { ...uncertain }, recoveryRequired, takingControl: Boolean(takingControl) });
   const publish = () => onChange(snapshot());
   const errorText = error => typeof error?.data === 'string' ? error.data
@@ -263,6 +278,7 @@ export function connect(url, onChange = () => {}) {
   }
   function relinquished() {
     owner = undefined;
+    stopping = false;
     // A request-scoped question belongs to its live parent RPC, independent of pilot ownership.
     const held = [interaction, ...interactionQueue].filter(item => item?.requestScoped);
     interaction = held.shift();
@@ -284,6 +300,7 @@ export function connect(url, onChange = () => {}) {
       return;
     }
     if (!applied) return;
+    if (!history.runningNow || history.activity.session === 'ended') stopping = false;
     if (message.params.update?.sessionUpdate === '_hive_activity' && message.params.update.kind === 'session' && message.params.update.status === 'ended') { urlFlows.clear(); clearInteractions(); }
     if (owner?.role === 'pilot' && history.generation > owner.generation) relinquished();
     else publish();
@@ -377,18 +394,22 @@ export function connect(url, onChange = () => {}) {
     const target = selected.sessionId;
     const targetCwd = selected.cwd;
     const version = openVersion;
+    const epoch = connectionEpoch;
+    const attachment = Symbol('attachment');
     const params = { sessionId: selected.sessionId, cwd: selected.cwd,
       ...((mode === 'observe' || acknowledge) ? { _meta: { hive: { ...(mode === 'observe' ? { mode } : {}),
         ...(acknowledge ? { recoveryAction: 'acknowledge' } : {}) } } } : {}) };
     if (replay) params.replayFrom = history.seq
       ? { type: '_hive_seq', seq: history.seq + 1 } : { type: 'start' };
-    attaching = true;
+    attaching = attachment;
+    publish();
     try {
       const response = await request('session/resume', params);
+      // A previous socket's promise may settle after reconnect has begun a new attachment.
+      if (epoch !== connectionEpoch) return response;
       // A delayed response from an older attachment must never grant control over the new view.
-      if (selected?.sessionId !== target || version !== openVersion) {
-        attaching = false;
-        queuedUpdates = [];
+      if (selected?.sessionId !== target || version !== openVersion || attaching !== attachment) {
+        if (attaching === attachment) { attaching = false; queuedUpdates = []; }
         const stale = response?._meta?.hive;
         if (stale?.role === 'pilot' && stale.token) {
           // An overtaken handoff may succeed at the daemon after the user has left its view.
@@ -417,6 +438,7 @@ export function connect(url, onChange = () => {}) {
       publish();
       return response;
     } catch (error) {
+      if (epoch !== connectionEpoch || attaching !== attachment) throw error;
       attaching = false;
       queuedUpdates = [];
       if (selected?.sessionId !== target || version !== openVersion) throw error;
@@ -472,6 +494,8 @@ export function connect(url, onChange = () => {}) {
     ws.onclose = () => {
       if (socket !== ws) return;
       connected = false;
+      stopping = false;
+      opening = undefined;
       readyNow = false;
       for (const waiter of [...readiness]) waiter.reject(new Error('ACP connection failed; check the daemon URL. Reconnecting…'));
       attaching = false;
@@ -498,9 +522,10 @@ export function connect(url, onChange = () => {}) {
     open(session) {
       if (!session?.sessionId || !session.cwd) throw new Error('Select a listed Hive session with a cwd');
       desired = { ...session };
+      const version = ++openVersion;
+      opening = version;
       status = `Opening ${session.sessionId}${readyNow ? '' : ' — waiting for ACP connection'}…`;
       publish();
-      const version = ++openVersion;
       const operation = openQueue.then(async () => {
         await ready();
         if (version !== openVersion) return;
@@ -520,14 +545,16 @@ export function connect(url, onChange = () => {}) {
         creationUncertain = false;
         store?.removeItem('hive.creating');
         history = conversation();
+        stopping = false;
         owner = undefined;
         clearInteractions();
         uncertain = JSON.parse(store?.getItem(`hive.pending.${selected.sessionId}`) || 'null');
         publish();
         return resume('observe');
       });
-      openQueue = operation.catch(() => {});
-      return operation;
+      const completed = operation.finally(() => { if (opening === version) opening = undefined; publish(); });
+      openQueue = completed.catch(() => {});
+      return completed;
     },
     async attachWithoutHistory() { if (!gap) throw new Error('No history gap to skip'); return resume('observe', false); },
     async acknowledgeRecovery() {
@@ -543,7 +570,8 @@ export function connect(url, onChange = () => {}) {
       if (!selected || !connected || gap) throw new Error('Attach to a session before taking control');
       if (owner?.role === 'pilot') return;
       if (!takingControl) {
-        takingControl = resume('pilot').finally(() => { takingControl = undefined; publish(); });
+        const operation = resume('pilot').finally(() => { if (takingControl === operation) takingControl = undefined; publish(); });
+        takingControl = operation;
         publish();
       }
       return takingControl;
@@ -647,6 +675,8 @@ export function connect(url, onChange = () => {}) {
       urlFlows.clear();
       while (interaction) this.respond(interaction.method === 'elicitation/create'
         ? { action: 'cancel' } : { outcome: { outcome: 'cancelled' } }, interaction.id);
+      stopping = history.runningNow;
+      publish();
       return true;
     },
     respond(result, id) {

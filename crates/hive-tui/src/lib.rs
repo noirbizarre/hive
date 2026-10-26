@@ -1,5 +1,6 @@
 //! Full-screen ACPv2 client; the daemon remains the sole session authority.
 
+mod activity;
 mod clipboard;
 mod editor;
 mod external_editor;
@@ -208,10 +209,45 @@ impl Interaction {
     fn request_scoped(&self) -> bool {
         matches!(self, Self::Elicitation(request, _, _) if matches!(request.scope(), v2::ElicitationScope::Request(_)))
     }
+    fn available(&self, app: &App) -> bool {
+        if self.request_scoped() {
+            return true;
+        }
+        if !app.pilot() {
+            return false;
+        }
+        let session = match self {
+            Self::Permission(request, _) => request.session_id.to_string(),
+            Self::Elicitation(request, _, _) => match request.scope() {
+                v2::ElicitationScope::Session(scope) => scope.session_id.to_string(),
+                _ => return false,
+            },
+        };
+        app.active.as_deref() == Some(session.as_str())
+    }
     fn expired(&self) -> bool {
         match self {
             Self::Permission(_, tx) => tx.is_closed(),
             Self::Elicitation(_, tx, _) => tx.is_closed(),
+        }
+    }
+}
+
+fn reconcile_interactions(
+    app: &mut App,
+    interaction: &mut Option<Interaction>,
+    queued: &mut VecDeque<Interaction>,
+) {
+    // Destination questions can precede the resume response; keep them after installing that session.
+    queued.retain(|request| request.available(app));
+    if !interaction
+        .as_ref()
+        .is_some_and(|request| request.available(app))
+    {
+        *interaction = None;
+        if app.dialog.take().is_some() {
+            app.input.clear();
+            restore_draft(app);
         }
     }
 }
@@ -359,6 +395,14 @@ async fn resume(
         }
         Err(error) => return Err(error),
     };
+    apply_resume(app, id, response)
+}
+
+fn apply_resume(
+    app: &mut App,
+    id: String,
+    response: v2::ResumeSessionResponse,
+) -> agent_client_protocol::Result<()> {
     let hive = response
         .meta
         .as_ref()
@@ -401,6 +445,261 @@ async fn resume(
         app.page = Page::Chat;
     }
     Ok(())
+}
+
+pub struct SessionOperation {
+    label: &'static str,
+    result: oneshot::Receiver<SessionOperationResult>,
+}
+
+struct SessionOperationResult {
+    relinquished: bool,
+    outcome: SessionOutcome,
+}
+
+enum SessionOutcome {
+    Resume {
+        id: String,
+        response: agent_client_protocol::Result<v2::ResumeSessionResponse>,
+    },
+    Create(Result<v2::NewSessionResponse, String>),
+}
+
+fn previous_pilot(app: &App, target: Option<&str>) -> Option<v2::ResumeSessionRequest> {
+    let previous = app.active.as_ref()?;
+    if !app.pilot() || target == Some(previous.as_str()) {
+        return None;
+    }
+    let cwd = app
+        .sessions
+        .iter()
+        .find(|s| &s.session_id == previous)
+        .map_or_else(|| app.cwd.clone(), |s| s.cwd.clone());
+    Some(
+        v2::ResumeSessionRequest::new(v2::SessionId::new(previous.clone()), cwd)
+            .meta(hive_meta("relinquish", app.owner.as_ref())),
+    )
+}
+
+fn start_resume(
+    cx: &V2ConnectionTo<Agent>,
+    app: &mut App,
+    id: String,
+    cwd: std::path::PathBuf,
+    mode: &str,
+    acknowledge: bool,
+) {
+    if app.session_operation.is_some() {
+        return;
+    }
+    let previous = previous_pilot(app, Some(&id));
+    let seq = app.conversations.get(&id).map_or(0, |c| c.seq);
+    let replay = if seq == 0 {
+        v2::ReplayFrom::Start(v2::ReplayFromStart::new())
+    } else {
+        v2::ReplayFrom::Other(v2::OtherReplayFrom::new(
+            "_hive_seq",
+            BTreeMap::from([("seq".into(), serde_json::json!(seq + 1))]),
+        ))
+    };
+    let mut meta = hive_meta(mode, app.owner.as_ref());
+    if acknowledge {
+        meta.insert(
+            "hive".into(),
+            serde_json::json!({"recoveryAction":"acknowledge"}),
+        );
+    }
+    let mut request =
+        v2::ResumeSessionRequest::new(v2::SessionId::new(id.clone()), cwd.clone()).meta(meta);
+    if !app.skip_replay && !acknowledge {
+        request = request.replay_from(replay);
+    }
+    if acknowledge {
+        app.skip_replay = true;
+    }
+    let (sent, result) = oneshot::channel();
+    let label = if acknowledge {
+        "Acknowledging recovery"
+    } else {
+        match mode {
+            "pilot" => "Taking control",
+            "relinquish" => "Releasing control",
+            _ => "Opening conversation",
+        }
+    };
+    app.session_operation = Some(SessionOperation { label, result });
+    app.status = format!("{label}…");
+    let peer = cx.clone();
+    if let Err(error) = cx.spawn(async move {
+        let mut relinquished = false;
+        let response = async {
+            if let Some(previous) = previous {
+                peer.send_request(previous).block_task().await?;
+                relinquished = true;
+            }
+            let response = peer.send_request(request).block_task().await?;
+            if acknowledge {
+                // Recovery acknowledgement and live-only attachment remain separate daemon operations.
+                peer.send_request(
+                    v2::ResumeSessionRequest::new(v2::SessionId::new(id.clone()), cwd)
+                        .meta(hive_meta("pilot", response.meta.as_ref())),
+                )
+                .block_task()
+                .await
+            } else {
+                Ok(response)
+            }
+        }
+        .await;
+        let _ = sent.send(SessionOperationResult {
+            relinquished,
+            outcome: SessionOutcome::Resume { id, response },
+        });
+        Ok(())
+    }) {
+        app.session_operation = None;
+        app.skip_replay = false;
+        app.status = error.to_string();
+    }
+}
+
+fn start_creation(cx: &V2ConnectionTo<Agent>, app: &mut App, profile: String) {
+    if app.session_operation.is_some() {
+        return;
+    }
+    let previous = previous_pilot(app, None);
+    let mut meta = v2::Meta::new();
+    meta.insert("hive".into(), serde_json::json!({"agent":profile}));
+    let request = v2::NewSessionRequest::new(app.cwd.clone()).meta(meta);
+    let (sent, result) = oneshot::channel();
+    app.session_operation = Some(SessionOperation {
+        label: "Creating session",
+        result,
+    });
+    app.page = Page::Chat;
+    app.status = "Creating session…".into();
+    let peer = cx.clone();
+    if let Err(error) = cx.spawn(async move {
+        let mut relinquished = false;
+        let response = async {
+            if let Some(previous) = previous {
+                peer.send_request(previous)
+                    .block_task()
+                    .await
+                    .map_err(|error| resume_failure(&error))?;
+                relinquished = true;
+            }
+            peer.send_request(request)
+                .block_task()
+                .await
+                .map_err(|error| error.to_string())
+        }
+        .await;
+        let _ = sent.send(SessionOperationResult {
+            relinquished,
+            outcome: SessionOutcome::Create(response),
+        });
+        Ok(())
+    }) {
+        app.session_operation = None;
+        app.status = error.to_string();
+    }
+}
+
+async fn operation_completion(
+    operation: &mut Option<SessionOperation>,
+) -> Result<SessionOperationResult, oneshot::error::RecvError> {
+    match operation {
+        Some(operation) => (&mut operation.result).await,
+        None => std::future::pending().await,
+    }
+}
+
+fn apply_session_result(
+    app: &mut App,
+    result: SessionOperationResult,
+    label: &str,
+) -> Option<Result<v2::NewSessionResponse, String>> {
+    if result.relinquished {
+        app.owner = None;
+    }
+    match result.outcome {
+        SessionOutcome::Resume { id, response } => {
+            match response {
+                Ok(response) => match apply_resume(app, id, response) {
+                    Ok(()) => app.status = format!("{label} complete"),
+                    Err(error) => {
+                        app.skip_replay = false;
+                        app.status = resume_failure(&error);
+                    }
+                },
+                Err(error) => {
+                    app.skip_replay = false;
+                    // Ctrl-R must target the failed attachment, not the conversation we just left.
+                    if history_unavailable(&error) && app.active.as_deref() != Some(&id) {
+                        app.owner = None;
+                        app.select_session(id);
+                    }
+                    app.status = resume_failure(&error);
+                }
+            }
+            None
+        }
+        SessionOutcome::Create(result) => Some(result),
+    }
+}
+
+fn apply_created(app: &mut App, result: Result<v2::NewSessionResponse, String>) {
+    match result {
+        Ok(created) => {
+            let id = created.session_id.to_string();
+            let state = app.conversations.entry(id.clone()).or_default();
+            state.generation = 1;
+            state.pilot_present = true;
+            let seq = created
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("hive"))
+                .and_then(|hive| hive["configSeq"].as_u64())
+                .unwrap_or(0);
+            state.config_snapshot(created.config_options, seq);
+            if let Some(hive) = created.meta.as_ref().and_then(|meta| meta.get("hive")) {
+                state.plans_snapshot(&hive["planSnapshot"]);
+                state.transcript_snapshot(
+                    &hive["transcript"],
+                    hive["transcriptSeq"].as_u64().unwrap_or(0),
+                );
+            }
+            app.owner = created.meta;
+            app.select_session(id);
+            app.status = "Session created".into();
+        }
+        Err(error) => {
+            app.status = format!("Could not start session: {error}");
+            app.page = Page::Profiles;
+        }
+    }
+}
+
+fn apply_update(app: &mut App, update: v2::UpdateSessionNotification) -> bool {
+    let id = update.session_id.to_string();
+    let current = app.active.as_ref() == Some(&id);
+    let state = app.conversations.entry(id.clone()).or_default();
+    let applied = state.apply(update);
+    if app.stopping.as_ref() == Some(&id)
+        && (!state.running || state.activity["session"] == "ended")
+    {
+        app.stopping = None;
+        app.status = "Stopped".into();
+    }
+    if state.gap && current {
+        app.status = "Activity gap detected; reconnect to reconcile history".into();
+        return false;
+    }
+    if applied && current && !app.pilot() {
+        app.status = "Observer — take control to interact".into();
+    }
+    true
 }
 
 async fn refresh(address: &str, app: &mut App) -> Result<(), String> {
@@ -488,6 +787,17 @@ fn resume_failure(error: &agent_client_protocol::Error) -> String {
     }
 }
 
+fn history_unavailable(error: &agent_client_protocol::Error) -> bool {
+    let diagnostic = format!("{error:?}");
+    [
+        "replay cursor unavailable",
+        "hive::transcript::unsupported",
+        "hive::transcript::history_missing",
+    ]
+    .iter()
+    .any(|code| diagnostic.contains(code))
+}
+
 fn show_interaction(app: &mut App, interaction: &Interaction) {
     app.editor.cancel_drag();
     if app.suspended_draft.is_none() {
@@ -573,7 +883,7 @@ async fn handle_key(
     key: event::KeyEvent,
     interaction: &mut Option<Interaction>,
     acks: mpsc::UnboundedSender<(String, Result<(), String>)>,
-    created: mpsc::UnboundedSender<Result<v2::NewSessionResponse, String>>,
+    _created: mpsc::UnboundedSender<Result<v2::NewSessionResponse, String>>,
 ) -> bool {
     if key.kind == KeyEventKind::Release {
         return false;
@@ -595,6 +905,10 @@ async fn handle_key(
                 v2::CancelSessionNotification::new(v2::SessionId::new(id.clone()))
                     .meta(owner.clone()),
             );
+            if app.conversation().is_some_and(|state| state.running) {
+                app.stopping = Some(id.clone());
+                app.status = "Stopping…".into();
+            }
             *interaction = None;
             app.dialog = None;
             app.input.clear();
@@ -768,6 +1082,14 @@ async fn handle_key(
         }
         return false;
     }
+    // Keep interaction answers and quitting responsive while preventing overlapping ownership RPCs.
+    if app.session_operation.is_some() {
+        if app.page == Page::Chat && app.editor.key(&mut app.input, key) {
+            return false;
+        }
+        return key.code == KeyCode::Esc
+            || (key.code == KeyCode::Char('q') && key.modifiers == KeyModifiers::CONTROL);
+    }
     let ctrl = key.modifiers == KeyModifiers::CONTROL;
     if app.picker.is_some() {
         let choices = app.config_choices();
@@ -849,10 +1171,8 @@ async fn handle_key(
             app.refresh_requested = true;
         }
         (KeyCode::Char('b'), true) if app.page == Page::Chat => {
-            if let Some(info) = app.previous_session()
-                && let Err(error) = resume(cx, app, info.session_id, info.cwd, "pilot").await
-            {
-                app.status = resume_failure(&error);
+            if let Some(info) = app.previous_session() {
+                start_resume(cx, app, info.session_id, info.cwd, "pilot", false);
             }
         }
         (KeyCode::Char('n'), true) => {
@@ -876,10 +1196,7 @@ async fn handle_key(
                 } else {
                     "pilot"
                 };
-                if let Err(error) = resume(cx, app, id, cwd, mode).await {
-                    app.skip_replay = false;
-                    app.status = resume_failure(&error);
-                }
+                start_resume(cx, app, id, cwd, mode, false);
             }
         }
         (KeyCode::Char('y'), true) => {
@@ -889,30 +1206,7 @@ async fn handle_key(
                     .iter()
                     .find(|session| session.session_id == id)
                     .map_or_else(|| app.cwd.clone(), |session| session.cwd.clone());
-                let mut meta = v2::Meta::new();
-                meta.insert(
-                    "hive".into(),
-                    serde_json::json!({ "recoveryAction": "acknowledge" }),
-                );
-                match cx
-                    .send_request(
-                        v2::ResumeSessionRequest::new(v2::SessionId::new(id.clone()), cwd.clone())
-                            .meta(meta),
-                    )
-                    .block_task()
-                    .await
-                {
-                    Ok(response) => {
-                        app.owner = response.meta;
-                        app.skip_replay = true;
-                        if let Err(error) = resume(cx, app, id, cwd, "pilot").await {
-                            app.status = resume_failure(&error);
-                        } else {
-                            app.status = "Interrupted work acknowledged; verify agent state before sending a new prompt".into();
-                        }
-                    }
-                    Err(error) => app.status = resume_failure(&error),
-                }
+                start_resume(cx, app, id, cwd, "pilot", true);
             }
         }
         (KeyCode::Char('c'), true) => {
@@ -937,9 +1231,7 @@ async fn handle_key(
                     .iter()
                     .find(|s| s.session_id == id)
                     .map_or_else(|| app.cwd.clone(), |s| s.cwd.clone());
-                if let Err(error) = resume(cx, app, id, cwd, mode).await {
-                    app.status = resume_failure(&error);
-                }
+                start_resume(cx, app, id, cwd, mode, false);
             }
         }
         (KeyCode::Up, _) => {
@@ -970,38 +1262,19 @@ async fn handle_key(
             app.refresh_requested = true;
         }
         (KeyCode::Char('o'), _) if app.page == Page::Sessions => {
-            if let Some(info) = app.sessions.get(app.selected).cloned()
-                && let Err(error) = resume(cx, app, info.session_id, info.cwd, "observe").await
-            {
-                app.status = resume_failure(&error);
+            if let Some(info) = app.sessions.get(app.selected).cloned() {
+                start_resume(cx, app, info.session_id, info.cwd, "observe", false);
             }
         }
         (KeyCode::Enter, _) => match app.page {
             Page::Sessions => {
-                if let Some(info) = app.sessions.get(app.selected).cloned()
-                    && let Err(error) = resume(cx, app, info.session_id, info.cwd, "pilot").await
-                {
-                    app.status = resume_failure(&error);
+                if let Some(info) = app.sessions.get(app.selected).cloned() {
+                    start_resume(cx, app, info.session_id, info.cwd, "pilot", false);
                 }
             }
             Page::Profiles => {
                 if let Some(profile) = app.profiles.get(app.profile_selected).cloned() {
-                    let mut meta = v2::Meta::new();
-                    meta.insert("hive".into(), serde_json::json!({"agent": profile}));
-                    if let Err(error) = relinquish_active(cx, app).await {
-                        app.status = format!("Could not leave the previous session: {error}");
-                        return false;
-                    }
-                    let request = cx
-                        .send_request(v2::NewSessionRequest::new(app.cwd.clone()).meta(meta))
-                        .block_task();
-                    cx.spawn(async move {
-                        let _ = created.send(request.await.map_err(|error| error.to_string()));
-                        Ok(())
-                    })
-                    .unwrap_or_else(|error| app.status = error.to_string());
-                    app.page = Page::Chat;
-                    app.status = "Creating session…".into();
+                    start_creation(cx, app, profile);
                 }
             }
             Page::Chat => {
@@ -1018,6 +1291,7 @@ async fn handle_key(
                     let key = uuid::Uuid::new_v4().to_string();
                     let id = app.active.clone().unwrap_or_default();
                     // Only sequenced daemon messages enter history; the admission echo would duplicate this draft.
+                    app.submitting.insert(id.clone());
                     app.pending.insert(id, (key, content));
                     send_prompt(cx, app, acks);
                 } else {
@@ -1493,7 +1767,7 @@ async fn run_with_clipboard(
                   let (ack_tx, mut ack_rx) = mpsc::unbounded_channel::<(String, Result<(), String>)>();
                   let (created_tx, mut created_rx) = mpsc::unbounded_channel::<Result<v2::NewSessionResponse, String>>();
                 // The previous acknowledgement may have been lost; the original key is safe to retry.
-                 if app.active.as_ref().is_some_and(|id| app.pending.contains_key(id)) && app.pilot() { send_prompt(&cx, &app, ack_tx.clone()); }
+                 if app.active.as_ref().is_some_and(|id| app.pending.contains_key(id)) && app.pilot() { if let Some(id) = &app.active { app.submitting.insert(id.clone()); } send_prompt(&cx, &app, ack_tx.clone()); }
                   let mut interaction: Option<Interaction> = None;
                   let mut queued = VecDeque::<Interaction>::new();
                   let mut url_flows = BTreeMap::<String, (bool, bool, tokio::time::Instant)>::new();
@@ -1501,7 +1775,9 @@ async fn run_with_clipboard(
                   let mut catalog_tick = tokio::time::interval(Duration::from_secs(2));
                   let mut frames = tokio::time::interval(Duration::from_millis(16));
                   frames.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                  let mut dirty = true;
+                   let mut dirty = true;
+                   let animation_clock = std::time::Instant::now();
+                   let mut staged_updates = Vec::new();
                   let (catalog_tx, mut catalog_rx) = mpsc::unbounded_channel();
                   let mut refreshing = false;
                  loop {
@@ -1530,7 +1806,21 @@ async fn run_with_clipboard(
                             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
                         }
                     }
-                      tokio::select! {
+                       tokio::select! {
+                          result = operation_completion(&mut app.session_operation) => {
+                              let operation = app.session_operation.take().expect("completed operation");
+                              match result {
+                                  Ok(result) => {
+                                      if let Some(created) = apply_session_result(&mut app, result, operation.label) { apply_created(&mut app, created); }
+                                  }
+                                  Err(_) => { app.skip_replay = false; app.status = "Session operation interrupted; reconnect to inspect its outcome".into(); }
+                              }
+                              // Install the attachment boundary before accepting its snapshot notifications.
+                              let mut reconciled = true;
+                              for update in staged_updates.drain(..) { if !apply_update(&mut app, update) { reconciled = false; break; } }
+                              if !reconciled { break; }
+                              reconcile_interactions(&mut app, &mut interaction, &mut queued);
+                          }
                           _ = tokio::signal::ctrl_c() => {
                               // In cooked mode SIGINT reaches the entire foreground process group.
                               // The editor receives it too; keep its parent alive to restore the TUI.
@@ -1557,7 +1847,10 @@ async fn run_with_clipboard(
                               refreshing = false;
                               match result { Ok(catalog) => apply_catalog(&mut app, catalog), Err(error) => app.status = format!("Session list unavailable: {error}") }
                           }
-                          _ = interaction_tick.tick() => {
+                           _ = interaction_tick.tick() => {
+                               let phase = (animation_clock.elapsed().as_millis() / 100) as usize;
+                               let animated = editing.is_none() && app.animation_visible && phase != app.animation_phase;
+                               app.animation_phase = phase;
                               let previous_status = app.status.clone();
                               let previous_dialog = app.dialog.is_some();
                               if editor_prefix.is_some_and(|started| started.elapsed() >= Duration::from_secs(2)) {
@@ -1576,8 +1869,8 @@ async fn run_with_clipboard(
                                  if let Some(id) = interaction.as_ref().and_then(Interaction::url_id) { url_flows.remove(&id); }
                                  interaction = None; app.dialog = None; app.input.clear();
                              }
-                              if editing.is_none() && interaction.is_none() && let Some(index) = queued.iter().position(|request| app.pilot() || request.request_scoped()) && let Some(next) = queued.remove(index) { editor_prefix = None; show_interaction(&mut app, &next); interaction = Some(next); }
-                              if !scrolled && previous_status == app.status && previous_dialog == app.dialog.is_some() { continue; }
+                               if editing.is_none() && interaction.is_none() && let Some(index) = queued.iter().position(|request| request.available(&app) && (app.session_operation.is_none() || request.request_scoped())) && let Some(next) = queued.remove(index) { editor_prefix = None; show_interaction(&mut app, &next); interaction = Some(next); }
+                               if !animated && !scrolled && previous_status == app.status && previous_dialog == app.dialog.is_some() { continue; }
                          }
                          Some(id) = completions.recv() => {
                              if url_flows.len() >= 128 { url_flows.clear(); }
@@ -1585,41 +1878,15 @@ async fn run_with_clipboard(
                              flow.1 = true;
                              if flow.0 { app.status = "External elicitation completed".into(); }
                          }
-                         Some(result) = created_rx.recv() => match result {
-                             Ok(created) => {
-                                 let id = created.session_id.to_string();
-                                 let state = app.conversations.entry(id.clone()).or_default();
-                                 state.generation = 1;
-                                  state.pilot_present = true;
-                                  let seq = created.meta.as_ref().and_then(|meta| meta.get("hive")).and_then(|hive| hive["configSeq"].as_u64()).unwrap_or(0);
-                                  state.config_snapshot(created.config_options, seq);
-                                   if let Some(hive) = created.meta.as_ref().and_then(|meta| meta.get("hive")) {
-                                       state.plans_snapshot(&hive["planSnapshot"]);
-                                       state.transcript_snapshot(&hive["transcript"], hive["transcriptSeq"].as_u64().unwrap_or(0));
-                                  }
-                                 app.owner = created.meta;
-                                 app.select_session(id);
-                                 app.status = "Session created".into();
-                             }
-                             Err(error) => { app.status = format!("Could not start session: {error}"); app.page = Page::Profiles; }
-                         },
+                          Some(result) = created_rx.recv() => { apply_created(&mut app, result); reconcile_interactions(&mut app, &mut interaction, &mut queued); }
                          _ = cx.incoming_closed() => break,
                           _ = catalog_tick.tick() => {
                               app.refresh_requested = true;
                          }
-                         Some(update) = updates.recv() => {
-                            let id = update.session_id.to_string();
-                            let current = app.active.as_ref() == Some(&id);
-                            let state = app.conversations.entry(id).or_default();
-                             let applied = state.apply(update);
-                             let missing = state.gap;
-                             if missing && current {
-                                 app.status = "Activity gap detected; reconnect to reconcile history".into();
-                                 // The next connection replays from the last committed sequence.
-                                 break;
-                             }
-                             if applied && current && !app.pilot() {
-                                app.status = "Observer — take control to interact".into();
+                          Some(update) = updates.recv() => {
+                              if app.session_operation.is_some() { staged_updates.push(update); continue; }
+                              if !apply_update(&mut app, update) { break; }
+                              if !app.pilot() {
                                 queued.retain(Interaction::request_scoped);
                                 if !interaction.as_ref().is_some_and(Interaction::request_scoped) {
                                     interaction = None;
@@ -1637,11 +1904,12 @@ async fn run_with_clipboard(
                                 flow.0 = true;
                                 app.status = if flow.1 { "External elicitation completed" } else { "Waiting for external completion" }.into();
                             }
-                             if editing.is_none() && interaction.is_none() && (app.pilot() || next.request_scoped()) { editor_prefix = None; show_interaction(&mut app, &next); interaction = Some(next); }
+                              if editing.is_none() && interaction.is_none() && next.available(&app) && (app.session_operation.is_none() || next.request_scoped()) { editor_prefix = None; show_interaction(&mut app, &next); interaction = Some(next); }
                              else if queued.len() < 128 { queued.push_back(next); }
                              // Dropping an overflow request safely cancels it at the daemon boundary.
                         }
-                         Some((id, result)) = ack_rx.recv() => {
+                          Some((id, result)) = ack_rx.recv() => {
+                              app.submitting.remove(&id);
                              match result { Ok(()) => { app.pending.remove(&id); }, Err(error) => {
                                  app.status = format!("Prompt acknowledgement uncertain: {error}; retry with the same key after reconnect");
                                  if error.contains("stale") && app.active.as_deref() == Some(&id) { app.owner = None; }
@@ -1711,6 +1979,10 @@ async fn run_with_clipboard(
                 Ok(())
             }).await;
         app.connected = false;
+        app.session_operation = None;
+        app.configuration = None;
+        app.submitting.clear();
+        app.stopping = None;
         editor_prefix = None;
         app.picker = None;
         // A disconnected form draft must never reappear as an ordinary chat prompt.

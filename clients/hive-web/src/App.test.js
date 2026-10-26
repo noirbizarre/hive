@@ -3,6 +3,7 @@ import { flushPromises, mount } from '@vue/test-utils';
 import { nextTick, shallowRef } from 'vue';
 import OpenVue from 'openvue/config';
 import Select from 'openvue/select';
+import Button from 'openvue/button';
 import App from './App.vue';
 import InteractionCard from './InteractionCard.vue';
 import TranscriptView from './TranscriptView.vue';
@@ -41,6 +42,44 @@ beforeEach(() => {
   });
 });
 afterEach(() => { wrapper?.unmount(); document.body.innerHTML = ''; vi.unstubAllGlobals(); });
+
+test('only executing work spins and historical thinking never reactivates with a later turn', async () => {
+  const statuses = ['in_progress', 'pending', 'queued', 'completed', 'failed', 'cancelled', 'future', undefined];
+  const state = { connected: true, session, running: true,
+    lines: [...statuses.map(status => ({ kind: 'tool', title: 'Read', status })),
+      { kind: 'thought', text: 'Old thinking', active: false }, { kind: 'thought', text: 'Live thinking', active: true }],
+    activity: { session: 'active', foreground: 'running',
+      tasks: Object.fromEntries([...statuses, 'running'].map((status, id) => [id, { status, title: 'Task' }])),
+      tools: {}, plans: { plan: { entries: statuses.map(status => ({ status, content: 'Step' })) } } } };
+  render(TranscriptView, { state });
+  expect(wrapper.findAll('.activity-spinner')).toHaveLength(6);
+  expect(wrapper.findAll('.message-speaker').map(node => node.text())).toEqual(['Thinking', 'Thinking']);
+  const tool = wrapper.get('.tool-message'); tool.element.open = true;
+  await wrapper.setProps({ state: { ...state, activity: { ...state.activity, foreground: 'requires_action' } } });
+  expect(wrapper.findAll('.activity-spinner')).toHaveLength(4);
+  expect(tool.element.open).toBe(true);
+  // Foreground idle leaves reported background tasks and tools independently active.
+  await wrapper.setProps({ state: { ...state, lines: state.lines.map(line => ({ ...line, active: false })), running: false, activity: { ...state.activity, foreground: 'idle' } } });
+  expect(wrapper.findAll('.activity-spinner')).toHaveLength(4);
+  for (const change of [{ connected: false }, { gap: true }, { activity: { ...state.activity, session: 'ended' } }]) {
+    await wrapper.setProps({ state: { ...state, ...change } });
+    expect(wrapper.findAll('.activity-spinner')).toHaveLength(0);
+  }
+});
+
+test('pending UI actions pause their animation for input and stopping preserves the active turn', async () => {
+  const { publish } = application({ session, role: 'pilot', running: true, stopping: true });
+  await flushPromises();
+  expect(wrapper.get('#cancel').text()).toContain('Stopping');
+  expect(wrapper.findAllComponents(Button).find(button => button.attributes('id') === 'cancel').props('loading')).toBe(true);
+  expect(wrapper.get('#cancel').element.disabled).toBe(true);
+  publish({ stopping: false, running: false, configuring: true, configOptions: options });
+  await nextTick();
+  expect(wrapper.get('.configuration-bar .activity-spinner').exists()).toBe(true);
+  publish({ interaction: { id: 'question', epoch: 1, method: 'session/request_permission', params: { options: [] } } });
+  await nextTick();
+  expect(wrapper.find('.configuration-bar .activity-spinner').exists()).toBe(false);
+});
 
 test('plans show known support before observation and render native content once in source order', async () => {
   const state = { session, lines: [], planSnapshot: { version: 1, authoritative: true, support: 'supported', observation: 'not_observed', plans: {} } };

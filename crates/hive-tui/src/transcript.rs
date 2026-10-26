@@ -259,7 +259,14 @@ impl Transcript {
         }
     }
 
-    pub fn render(&mut self, conversation: &Conversation, frame: &mut Frame, area: Rect) {
+    pub fn render(
+        &mut self,
+        conversation: &Conversation,
+        frame: &mut Frame,
+        area: Rect,
+        live: bool,
+        waiting_for_input: bool,
+    ) {
         self.area = area;
         if self.epoch != conversation.transcript_epoch {
             *self = Self {
@@ -406,6 +413,27 @@ impl Transcript {
             {
                 header.style = Theme.selected();
             }
+            if visible_start == start
+                && let Some(header) = text.lines.first_mut()
+            {
+                let entry = &conversation.lines[index];
+                let active = live
+                    && (entry
+                        .tool
+                        .as_ref()
+                        .is_some_and(|tool| tool["status"] == "in_progress")
+                        || (entry.kind == LineKind::Thought
+                            && conversation.active_thought == Some(index)
+                            && conversation.foreground != "requires_action"
+                            && !waiting_for_input));
+                if matches!(entry.kind, LineKind::Tool | LineKind::Thought) {
+                    // Replace only the reserved cell, leaving cached text and selection offsets stable.
+                    if let Some(span) = header.spans.first_mut() {
+                        span.content = span.content.chars().skip(1).collect::<String>().into();
+                    }
+                    header.spans.insert(0, crate::activity::marker(active));
+                }
+            }
             frame.render_widget(Paragraph::new(text).style(Theme.text()), target);
         }
     }
@@ -460,13 +488,16 @@ fn markdown(input: &str, width: u16) -> Vec<Line<'static>> {
 fn entry_text(entry: &ConversationLine, expanded: bool, width: u16) -> Text<'static> {
     if let Some(tool) = &entry.tool {
         let mut lines = vec![Line::styled(
-            short(
-                &format!(
-                    "{} {}",
-                    if expanded { "▾" } else { "▸" },
-                    tool_summary(tool)
-                ),
-                width,
+            format!(
+                " {}",
+                short(
+                    &format!(
+                        "{} {}",
+                        if expanded { "▾" } else { "▸" },
+                        tool_summary(tool)
+                    ),
+                    width.saturating_sub(1),
+                )
             ),
             if tool["status"] == "failed" {
                 Theme.warning()
@@ -480,6 +511,23 @@ fn entry_text(entry: &ConversationLine, expanded: bool, width: u16) -> Text<'sta
         return Text::from(lines);
     }
     match entry.kind {
+        LineKind::Thought => Text::from(
+            entry
+                .text
+                .lines()
+                .enumerate()
+                .map(|(index, line)| {
+                    Line::styled(
+                        if index == 0 {
+                            format!(" {line}")
+                        } else {
+                            line.to_owned()
+                        },
+                        Theme.muted(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        ),
         LineKind::Agent | LineKind::User => {
             let (label, prefix, style) = if entry.kind == LineKind::User {
                 ("▏ You", "You: ", Theme.accent())
@@ -693,7 +741,7 @@ mod tests {
         terminal: &mut Terminal<TestBackend>,
     ) {
         terminal
-            .draw(|frame| view.render(conversation, frame, frame.area()))
+            .draw(|frame| view.render(conversation, frame, frame.area(), true, false))
             .unwrap();
     }
 
@@ -742,6 +790,41 @@ mod tests {
                 .flat_map(|line| &line.spans)
                 .any(|span| span.style.add_modifier.contains(Modifier::ITALIC))
         );
+    }
+
+    #[test]
+    fn spinner_frames_leave_cached_layout_selection_and_revisions_unchanged() {
+        let mut conversation = Conversation::default();
+        update(
+            &mut conversation,
+            json!({"sessionUpdate":"tool_call_update","toolCallId":"call","title":"Compile","status":"in_progress"}),
+        );
+        let mut view = Transcript::default();
+        let mut terminal = Terminal::new(TestBackend::new(80, 18)).unwrap();
+        let mut render = |view: &mut Transcript, phase| {
+            terminal
+                .draw(|frame| {
+                    view.render(&conversation, frame, frame.area(), true, false);
+                    assert!(crate::activity::finish(frame, phase, true));
+                })
+                .unwrap();
+            screen(&terminal)
+        };
+        let first = render(&mut view, 0);
+        view.selection = Some(((0, 0), (0, view.cache[0].plain.len())));
+        let copied = view.selected_text();
+        let plain = view.cache[0].plain.clone();
+        let rows = view.starts.clone();
+        let revision = conversation.lines_revision;
+        let second = render(&mut view, 1);
+        assert_ne!(first, second);
+        assert!(first.contains('⠋'));
+        assert!(second.contains('⠙'));
+        assert_eq!(view.selected_text(), copied);
+        assert_eq!(view.cache[0].plain, plain);
+        assert_eq!(view.starts, rows);
+        assert_eq!(conversation.lines_revision, revision);
+        assert!(!view.selection_invalidated);
     }
 
     #[test]
@@ -909,12 +992,12 @@ mod tests {
         draw(&mut view, &conversation, &mut terminal);
         view.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 0));
         terminal
-            .draw(|frame| view.render(&conversation, frame, Rect::new(0, 4, 10, 0)))
+            .draw(|frame| view.render(&conversation, frame, Rect::new(0, 4, 10, 0), true, false))
             .unwrap();
         view.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 2, 0));
         assert!(!view.dragging);
         terminal
-            .draw(|frame| view.render(&conversation, frame, Rect::new(0, 0, 10, 8)))
+            .draw(|frame| view.render(&conversation, frame, Rect::new(0, 0, 10, 8), true, false))
             .unwrap();
         assert_eq!(view.cache[0].width, 10);
     }

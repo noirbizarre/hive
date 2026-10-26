@@ -108,6 +108,14 @@ following. Updates preserve composer drafts, interaction fields and open tools.
 The composer explains why sending is unavailable. Connection and pilot/read-only
 indicators remain separate from session activity.
 
+Spinners mark executing tool calls, background tasks, plan entries, live thinking,
+and foreground work. Queued work and requests waiting for your input remain
+static. Asynchronous actions show progress while pending; **Stopping** waits for
+the agent to confirm idle. Background tasks can keep spinning after foreground
+work ends. Disconnected or ended sessions do not animate stale activity, and
+reduced-motion preferences replace animation with static indicators. Restored
+thinking blocks stay static until new live thinking arrives for that block.
+
 The initially expanded Activity panel includes **Plans**, separate from background
 tasks. Plans show their IDs and the agent's ordered descriptions, statuses, and
 priorities. “Supported · not yet observed” means Hive handles plans but this agent

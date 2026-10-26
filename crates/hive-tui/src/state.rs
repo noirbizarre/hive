@@ -896,6 +896,22 @@ mod tests {
     }
 
     #[test]
+    fn a_context_free_resume_idle_ends_replayed_work_without_confirming_a_cancellation() {
+        let mut conversation = Conversation::default();
+        conversation.apply(event(
+            1,
+            v2::SessionUpdate::StateUpdate(v2::StateUpdate::Running(v2::RunningStateUpdate::new())),
+        ));
+        conversation.apply(event(
+            2,
+            v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(v2::IdleStateUpdate::new())),
+        ));
+        assert!(!conversation.running);
+        assert!(conversation.lines.is_empty());
+        assert_eq!(conversation.seq, 2);
+    }
+
+    #[test]
     fn resumed_active_work_ends_only_after_idle() {
         let mut conversation = Conversation {
             running: true,

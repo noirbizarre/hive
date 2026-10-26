@@ -363,12 +363,14 @@ impl Worker {
             }
             Command::Prompt(request, generation, key) => {
                 if !current(&self.control, generation) {
+                    if let Ok(mut state) = self.control.lock() {
+                        state.rollback_foreground(&key);
+                    }
                     complete(
                         &self.control,
                         &key,
                         Err("controller was superseded before prompt dispatch; resume with a new key".into()),
                     );
-                    self.clear_running();
                 } else if self.turn.is_some() {
                     complete(
                         &self.control,
@@ -396,7 +398,6 @@ impl Worker {
                         Err(error) => {
                             tracing::warn!(code = error.code(), "OpenCode prompt failed");
                             complete(&self.control, &key, Err(error.wire()));
-                            self.clear_running();
                         }
                     }
                 }
@@ -427,13 +428,6 @@ impl Worker {
                     true
                 }
             }
-        }
-    }
-
-    fn clear_running(&self) {
-        if let Ok(mut state) = self.control.lock() {
-            state.running = false;
-            state.notify();
         }
     }
 

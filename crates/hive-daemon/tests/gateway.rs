@@ -33,6 +33,229 @@ async fn summaries(address: SocketAddr) -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn every_resume_replay_mode_ends_with_current_state_before_the_response_on_both_transports() {
+    let config = config_with_agent(
+        "mock",
+        env!("CARGO_BIN_EXE_hive-test-agent"),
+        AgentVersion::V2,
+    );
+    let (address, server) = start_gateway(config).await;
+    for scheme in ["ws", "http"] {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let boundary = tx.clone();
+        timeout(
+            Duration::from_secs(30),
+            Client
+                .v2()
+                .on_receive_notification(
+                    async move |update: v2::UpdateSessionNotification, _: V2ConnectionTo<Agent>| {
+                        tx.send(Some(update)).map_err(Error::into_internal_error)
+                    },
+                    agent_client_protocol::on_receive_notification!(),
+                )
+                .connect_with(
+                    HttpClient::new(format!("{scheme}://{address}")).unwrap(),
+                    async move |cx| {
+                        cx.send_request(v2::InitializeRequest::new(
+                            ProtocolVersion::V2,
+                            v2::Implementation::new("barrier-test", "1"),
+                        ))
+                        .block_task()
+                        .await?;
+                        let cwd = std::env::current_dir().unwrap();
+                        for status in ["unknown", "running", "idle", "requires_action"] {
+                            let opened = cx
+                                .send_request(v2::NewSessionRequest::new(cwd.clone()))
+                                .block_task()
+                                .await?;
+                            let id = opened.session_id;
+                            if status != "unknown" {
+                                cx.send_request(
+                                    v2::PromptRequest::new(
+                                        id.clone(),
+                                        vec![format!("resume-state-{status}").into()],
+                                    )
+                                    .meta(controlled(&opened.meta, status)),
+                                )
+                                .block_task()
+                                .await?;
+                                // The derived activity event follows the source state, closing ingestion deterministically.
+                                loop {
+                                    let event = rx
+                                        .recv()
+                                        .await
+                                        .flatten()
+                                        .ok_or_else(Error::internal_error)?;
+                                    let value = serde_json::to_value(&event.update).unwrap();
+                                    if value["sessionUpdate"] == "_hive_activity"
+                                        && value["state"]["state"] == status
+                                        && value["state"]["_meta"]["resumeSentinel"] == true
+                                    {
+                                        break;
+                                    }
+                                }
+                            }
+                            // Relinquish the creator so observe genuinely exercises a non-pilot attachment.
+                            let mut meta = opened.meta.clone().unwrap();
+                            meta.get_mut("hive").unwrap()["mode"] = "relinquish".into();
+                            let (completed, response) = oneshot::channel();
+                            let marker = boundary.clone();
+                            cx.prepare_request(
+                                v2::ResumeSessionRequest::new(id.clone(), cwd.clone()).meta(meta),
+                            )
+                            .on_receiving_result(
+                                async move |result| {
+                                    let _ = marker.send(None);
+                                    let _ = completed.send(result);
+                                    Ok(())
+                                },
+                            )?;
+                            let relinquished =
+                                response.await.map_err(|_| Error::internal_error())??;
+                            let mut through = relinquished.meta.unwrap()["hive"]["nextSeq"]
+                                .as_u64()
+                                .unwrap()
+                                - 1;
+                            while rx.recv().await.ok_or_else(Error::internal_error)?.is_some() {}
+                            for observe in [true, false] {
+                                for replay in ["none", "start", "incremental"] {
+                                    let mut request =
+                                        v2::ResumeSessionRequest::new(id.clone(), cwd.clone());
+                                    if observe {
+                                        request = request.meta(v2::Meta::from_iter([(
+                                            "hive".into(),
+                                            serde_json::json!({"mode":"observe"}),
+                                        )]));
+                                    }
+                                    request.replay_from = match replay {
+                                        "start" => {
+                                            Some(v2::ReplayFrom::Start(v2::ReplayFromStart::new()))
+                                        }
+                                        "incremental" => {
+                                            Some(v2::ReplayFrom::Other(v2::OtherReplayFrom::new(
+                                                "_hive_seq",
+                                                BTreeMap::from([(
+                                                    "seq".into(),
+                                                    serde_json::json!(1),
+                                                )]),
+                                            )))
+                                        }
+                                        _ => None,
+                                    };
+                                    let (completed, response) = oneshot::channel();
+                                    let marker = boundary.clone();
+                                    cx.prepare_request(request).on_receiving_result(
+                                        async move |result| {
+                                            // The same ordered channel captures the actual response boundary.
+                                            let _ = marker.send(None);
+                                            let _ = completed.send(result);
+                                            Ok(())
+                                        },
+                                    )?;
+                                    let resumed =
+                                        response.await.map_err(|_| Error::internal_error())??;
+                                    let hive = &resumed.meta.as_ref().unwrap()["hive"];
+                                    assert_eq!(
+                                        hive["running"],
+                                        matches!(status, "running" | "requires_action")
+                                    );
+                                    assert_eq!(hive["activitySnapshot"]["foreground"], status);
+                                    assert_eq!(
+                                        hive["role"],
+                                        if observe { "observer" } else { "pilot" }
+                                    );
+                                    assert_eq!(hive.get("token").is_some(), !observe);
+                                    if replay == "start" {
+                                        assert_eq!(hive["snapshotThroughSeq"], through);
+                                    }
+                                    let mut batch = Vec::new();
+                                    while let Some(event) =
+                                        rx.recv().await.ok_or_else(Error::internal_error)?
+                                    {
+                                        assert_eq!(event.session_id, id);
+                                        batch.push(event);
+                                    }
+                                    let fresh: Vec<_> = batch
+                                        .iter()
+                                        .filter(|event| {
+                                            matches!(
+                                                event.update,
+                                                v2::SessionUpdate::StateUpdate(_)
+                                            ) && event.meta.as_ref().unwrap()["hive"]["seq"]
+                                                .as_u64()
+                                                .unwrap()
+                                                > through
+                                        })
+                                        .collect();
+                                    if status == "unknown" {
+                                        assert!(fresh.is_empty());
+                                    } else {
+                                        assert_eq!(
+                                            fresh.len(),
+                                            1,
+                                            "{scheme}/{status}/{observe}/{replay}"
+                                        );
+                                        let barrier = fresh[0];
+                                        assert!(std::ptr::eq(batch.last().unwrap(), barrier));
+                                        let value = serde_json::to_value(&barrier.update).unwrap();
+                                        assert_eq!(value["state"], status);
+                                        assert_eq!(value["_meta"]["resumeSentinel"], true);
+                                        assert_ne!(
+                                            barrier.meta.as_ref().unwrap()["hive"]["snapshot"],
+                                            true
+                                        );
+                                        assert_eq!(
+                                            barrier.meta.as_ref().unwrap()["hive"]["seq"]
+                                                .as_u64()
+                                                .unwrap()
+                                                + 1,
+                                            hive["nextSeq"].as_u64().unwrap()
+                                        );
+                                        if replay == "start" {
+                                            assert!(
+                                                batch.iter().any(|event| event
+                                                    .meta
+                                                    .as_ref()
+                                                    .unwrap()["hive"]["snapshot"]
+                                                    == true)
+                                            );
+                                        }
+                                        if replay == "incremental" {
+                                            assert!(batch.iter().any(|event| {
+                                                event.meta.as_ref().unwrap()["hive"]["seq"]
+                                                    .as_u64()
+                                                    .unwrap()
+                                                    <= through
+                                            }));
+                                        }
+                                    }
+                                    // Every live allocation reaches existing subscribers, including observer-only resumes.
+                                    let live: Vec<_> = batch
+                                        .iter()
+                                        .filter_map(|event| {
+                                            event.meta.as_ref().unwrap()["hive"]["seq"].as_u64()
+                                        })
+                                        .filter(|seq| *seq > through)
+                                        .collect();
+                                    for (index, seq) in live.iter().enumerate() {
+                                        assert_eq!(*seq, through + index as u64 + 1);
+                                    }
+                                    through = hive["nextSeq"].as_u64().unwrap() - 1;
+                                }
+                            }
+                        }
+                        Ok::<_, Error>(())
+                    },
+                ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+    server.abort();
+}
+
+#[tokio::test]
 async fn reload_changes_new_sessions_without_interrupting_an_existing_worker() {
     let dir = std::env::temp_dir().join(format!("hive-live-reload-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&dir).unwrap();
@@ -1633,6 +1856,16 @@ async fn transcript_snapshot(
                     .unwrap()
                 {
                     assert_eq!(event.session_id, id);
+                    if matches!(event.update, v2::SessionUpdate::StateUpdate(_)) {
+                        assert_ne!(event.meta.as_ref().unwrap()["hive"]["snapshot"], true);
+                        assert!(
+                            event.meta.as_ref().unwrap()["hive"]["seq"]
+                                .as_u64()
+                                .unwrap()
+                                > through
+                        );
+                        continue;
+                    }
                     assert_eq!(event.meta.as_ref().unwrap()["hive"]["snapshot"], true);
                     let value = serde_json::to_value(event.update).unwrap();
                     assert!(matches!(

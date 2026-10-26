@@ -479,6 +479,36 @@ test('transcript coverage survives older replay and live updates without blockin
   assert.deepEqual(view.transcript, partial);
 });
 
+for (const foreground of ['running', 'idle', 'requires_action']) {
+  test(`resume barriers and response snapshots agree for ${foreground} with and without replay`, async () => {
+    for (const replay of [true, false]) {
+      transport((socket, message, result) => {
+        if (message.method !== 'session/resume') return;
+        if (!replay && message.params.replayFrom) {
+          queueMicrotask(() => socket.receive({ jsonrpc: '2.0', id: message.id,
+            error: { code: -32600, message: 'replay cursor unavailable' } }));
+          return false;
+        }
+        socket.receive(update(11, { sessionUpdate: 'state_update', state: foreground }));
+        return { ...result, _meta: { hive: { ...result._meta.hive, nextSeq: 12,
+          running: foreground !== 'idle',
+          ...(message.params.replayFrom ? { snapshotThroughSeq: 10 } : {}),
+          activitySnapshot: { version: 1, seq: 11, foreground, session: 'active', tools: {}, plans: {}, tasks: {} } } } };
+      });
+      const client = connect('ws://localhost/acp');
+      if (replay) await client.open(session);
+      else {
+        await assert.rejects(client.open(session), /replay cursor unavailable/);
+        await client.attachWithoutHistory();
+      }
+      assert.equal(client.state().running, foreground !== 'idle');
+      assert.equal(client.state().activity.foreground, foreground);
+      assert.equal(client.state().gap, false);
+      client.close();
+    }
+  });
+}
+
 test('failed snapshot attachments discard staged messages and failures before explicit live-only attachment', async () => {
   let rejected = false;
   const sockets = transport((socket, message) => {

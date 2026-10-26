@@ -481,6 +481,15 @@ async fn main() -> agent_client_protocol::Result<()> {
                             v2::RunningStateUpdate::new(),
                         )),
                     )?;
+                    if let Some(status) = text.strip_prefix("resume-state-") {
+                        // Hold an exact foreground state without timers or an automatic idle.
+                        let update = serde_json::from_value(serde_json::json!({
+                            "sessionUpdate": "state_update", "state": status,
+                            "_meta": {"resumeSentinel": true}
+                        })).map_err(Error::into_internal_error)?;
+                        notify(&cx, &request.session_id, update)?;
+                        return Ok(());
+                    }
                     if text.contains("native-failure") {
                         let idle: v2::SessionUpdate = serde_json::from_value(serde_json::json!({
                             "sessionUpdate":"state_update", "state":"idle", "stopReason":"error",

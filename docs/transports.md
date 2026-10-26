@@ -7,7 +7,7 @@
 | Hive to agent | v2 | stdio | Integration-tested with deterministic mock |
 | Hive to agent | v1 | stdio | Integration-tested text prompt compatibility adapter |
 | Hive to agent | v2/v1 | WebSocket, HTTP/SSE | SDK client transport; v2 HTTP/SSE and WS integration-tested with mock |
-| Hive to OpenCode server | REST + SSE (not ACP) | HTTP `/session`, `/event` or the `/api/*` preview | `kind = "opencode-server"`; integration-tested with a scripted fake and probed against OpenCode 1.19.3 (v1 routes). See [the adapter](acp-compatibility.md#opencode-server-adapter) |
+| Hive to OpenCode server | REST + SSE (not ACP) | HTTP `/session`, `/event` or the `/api/*` preview | `kind = "opencode-server"`; integration-tested with a scripted fake and probed against OpenCode 1.19.3 (v1 routes). See [the adapter](compatibility.md#opencode-server-adapter) |
 | Client to Hive | v1 | Any | Rejected by v2 gateway |
 
 HTTP/SSE uses connection- and session-scoped GET streams for server events;

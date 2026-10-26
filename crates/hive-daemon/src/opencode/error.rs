@@ -52,7 +52,7 @@ pub(crate) enum OpencodeError {
     #[diagnostic(
         code(hive::opencode::unsupported_version),
         help(
-            "upgrade OpenCode; see the OpenCode server capability matrix in docs/acp-compatibility.md for tested versions"
+            "upgrade OpenCode; see the OpenCode server capability matrix in docs/compatibility.md for tested versions"
         )
     )]
     UnsupportedVersion {
@@ -146,7 +146,7 @@ pub(crate) enum OpencodeError {
     #[diagnostic(
         code(hive::opencode::protocol),
         help(
-            "this OpenCode version may be newer than the tested matrix; see docs/acp-compatibility.md"
+            "this OpenCode version may be newer than the tested matrix; see docs/compatibility.md"
         )
     )]
     Protocol { what: &'static str },

@@ -23,5 +23,5 @@ Models retain the dedicated `Ctrl-P` picker. Both remain changeable between
 turns. Native configuration takes precedence over duplicate legacy modes.
 
 These findings are source-verified, not live-agent-verified. See
-[session configuration compatibility](../acp-compatibility.md#session-modes-and-agent-settings)
+[session configuration compatibility](../compatibility.md#session-modes-and-agent-settings)
 for state propagation and recovery behavior.

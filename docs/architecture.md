@@ -145,7 +145,7 @@ not completion: foreground work ends at idle, and additional distinct prompts
 are refused while busy.
 
 See [ADR-001](adr/001-session-control-and-replay.md) and the
-[exact control contract](acp-compatibility.md#control-and-replay).
+[exact control contract](compatibility.md#control-and-replay).
 
 ## Events, replay, and snapshots
 
@@ -191,7 +191,7 @@ per-request drafts. Client delivery identities prevent stale answers from
 answering a newer question. URL consent and completion are correlated separately.
 
 See [ADR-007](adr/007-capability-aware-human-interaction-routing.md) and
-[interaction capabilities](acp-compatibility.md#interaction-capabilities-and-fallback).
+[interaction capabilities](compatibility.md#interaction-capabilities-and-fallback).
 
 ## Persistence and recovery
 

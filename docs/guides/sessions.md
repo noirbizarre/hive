@@ -50,7 +50,7 @@ relinquishes control while continuing to observe.
 A prompt response acknowledges acceptance. Wait for the agent's idle state to
 know foreground work ended. A second distinct prompt is refused while work is
 marked running. Blocked-first/restored `requires_action` handling is incomplete;
-see the [compatibility matrix](../acp-compatibility.md#prompts-messages-state-and-content)
+see the [compatibility matrix](../compatibility.md#prompts-messages-state-and-content)
 for that admission limitation and the active-close deviation from standard ACPv2.
 Hive's CLI does not provide a session-close subcommand.
 
@@ -106,4 +106,4 @@ because another client takes control.
 Answer explicitly. Missing UI support, invalid input, cancellation, and timeout
 never imply approval. Human decisions have a bounded deadline. See each client
 guide for form and URL controls, or the
-[interaction contract](../acp-compatibility.md#interaction-capabilities-and-fallback).
+[interaction contract](../compatibility.md#interaction-capabilities-and-fallback).

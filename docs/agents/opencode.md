@@ -32,7 +32,7 @@ See [getting started](../getting-started.md) for the full sequence.
 This launches a separate ACP process per Hive session. It is not native-session
 adoption. Confirm the wire version after upgrades and keep initialization,
 prompting, and recovery evidence separate in the
-[Known agents matrix](../acp-compatibility.md#known-agents).
+[Known agents matrix](../compatibility.md#known-agents).
 
 ### Mode and model selection
 
@@ -54,7 +54,7 @@ Hive's backend default or an inference from a plan. Agent-reported changes
 refresh attached clients; OpenCode versions differ in which external changes
 produce notifications. The no-inference settings probe passed with installed
 OpenCode 1.19.4 on 2026-10-26, including change, restoration, and attachment.
-See the [mode compatibility reference](../acp-compatibility.md#session-modes-and-agent-settings).
+See the [mode compatibility reference](../compatibility.md#session-modes-and-agent-settings).
 
 ### Provider errors
 
@@ -91,7 +91,7 @@ or configure the server. Restart Hive after changing profiles and run
 
 The retained real-server probe covers OpenCode 1.19.3 on v1 routes. The adapter
 rejects reported versions below 1.19.0. The `/api/*` preview has separate stores
-and narrower evidence. See the [server capability matrix](../acp-compatibility.md#capability-and-version-matrix).
+and narrower evidence. See the [server capability matrix](../compatibility.md#capability-and-version-matrix).
 
 ## Discover and adopt a native session
 
@@ -156,5 +156,5 @@ Recovery preserves the original native ID and API flavor. A missing native
 session is reported lost rather than replaced.
 
 See [ADR-002](../adr/002-opencode-server-adoption.md) and the
-[adapter reference](../acp-compatibility.md#opencode-server-adapter) for exact
+[adapter reference](../compatibility.md#opencode-server-adapter) for exact
 protocol, API-flavor, security, and diagnostic details.

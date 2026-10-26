@@ -1,5 +1,5 @@
 //! A scriptable stand-in for `opencode serve`, faithful to the routes and event shapes probed
-//! against OpenCode 1.19.3 (see docs/acp-compatibility.md). It records every call so tests can
+//! against OpenCode 1.19.3 (see docs/compatibility.md). It records every call so tests can
 //! prove what Hive did *not* do (for example, create a second session).
 
 #![allow(dead_code)]

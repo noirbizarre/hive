@@ -40,4 +40,4 @@ implementations aligned without assuming they execute the same code.
 Implementation: [daemon routing](https://github.com/noirbizarre/hive/blob/main/crates/hive-daemon/src/interactions.rs),
 [native validation](https://github.com/noirbizarre/hive/blob/main/crates/hive-protocol/src/interactions.rs), and
 [scripted interactions](https://github.com/noirbizarre/hive/blob/main/crates/hive-daemon/tests/support/interactions.rs).
-See the [interaction contract](../acp-compatibility.md#interaction-capabilities-and-fallback).
+See the [interaction contract](../compatibility.md#interaction-capabilities-and-fallback).

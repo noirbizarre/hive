@@ -61,7 +61,7 @@ async fn a_profile_declaring_the_wrong_protocol_fails_with_its_compat_code_and_h
     let finding = &profile(&report, "wrong").findings[0];
     assert_eq!(
         finding.code.as_deref(),
-        Some("hive::compat::initialize_failed")
+        Some("hive::compat::protocol_mismatch")
     );
     assert!(finding.help.is_some());
 }

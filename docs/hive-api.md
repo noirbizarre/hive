@@ -60,7 +60,7 @@ There is no parallel REST session-mutation or question protocol.
 New/resume responses expose role, current snapshots, and sequence metadata.
 Only pilots receive control tokens. Mutations require current generation/token,
 and prompts additionally need a stable key. See the
-[ACP wire contract](acp-compatibility.md#control-and-replay).
+[ACP wire contract](compatibility.md#control-and-replay).
 
 ## Session catalog
 
@@ -151,7 +151,7 @@ connection that created each session:
 Activity timestamps are not proof of ongoing work. Unknown is not idle.
 Foreground state does not describe every tool, plan, or late background task.
 For those, use `_hive_activity` and the atomic `activitySnapshot` on `/acp`.
-See [live execution activity](acp-compatibility.md#live-execution-activity).
+See [live execution activity](compatibility.md#live-execution-activity).
 
 ### Lifecycle and recovery fields
 
@@ -201,7 +201,7 @@ non-pilot attachments. Summaries never expose a control token.
 
 `usage` is the current session aggregate. `usageByAgent` groups by configured
 profile across sessions. Null values mean unknown, not zero. See
-[token usage and costs](acp-compatibility.md#token-usage-and-costs).
+[token usage and costs](compatibility.md#token-usage-and-costs).
 
 ## Native session discovery
 

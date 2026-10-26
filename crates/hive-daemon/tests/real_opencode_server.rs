@@ -10,7 +10,7 @@
 //! `HIVE_REAL_OPENCODE_SERVER_PASSWORD_ENV` naming the variable that holds its password).
 //!
 //! The `PROBE`, `NATIVE`, `ADOPTED`, `FIRST` and `RESUMED` markers on stderr are the evidence
-//! that fills the OpenCode server capability matrix in docs/acp-compatibility.md.
+//! that fills the OpenCode server capability matrix in docs/compatibility.md.
 
 use std::{
     collections::BTreeMap,

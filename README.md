@@ -88,7 +88,7 @@ Full site: <https://noirbizarre.github.io/hive/>
 - [OpenCode](docs/agents/opencode.md) and [Pi](docs/agents/pi.md) integrations
 - [Operations](docs/operations.md) and [troubleshooting](docs/troubleshooting.md)
 - [Architecture and diagrams](docs/architecture.md), [decisions](docs/adr/README.md), and [roadmap](docs/roadmap.md)
-- [ACP / ACPv2 compatibility matrix](docs/acp-compatibility.md), [transports](docs/transports.md), and [HTTP API](docs/hive-api.md)
+- [ACP / ACPv2 compatibility matrix](docs/compatibility.md), [transports](docs/transports.md), and [HTTP API](docs/hive-api.md)
 
 Replay is bounded, not a durable transcript. Restart recovery depends on the
 downstream agent and never silently resends interrupted prompts.

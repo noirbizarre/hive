@@ -27,5 +27,5 @@ are not synonymous with planning. Use TUI `Ctrl-G` for these settings and
 between turns in an existing session.
 
 These findings are source-verified, not live-agent-verified. See
-[session configuration compatibility](../acp-compatibility.md#session-modes-and-agent-settings)
+[session configuration compatibility](../compatibility.md#session-modes-and-agent-settings)
 for notification and recovery limitations.

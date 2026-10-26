@@ -134,7 +134,7 @@ opencode acp --help
 ```
 
 Pi has no ACP mode of its own. Install the external `pi-acp` adapter (see
-[Pi](acp-compatibility.md#pi)). The inspected OpenCode 1.18.35 CLI advertises
+[Pi](compatibility.md#pi)). The inspected OpenCode 1.18.35 CLI advertises
 `opencode acp` with documented stdio wire v1.
 
 These observations do not prove the agent can initialize or prompt.
@@ -207,7 +207,7 @@ and fail if attachment returns no conversation. A failed load does not establish
 be reopened via their own CLI or server. Hive adopts native IDs only through an
 `opencode-server` profile (below), never an ACP one: record native-CLI reopen,
 direct ACP attachment and Hive's live-worker resume as **separate** results in the
-[Known agents matrix](acp-compatibility.md#known-agents).
+[Known agents matrix](compatibility.md#known-agents).
 
 For optional tool calls/results, permission requests, user-input requests,
 cancel, and disconnect while generation is active, inspect a deliberately
@@ -240,7 +240,7 @@ HIVE_REAL_OPENCODE_SERVER=1   cargo test -p hive-daemon --test real_opencode_ser
 
 It prints `PROBE`, `NATIVE`, `ADOPTED`, `FIRST` and `RESUMED` markers. Retain them
 with the run date before changing a cell of the
-[OpenCode server matrix](acp-compatibility.md#capability-and-version-matrix).
+[OpenCode server matrix](compatibility.md#capability-and-version-matrix).
 Failures name a fixed stage and never echo server replies. The deterministic
 equivalent, covering cancel, permissions, questions, reconnect, restart, version
 and credential handling, is `cargo test -p hive-daemon --test opencode`. It runs

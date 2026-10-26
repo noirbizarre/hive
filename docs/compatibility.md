@@ -7,19 +7,22 @@ the [OpenCode](agents/opencode.md), [Claude Code](agents/claude.md),
 
 ## Audit baseline
 
-Audited **2026-10-25**, with a behavioral refresh on **2026-10-26** against Hive commit
-[`a3bd217`](https://github.com/noirbizarre/hive/tree/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9).
+Re-audited **2026-10-26** for the SDK 3.5.0 upgrade, with pre-upgrade behavior
+checked against Hive commit
+[`f9e6a41`](https://github.com/noirbizarre/hive/tree/f9e6a4108b8ca885a0f58dbccd9e4dd92e5ccc17).
+Upgrade-specific regression names below refer to the accompanying source changes.
 The matrix inventories the specification shipped with Hive's current dependencies,
 including features Hive does not implement. It is not a declaration of full ACP conformance.
 
 | Version identifier | Audited value |
 | --- | --- |
 | Wire protocols | ACPv1 downstream compatibility; **draft ACPv2** upstream and native downstream |
-| Rust SDK / HTTP adapter | `agent-client-protocol =3.4.0` / `agent-client-protocol-http =3.4.0` |
+| Rust SDK / HTTP adapter | `agent-client-protocol =3.5.0` / `agent-client-protocol-http =3.5.0` |
 | Rust schema crate | `agent-client-protocol-schema =1.12.0`, resolved in `Cargo.lock` |
 | Schema/specification provenance | [`e2d83349bc9e28a4059ea3acefa1c91c966f74e2`][spec-pin], 2026-10-16, from the published crate's `.cargo_vcs_info.json` |
-| SDK provenance | [`4f82aef0e7559a50c2b95aff4f7ba60af10d9e04`][sdk-pin] |
-| JSON schema artifact versions at that revision | v1 **1.26.0**; v2 **2.0.0-alpha.9**; these are not Rust crate or wire versions |
+| SDK / HTTP adapter provenance | [`305aefda6fbe88be6ae8b9088003e383f909b135`][sdk-pin], independently confirmed from both published crates' `.cargo_vcs_info.json` |
+| Additional upstream draft reviewed | [`1c0fe8dd680aa6de119b2136a7e5495075baf257`][draft-pin], 2026-10-26; not the published schema's source |
+| JSON schema artifact versions at the schema source revision | v1 **1.26.0**; v2 **2.0.0-alpha.9**; these are not Rust crate or wire versions |
 | Enabled experimental protocol features | `unstable_protocol_v2`, `unstable_end_turn_token_usage` |
 
 The authoritative inventory is the pinned [v1 registry][v1-methods] and [schema][v1-schema],
@@ -29,10 +32,40 @@ Here, **baseline v2** means the schema without additional experimental features;
 the whole v2 protocol is still a draft. A feature appearing in an SDK type or an
 experimental schema does not establish that Hive enables or supports it.
 
-The newer upstream draft observed during this audit is
-[`66ff8076`](https://github.com/agentclientprotocol/agent-client-protocol/commit/66ff8076ec2320d85e84fedc83cb779e9d906a89).
-It is outside this matrix's dependency-matched contract. The dependency/draft upgrade
-and re-audit are tracked in [#64](https://github.com/noirbizarre/hive/issues/64).
+The latest suitable published SDK and HTTP releases are 3.5.0; both still use
+schema 1.12.0. A source override is unnecessary for the enabled features. This
+audit also reviews the [complete schema-to-draft comparison][draft-comparison],
+including the intermediate `66ff8076` revision requested in
+[#64](https://github.com/noirbizarre/hive/issues/64). The following differences
+qualify the dependency-matched matrix; equal manifest/schema artifact versions
+do not imply equal source or full conformance to the newer draft.
+
+### Reviewed draft differences
+
+| Changed surface at the reviewed draft | Hive behavior / deviation |
+| --- | --- |
+| Version selection and errors ([draft initialization][draft-init]) | SDK 3.5.0 selects the highest configured version at or below the request. Hive's v2-only endpoint selects v2 for compatible newer requests, rejects v1 with `-32022` and required `data.requested` / `data.supported`, and rejects missing/non-integer/out-of-range versions with `-32602`. Errors leave the connection uninitialized. The SDK implements this even though schema 1.12.0 lacks the named error variant. |
+| Lower-version successful initialization ([SDK v2 guide][sdk-v2]) | Downstream v2 probes/workers use typed `send_initialize` outcomes to report a validated v1 selection as a profile mismatch. Hive never switches adapters or retries automatically. Explicitly configured v1 adaptation remains available. |
+| Available-command `type` discriminator and custom/future kinds ([draft commands][draft-commands]) | The newer v2 schema requires `type: "command"` or a custom/future discriminator and raw preservation for unfamiliar command metadata. Released schema 1.12.0 still models the older untagged command shape; its typed round-trip drops the discriminator and unmodeled fields. Native command relay is therefore not conformance to the newer shape. Neither built-in client offers command discovery/completion. |
+| Inter-session message identity ([draft experimental schema][draft-unstable]) | `session_message` upserts add `senderMessageId` / `recipientMessageId` to link transcript-local views. Participants/references belong on upserts; chunks carry content, not identity. `unstable_subagents` stays disabled; generic unknown-update relay does not implement linkage, child routing, or control. |
+| Resume synchronization ([draft session setup][draft-setup]) | The draft additionally recommends current config in the response and current `session_info_update` after replay, before response, even without replay. Hive returns current config snapshots but lacks a standard session-info snapshot and the already-required fresh upstream `state_update` barrier ([#63](https://github.com/noirbizarre/hive/issues/63)). |
+| Configuration and session-info notifications ([draft configuration][draft-config], [draft session list][draft-list]) | Agents should notify attached clients after changes, including client setters; duplicate notifications should precede the setter response, subsequent changes follow it. Hive publishes confirmed config changes to subscribers and reconciles newer observations; standard session-info retention remains partial. |
+| Adjacent streamed tool text ([draft tools][draft-tools]) | Each text piece may be a separate `tool_call_content_chunk`; adjacent items can be displayed continuously. Existing typed relay/materialization accepts these chunks. Rich presentation and the superseded activity-buffer limitation remain as listed below. |
+| Session status and client-set titles RFDs | `session/status` and `session/set_title` are draft proposals, absent from both reviewed method registries; their publication does not add supported methods or capabilities to Hive. |
+
+SDK 3.5.0 also supplies a termination signal for every connection end. Independent
+gateway cleanup observers wait for EOF **or** termination so failed/dropped drivers
+release subscriptions, ownership, and connection capabilities without killing the
+downstream session. The TUI foreground still waits on EOF: driver termination is
+published after foreground completion and cannot replace that wakeup.
+
+Upgrade regressions in the accompanying
+`crates/hive-daemon/tests/gateway.rs` and `crates/hive-daemon/src/lib.rs` include
+`gateway_negotiation_errors_and_future_versions_match_the_draft_over_both_transports`,
+`dropping_the_gateway_driver_releases_capabilities_without_waiting_for_eof`, and
+`driver_drop_releases_only_its_attachment_and_fences_a_pilot_once`.
+The TUI connection tests in `crates/hive-tui/src/lib.rs` include
+`the_tui_foreground_returns_on_eof_without_waiting_for_driver_termination`.
 
 ## Reading the matrix
 
@@ -89,8 +122,8 @@ Sources: [v1 prompt turns][v1-prompt], [v2 prompt lifecycle][v2-prompt],
 | Feature / specification | Status | Ingestion: v1 / v2 | Daemon / client API | TUI / Web | Evidence / gap |
 | --- | --- | --- | --- | --- | --- |
 | `session/prompt`, acceptance versus completion ([v1][v1-prompt], [v2][v2-prompt]) | 🟡 P | V1 completion adapted into asynchronous running/idle; native v2 returns insertion `messageId` | Acknowledgement is not completion; ownership/idempotency and running-work admission implemented, but blocked-first admission is incomplete | Both consume state, not just response; blocked-state busy handling incomplete | [Gateway tests][gateway-tests]; [ownership](#mutation-ownership-and-idempotency); [#65](https://github.com/noirbizarre/hive/issues/65) |
-| `state_update`: `running`, `idle`, `requires_action`; background updates ([v2 lifecycle][v2-prompt]) | 🟡 P | V1 synthesizes running/idle; v2 relays all native states | Activity records `requires_action`, but live admission boolean ignores it and restoration treats it as not running; late tools do not reopen foreground | Both running booleans only track running/idle; normalized blocked activity is separate | [Activity][activity]; [workers][daemon]; [#65](https://github.com/noirbizarre/hive/issues/65); resume barrier [#63](https://github.com/noirbizarre/hive/issues/63) |
-| Stop reasons: end-turn, limits, refusal, cancellation, v2 error ([v1][v1-prompt], [v2][v2-prompt]) | 🟡 P | V1 `end_turn` maps exactly; other successful stop reasons become `_v1_stop`; v2 keeps typed reason | Native reason/error relayed but not retained as a materialized failure entry; controlled v1 error extension before idle | Both show Hive failures, but neither surfaces native idle/error details; TUI shows native cancellation | [Worker prompt handling][daemon]; [#66](https://github.com/noirbizarre/hive/issues/66) |
+| `state_update`: `running`, `idle`, `requires_action`; background updates ([v2 lifecycle][v2-prompt]) | 🟡 P | V1 synthesizes running/idle; v2 relays all native states | Activity records `requires_action`, but live admission boolean ignores it and restoration treats it as not running; late tools do not reopen foreground | Both treat `requires_action` as active foreground work until idle; daemon admission/restoration still has the stated gap | [Activity][activity]; [workers][daemon]; [#65](https://github.com/noirbizarre/hive/issues/65); resume barrier [#63](https://github.com/noirbizarre/hive/issues/63) |
+| Stop reasons: end-turn, limits, refusal, cancellation, v2 error ([v1][v1-prompt], [v2][v2-prompt]) | ✅ S | All known successful v1 stop reasons map to equivalent v2 reasons; future non-equivalent reasons use `_v1_stop`; native v2 keeps typed reason | Native idle/error emits a controlled, materialized `_hive_error` companion; v1 failures emit a controlled extension before idle | Both render failure companions live and on replay; TUI also displays cancellation; Web ends work without inventing a reason | `stop_reasons_and_native_failures_survive_the_gateway_and_replay` in [gateway tests][gateway-tests]; [error boundary](#protocol-boundary) |
 | Text blocks; `user_message_chunk`, `agent_message_chunk` ([v1][v1-content], [v2][v2-content]) | ✅ S | V1 synthetic IDs, live user echo suppressed; v2 native IDs/chunks | Relayed; transcript coalesces compatible text chunks in first-appearance order | Both compose/render text streams; Web renders user/agent discussion Markdown, including accumulated chunks | [Transcript][transcript]; [TUI state][tui-state]; [Web reducer tests][web-tests]; [Markdown tests][web-markdown-tests] |
 | `user_message`, `agent_message`, `agent_thought`: whole-message upserts and null/omission ([v2 schema][v2-schema]) | 🟡 P | V1 has no whole-message identity API; v2 typed updates accepted | Transcript correctly replaces arrays, retains omission, clears null | Web omission erases content; TUI null fails to clear; concrete text replacement works | `full_message_patches_replace_content_without_reordering_or_erasing_omitted_fields` in [transcript][transcript]; [#60](https://github.com/noirbizarre/hive/issues/60) |
 | `agent_thought_chunk` ([v1][v1-prompt], [v2][v2-prompt]) | 🟡 P | V1 adapter drops thoughts; v2 relays | Native thoughts materialized with a separate message namespace | Both render native thought text | [V1 match][daemon]; [TUI][tui-state]; [Web][web-client] |
@@ -119,7 +152,7 @@ Sources: [v1 tool calls][v1-tools], [v2 tool calls][v2-tools],
 | `elicitation/create`: form mode, primitive schemas/validation ([v1][v1-elicitation], [v2][v2-elicitation]) | 🟡 P | V1 session-scoped handler exists but initializer does not advertise form; v2 broker advertises form | Pilot capability checked; supported primitive validation; restricted cross-host pattern subset | Both support forms; browser rejects unsafe integers; unsupported patterns/types cancel | [Validation limits](#form-validation); [interaction broker][interactions]; [TUI tests][tui-interactions]; [Web tests][web-component-tests] |
 | URL mode and `elicitation/complete` ([v1][v1-elicitation], [v2][v2-elicitation]) | 🟡 P | V1 handlers without mode advertisement; v2 broker advertises URL | IDs remapped, early completion correlated, takeover/deadline behavior defined | Both require explicit HTTP(S) link action/consent; completion is distinct from consent | [URL completion](#url-completion); [gateway tests][gateway-tests]; [Web tests][web-component-tests] |
 | Session/request interaction scope; `accept` / `decline` / `cancel` ([v2 elicitation][v2-elicitation]) | 🟡 P | V1 session scope; native v2 live new/prompt parents mapped | Request scope requires a unique live parent; unmapped/expired/ambiguous parents cancel; session scope follows pilot | Both handle queued interactions; unsupported negotiated modes cancel | [Routing limits](#interaction-capabilities-and-fallback); [interaction broker][interactions] |
-| `session/cancel` versus `$/cancel_request` ([v1][v1-cancel], [v2][v2-cancel]) | 🟡 P | Session cancellation forwarded, but v1 cancelled completion becomes `_v1_stop`; RPC cancellation correlated per connection | Session cancellation withdraws decisions; RPC IDs remapped, never copied across hops | Both cancel work/questions; native cancellation notice only in TUI; v1 standard completion reason lost | [Interaction broker][interactions]; [gateway tests][gateway-tests]; [#66](https://github.com/noirbizarre/hive/issues/66) |
+| `session/cancel` versus `$/cancel_request` ([v1][v1-cancel], [v2][v2-cancel]) | ✅ S | Session cancellation forwarded; v1 cancelled completion maps to standard v2 `cancelled`; RPC cancellation correlated per connection | Session cancellation withdraws decisions; RPC IDs remapped, never copied across hops | Both cancel work/questions and await authoritative idle; cancellation notice only in TUI | [Interaction broker][interactions]; `stop_reasons_and_native_failures_survive_the_gateway_and_replay` in [gateway tests][gateway-tests] |
 
 ### Configuration, discovery, usage, and compaction
 
@@ -129,7 +162,7 @@ Sources: [v1 tool calls][v1-tools], [v2 tool calls][v2-tools],
 | Boolean config options ([v1][v1-config], [v2][v2-config]) | 🟡 P | Typed translation/setters implemented; v1 boolean client marker not advertised | Advertised boolean values accepted; no blanket unknown-kind setter support | Both cache options but only offer select controls | [Config adapter][config]; [TUI picker][tui-ui]; [Web UI][web-ui] |
 | Categories `mode`, `model`, `model_config`, `thought_level`; dependent config replacement ([v1][v1-config], [v2][v2-config]) | 🔀 A | Agent-defined category/choices retained; usable native configuration takes precedence as a complete surface | Full authoritative config set replaces snapshot and can remove choices; mode and collaboration mode remain independent | Select options exposed; unknown categories preserved, not collapsed into one mode control | [Config adapter][config]; [gateway tests][gateway-tests] |
 | V1 modes, `session/set_mode`, `current_mode_update` ([session modes][v1-modes]) | 🔀 A | Without usable native config, translate discovered modes into `_hive_legacy_mode`; consume updates and call native setter | Exposed upstream through `session/set_config_option`; confirmed snapshots sequenced; restart rediscovers settings from original session | TUI `Ctrl-G` and Web settings expose fallback selector; idle pilot only | `legacy_modes_use_the_native_setter_and_reconcile_acknowledgements_and_observers` and `modes_are_rediscovered_from_the_original_session_after_daemon_restart` in [gateway tests][gateway-tests] |
-| `available_commands_update`, initial available commands; slash-command text input ([v1][v1-commands], [v2][v2-commands]) | 🟡 P | V1 discovery dropped; native v2 update/new-response typed fields relayed | No retained current-command snapshot on broker resume; slash text still ordinary prompt content | Neither provides protocol command discovery/completion | [Workers/broker][daemon]; [client reducers][web-client] |
+| `available_commands_update`, initial available commands; slash-command text input ([v1][v1-commands], [v2][v2-commands]) | 🟡 P | V1 discovery dropped; native v2 update/new-response typed fields relayed, but newer draft discriminators are not retained | No retained current-command snapshot on broker resume; slash text still ordinary prompt content | Neither provides protocol command discovery/completion | [Workers/broker][daemon]; [reviewed draft differences](#reviewed-draft-differences); [client reducers][web-client] |
 | `session_info_update`: title and last-activity timestamp ([v1 schema][v1-schema], [v2 schema][v2-schema]) | 🟡 P | V1 drops; native v2 relays | Does not become a standard-info snapshot; Hive catalog summaries are a separate broker surface | Neither consumes standard session-info updates | [Workers][daemon]; [session catalog](hive-api.md#session-catalog) |
 | `usage_update`: context used/size, cumulative cost ([v1 schema][v1-schema], [v2 schema][v2-schema]) | 🔀 A | V1 consumed for accounting, not raw proxy; native v2 relayed and consumed | Hive aggregates through `_hive_usage`; context gauge is not billable-token usage | Both show available aggregates; missing data stays unknown | [Usage details](#token-usage-and-costs); [gateway tests][gateway-tests] |
 | Experimental end-turn token usage ([v1 unstable][v1-unstable], [v2 unstable][v2-unstable]) | 🔀 A | Enabled; v1 prompt result / v2 idle update | Optional agent-reported turn totals, not individual model calls; durable Hive accounting | Both show Hive usage snapshots; no fabricated missing counts | [Usage details](#token-usage-and-costs); [gateway tests][gateway-tests]; [#31](https://github.com/noirbizarre/hive/issues/31) |
@@ -157,7 +190,7 @@ The `unstable` umbrella is not enabled; it would not implicitly enable protocol 
 | --- | --- | --- | --- | --- | --- |
 | Resume `replayFrom: start`, retained history and current-state barrier ([v2 setup][v2-setup]) | 🟡 P | V1 load replays agent history; resume-only cannot; v2 requests retained history on restoration | Materialized message/tool transcript plus current plans, not full terminal/compaction history; upstream state-barrier gap | Both use explicit history-gap decisions rather than silently resending prompts | [Transcript][transcript]; [replay details](#replay-cursors); [#63](https://github.com/noirbizarre/hive/issues/63) |
 | Replay cursors other than standard `start` ([v2 schema][v2-schema]) | 🟡 P | No generic downstream cursor translation | Hive supports `_hive_seq`, with a bounded ring; unsupported/expired/future cursors fail rather than inventing history | Both use Hive cursor/snapshot rules; not arbitrary agent cursors | [Replay details](#replay-cursors); [gateway tests][gateway-tests] |
-| JSON-RPC errors/data and post-insertion failures ([v1][v1-errors], [v2][v2-errors]) | 🟡 P | Typed SDK RPC errors; v1 post-admission errors become `_hive_error` then idle | Controlled Hive diagnostics; native idle/error relayed but not materialized as a failure entry; no arbitrary error-data preservation guarantee | Both render Hive extension failures including replay; neither surfaces native fatal-state errors | [Gateway tests][gateway-tests]; [#66](https://github.com/noirbizarre/hive/issues/66) |
+| JSON-RPC errors/data and post-insertion failures ([v1][v1-errors], [v2][v2-errors]) | 🟡 P | Typed SDK RPC errors; v1 post-admission errors become `_hive_error` then idle | Controlled Hive diagnostics; native idle/error relayed and accompanied by a materialized failure; no arbitrary error-data preservation guarantee | Both render controlled failure companions including replay, without exposing arbitrary agent error payloads | `stop_reasons_and_native_failures_survive_the_gateway_and_replay` in [gateway tests][gateway-tests]; [error boundary](#protocol-boundary) |
 | `_meta`: entity patches, request/response and notification envelope metadata ([v1][v1-ext], [v2][v2-ext]) | 🟡 P | Native typed update metadata retained; downstream envelope metadata discarded | Entity metadata patches by top-level key; new-response metadata replaced by Hive attachment metadata; resume reconstructed; activity filters provider metadata | No arbitrary metadata UI; native plan metadata preserved within typed boundary | [Workers][daemon]; [transcript][transcript]; [plans][plans] |
 | Unknown/custom values, `_` extensions and unknown updates ([v1][v1-ext], [v2][v2-ext]) | 🟡 P | V1 closed typed update set; v2 schema preserves supported unknown branches, not unmodeled fields on every known type | Generic v2 update relay/ring replay; no blanket arbitrary-method forwarding or full-snapshot preservation | Unknown updates ignored; unfamiliar plans shown generically; never interpreted as authorization | [Workers][daemon]; [plan limitations](#native-acpv2-plans) |
 | Absolute filesystem paths / 1-based tool locations ([v1][v1-tools], [v2][v2-tools]) | 🔀 A | Agent-provided typed paths/locations retained where present | No generic path remapping or location correction; cwd identity checked for resume | Tool details shown, not a full editor-navigation service | [Workers][daemon]; [TUI tool renderer][tui-transcript] |
@@ -213,6 +246,14 @@ The baseline update unions contain **14 v1** and **19 named v2** variants; the l
 also has an unknown-update branch. The tables cover every variant. Experimental
 additions are v1 `plan_update` / `plan_removed`, and both versions' subagent and
 session-message variants; v2 additionally adds `plan_removed` beyond its baseline.
+
+The reviewed draft has the same baseline/experimental method counts, capability
+fields, content-block kinds, and update discriminators: the comparison changes
+negotiation semantics, command entry shapes, and experimental message fields,
+not those registries. Command kinds now include `command` and custom/future
+discriminators; the released typed boundary still has the older shape described
+in [Reviewed draft differences](#reviewed-draft-differences).
+
 Nested features are included under their owning surface rather than treated as
 separate methods. Specifically, the audited known values are:
 
@@ -248,7 +289,7 @@ infer it merely from negotiating protocol v2.
 | Generation/token, pilot/observer/relinquish, `_hive_control` | ✅ S | Broker ownership across transports; both built-ins support handoff and observer state | [Control and replay](#control-and-replay), [ownership](#mutation-ownership-and-idempotency) |
 | Prompt key/fingerprint and `recoveryAction` | ✅ S | Durable deduplication/recovery fence; no automatic redispatch; future hardening is not complete certainty about provider execution | [Ownership](#mutation-ownership-and-idempotency); [#56](https://github.com/noirbizarre/hive/issues/56) |
 | `_hive_seq`, `seq`/`nextSeq`, snapshot markers/watermarks | ✅ S | Bounded incremental ring plus materialized start snapshot; both clients handle gap decisions | [Replay cursors](#replay-cursors) |
-| `_hive_v1_tool_call`, `_hive_v1_tool_update`, `_hive_v1_plan`, `_v1_stop` | 🟡 P | Explicit compatibility wrappers/reason; not native v2 tools/plans or exact v1 stop-reason translation | [Tool/plan rows](#tools-terminals-plans-and-interactions), [activity](#live-execution-activity) |
+| `_hive_v1_tool_call`, `_hive_v1_tool_update`, `_hive_v1_plan`, `_v1_stop` | 🟡 P | Explicit compatibility wrappers for v1 tools/plans; `_v1_stop` is only a future non-equivalent stop-reason fallback, not the mapping for currently known reasons | [Tool/plan rows](#tools-terminals-plans-and-interactions), [activity](#live-execution-activity) |
 | `_hive_activity`, `_hive_task`, `activitySnapshot` | 🟡 P | Convenience tool/plan/foreground projection shown by both UIs; tool chunk buffer can retain superseded chunks; background tasks require extension IDs, not inferred subagents | [Live execution activity](#live-execution-activity); [#67](https://github.com/noirbizarre/hive/issues/67) |
 | `planSnapshot`, config snapshots/sequence, transcript status | ✅ S | Attachment state independent of bounded replay; both clients fence old replay; agent retention still determines restart completeness | [Native plans](#native-acpv2-plans), [replay](#replay-cursors), [transcript status](hive-api.md#transcript-ownership-and-status) |
 | `_hive_usage`, usage snapshot/cost estimates | 🔀 A | Hive accounting depends on agent reports and optional price identity; both UIs show available totals | [Token usage and costs](#token-usage-and-costs) |
@@ -280,8 +321,8 @@ infer it merely from negotiating protocol v2.
 ## Protocol boundary
 
 Hive clients always initialize with ACP protocol version 2. The current SDK
-`agent-client-protocol =3.4.0` needs its `unstable_protocol_v2` feature.
-`agent-client-protocol-http =3.4.0` provides both server transport shapes.
+`agent-client-protocol =3.5.0` needs its `unstable_protocol_v2` feature.
+`agent-client-protocol-http =3.5.0` provides both server transport shapes.
 Their crate versions do not denote the ACP wire version. The SDK pins schema
 `=1.12.0`. The Cargo lockfile records the resolved dependency set.
 
@@ -927,7 +968,7 @@ HIVE_REAL_PI=1 cargo test -p hive-daemon --test real_agents \
 
 ## Native ACPv2 plans
 
-Hive's pinned SDK (3.4.0, schema 1.12.0, `unstable_protocol_v2`) accepts native
+Hive's pinned SDK (3.5.0, schema 1.12.0, `unstable_protocol_v2`) accepts native
 `session/update` notifications with this shape:
 
 ```json
@@ -1266,9 +1307,18 @@ Unsupported workflows:
 [claude-acp]: https://github.com/agentclientprotocol/claude-agent-acp/blob/739dde3ae5bb848bdb90e2c9150e2cc4687d480c/README.md
 [codex-acp]: https://github.com/agentclientprotocol/codex-acp/blob/a77829fecc87cebbb2e53782ce6795aee072adc8/README.md
 [spec-pin]: https://github.com/agentclientprotocol/agent-client-protocol/tree/e2d83349bc9e28a4059ea3acefa1c91c966f74e2
-[sdk-pin]: https://github.com/agentclientprotocol/rust-sdk/tree/4f82aef0e7559a50c2b95aff4f7ba60af10d9e04
-[sdk-v2]: https://github.com/agentclientprotocol/rust-sdk/blob/4f82aef0e7559a50c2b95aff4f7ba60af10d9e04/md/protocol-v2.md
-[sdk-http]: https://github.com/agentclientprotocol/rust-sdk/blob/4f82aef0e7559a50c2b95aff4f7ba60af10d9e04/md/http-transport.md
+[sdk-pin]: https://github.com/agentclientprotocol/rust-sdk/tree/305aefda6fbe88be6ae8b9088003e383f909b135
+[sdk-v2]: https://github.com/agentclientprotocol/rust-sdk/blob/305aefda6fbe88be6ae8b9088003e383f909b135/md/protocol-v2.md
+[sdk-http]: https://github.com/agentclientprotocol/rust-sdk/blob/305aefda6fbe88be6ae8b9088003e383f909b135/md/http-transport.md
+[draft-pin]: https://github.com/agentclientprotocol/agent-client-protocol/tree/1c0fe8dd680aa6de119b2136a7e5495075baf257
+[draft-comparison]: https://github.com/agentclientprotocol/agent-client-protocol/compare/e2d83349bc9e28a4059ea3acefa1c91c966f74e2...1c0fe8dd680aa6de119b2136a7e5495075baf257
+[draft-init]: https://github.com/agentclientprotocol/agent-client-protocol/blob/1c0fe8dd680aa6de119b2136a7e5495075baf257/docs/protocol/v2/initialization.mdx
+[draft-commands]: https://github.com/agentclientprotocol/agent-client-protocol/blob/1c0fe8dd680aa6de119b2136a7e5495075baf257/docs/protocol/v2/slash-commands.mdx
+[draft-unstable]: https://github.com/agentclientprotocol/agent-client-protocol/blob/1c0fe8dd680aa6de119b2136a7e5495075baf257/schema/v2/schema.unstable.json
+[draft-setup]: https://github.com/agentclientprotocol/agent-client-protocol/blob/1c0fe8dd680aa6de119b2136a7e5495075baf257/docs/protocol/v2/session-setup.mdx
+[draft-config]: https://github.com/agentclientprotocol/agent-client-protocol/blob/1c0fe8dd680aa6de119b2136a7e5495075baf257/docs/protocol/v2/session-config-options.mdx
+[draft-list]: https://github.com/agentclientprotocol/agent-client-protocol/blob/1c0fe8dd680aa6de119b2136a7e5495075baf257/docs/protocol/v2/session-list.mdx
+[draft-tools]: https://github.com/agentclientprotocol/agent-client-protocol/blob/1c0fe8dd680aa6de119b2136a7e5495075baf257/docs/protocol/v2/tool-calls.mdx
 [v1-methods]: https://github.com/agentclientprotocol/agent-client-protocol/blob/e2d83349bc9e28a4059ea3acefa1c91c966f74e2/schema/v1/meta.json
 [v2-methods]: https://github.com/agentclientprotocol/agent-client-protocol/blob/e2d83349bc9e28a4059ea3acefa1c91c966f74e2/schema/v2/meta.json
 [v1-schema]: https://github.com/agentclientprotocol/agent-client-protocol/blob/e2d83349bc9e28a4059ea3acefa1c91c966f74e2/schema/v1/schema.json
@@ -1310,23 +1360,23 @@ Unsupported workflows:
 [v2-ext]: https://github.com/agentclientprotocol/agent-client-protocol/blob/e2d83349bc9e28a4059ea3acefa1c91c966f74e2/docs/protocol/v2/extensibility.mdx
 [v1-transports]: https://github.com/agentclientprotocol/agent-client-protocol/blob/e2d83349bc9e28a4059ea3acefa1c91c966f74e2/docs/protocol/v1/transports.mdx
 [v2-transports]: https://github.com/agentclientprotocol/agent-client-protocol/blob/e2d83349bc9e28a4059ea3acefa1c91c966f74e2/docs/protocol/v2/transports.mdx
-[manifest]: https://github.com/noirbizarre/hive/blob/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9/Cargo.toml
-[daemon]: https://github.com/noirbizarre/hive/blob/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9/crates/hive-daemon/src/lib.rs
-[transcript]: https://github.com/noirbizarre/hive/blob/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9/crates/hive-daemon/src/transcript.rs
-[plans]: https://github.com/noirbizarre/hive/blob/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9/crates/hive-daemon/src/plans.rs
-[activity]: https://github.com/noirbizarre/hive/blob/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9/crates/hive-daemon/src/activity.rs
-[interactions]: https://github.com/noirbizarre/hive/blob/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9/crates/hive-daemon/src/interactions.rs
-[config]: https://github.com/noirbizarre/hive/blob/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9/crates/hive-daemon/src/session_config.rs
-[journal]: https://github.com/noirbizarre/hive/blob/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9/crates/hive-daemon/src/prompt_journal.rs
-[persistence]: https://github.com/noirbizarre/hive/blob/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9/crates/hive-daemon/src/persistence.rs
-[gateway-tests]: https://github.com/noirbizarre/hive/blob/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9/crates/hive-daemon/tests/gateway.rs
-[compat-tests]: https://github.com/noirbizarre/hive/blob/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9/crates/hive-daemon/tests/compat.rs
-[tui-state]: https://github.com/noirbizarre/hive/blob/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9/crates/hive-tui/src/state.rs
-[tui-ui]: https://github.com/noirbizarre/hive/blob/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9/crates/hive-tui/src/ui.rs
-[tui-transcript]: https://github.com/noirbizarre/hive/blob/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9/crates/hive-tui/src/transcript.rs
-[tui-interactions]: https://github.com/noirbizarre/hive/blob/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9/crates/hive-tui/src/interaction_tests.rs
-[web-client]: https://github.com/noirbizarre/hive/blob/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9/clients/hive-web/src/client.js
-[web-ui]: https://github.com/noirbizarre/hive/blob/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9/clients/hive-web/src/App.vue
-[web-tests]: https://github.com/noirbizarre/hive/blob/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9/clients/hive-web/app.test.js
-[web-component-tests]: https://github.com/noirbizarre/hive/blob/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9/clients/hive-web/src/App.test.js
-[web-markdown-tests]: https://github.com/noirbizarre/hive/blob/a3bd217d4dfd1b1d32281ca73300aefd2c8584a9/clients/hive-web/src/MarkdownMessage.test.js
+[manifest]: https://github.com/noirbizarre/hive/blob/f9e6a4108b8ca885a0f58dbccd9e4dd92e5ccc17/Cargo.toml
+[daemon]: https://github.com/noirbizarre/hive/blob/f9e6a4108b8ca885a0f58dbccd9e4dd92e5ccc17/crates/hive-daemon/src/lib.rs
+[transcript]: https://github.com/noirbizarre/hive/blob/f9e6a4108b8ca885a0f58dbccd9e4dd92e5ccc17/crates/hive-daemon/src/transcript.rs
+[plans]: https://github.com/noirbizarre/hive/blob/f9e6a4108b8ca885a0f58dbccd9e4dd92e5ccc17/crates/hive-daemon/src/plans.rs
+[activity]: https://github.com/noirbizarre/hive/blob/f9e6a4108b8ca885a0f58dbccd9e4dd92e5ccc17/crates/hive-daemon/src/activity.rs
+[interactions]: https://github.com/noirbizarre/hive/blob/f9e6a4108b8ca885a0f58dbccd9e4dd92e5ccc17/crates/hive-daemon/src/interactions.rs
+[config]: https://github.com/noirbizarre/hive/blob/f9e6a4108b8ca885a0f58dbccd9e4dd92e5ccc17/crates/hive-daemon/src/session_config.rs
+[journal]: https://github.com/noirbizarre/hive/blob/f9e6a4108b8ca885a0f58dbccd9e4dd92e5ccc17/crates/hive-daemon/src/prompt_journal.rs
+[persistence]: https://github.com/noirbizarre/hive/blob/f9e6a4108b8ca885a0f58dbccd9e4dd92e5ccc17/crates/hive-daemon/src/persistence.rs
+[gateway-tests]: https://github.com/noirbizarre/hive/blob/f9e6a4108b8ca885a0f58dbccd9e4dd92e5ccc17/crates/hive-daemon/tests/gateway.rs
+[compat-tests]: https://github.com/noirbizarre/hive/blob/f9e6a4108b8ca885a0f58dbccd9e4dd92e5ccc17/crates/hive-daemon/tests/compat.rs
+[tui-state]: https://github.com/noirbizarre/hive/blob/f9e6a4108b8ca885a0f58dbccd9e4dd92e5ccc17/crates/hive-tui/src/state.rs
+[tui-ui]: https://github.com/noirbizarre/hive/blob/f9e6a4108b8ca885a0f58dbccd9e4dd92e5ccc17/crates/hive-tui/src/ui.rs
+[tui-transcript]: https://github.com/noirbizarre/hive/blob/f9e6a4108b8ca885a0f58dbccd9e4dd92e5ccc17/crates/hive-tui/src/transcript.rs
+[tui-interactions]: https://github.com/noirbizarre/hive/blob/f9e6a4108b8ca885a0f58dbccd9e4dd92e5ccc17/crates/hive-tui/src/interaction_tests.rs
+[web-client]: https://github.com/noirbizarre/hive/blob/f9e6a4108b8ca885a0f58dbccd9e4dd92e5ccc17/clients/hive-web/src/client.js
+[web-ui]: https://github.com/noirbizarre/hive/blob/f9e6a4108b8ca885a0f58dbccd9e4dd92e5ccc17/clients/hive-web/src/App.vue
+[web-tests]: https://github.com/noirbizarre/hive/blob/f9e6a4108b8ca885a0f58dbccd9e4dd92e5ccc17/clients/hive-web/app.test.js
+[web-component-tests]: https://github.com/noirbizarre/hive/blob/f9e6a4108b8ca885a0f58dbccd9e4dd92e5ccc17/clients/hive-web/src/App.test.js
+[web-markdown-tests]: https://github.com/noirbizarre/hive/blob/f9e6a4108b8ca885a0f58dbccd9e4dd92e5ccc17/clients/hive-web/src/MarkdownMessage.test.js

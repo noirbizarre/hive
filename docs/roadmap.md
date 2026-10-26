@@ -2,7 +2,7 @@
 
 This page describes the implementation in this checkout as of 2026-10-24.
 It does not assert the current state of linked issues or a published release.
-The [compatibility matrices](acp-compatibility.md) distinguish deterministic
+The [compatibility matrices](compatibility.md) distinguish deterministic
 coverage from retained real-agent evidence.
 
 ## Implemented foundation

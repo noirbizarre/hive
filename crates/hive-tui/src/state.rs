@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use agent_client_protocol::schema::v2;
+use agent_client_protocol::schema::{MaybeUndefined, v2};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LineKind {
@@ -203,6 +203,17 @@ impl Conversation {
         line.revision += 1;
     }
 
+    fn message(
+        &mut self,
+        key: String,
+        kind: LineKind,
+        content: &MaybeUndefined<Vec<v2::ContentBlock>>,
+    ) {
+        let text = message_content(content);
+        // Even metadata-only first appearances reserve their position in daemon snapshots.
+        self.upsert(key, kind, text.as_deref().unwrap_or(""), text.is_some());
+    }
+
     pub fn apply(&mut self, notification: v2::UpdateSessionNotification) -> bool {
         let snapshot = notification
             .meta
@@ -279,14 +290,11 @@ impl Conversation {
                 {
                     self.active_thought = None;
                 }
-                if let Some(text) = message_content(&message.content) {
-                    self.upsert(
-                        format!("thought:{}", message.message_id),
-                        LineKind::Thought,
-                        &text,
-                        true,
-                    );
-                }
+                self.message(
+                    format!("thought:{}", message.message_id),
+                    LineKind::Thought,
+                    &message.content,
+                );
             }
             v2::SessionUpdate::UserMessageChunk(chunk) => self.upsert(
                 format!("user:{}", chunk.message_id),
@@ -296,24 +304,18 @@ impl Conversation {
             ),
             v2::SessionUpdate::AgentMessage(message) => {
                 self.active_thought = None;
-                if let Some(text) = message_content(&message.content) {
-                    self.upsert(
-                        format!("agent:{}", message.message_id),
-                        LineKind::Agent,
-                        &text,
-                        true,
-                    );
-                }
+                self.message(
+                    format!("agent:{}", message.message_id),
+                    LineKind::Agent,
+                    &message.content,
+                );
             }
             v2::SessionUpdate::UserMessage(message) => {
-                if let Some(text) = message_content(&message.content) {
-                    self.upsert(
-                        format!("user:{}", message.message_id),
-                        LineKind::User,
-                        &text,
-                        true,
-                    );
-                }
+                self.message(
+                    format!("user:{}", message.message_id),
+                    LineKind::User,
+                    &message.content,
+                );
             }
             v2::SessionUpdate::ToolCallUpdate(tool) => {
                 self.active_thought = None;
@@ -431,16 +433,19 @@ fn content_text(block: &v2::ContentBlock) -> String {
     }
 }
 
-fn message_content<T: serde::Serialize>(content: &T) -> Option<String> {
-    let value = serde_json::to_value(content).ok()?;
-    let blocks = value.as_array()?;
-    Some(
-        blocks
-            .iter()
-            .map(|block| block["text"].as_str().unwrap_or("[content]"))
-            .collect::<Vec<_>>()
-            .join("\n"),
-    )
+fn message_content(content: &MaybeUndefined<Vec<v2::ContentBlock>>) -> Option<String> {
+    // Serialization collapses undefined and null, losing the distinction between preserve and clear.
+    match content {
+        MaybeUndefined::Undefined => None,
+        MaybeUndefined::Null => Some(String::new()),
+        MaybeUndefined::Value(blocks) => Some(
+            blocks
+                .iter()
+                .map(content_text)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -452,6 +457,102 @@ mod tests {
         let mut meta = v2::Meta::new();
         meta.insert("hive".into(), serde_json::json!({"seq": seq}));
         v2::UpdateSessionNotification::new(v2::SessionId::new("hive-test"), update).meta(meta)
+    }
+
+    #[test]
+    fn message_patches_preserve_omissions_clear_null_and_match_restored_snapshots() {
+        use serde_json::json;
+
+        for (kind, label) in [
+            ("user_message", "You"),
+            ("agent_message", "Agent"),
+            ("agent_thought", "Thinking"),
+        ] {
+            let mut conversation = Conversation::default();
+            let mut seq = 0;
+            let mut apply = |conversation: &mut Conversation, value| {
+                seq += 1;
+                assert!(conversation.apply(event(seq, serde_json::from_value(value).unwrap())));
+            };
+            apply(
+                &mut conversation,
+                json!({"sessionUpdate":kind,"messageId":"same"}),
+            );
+            apply(
+                &mut conversation,
+                json!({"sessionUpdate":"user_message","messageId":"other","content":[{"type":"text","text":"next"}]}),
+            );
+            let chunk = |text| json!({"sessionUpdate":format!("{kind}_chunk"),"messageId":"same","content":{"type":"text","text":text}});
+            apply(&mut conversation, chunk("draft"));
+            apply(
+                &mut conversation,
+                json!({"sessionUpdate":kind,"messageId":"same","_meta":{"reviewed":true}}),
+            );
+            assert_eq!(conversation.lines[0].text, format!("{label}: draft"));
+            let revision = conversation.lines[0].revision;
+            apply(
+                &mut conversation,
+                json!({"sessionUpdate":kind,"messageId":"same","content":null}),
+            );
+            assert_eq!(conversation.lines[0].text, format!("{label}: "));
+            assert!(conversation.lines[0].revision > revision);
+            apply(
+                &mut conversation,
+                json!({"sessionUpdate":kind,"messageId":"same"}),
+            );
+            assert_eq!(conversation.lines[0].text, format!("{label}: "));
+            apply(
+                &mut conversation,
+                json!({"sessionUpdate":kind,"messageId":"same","content":[{"type":"text","text":"final"}]}),
+            );
+            apply(&mut conversation, chunk("!"));
+            assert_eq!(conversation.lines.len(), 2);
+            assert_eq!(conversation.lines[0].text, format!("{label}: final!"));
+            assert_eq!(conversation.lines[1].text, "You: next");
+
+            let mut restored = Conversation::default();
+            restored.begin_transcript(conversation.seq);
+            for value in [
+                json!({"sessionUpdate":kind,"messageId":"same","content":[{"type":"text","text":"final!"}]}),
+                json!({"sessionUpdate":"user_message","messageId":"other","content":[{"type":"text","text":"next"}]}),
+            ] {
+                let mut notification =
+                    event(conversation.seq, serde_json::from_value(value).unwrap());
+                notification.meta.as_mut().unwrap().get_mut("hive").unwrap()["snapshot"] =
+                    true.into();
+                assert!(restored.apply(notification));
+            }
+            let later = event(
+                conversation.seq + 1,
+                serde_json::from_value(chunk("?")).unwrap(),
+            );
+            for client in [&mut conversation, &mut restored] {
+                assert!(client.apply(later.clone()));
+                assert!(!client.apply(later.clone()));
+            }
+            assert_eq!(
+                conversation
+                    .lines
+                    .iter()
+                    .map(|line| &line.text)
+                    .collect::<Vec<_>>(),
+                restored
+                    .lines
+                    .iter()
+                    .map(|line| &line.text)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(conversation.active_thought, restored.active_thought);
+            let clear = event(
+                conversation.seq + 1,
+                serde_json::from_value(
+                    json!({"sessionUpdate":kind,"messageId":"same","content":[]}),
+                )
+                .unwrap(),
+            );
+            conversation.apply(clear);
+            assert_eq!(conversation.lines[0].text, format!("{label}: "));
+        }
     }
 
     #[test]

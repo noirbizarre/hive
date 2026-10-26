@@ -339,6 +339,34 @@ mod tests {
     }
 
     #[test]
+    fn tool_clears_survive_metadata_patches_and_chunks_restart_canonical_content() {
+        let mut transcript = Transcript::default();
+        for fields in [
+            json!({"title":"Read","rawInput":{"path":"file"},"rawOutput":"fallback","content":[{"type":"content","content":{"type":"text","text":"old"}}]}),
+            json!({"title":null,"rawInput":null,"rawOutput":null,"content":null}),
+            json!({"status":"completed"}),
+        ] {
+            let mut value = json!({"sessionUpdate":"tool_call_update","toolCallId":"call"});
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            ingest(&mut transcript, value);
+        }
+        let updates = serde_json::to_value(transcript.updates().unwrap()).unwrap();
+        for field in ["title", "rawInput", "rawOutput", "content"] {
+            assert!(updates[0][field].is_null());
+        }
+        ingest(
+            &mut transcript,
+            json!({"sessionUpdate":"tool_call_content_chunk","toolCallId":"call","content":{"type":"content","content":{"type":"text","text":"new"}}}),
+        );
+        let updates = serde_json::to_value(transcript.updates().unwrap()).unwrap();
+        assert_eq!(updates[0]["content"][0]["content"]["text"], "new");
+        assert!(updates[0]["rawOutput"].is_null());
+    }
+
+    #[test]
     fn historical_tool_patches_retain_fields_and_append_content_without_an_execution_path() {
         let mut transcript = Transcript::default();
         for update in [

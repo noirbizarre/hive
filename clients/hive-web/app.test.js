@@ -512,6 +512,97 @@ test('failed snapshot attachments discard staged messages and failures before ex
   client.close();
 });
 
+for (const [kind, speaker] of [['user_message', 'user'], ['agent_message', 'agent'], ['agent_thought', 'thought']]) {
+  test(`${kind} patches preserve omissions and clear null before replacements and later chunks`, () => {
+    const view = conversation();
+    let seq = 0;
+    const apply = fields => view.apply(update(++seq, { sessionUpdate: kind, messageId: 'same', ...fields }).params);
+    apply({});
+    view.apply(update(++seq, { sessionUpdate: 'user_message', messageId: 'other', content: [{ type: 'text', text: 'next' }] }).params);
+    const chunk = text => ({ sessionUpdate: `${kind}_chunk`, messageId: 'same', content: { type: 'text', text } });
+    view.apply(update(++seq, chunk('draft')).params);
+    apply({ _meta: { reviewed: true } });
+    assert.equal(view.lines[0].text, 'draft');
+    apply({ content: null });
+    assert.equal(view.lines[0].text, '');
+    apply({});
+    assert.equal(view.lines[0].text, '');
+    apply({ content: [{ type: 'text', text: 'final' }] });
+    view.apply(update(++seq, chunk('!')).params);
+    assert.equal(view.lines[0].text, 'final!');
+    assert.equal(view.lines[0].kind, speaker);
+    assert.equal(view.lines[1].text, 'next');
+    const restored = conversation();
+    restored.restore([
+      update(seq, { sessionUpdate: kind, messageId: 'same', content: [{ type: 'text', text: 'final!' }] }).params,
+      update(seq, { sessionUpdate: 'user_message', messageId: 'other', content: [{ type: 'text', text: 'next' }] }).params,
+    ], seq);
+    // Whole-message upserts end live thinking before comparison with inactive snapshots.
+    apply({});
+    restored.apply(update(seq, { sessionUpdate: kind, messageId: 'same' }).params);
+    assert.deepEqual(restored.lines, view.lines);
+    const later = update(++seq, chunk('?')).params;
+    for (const client of [view, restored]) {
+      assert.equal(client.apply(later), true);
+      assert.equal(client.apply(later), false);
+    }
+    assert.deepEqual(restored.lines, view.lines);
+    apply({ content: [] });
+    assert.equal(view.lines[0].text, '');
+  });
+}
+
+test('message speaker namespaces keep identical ids independent', () => {
+  const view = conversation();
+  ['user_message', 'agent_message', 'agent_thought'].forEach((kind, index) => {
+    view.apply(update(index + 1, { sessionUpdate: kind, messageId: 'same', content: [{ type: 'text', text: kind }] }).params);
+  });
+  assert.deepEqual(view.lines.map(line => line.text), ['user_message', 'agent_message', 'agent_thought']);
+});
+
+for (const wrapped of [false, true]) {
+  test(`${wrapped ? 'translated v1' : 'native v2'} tools clear fields without resurrecting output on patches or restore`, () => {
+    const view = conversation();
+    let seq = 0;
+    const state = { toolCallId: 'call' };
+    const notification = tool => wrapped ? { sessionUpdate: '_hive_v1_tool_update', tool } : { sessionUpdate: 'tool_call_update', ...tool };
+    const patch = fields => {
+      Object.assign(state, fields);
+      view.apply(update(++seq, notification({ toolCallId: 'call', ...fields })).params);
+      const restored = conversation();
+      restored.restore([update(seq, notification(state)).params], seq);
+      assert.deepEqual(restored.lines, view.lines);
+      return restored;
+    };
+    patch({ title: 'Read', status: 'in_progress', rawInput: { path: 'file' }, rawOutput: 'fallback' });
+    const content = [{ type: 'content', content: { type: 'text', text: 'structured' } }];
+    patch({ content });
+    patch({ status: 'completed' });
+    assert.equal(view.lines[0].text, 'structured');
+    patch({ title: null, status: null, rawInput: null, content: null });
+    assert.deepEqual(view.lines, [{ kind: 'tool', text: 'fallback', title: 'Tool activity', status: 'unknown' }]);
+    patch({ content: [] });
+    assert.equal(view.lines[0].text, 'fallback');
+    patch({ rawOutput: null });
+    patch({ status: 'completed' });
+    assert.equal(view.lines[0].text, '');
+    patch({ content });
+    assert.equal(view.lines[0].text, 'structured');
+    const restored = patch({ content: null });
+    if (!wrapped) {
+      const chunk = update(++seq, { sessionUpdate: 'tool_call_content_chunk', toolCallId: 'call', content: content[0] }).params;
+      view.apply(chunk);
+      restored.apply(chunk);
+      assert.deepEqual(restored.lines, view.lines);
+      assert.equal(view.lines[0].text, 'structured');
+    }
+    view.restore([update(seq, notification({ toolCallId: 'call' })).params], seq);
+    view.apply(update(++seq, notification({ toolCallId: 'call', status: 'completed' })).params);
+    assert.equal(view.lines[0].text, '');
+    assert.equal(view.lines[0].title, 'Tool activity');
+  });
+}
+
 test('tool status patches preserve readable output and the original title', () => {
   const view = conversation();
   view.apply(update(1, { sessionUpdate: 'tool_call_update', toolCallId: 'call', title: 'Check files', status: 'in_progress', rawInput: { command: 'ls' } }).params);

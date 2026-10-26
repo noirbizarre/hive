@@ -1,6 +1,7 @@
 """Drive the instrumented TUI test binary through its real terminal and ACP event loop."""
 
 import errno
+import faulthandler
 import fcntl
 import json
 import os
@@ -55,6 +56,9 @@ def main():
                 env["HIVE_RUNTIME_CREATE"] = "1"
             os.execve(sys.argv[1], [sys.argv[1], "terminal_tests::runtime_fixture", "--ignored", "--exact", "--nocapture"], env)
         fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
+        os.set_blocking(master, False)
+        # A stalled kernel/HTTP call must leave a useful trace before the outer test timeout.
+        faulthandler.dump_traceback_later(45, exit=True)
         original = settings(master)
         output = bytearray()
         screen = Screen()
@@ -69,7 +73,7 @@ def main():
             try:
                 chunk = os.read(master, 65536)
             except OSError as error:
-                if error.errno == errno.EIO:
+                if error.errno in (errno.EIO, errno.EAGAIN, errno.EWOULDBLOCK):
                     return
                 raise
             output.extend(chunk)
@@ -101,6 +105,7 @@ def main():
             os.write(master, value)
 
         try:
+            print(f"PTY scenario: {sys.argv[2]}", file=sys.stderr, flush=True)
             wait(lambda: address is not None)
             if create:
                 wait(lambda: screen.contains("fixture"))
@@ -114,6 +119,7 @@ def main():
             wait(ready.exists)
             assert ready.read_text() == "abz\npasted", ready.read_text()
             assert not state()["prompts"]
+            print("PTY: first editor owns the terminal", file=sys.stderr, flush=True)
             action("update")
             action("permission")
             assert state()["permissions"] == 0
@@ -121,6 +127,7 @@ def main():
             wait(lambda: screen.contains("PTY approval"))
             send(b"1\r")
             wait(lambda: state()["permissions"] == 1)
+            print("PTY: queued permission answered", file=sys.stderr, flush=True)
             assert not state()["prompts"]
 
             ready.unlink()
@@ -137,6 +144,7 @@ def main():
             send(b"\r")
             wait(lambda: len(state()["prompts"]) == 1)
             assert state()["prompts"][0] == [{"type": "text", "text": "from editor\nsecond"}]
+            print("PTY: editor failure and clipboard preserved draft", file=sys.stderr, flush=True)
 
             send(b"\x10\x1b[B\r")
             wait(lambda: state()["configurations"] == 1)
@@ -153,6 +161,7 @@ def main():
             # Less than the HTTP timeout: progress must happen before a stalled refresh can fail.
             wait(ready.exists, timeout=4)
             assert ready.read_text() == "responsive", "catalog fetch blocked prompt editing"
+            print("PTY: editing progressed during stalled catalog", file=sys.stderr, flush=True)
             release.touch()
             wait(lambda: output.count(b"\x1b[?1049h") >= 4)
             send(b"\x01\x1b[3~")
@@ -166,6 +175,7 @@ def main():
             resumes = state()["resumes"]
             action("gap")
             wait(lambda: state()["resumes"] > resumes)
+            print("PTY: replay gap recovered", file=sys.stderr, flush=True)
             wait(lambda: screen.contains("Message"))
             send(b"\x1b[200~survives handoff\x1b[201~")
             # Global session/control keys must remain usable without consuming the editable draft.
@@ -173,6 +183,7 @@ def main():
                 resumes = state()["resumes"]
                 send(keys)
                 wait(lambda: state()["resumes"] >= resumes + count)
+            print("PTY: control transitions preserved draft", file=sys.stderr, flush=True)
             send(b"\t")
             wait(lambda: screen.contains("Sessions"))
             resumes = state()["resumes"]
@@ -186,6 +197,7 @@ def main():
             send(b"\x18\x05")
             wait(ready.exists)
             assert ready.read_text() == "survives handoff"
+            print("PTY: session navigation preserved draft", file=sys.stderr, flush=True)
             wait(lambda: output.count(b"\x1b[?1049h") >= 5)
             send(b"\x11")
             deadline = time.monotonic() + 20
@@ -207,6 +219,7 @@ def main():
                 os.killpg(pid, signal.SIGKILL)
                 os.waitpid(pid, 0)
             os.close(master)
+            faulthandler.cancel_dump_traceback_later()
 
 
 if __name__ == "__main__":

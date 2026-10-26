@@ -1976,7 +1976,7 @@ fn forward_locked(
         state.history_status.completeness,
         state.history_status.warnings.len(),
     );
-    state.transcript.ingest(&update)?;
+    let failure = state.transcript.ingest(&update)?;
     if let v2::SessionUpdate::PlanUpdate(plan) = &update {
         state.plans.ingest(plan);
         if state.hydrating {
@@ -1988,6 +1988,10 @@ fn forward_locked(
         state.history_status.partial(WarningCode::ProjectionLimited);
     }
     if state.hydrating {
+        if let Some(failure) = failure {
+            // Restored diagnostics belong to history without allocating live cursors or usage.
+            state.transcript.ingest(&failure)?;
+        }
         // Resume's final state describes current execution; historical usage never enters the ledger.
         match &update {
             v2::SessionUpdate::StateUpdate(status) => {
@@ -2113,7 +2117,24 @@ fn forward_locked(
     {
         forward_locked(state, id, None)?;
     }
+    if let Some(failure) = failure {
+        // Publish through the normal sequenced path so incremental and start replay agree.
+        forward_locked(state, id, Some(failure))?;
+    }
     Ok(())
+}
+
+fn v1_stop_reason(reason: agent_client_protocol::schema::v1::StopReason) -> v2::StopReason {
+    use agent_client_protocol::schema::v1::StopReason;
+    match reason {
+        StopReason::EndTurn => v2::StopReason::EndTurn,
+        StopReason::MaxTokens => v2::StopReason::MaxTokens,
+        StopReason::MaxTurnRequests => v2::StopReason::MaxTurnRequests,
+        StopReason::Refusal => v2::StopReason::Refusal,
+        StopReason::Cancelled => v2::StopReason::Cancelled,
+        // Future SDK variants must not be silently reported as successful completion.
+        _ => v2::StopReason::Other(v2::OtherStopReason::new("_v1_stop", Default::default())),
+    }
 }
 
 fn selected_model(options: &[v2::SessionConfigOption]) -> Option<String> {
@@ -2850,13 +2871,7 @@ async fn run_v1_agent(
                             }
                         };
                         let (stop, tokens) = match result {
-                            Ok(response) => (match response.stop_reason {
-                                v1::StopReason::EndTurn => v2::StopReason::EndTurn,
-                                _ => v2::StopReason::Other(v2::OtherStopReason::new(
-                                    "_v1_stop",
-                                    Default::default(),
-                                )),
-                            }, response.usage),
+                            Ok(response) => (v1_stop_reason(response.stop_reason), response.usage),
                             Err(error) => {
                                 tracing::warn!(code = ?error.code, "v1 prompt failed");
                                 // Admission already succeeded: a replayable event carries late failure, not a second RPC response.
@@ -3677,6 +3692,101 @@ mod control_tests {
             configuring: false,
             external_activity: false,
             native: None,
+        }
+    }
+
+    #[test]
+    fn every_known_v1_stop_reason_keeps_its_v2_meaning() {
+        use agent_client_protocol::schema::v1::StopReason;
+        for (reason, expected) in [
+            (StopReason::EndTurn, "end_turn"),
+            (StopReason::MaxTokens, "max_tokens"),
+            (StopReason::MaxTurnRequests, "max_turn_requests"),
+            (StopReason::Refusal, "refusal"),
+            (StopReason::Cancelled, "cancelled"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(v1_stop_reason(reason)).unwrap()["stopReason"],
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn native_failures_are_safe_replayable_context_without_repeated_completions() {
+        let mut state = detached();
+        let id = v2::SessionId::new("failure");
+        let active = |kind| {
+            serde_json::from_value(serde_json::json!({"sessionUpdate":"state_update","state":kind}))
+                .unwrap()
+        };
+        let failure: v2::SessionUpdate = serde_json::from_value(serde_json::json!({
+            "sessionUpdate":"state_update", "state":"idle", "stopReason":"error",
+            "error":{"code":-32603,"message":"secret-message", "data":"secret-data"},
+            "_meta":{"private":"secret-metadata"}
+        }))
+        .unwrap();
+        forward_locked(&mut state, &id, Some(active("requires_action"))).unwrap();
+        forward_locked(&mut state, &id, Some(failure.clone())).unwrap();
+        assert!(!state.running);
+        forward_locked(&mut state, &id, Some(failure.clone())).unwrap();
+        let history = serde_json::to_value(state.transcript.updates().unwrap()).unwrap();
+        assert_eq!(history.as_array().unwrap().len(), 1);
+        assert_eq!(history[0]["code"], "hive::agent::foreground_failed");
+        assert!(!history.to_string().contains("secret-"));
+        let companions = state
+            .events
+            .iter()
+            .filter(|(_, update)| {
+                matches!(update,
+            v2::SessionUpdate::Other(other) if other.session_update == "_hive_error")
+            })
+            .count();
+        assert_eq!(companions, 1);
+        // A new interval with identical details is a separate failure, even across blocked states.
+        forward_locked(&mut state, &id, Some(active("running"))).unwrap();
+        forward_locked(&mut state, &id, Some(active("requires_action"))).unwrap();
+        forward_locked(&mut state, &id, Some(failure)).unwrap();
+        for _ in 0..270 {
+            forward_locked(
+                &mut state,
+                &id,
+                Some(v2::SessionUpdate::Other(v2::OtherSessionUpdate::new(
+                    "_padding",
+                    Default::default(),
+                ))),
+            )
+            .unwrap();
+        }
+        assert_eq!(state.transcript.updates().unwrap().len(), 2);
+        assert!(!state.events.iter().any(|(_, update)| matches!(update,
+            v2::SessionUpdate::Other(other) if other.session_update == "_hive_error")));
+        assert!(state.usage.turns.is_empty());
+    }
+
+    #[test]
+    fn restored_native_failures_do_not_publish_or_acknowledge_interrupted_work() {
+        let mut state = detached();
+        state.hydrating = true;
+        state.active_turn = Some("interrupted".into());
+        let id = v2::SessionId::new("failure");
+        for details in [
+            serde_json::json!(null),
+            serde_json::json!({"bad":"sk-must-not-leak"}),
+            serde_json::json!({"code":-32603,"message":"This API key has expired. sk-must-not-leak"}),
+        ] {
+            state.transcript = transcript::Transcript::default();
+            let idle = serde_json::from_value(serde_json::json!({"sessionUpdate":"state_update",
+                "state":"idle", "stopReason":"error", "error":details}))
+            .unwrap();
+            forward_locked(&mut state, &id, Some(idle)).unwrap();
+            let history = serde_json::to_value(state.transcript.updates().unwrap()).unwrap();
+            assert_eq!(history.as_array().unwrap().len(), 1);
+            assert!(!history.to_string().contains("sk-must-not-leak"));
+            assert!(state.events.is_empty());
+            assert_eq!(state.next_seq, 1);
+            assert!(state.usage.turns.is_empty());
+            assert_eq!(state.active_turn.as_deref(), Some("interrupted"));
         }
     }
 

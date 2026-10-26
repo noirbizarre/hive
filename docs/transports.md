@@ -27,6 +27,13 @@ These are separate guarantees:
   use a separate transcript snapshot, rebuilt from agent-retained history after
   restart. Hive does not durably archive conversation payloads.
 
+Controlled native fatal-error entries participate in both incremental replay
+and full transcript snapshots. They remain visible after ring eviction while
+the daemon stays alive. Historical failures do not replay state transitions or
+override current foreground activity. Repeated idle/error snapshots add no
+duplicate failures. After restart, failure history depends on what the agent
+replays; a last-reported error snapshot alone does not establish complete history.
+
 The separate `/v1/sessions/events` SSE feed announces catalog revision
 changes only. Clients re-list sessions rather than replaying this feed.
 

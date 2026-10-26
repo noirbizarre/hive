@@ -564,6 +564,195 @@ async fn legacy_modes_use_the_native_setter_and_reconcile_acknowledgements_and_o
 }
 
 #[tokio::test]
+async fn stop_reasons_and_native_failures_survive_the_gateway_and_replay() {
+    for version in [AgentVersion::V1, AgentVersion::V2] {
+        let command = format!(
+            "{}{}",
+            env!("CARGO_BIN_EXE_hive-test-agent"),
+            if version == AgentVersion::V1 {
+                " v1"
+            } else {
+                ""
+            }
+        );
+        let (address, server) = start_gateway(config_with_agent("mock", &command, version)).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let boundary_tx = tx.clone();
+        timeout(
+            Duration::from_secs(15),
+            Client
+                .v2()
+                .on_receive_notification(
+                    async move |update: v2::UpdateSessionNotification, _: V2ConnectionTo<Agent>| {
+                        tx.send(Some(update)).map_err(Error::into_internal_error)
+                    },
+                    agent_client_protocol::on_receive_notification!(),
+                )
+                .connect_with(
+                    HttpClient::new(format!("ws://{address}")).unwrap(),
+                    async move |cx| {
+                        cx.send_request(v2::InitializeRequest::new(
+                            ProtocolVersion::V2,
+                            v2::Implementation::new("stop-test", "1"),
+                        ))
+                        .block_task()
+                        .await?;
+                        let cwd = std::env::current_dir().map_err(Error::into_internal_error)?;
+                        let opened = cx
+                            .send_request(v2::NewSessionRequest::new(cwd.clone()))
+                            .block_task()
+                            .await?;
+                        let id = opened.session_id;
+                        if version == AgentVersion::V1 {
+                            for (text, expected) in [
+                                ("plain", "end_turn"),
+                                ("stop-max-tokens", "max_tokens"),
+                                ("stop-max-turn-requests", "max_turn_requests"),
+                                ("stop-refusal", "refusal"),
+                                ("wait-for-cancel", "cancelled"),
+                                ("wait-for-cancel cancel-end-turn", "end_turn"),
+                                ("wait-for-cancel cancel-error", "_v1_error"),
+                            ] {
+                                cx.send_request(
+                                    v2::PromptRequest::new(id.clone(), vec![text.into()])
+                                        .meta(controlled(&opened.meta, text)),
+                                )
+                                .block_task()
+                                .await?;
+                                loop {
+                                    let event = rx
+                                        .recv()
+                                        .await
+                                        .flatten()
+                                        .ok_or_else(Error::internal_error)?;
+                                    let value = serde_json::to_value(&event.update).unwrap();
+                                    assert!(!value.to_string().contains("sk-must-not-leak"));
+                                    if value["sessionUpdate"] == "agent_message_chunk"
+                                        && value["content"]["text"] == "ready-for-cancel"
+                                    {
+                                        cx.send_notification(
+                                            v2::CancelSessionNotification::new(id.clone())
+                                                .meta(opened.meta.clone()),
+                                        )?;
+                                    }
+                                    if value["sessionUpdate"] == "state_update"
+                                        && value["state"] == "idle"
+                                    {
+                                        assert_eq!(value["stopReason"], expected);
+                                        break;
+                                    }
+                                }
+                            }
+                        } else {
+                            cx.send_request(
+                                v2::PromptRequest::new(id.clone(), vec!["native-failure".into()])
+                                    .meta(controlled(&opened.meta, "failure")),
+                            )
+                            .block_task()
+                            .await?;
+                            let mut saw_native = false;
+                            let boundary = loop {
+                                let event = rx
+                                    .recv()
+                                    .await
+                                    .flatten()
+                                    .ok_or_else(Error::internal_error)?;
+                                let value = serde_json::to_value(&event.update).unwrap();
+                                if value["sessionUpdate"] == "state_update"
+                                    && value["state"] == "idle"
+                                {
+                                    saw_native = true;
+                                    assert_eq!(value["stopReason"], "error");
+                                }
+                                if value["sessionUpdate"] == "_hive_error" {
+                                    assert!(saw_native);
+                                    assert_eq!(value["code"], "hive::agent::foreground_failed");
+                                    assert!(!value.to_string().contains("sk-must-not-leak"));
+                                    break event.meta.unwrap()["hive"]["seq"].as_u64().unwrap();
+                                }
+                            };
+                            let (completed, response) = oneshot::channel();
+                            let marker = boundary_tx.clone();
+                            cx.prepare_request(
+                                v2::ResumeSessionRequest::new(id.clone(), cwd.clone()).replay_from(
+                                    v2::ReplayFrom::Other(v2::OtherReplayFrom::new(
+                                        "_hive_seq",
+                                        std::collections::BTreeMap::from([(
+                                            "seq".into(),
+                                            serde_json::json!(boundary),
+                                        )]),
+                                    )),
+                                ),
+                            )
+                            .on_receiving_result(
+                                async move |result| {
+                                    let _ = marker.send(None);
+                                    let _ = completed.send(result);
+                                    Ok(())
+                                },
+                            )?;
+                            response.await.map_err(|_| Error::internal_error())??;
+                            let mut failures = 0;
+                            while let Some(event) =
+                                rx.recv().await.ok_or_else(Error::internal_error)?
+                            {
+                                let value = serde_json::to_value(event.update).unwrap();
+                                if value["sessionUpdate"] == "_hive_error" {
+                                    assert_eq!(event.meta.unwrap()["hive"]["seq"], boundary);
+                                    failures += 1;
+                                }
+                            }
+                            assert_eq!(failures, 1);
+                            let (completed, response) = oneshot::channel();
+                            cx.prepare_request(
+                                v2::ResumeSessionRequest::new(id.clone(), cwd)
+                                    .replay_from(v2::ReplayFrom::Start(v2::ReplayFromStart::new())),
+                            )
+                            .on_receiving_result(
+                                async move |result| {
+                                    // An ordered marker proves the complete snapshot batch has arrived.
+                                    let _ = boundary_tx.send(None);
+                                    let _ = completed.send(result);
+                                    Ok(())
+                                },
+                            )?;
+                            let replay = response.await.map_err(|_| Error::internal_error())??;
+                            let through = replay.meta.unwrap()["hive"]["snapshotThroughSeq"]
+                                .as_u64()
+                                .unwrap();
+                            let mut failures = 0;
+                            // Snapshot delivery precedes the response, and can share its boundary cursor.
+                            while let Some(event) =
+                                rx.recv().await.ok_or_else(Error::internal_error)?
+                            {
+                                if event
+                                    .meta
+                                    .as_ref()
+                                    .is_some_and(|meta| meta["hive"]["snapshot"] == true)
+                                {
+                                    let value = serde_json::to_value(event.update).unwrap();
+                                    assert_ne!(value["sessionUpdate"], "state_update");
+                                    assert!(!value.to_string().contains("sk-must-not-leak"));
+                                    if value["sessionUpdate"] == "_hive_error" {
+                                        failures += 1;
+                                    }
+                                }
+                            }
+                            assert_eq!(failures, 1);
+                            assert!(through >= boundary);
+                        }
+                        Ok::<_, Error>(())
+                    },
+                ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.abort();
+    }
+}
+
+#[tokio::test]
 async fn model_choices_survive_translation_setters_rejection_and_observer_attachment() {
     for version in [AgentVersion::V1, AgentVersion::V2] {
         for transport in ["ws", "http"] {

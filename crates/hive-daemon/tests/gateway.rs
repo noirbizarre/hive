@@ -380,7 +380,20 @@ async fn modes_are_rediscovered_from_the_original_session_after_daemon_restart()
             .len(),
             1
         );
-        std::fs::remove_dir_all(dir).unwrap();
+        // Aborting the listener does not join its detached connection tasks; let them release SQLite handles.
+        timeout(Duration::from_secs(5), async {
+            loop {
+                match std::fs::remove_dir_all(&dir) {
+                    Ok(()) => break,
+                    Err(error) if cfg!(windows) && error.raw_os_error() == Some(32) => {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("cannot remove mode recovery fixture: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("connection tasks must release mode recovery fixture handles");
     }
 }
 

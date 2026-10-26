@@ -41,6 +41,22 @@ the [browser smoke checklist](guides/web.md#browser-smoke-checklist) for visual 
 
 ## Local runtime
 
+For the TUI, `cargo test -p hive-tui` covers editing, selection, clipboard result
+routing, and protocol interactions. On Unix, run
+`python3 crates/hive-tui/tests/terminal.py` from the repository root for the
+opt-in controlling-PTY smoke test. It checks cursor visibility, bracketed paste,
+exclusive editor handoff, and restoration after editor failure without opening
+a desktop clipboard or running an interactive editor.
+
+The ignored native clipboard round-trip test writes the clipboard. Run it on an
+isolated display, for example with Xvfb on Linux:
+
+```sh
+xvfb-run -a env -u WAYLAND_DISPLAY cargo test -p hive-tui \
+  clipboard::tests::a_native_clipboard_worker_retains_ownership_between_copy_and_paste \
+  -- --ignored --exact
+```
+
 Follow [getting started](getting-started.md) for a real-agent or mock session.
 Use [configuration](configuration.md) and [operations](operations.md) for path,
 listener, persistence, and recovery behavior instead of duplicating those rules

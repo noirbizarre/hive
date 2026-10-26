@@ -53,6 +53,7 @@ pub struct App {
     pub profile_list: ListState,
     pub picker: Option<Picker>,
     pub all: bool,
+    pub refresh_requested: bool,
     pub active: Option<String>,
     pub recent: Vec<String>,
     pub cwd: std::path::PathBuf,
@@ -60,6 +61,11 @@ pub struct App {
     pub transcripts: HashMap<String, Transcript>,
     pub owner: Option<v2::Meta>,
     pub input: String,
+    pub editor: crate::editor::PromptEditor,
+    pub draft_editors: HashMap<String, crate::editor::PromptEditor>,
+    pub transcript_focused: bool,
+    // Questions have their own input lifetime; their answers must never become chat drafts.
+    pub suspended_draft: Option<String>,
     pub status: String,
     pub connected: bool,
     pub pending: HashMap<String, (String, String)>,
@@ -153,10 +159,16 @@ impl App {
     pub fn select_session(&mut self, id: String) {
         self.picker = None;
         if let Some(previous) = self.active.take() {
+            self.editor.cancel_drag();
+            self.editor.sync(&self.input);
+            self.draft_editors
+                .insert(previous.clone(), std::mem::take(&mut self.editor));
             self.drafts
                 .insert(previous, std::mem::take(&mut self.input));
         }
         self.input = self.drafts.remove(&id).unwrap_or_default();
+        self.editor = self.draft_editors.remove(&id).unwrap_or_default();
+        self.transcript_focused = false;
         self.recent.retain(|recent| recent != &id);
         self.recent.insert(0, id.clone());
         self.active = Some(id);
@@ -231,7 +243,18 @@ impl App {
                 } else if self.dialog.is_some() {
                     (main.height / 2).max(8).min(main.height.saturating_sub(4))
                 } else {
-                    4
+                    // Grow short drafts without allowing the composer to consume the conversation.
+                    let text = Text::from(
+                        self.input
+                            .split('\n')
+                            .map(|line| Line::from(line.to_owned()))
+                            .collect::<Vec<_>>(),
+                    );
+                    (crate::editor::layout(&text, main.width.saturating_sub(5))
+                        .1
+                        .len() as u16
+                        + 1)
+                    .clamp(4, (main.height / 3).clamp(4, 8))
                 }),
                 Constraint::Length(if compact { 1 } else { 2 }),
             ])
@@ -251,6 +274,9 @@ impl App {
     }
 
     fn render_picker(&mut self, frame: &mut Frame, theme: Theme) {
+        if self.picker.is_none() {
+            return;
+        }
         let choices = self.config_choices();
         // An advertised selector still supports selection when its catalog is empty.
         let supports_selection = self
@@ -526,10 +552,16 @@ impl App {
                 frame,
                 body.inner(area),
             );
+            if let Some(view) = self.transcripts.get_mut(id)
+                && view.selection_invalidated
+            {
+                self.status = "Selected content changed; select it again to copy".into();
+                view.selection_invalidated = false;
+            }
         }
     }
 
-    fn render_composer(&self, frame: &mut Frame, area: Rect, theme: Theme) {
+    fn render_composer(&mut self, frame: &mut Frame, area: Rect, theme: Theme) {
         if let Some(dialog) = &self.dialog {
             let block = Block::default()
                 .title(" Agent request · PgUp/PgDn details")
@@ -552,24 +584,55 @@ impl App {
                 Paragraph::new(format!("> {}", self.input)).style(theme.text()),
                 sections[1],
             );
+            if self.picker.is_none() && sections[1].width > 2 && sections[1].height > 0 {
+                use unicode_width::UnicodeWidthStr;
+                let x = self.input.width().min(usize::from(sections[1].width - 3)) as u16;
+                frame.set_cursor_position((sections[1].x + 2 + x, sections[1].y));
+            }
             return;
         }
-        let label = if self.dialog.is_some() {
-            " Agent request"
-        } else if self.page == Page::Chat {
-            " Message"
-        } else {
-            " Tab sessions · Ctrl-N new"
-        };
-        let prompt = if let Some(dialog) = &self.dialog {
-            format!("{dialog}\n> {}", self.input)
-        } else if self.page == Page::Chat {
+        if self.page == Page::Chat {
+            let block = Block::default()
+                .title(Line::styled(
+                    " Message · Alt-Enter newline · Ctrl-X Ctrl-E editor",
+                    theme.muted(),
+                ))
+                .borders(Borders::LEFT)
+                .border_style(theme.accent())
+                .padding(Padding::horizontal(2));
+            let inner = block.inner(area);
+            frame.render_widget(block, area);
+            self.editor.prepare(&self.input, inner);
             if self.input.is_empty() {
-                "Type a message…".to_owned()
+                frame.render_widget(
+                    Paragraph::new("Type a message…").style(theme.muted()),
+                    inner,
+                );
             } else {
-                self.input.clone()
+                let selection = self.editor.selection();
+                let lines = self
+                    .editor
+                    .rows
+                    .iter()
+                    .skip(self.editor.top)
+                    .take(usize::from(inner.height))
+                    .map(|row| row.line(selection.clone()))
+                    .collect::<Vec<_>>();
+                frame.render_widget(Paragraph::new(lines).style(theme.text()), inner);
             }
-        } else if self.page == Page::Sessions && self.sessions.is_empty() {
+            if self.picker.is_none() && !inner.is_empty() {
+                let (row, column) = self.editor.position();
+                frame.set_cursor_position((
+                    inner.x + (column as u16).min(inner.width - 1),
+                    inner.y
+                        + row
+                            .saturating_sub(self.editor.top)
+                            .min(usize::from(inner.height - 1)) as u16,
+                ));
+            }
+            return;
+        }
+        let prompt = if self.page == Page::Sessions && self.sessions.is_empty() {
             if self.all {
                 "Ctrl-N to create a session".to_owned()
             } else {
@@ -580,7 +643,7 @@ impl App {
         } else {
             "Select an item with ↑/↓ and Enter".to_owned()
         };
-        let style = if self.input.is_empty() && self.dialog.is_none() {
+        let style = if self.input.is_empty() {
             theme.muted()
         } else {
             theme.text()
@@ -591,7 +654,7 @@ impl App {
                 .wrap(Wrap { trim: false })
                 .block(
                     Block::default()
-                        .title(Line::styled(label, theme.muted()))
+                        .title(Line::styled(" Tab sessions · Ctrl-N new", theme.muted()))
                         .borders(Borders::LEFT)
                         .border_style(theme.accent())
                         .padding(Padding::horizontal(2)),
@@ -626,7 +689,7 @@ impl App {
                 "History · PgUp/PgDn or wheel scroll · End live · Ctrl-↑↓ tool · Ctrl-O details"
             }
             Page::Chat => {
-                "Enter send  Tab sessions  PgUp/PgDn scroll  End live  Ctrl-↑↓ tool  Ctrl-O details  Ctrl-P model  Ctrl-N new  Ctrl-C cancel  Esc quit"
+                "Enter send  Tab sessions  PgUp/PgDn scroll  End live  Alt-C/V/X clipboard  Ctrl-X Ctrl-E editor  Ctrl-C cancel  Esc quit"
             }
         };
         // Browsing older messages must not hide a new connection or submission error.

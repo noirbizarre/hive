@@ -75,6 +75,8 @@ status on failure. Unix SIGHUP invokes the same operation. See
 | `HIVE_LISTEN` | Daemon, doctor, serve | Listen address; URL fallback for status/web/reload |
 | `HIVE_URL` | Status, web, reload | Daemon base URL |
 | `RUST_LOG` | Daemon tracing | Log filter |
+| `VISUAL` | TUI | Preferred external prompt editor, executable and arguments |
+| `EDITOR` | TUI | Prompt editor when `VISUAL` is empty or unset |
 | `XDG_CONFIG_HOME` | Configuration lookup | Configuration base directory |
 | `XDG_RUNTIME_DIR` | Instance lock | Runtime base directory |
 | `XDG_STATE_HOME` | Catalog | Durable state base directory |
@@ -82,6 +84,9 @@ status on failure. Unix SIGHUP invokes the same operation. See
 
 Explicit CLI options override their environment equivalents. Agent-specific
 credentials and profile `password_env` variables belong to the daemon environment.
+
+The TUI's `Ctrl-X`, `Ctrl-E` editor shortcut uses `vi` if both editor variables
+are empty or unset. See [external editing](../guides/tui.md#use-an-external-editor).
 
 ## Shell completions
 

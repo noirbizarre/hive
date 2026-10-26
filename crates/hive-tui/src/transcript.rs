@@ -8,7 +8,7 @@ use ratatui::{
     layout::{Position, Rect},
     style::{Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Paragraph, Wrap},
+    widgets::Paragraph,
 };
 use serde_json::Value;
 
@@ -28,16 +28,98 @@ pub struct Transcript {
     tool_rows: Vec<(usize, usize)>,
     cache: Vec<RenderedEntry>,
     width: u16,
+    epoch: u64,
+    selection: Option<((usize, usize), (usize, usize))>,
+    dragging: bool,
+    pressed_tool: Option<usize>,
+    dragged: bool,
+    edge: Option<(usize, isize)>,
+    starts: Vec<usize>,
+    total_rows: usize,
+    seen_revision: u64,
+    layout_dirty: bool,
+    pub selection_invalidated: bool,
 }
 
 struct RenderedEntry {
+    width: u16,
     revision: u64,
     expanded: bool,
-    text: Text<'static>,
+    plain: String,
+    layout: Vec<crate::editor::Row>,
     rows: usize,
 }
 
 impl Transcript {
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+        self.dragging = false;
+        self.pressed_tool = None;
+        self.edge = None;
+    }
+
+    pub fn selected_text(&self) -> Option<String> {
+        let (a, b) = self.selection?;
+        let (start, end) = if a <= b { (a, b) } else { (b, a) };
+        if start == end {
+            return None;
+        }
+        let mut text = String::new();
+        for index in start.0..=end.0 {
+            let entry = self.cache.get(index)?;
+            if index > start.0 {
+                text.push('\n');
+                if self.starts[index] > self.starts[index - 1] + self.cache[index - 1].rows {
+                    text.push('\n');
+                }
+            }
+            let from = if index == start.0 { start.1 } else { 0 };
+            let to = if index == end.0 {
+                end.1
+            } else {
+                entry.plain.len()
+            };
+            text.push_str(entry.plain.get(from..to)?);
+        }
+        Some(text)
+    }
+
+    fn hit(&self, row: usize, column: usize) -> Option<(usize, usize)> {
+        let index = self
+            .starts
+            .partition_point(|&start| start <= row)
+            .saturating_sub(1);
+        let entry = self.cache.get(index)?;
+        Some((
+            index,
+            entry
+                .layout
+                .get(row.saturating_sub(self.starts[index]))
+                .map_or(entry.plain.len(), |row| row.hit(column)),
+        ))
+    }
+
+    pub fn autoscroll(&mut self) -> bool {
+        let Some((column, direction)) = self.edge else {
+            return false;
+        };
+        let before = self.top.unwrap_or(self.max_top);
+        self.scroll(direction);
+        let top = self.top.unwrap_or(self.max_top);
+        self.top = Some(top);
+        let row = if direction < 0 {
+            top
+        } else {
+            top + usize::from(self.area.height.saturating_sub(1))
+        };
+        if let Some(hit) = self.hit(row, column)
+            && let Some((_, end)) = &mut self.selection
+        {
+            *end = hit;
+        }
+        top != before
+    }
+
     pub fn scroll(&mut self, amount: isize) {
         let top = self
             .top
@@ -91,6 +173,7 @@ impl Transcript {
     }
 
     fn toggle(&mut self, index: usize) {
+        self.layout_dirty = true;
         self.selected = Some(index);
         let row = self
             .tool_rows
@@ -107,17 +190,69 @@ impl Transcript {
     }
 
     pub fn mouse(&mut self, event: MouseEvent) {
-        if !self.area.contains(Position::new(event.column, event.row)) {
+        let inside = self.area.contains(Position::new(event.column, event.row));
+        if let MouseEventKind::Up(MouseButton::Left) = event.kind {
+            if self.dragging
+                && !self.dragged
+                && inside
+                && self.tool_rows.iter().any(|&(index, row)| {
+                    Some(index) == self.pressed_tool
+                        && row
+                            == self.top.unwrap_or(self.max_top)
+                                + usize::from(event.row - self.area.y)
+                })
+                && let Some(index) = self.pressed_tool.take()
+            {
+                self.toggle(index);
+            }
+            self.dragging = false;
+            self.pressed_tool = None;
+            self.edge = None;
+            return;
+        }
+        if !inside && !self.dragging {
             return;
         }
         match event.kind {
             MouseEventKind::ScrollUp => self.scroll(-3),
             MouseEventKind::ScrollDown => self.scroll(3),
-            MouseEventKind::Down(MouseButton::Left) => {
+            MouseEventKind::Down(MouseButton::Left) if inside => {
                 let row = self.top.unwrap_or(self.max_top) + (event.row - self.area.y) as usize;
-                if let Some(&(index, _)) = self.tool_rows.iter().find(|(_, header)| *header == row)
+                self.top = Some(self.top.unwrap_or(self.max_top));
+                self.selection = self
+                    .hit(row, usize::from(event.column.saturating_sub(self.area.x)))
+                    .map(|hit| (hit, hit));
+                self.dragging = true;
+                self.dragged = false;
+                self.edge = None;
+                self.pressed_tool = self
+                    .tool_rows
+                    .iter()
+                    .find(|(_, header)| *header == row)
+                    .map(|&(index, _)| index);
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.dragging => {
+                self.dragged = true;
+                // The controller ticks edge scrolling, so event frequency cannot accelerate it.
+                self.edge = if event.row < self.area.y {
+                    Some((usize::from(event.column.saturating_sub(self.area.x)), -1))
+                } else if event.row >= self.area.bottom() {
+                    Some((usize::from(event.column.saturating_sub(self.area.x)), 1))
+                } else {
+                    None
+                };
+                let row = self.top.unwrap_or(self.max_top)
+                    + usize::from(
+                        event
+                            .row
+                            .clamp(self.area.y, self.area.bottom().saturating_sub(1))
+                            .saturating_sub(self.area.y),
+                    );
+                if let Some(hit) =
+                    self.hit(row, usize::from(event.column.saturating_sub(self.area.x)))
+                    && let Some((_, end)) = &mut self.selection
                 {
-                    self.toggle(index);
+                    *end = hit;
                 }
             }
             _ => {}
@@ -126,61 +261,116 @@ impl Transcript {
 
     pub fn render(&mut self, conversation: &Conversation, frame: &mut Frame, area: Rect) {
         self.area = area;
-        if self.width != area.width {
+        if self.epoch != conversation.transcript_epoch {
+            *self = Self {
+                area,
+                epoch: conversation.transcript_epoch,
+                ..Self::default()
+            };
+        }
+        let width_changed = self.width != area.width;
+        if width_changed {
             // Width changes affect Markdown tables and wrapped hit targets, not just line counts.
-            self.cache.clear();
             self.width = area.width;
+            self.layout_dirty = true;
         }
         if area.is_empty() {
+            self.clear_selection();
             return;
         }
-        self.tool_rows.clear();
-        let mut layout = Vec::new();
-        let mut rows = 0;
-        for (index, entry) in conversation.lines.iter().enumerate() {
-            let expanded = self.expanded.contains(&index);
-            if self.cache.get(index).is_none_or(|cached| {
-                cached.revision != entry.revision || cached.expanded != expanded
-            }) {
-                let text = entry_text(entry, expanded, area.width);
-                // Use the widget's word wrapping, not character-count estimates, for exact hit testing.
-                let count = Paragraph::new(text.clone())
-                    .wrap(Wrap { trim: false })
-                    .line_count(area.width);
-                let cached = RenderedEntry {
-                    revision: entry.revision,
-                    expanded,
-                    text,
-                    rows: count,
-                };
-                if index == self.cache.len() {
-                    self.cache.push(cached);
-                } else {
-                    self.cache[index] = cached;
+        // Scrolling and caret-only redraws must not scan every entry in a large retained history.
+        if self.layout_dirty
+            || self.seen_revision != conversation.lines_revision
+            || self.cache.len() != conversation.lines.len()
+        {
+            self.layout_dirty = false;
+            self.seen_revision = conversation.lines_revision;
+            self.tool_rows.clear();
+            let mut first_changed = self.cache.len().min(conversation.lines.len());
+            for (index, entry) in conversation.lines.iter().enumerate() {
+                let expanded = self.expanded.contains(&index);
+                if self.cache.get(index).is_none_or(|cached| {
+                    cached.width != area.width
+                        || cached.revision != entry.revision
+                        || cached.expanded != expanded
+                }) {
+                    let text = entry_text(entry, expanded, area.width);
+                    let (plain, layout) = crate::editor::layout(&text, area.width);
+                    let count = layout.len();
+                    if self
+                        .selection
+                        .is_some_and(|(a, b)| index >= a.0.min(b.0) && index <= a.0.max(b.0))
+                        && self
+                            .cache
+                            .get(index)
+                            .is_some_and(|cached| cached.plain != plain)
+                    {
+                        self.clear_selection();
+                        self.selection_invalidated = true;
+                    }
+                    let cached = RenderedEntry {
+                        width: area.width,
+                        revision: entry.revision,
+                        expanded,
+                        plain,
+                        layout,
+                        rows: count,
+                    };
+                    first_changed = first_changed.min(index);
+                    if index == self.cache.len() {
+                        self.cache.push(cached);
+                    } else {
+                        self.cache[index] = cached;
+                    }
                 }
             }
-            if index > 0
-                && !(entry.kind == LineKind::Tool
-                    && conversation.lines[index - 1].kind == LineKind::Tool)
+            self.cache.truncate(conversation.lines.len());
+            if first_changed < self.starts.len() {
+                self.starts.truncate(first_changed);
+            }
+            let mut rows = self
+                .starts
+                .last()
+                .map_or(0, |&start| start + self.cache[self.starts.len() - 1].rows);
+            for (index, entry) in conversation
+                .lines
+                .iter()
+                .enumerate()
+                .skip(self.starts.len())
             {
-                rows += 1;
+                if index > 0
+                    && !(entry.kind == LineKind::Tool
+                        && conversation.lines[index - 1].kind == LineKind::Tool)
+                {
+                    rows += 1;
+                }
+                self.starts.push(rows);
+                rows += self.cache[index].rows;
             }
-            if entry.kind == LineKind::Tool {
-                self.tool_rows.push((index, rows));
+            self.total_rows = rows;
+            for (index, entry) in conversation.lines.iter().enumerate() {
+                if entry.kind == LineKind::Tool {
+                    self.tool_rows.push((index, self.starts[index]));
+                }
             }
-            layout.push((index, rows));
-            rows += self.cache[index].rows;
         }
-        self.max_top = rows.saturating_sub(area.height as usize);
+        self.max_top = self.total_rows.saturating_sub(area.height as usize);
         if let Some(top) = &mut self.top {
             *top = (*top).min(self.max_top);
         }
         let top = self.top.unwrap_or(self.max_top);
         let bottom = top + area.height as usize;
-        for (index, start) in layout {
+        let first = self
+            .starts
+            .partition_point(|&start| start <= top)
+            .saturating_sub(1);
+        for (index, &start) in self.starts.iter().enumerate().skip(first) {
             let cached = &self.cache[index];
             let end = start + cached.rows;
             if end <= top || start >= bottom {
+                if start >= bottom {
+                    break;
+                }
                 continue;
             }
             let visible_start = start.max(top);
@@ -191,19 +381,32 @@ impl Transcript {
                 area.width,
                 (visible_end - visible_start) as u16,
             );
-            let mut text = cached.text.clone();
+            let range = self.selection.and_then(|(a, b)| {
+                let (a, b) = if a <= b { (a, b) } else { (b, a) };
+                (index >= a.0 && index <= b.0).then_some(
+                    if index == a.0 { a.1 } else { 0 }..if index == b.0 {
+                        b.1
+                    } else {
+                        cached.plain.len()
+                    },
+                )
+            });
+            let mut text = Text::from(
+                cached
+                    .layout
+                    .iter()
+                    .skip(visible_start - start)
+                    .take(visible_end - visible_start)
+                    .map(|row| row.line(range.clone()))
+                    .collect::<Vec<_>>(),
+            );
             if self.selected == Some(index)
+                && visible_start == start
                 && let Some(header) = text.lines.first_mut()
             {
                 header.style = Theme.selected();
             }
-            frame.render_widget(
-                Paragraph::new(text)
-                    .style(Theme.text())
-                    .wrap(Wrap { trim: false })
-                    .scroll(((visible_start - start).min(u16::MAX as usize) as u16, 0)),
-                target,
-            );
+            frame.render_widget(Paragraph::new(text).style(Theme.text()), target);
         }
     }
 }
@@ -559,6 +762,7 @@ mod tests {
         assert!(!rendered.contains("Readable answer"));
         assert!(!rendered.contains("rawOutput"));
         view.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 5));
+        view.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 0, 5));
         draw(&mut view, &conversation, &mut terminal);
         let rendered = screen(&terminal);
         assert!(rendered.contains("▾ read"));
@@ -567,6 +771,7 @@ mod tests {
         assert!(!rendered.contains("**"));
         assert!(!rendered.contains("\\n"));
         view.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 5));
+        view.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 0, 5));
         draw(&mut view, &conversation, &mut terminal);
         assert!(!screen(&terminal).contains("Readable answer"));
     }
@@ -621,6 +826,7 @@ mod tests {
         view.mouse(mouse(MouseEventKind::Down(MouseButton::Left), row - 1, 1));
         assert!(view.expanded.is_empty());
         view.mouse(mouse(MouseEventKind::Down(MouseButton::Left), row, 1));
+        view.mouse(mouse(MouseEventKind::Up(MouseButton::Left), row, 1));
         assert!(view.expanded.contains(&1));
         draw(&mut view, &conversation, &mut terminal);
         assert!(screen(&terminal).contains("tests passed"));
@@ -640,5 +846,76 @@ mod tests {
         view.boundary(false);
         draw(&mut view, &conversation, &mut terminal);
         assert!(screen(&terminal).contains("Entry 0"));
+    }
+
+    #[test]
+    fn selecting_wrapped_wide_text_copies_logical_lines_without_screen_padding() {
+        let mut conversation = Conversation::default();
+        conversation.push_notice("hello 界 world and more words".into());
+        let mut view = Transcript::default();
+        let mut terminal = Terminal::new(TestBackend::new(12, 10)).unwrap();
+        draw(&mut view, &conversation, &mut terminal);
+        let expected = view.cache[0].plain.clone();
+        view.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 0));
+        let last = view.cache[0].rows as u16 - 1;
+        view.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), last, 11));
+        view.mouse(mouse(MouseEventKind::Up(MouseButton::Left), last, 11));
+        assert_eq!(view.selected_text().as_deref(), Some(expected.as_str()));
+        terminal.resize(Rect::new(0, 0, 18, 10)).unwrap();
+        draw(&mut view, &conversation, &mut terminal);
+        assert_eq!(view.selected_text().as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn dragging_a_tool_header_selects_instead_of_expanding_and_release_outside_ends_the_drag() {
+        let mut conversation = Conversation::default();
+        update(
+            &mut conversation,
+            json!({"sessionUpdate":"tool_call_update", "toolCallId":"tool", "name":"bash", "rawInput":{"command":"cargo test"}}),
+        );
+        let mut view = Transcript::default();
+        let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
+        draw(&mut view, &conversation, &mut terminal);
+        view.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 0));
+        view.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 0, 8));
+        view.mouse(mouse(MouseEventKind::Up(MouseButton::Left), 15, 8));
+        assert!(view.expanded.is_empty());
+        assert!(!view.dragging);
+        assert!(view.selected_text().is_some());
+    }
+
+    #[test]
+    fn snapshot_replacement_cannot_reuse_cached_text_or_selection() {
+        let mut conversation = Conversation::default();
+        conversation.push_notice("old text".into());
+        let mut view = Transcript::default();
+        let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+        draw(&mut view, &conversation, &mut terminal);
+        view.selection = Some(((0, 0), (0, 3)));
+        conversation.begin_transcript(1);
+        conversation.push_notice("replacement".into());
+        draw(&mut view, &conversation, &mut terminal);
+        assert!(screen(&terminal).contains("replacement"));
+        assert!(!screen(&terminal).contains("old text"));
+        assert!(view.selected_text().is_none());
+    }
+
+    #[test]
+    fn resizing_an_active_drag_to_an_empty_viewport_cancels_it_safely() {
+        let mut conversation = Conversation::default();
+        conversation.push_notice("some text".into());
+        let mut view = Transcript::default();
+        let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+        draw(&mut view, &conversation, &mut terminal);
+        view.mouse(mouse(MouseEventKind::Down(MouseButton::Left), 0, 0));
+        terminal
+            .draw(|frame| view.render(&conversation, frame, Rect::new(0, 4, 10, 0)))
+            .unwrap();
+        view.mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 2, 0));
+        assert!(!view.dragging);
+        terminal
+            .draw(|frame| view.render(&conversation, frame, Rect::new(0, 0, 10, 8)))
+            .unwrap();
+        assert_eq!(view.cache[0].width, 10);
     }
 }

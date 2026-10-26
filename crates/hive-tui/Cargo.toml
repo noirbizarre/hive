@@ -19,3 +19,9 @@ crossterm = { workspace = true }
 reqwest = { workspace = true }
 nucleo-matcher = { workspace = true }
 tui-markdown = { workspace = true }
+unicode-segmentation = { workspace = true }
+unicode-width = { workspace = true }
+arboard = { workspace = true }
+tempfile = { workspace = true }
+shell-words = { workspace = true }
+thiserror = { workspace = true }

@@ -1,5 +1,8 @@
 //! Full-screen ACPv2 client; the daemon remains the sole session authority.
 
+mod clipboard;
+mod editor;
+mod external_editor;
 mod picker;
 mod state;
 mod theme;
@@ -21,8 +24,8 @@ use agent_client_protocol::{
 use clap::Args;
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-        MouseEvent, MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -186,7 +189,9 @@ impl FormDraft {
     }
 }
 
-struct TerminalGuard;
+struct TerminalGuard {
+    active: bool,
+}
 impl Interaction {
     fn url_id(&self) -> Option<String> {
         match self {
@@ -209,19 +214,61 @@ impl Interaction {
 }
 impl TerminalGuard {
     fn enter() -> std::io::Result<Self> {
+        let mut guard = Self { active: false };
+        guard.resume()?;
+        Ok(guard)
+    }
+    fn resume(&mut self) -> std::io::Result<()> {
+        if self.active {
+            return Ok(());
+        }
         enable_raw_mode()?;
-        if let Err(error) = execute!(std::io::stdout(), EnterAlternateScreen, EnableMouseCapture) {
+        if let Err(error) = execute!(
+            std::io::stdout(),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste
+        ) {
             // An alternate-screen failure must not leave the user's shell in raw mode.
             let _ = disable_raw_mode();
-            let _ = execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+            let _ = execute!(
+                std::io::stdout(),
+                DisableMouseCapture,
+                DisableBracketedPaste,
+                LeaveAlternateScreen
+            );
             return Err(error);
         }
-        Ok(Self)
+        self.active = true;
+        Ok(())
+    }
+    fn suspend(&mut self) -> std::io::Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        // Attempt both restorations even if terminal output fails.
+        let screen = execute!(
+            std::io::stdout(),
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            crossterm::cursor::Show,
+            LeaveAlternateScreen
+        );
+        let raw = disable_raw_mode();
+        self.active = false;
+        screen.and(raw)
     }
 }
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = execute!(std::io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        // Retry all cleanup even after a partially failed suspend or resume.
+        let _ = execute!(
+            std::io::stdout(),
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            crossterm::cursor::Show,
+            LeaveAlternateScreen
+        );
         let _ = disable_raw_mode();
     }
 }
@@ -354,19 +401,32 @@ async fn resume(
 }
 
 async fn refresh(address: &str, app: &mut App) -> Result<(), String> {
-    let response = reqwest::get(format!("http://{address}/v1/sessions"))
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let catalog = load_catalog(&client, address).await?;
+    apply_catalog(app, catalog);
+    Ok(())
+}
+
+struct Catalog {
+    snapshot: SessionSnapshot,
+    providers: serde_json::Value,
+}
+
+async fn load_catalog(client: &reqwest::Client, address: &str) -> Result<Catalog, String> {
+    let response = client
+        .get(format!("http://{address}/v1/sessions"))
+        .send()
         .await
         .map_err(|error| error.to_string())?
         .error_for_status()
         .map_err(|error| error.to_string())?;
     let snapshot: SessionSnapshot = response.json().await.map_err(|error| error.to_string())?;
-    let sessions = snapshot
-        .sessions
-        .into_iter()
-        .filter(|s| app.all || s.cwd == app.cwd)
-        .collect();
-    app.update_sessions(sessions);
-    let providers: serde_json::Value = reqwest::get(format!("http://{address}/v1/providers"))
+    let providers = client
+        .get(format!("http://{address}/v1/providers"))
+        .send()
         .await
         .map_err(|error| error.to_string())?
         .error_for_status()
@@ -374,8 +434,21 @@ async fn refresh(address: &str, app: &mut App) -> Result<(), String> {
         .json()
         .await
         .map_err(|error| error.to_string())?;
-    update_profiles(app, &providers);
-    Ok(())
+    Ok(Catalog {
+        snapshot,
+        providers,
+    })
+}
+
+fn apply_catalog(app: &mut App, catalog: Catalog) {
+    let sessions = catalog
+        .snapshot
+        .sessions
+        .into_iter()
+        .filter(|s| app.all || s.cwd == app.cwd)
+        .collect();
+    app.update_sessions(sessions);
+    update_profiles(app, &catalog.providers);
 }
 
 fn update_profiles(app: &mut App, providers: &serde_json::Value) {
@@ -413,6 +486,13 @@ fn resume_failure(error: &agent_client_protocol::Error) -> String {
 }
 
 fn show_interaction(app: &mut App, interaction: &Interaction) {
+    app.editor.cancel_drag();
+    if app.suspended_draft.is_none() {
+        app.suspended_draft = Some(std::mem::take(&mut app.input));
+    }
+    if let Some(view) = app.transcript() {
+        view.clear_selection();
+    }
     app.picker = None;
     app.dialog_scroll = 0;
     app.dialog = Some(match interaction {
@@ -485,16 +565,17 @@ fn send_prompt(
 
 async fn handle_key(
     cx: &V2ConnectionTo<Agent>,
-    address: &str,
+    _address: &str,
     app: &mut App,
     key: event::KeyEvent,
     interaction: &mut Option<Interaction>,
     acks: mpsc::UnboundedSender<(String, Result<(), String>)>,
     created: mpsc::UnboundedSender<Result<v2::NewSessionResponse, String>>,
 ) -> bool {
-    if key.kind != KeyEventKind::Press {
+    if key.kind == KeyEventKind::Release {
         return false;
     }
+    restore_draft(app);
     if interaction.is_some() && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
         app.dialog_scroll = if key.code == KeyCode::PageUp {
             app.dialog_scroll.saturating_sub(4)
@@ -503,7 +584,7 @@ async fn handle_key(
         };
         return false;
     }
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+    if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
         if let (Some(id), Some(owner)) = (&app.active, &app.owner)
             && app.pilot()
         {
@@ -663,7 +744,13 @@ async fn handle_key(
                             }
                         }
                     }
-                    KeyCode::Char(ch) => app.input.push(ch),
+                    KeyCode::Char(ch)
+                        if !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    {
+                        app.input.push(ch)
+                    }
                     _ => {}
                 }
                 if keep {
@@ -674,10 +761,11 @@ async fn handle_key(
         if !keep {
             app.dialog = None;
             app.input.clear();
+            restore_draft(app);
         }
         return false;
     }
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let ctrl = key.modifiers == KeyModifiers::CONTROL;
     if app.picker.is_some() {
         let choices = app.config_choices();
         let picker = app.picker.as_mut().unwrap();
@@ -692,7 +780,11 @@ async fn handle_key(
             (KeyCode::Backspace, false) => {
                 picker.query.pop();
             }
-            (KeyCode::Char(ch), false) if !key.modifiers.contains(KeyModifiers::ALT) => {
+            (KeyCode::Char(ch), false)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+            {
                 picker.query.push(ch)
             }
             (KeyCode::Enter, _) => apply_configuration(cx, app),
@@ -702,6 +794,10 @@ async fn handle_key(
         if let Some(picker) = app.picker.as_mut() {
             picker.refresh(choices);
         }
+        return false;
+    }
+    if app.page == Page::Chat && app.editor.key(&mut app.input, key) {
+        app.transcript_focused = false;
         return false;
     }
     match (key.code, ctrl) {
@@ -727,6 +823,10 @@ async fn handle_key(
         }
         // Ctrl-M aliases Enter in terminals; Ctrl-P remains distinguishable for the model picker.
         (KeyCode::Char('p'), true) => {
+            app.editor.cancel_drag();
+            if let Some(view) = app.transcript() {
+                view.clear_selection();
+            }
             if let Some(id) = app.active.clone() {
                 app.picker = Some(picker::Picker::new(id, app.config_choices()));
             } else {
@@ -735,11 +835,8 @@ async fn handle_key(
         }
         (KeyCode::Esc, _) | (KeyCode::Char('q'), true) => return true,
         (KeyCode::Tab, _) => {
-            if app.toggle_sessions()
-                && let Err(error) = refresh(address, app).await
-            {
-                app.status = error;
-            }
+            app.toggle_sessions();
+            app.refresh_requested = true;
         }
         (KeyCode::Char('b'), true) if app.page == Page::Chat => {
             if let Some(info) = app.previous_session()
@@ -860,9 +957,7 @@ async fn handle_key(
         }
         (KeyCode::Char('a'), _) if app.page == Page::Sessions => {
             app.all = !app.all;
-            if let Err(error) = refresh(address, app).await {
-                app.status = error;
-            }
+            app.refresh_requested = true;
         }
         (KeyCode::Char('o'), _) if app.page == Page::Sessions => {
             if let Some(info) = app.sessions.get(app.selected).cloned()
@@ -923,10 +1018,107 @@ async fn handle_key(
         (KeyCode::Backspace, _) if app.page == Page::Chat => {
             app.input.pop();
         }
-        (KeyCode::Char(ch), _) if app.page == Page::Chat => app.input.push(ch),
+        (KeyCode::Char(ch), false)
+            if app.page == Page::Chat
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
+        {
+            app.input.push(ch)
+        }
         _ => {}
     }
     false
+}
+
+fn restore_draft(app: &mut App) {
+    if app.dialog.is_none()
+        && let Some(draft) = app.suspended_draft.take()
+    {
+        app.input = draft;
+    }
+}
+
+fn paste(app: &mut App, interaction: &Option<Interaction>, value: &str) {
+    let value = match editor::import(value) {
+        Ok(value) => value,
+        Err(error) => {
+            app.status = error.to_string();
+            return;
+        }
+    };
+    if let Some(Interaction::Elicitation(request, _, draft)) = interaction {
+        if FormDraft::fields(request)
+            .get(draft.field)
+            .is_some_and(|(_, schema)| FormDraft::choices(schema).is_empty())
+        {
+            app.input.push_str(&value.replace('\n', " "));
+        }
+    } else if interaction.is_none() && app.dialog.is_none() {
+        if let Some(picker) = app.picker.as_mut() {
+            picker.query.push_str(&value.replace('\n', " "));
+            let choices = app.config_choices();
+            if let Some(picker) = app.picker.as_mut() {
+                picker.refresh(choices);
+            }
+        } else if app.page == Page::Chat {
+            app.editor.insert(&mut app.input, &value);
+            app.transcript_focused = false;
+        }
+    }
+}
+
+fn clipboard_request(
+    app: &mut App,
+    interaction: &Option<Interaction>,
+    command: char,
+    clipboard: &clipboard::Clipboard,
+) {
+    let target = if let Some(Interaction::Elicitation(request, _, draft)) = interaction {
+        if command != 'v'
+            || !FormDraft::fields(request)
+                .get(draft.field)
+                .is_some_and(|(_, schema)| FormDraft::choices(schema).is_empty())
+        {
+            return;
+        }
+        clipboard::Target::Question(app.dialog.clone().unwrap_or_default())
+    } else if interaction.is_some() || app.dialog.is_some() {
+        return;
+    } else if let Some(picker) = &app.picker {
+        if command != 'v' {
+            return;
+        }
+        clipboard::Target::Picker(picker.query.clone())
+    } else if app.page == Page::Chat {
+        clipboard::Target::Chat
+    } else {
+        return;
+    };
+    if matches!(target, clipboard::Target::Chat) {
+        app.editor.prepare(&app.input, app.editor.area);
+    }
+    let selected = if app.transcript_focused {
+        app.transcript().and_then(|view| view.selected_text())
+    } else {
+        app.editor.selected()
+    };
+    let operation = match (command, selected) {
+        ('v', _) => clipboard::Operation::Paste,
+        ('c', Some(text)) => clipboard::Operation::Copy(text),
+        ('x', Some(text)) if !app.transcript_focused => clipboard::Operation::Cut(text),
+        _ => {
+            app.status = "Select text before copying or cutting".into();
+            return;
+        }
+    };
+    let _ = clipboard.requests.send(clipboard::Request {
+        operation,
+        session: app.active.clone(),
+        original: app.input.clone(),
+        editor: app.editor.clone(),
+        target,
+    });
 }
 
 fn apply_configuration(cx: &V2ConnectionTo<Agent>, app: &mut App) {
@@ -1013,10 +1205,17 @@ fn handle_mouse(app: &mut App, event: MouseEvent) {
             MouseEventKind::ScrollDown => app.dialog_scroll = app.dialog_scroll.saturating_add(3),
             _ => {}
         }
-    } else if app.page == Page::Chat
-        && let Some(view) = app.transcript()
-    {
-        view.mouse(event);
+    } else if app.page == Page::Chat {
+        app.editor.prepare(&app.input, app.editor.area);
+        if app.editor.mouse(event) {
+            app.transcript_focused = false;
+        } else if let Some(view) = app.transcript() {
+            let inside = view.area.contains((event.column, event.row).into());
+            view.mouse(event);
+            if inside {
+                app.transcript_focused = true;
+            }
+        }
     }
 }
 
@@ -1165,6 +1364,63 @@ fn read_keys(keys: mpsc::UnboundedSender<Event>, mut next: impl FnMut() -> Optio
     }
 }
 
+enum ReaderControl {
+    Pause(oneshot::Sender<()>),
+    Resume,
+}
+
+fn terminal_reader(
+    keys: mpsc::UnboundedSender<Event>,
+    controls: std::sync::mpsc::Receiver<ReaderControl>,
+) {
+    controlled_reader(keys, controls, || {
+        event::poll(Duration::from_millis(20))
+            .unwrap_or(false)
+            .then(|| event::read().ok())
+            .flatten()
+    });
+}
+
+fn controlled_reader(
+    keys: mpsc::UnboundedSender<Event>,
+    controls: std::sync::mpsc::Receiver<ReaderControl>,
+    mut next: impl FnMut() -> Option<Event>,
+) {
+    let mut paused = false;
+    read_keys(keys, || {
+        // Controls are checked before every poll, even under a continuous stream of mouse events.
+        let control = if paused {
+            controls.recv_timeout(Duration::from_millis(20)).ok()
+        } else {
+            controls.try_recv().ok()
+        };
+        match control {
+            Some(ReaderControl::Pause(ack)) => {
+                paused = true;
+                let _ = ack.send(());
+            }
+            Some(ReaderControl::Resume) => paused = false,
+            None => {}
+        }
+        if paused {
+            return None;
+        }
+        next()
+    });
+}
+
+async fn editor_completion(
+    task: &mut Option<external_editor::Task>,
+) -> Result<external_editor::Edited, String> {
+    match task {
+        Some(task) => (&mut task.0)
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string()),
+        None => std::future::pending().await,
+    }
+}
+
 pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut app = App {
         cwd: std::env::current_dir()?,
@@ -1183,18 +1439,18 @@ pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error + Sen
         }
         app.profile_selected = app.profiles.iter().position(|id| id == agent).unwrap_or(0);
     }
-    let _guard = TerminalGuard::enter()?;
+    let mut guard = TerminalGuard::enter()?;
     let mut terminal =
         ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))?;
     let (keys_tx, mut keys) = mpsc::unbounded_channel();
-    let reader = tokio::task::spawn_blocking(move || {
-        read_keys(keys_tx, || {
-            event::poll(Duration::from_millis(80))
-                .unwrap_or(false)
-                .then(|| event::read().ok())
-                .flatten()
-        });
-    });
+    let (reader_control, controls) = std::sync::mpsc::channel();
+    let reader = tokio::task::spawn_blocking(move || terminal_reader(keys_tx, controls));
+    let mut clipboard = clipboard::Clipboard::new();
+    let mut editing = None;
+    let mut editor_prefix: Option<std::time::Instant> = None;
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
     let mut quit = false;
     while !quit {
         let url = format!("{}://{}", options.transport, options.address);
@@ -1226,8 +1482,21 @@ pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error + Sen
                   let mut queued = VecDeque::<Interaction>::new();
                   let mut url_flows = BTreeMap::<String, (bool, bool, tokio::time::Instant)>::new();
                   let mut interaction_tick = tokio::time::interval(Duration::from_millis(50));
-                 let mut catalog_tick = tokio::time::interval(Duration::from_secs(2));
+                  let mut catalog_tick = tokio::time::interval(Duration::from_secs(2));
+                  let mut frames = tokio::time::interval(Duration::from_millis(16));
+                  frames.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                  let mut dirty = true;
+                  let (catalog_tx, mut catalog_rx) = mpsc::unbounded_channel();
+                  let mut refreshing = false;
                  loop {
+                    if app.refresh_requested && !refreshing {
+                        app.refresh_requested = false;
+                        refreshing = true;
+                        let client = http.clone();
+                        let address = options.address.clone();
+                        let results = catalog_tx.clone();
+                        tokio::spawn(async move { let _ = results.send(load_catalog(&client, &address).await); });
+                    }
                     if let Some(receiver) = app.configuration.as_mut() {
                         match receiver.try_recv() {
                             Ok((id, result)) => {
@@ -1242,9 +1511,41 @@ pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error + Sen
                             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
                         }
                     }
-                    terminal.draw(|frame| app.show(frame)).map_err(Error::into_internal_error)?;
-                     tokio::select! {
-                         _ = interaction_tick.tick() => {
+                      tokio::select! {
+                          _ = tokio::signal::ctrl_c() => {
+                              // In cooked mode SIGINT reaches the entire foreground process group.
+                              // The editor receives it too; keep its parent alive to restore the TUI.
+                              if editing.is_none() { quit = true; break; }
+                          }
+                          _ = frames.tick() => {
+                              if dirty && editing.is_none() {
+                                  restore_draft(&mut app);
+                                  terminal.draw(|frame| app.show(frame)).map_err(Error::into_internal_error)?;
+                                  dirty = false;
+                              }
+                              continue;
+                          }
+                          result = editor_completion(&mut editing) => {
+                              editing = None;
+                              guard.resume().map_err(Error::into_internal_error)?;
+                              terminal.clear().map_err(Error::into_internal_error)?;
+                              while keys.try_recv().is_ok() {}
+                              let _ = reader_control.send(ReaderControl::Resume);
+                              match result { Ok(edited) => external_editor::apply(&mut app, edited), Err(error) => app.status = error }
+                          }
+                          Some(completion) = clipboard.completions.recv(), if editing.is_none() => clipboard::complete(&mut app, completion),
+                          Some(result) = catalog_rx.recv() => {
+                              refreshing = false;
+                              match result { Ok(catalog) => apply_catalog(&mut app, catalog), Err(error) => app.status = format!("Session list unavailable: {error}") }
+                          }
+                          _ = interaction_tick.tick() => {
+                              let previous_status = app.status.clone();
+                              let previous_dialog = app.dialog.is_some();
+                              if editor_prefix.is_some_and(|started| started.elapsed() >= Duration::from_secs(2)) {
+                                  editor_prefix = None;
+                                  if app.status.starts_with("Ctrl-X:") { app.status.clear(); }
+                              }
+                              let scrolled = editing.is_none() && app.dialog.is_none() && app.picker.is_none() && app.page == Page::Chat && app.transcript().is_some_and(|view| view.autoscroll());
                              url_flows.retain(|_, (known, complete, expires)| {
                                  if *expires <= tokio::time::Instant::now() {
                                      if *known && !*complete { app.status = "Completion not received before timeout".into(); }
@@ -1256,7 +1557,8 @@ pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error + Sen
                                  if let Some(id) = interaction.as_ref().and_then(Interaction::url_id) { url_flows.remove(&id); }
                                  interaction = None; app.dialog = None; app.input.clear();
                              }
-                             if interaction.is_none() && let Some(index) = queued.iter().position(|request| app.pilot() || request.request_scoped()) && let Some(next) = queued.remove(index) { show_interaction(&mut app, &next); interaction = Some(next); }
+                              if editing.is_none() && interaction.is_none() && let Some(index) = queued.iter().position(|request| app.pilot() || request.request_scoped()) && let Some(next) = queued.remove(index) { editor_prefix = None; show_interaction(&mut app, &next); interaction = Some(next); }
+                              if !scrolled && previous_status == app.status && previous_dialog == app.dialog.is_some() { continue; }
                          }
                          Some(id) = completions.recv() => {
                              if url_flows.len() >= 128 { url_flows.clear(); }
@@ -1283,8 +1585,8 @@ pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error + Sen
                              Err(error) => { app.status = format!("Could not start session: {error}"); app.page = Page::Profiles; }
                          },
                          _ = cx.incoming_closed() => break,
-                         _ = catalog_tick.tick() => {
-                             if let Err(error) = refresh(&options.address, &mut app).await { app.status = format!("Session list unavailable: {error}"); }
+                          _ = catalog_tick.tick() => {
+                              app.refresh_requested = true;
                          }
                          Some(update) = updates.recv() => {
                             let id = update.session_id.to_string();
@@ -1302,8 +1604,10 @@ pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error + Sen
                                 queued.retain(Interaction::request_scoped);
                                 if !interaction.as_ref().is_some_and(Interaction::request_scoped) {
                                     interaction = None;
-                                    app.dialog = None;
-                                    app.input.clear();
+                                     if app.dialog.take().is_some() {
+                                         app.input.clear();
+                                         restore_draft(&mut app);
+                                     }
                                 }
                             }
                         }
@@ -1314,7 +1618,7 @@ pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error + Sen
                                 flow.0 = true;
                                 app.status = if flow.1 { "External elicitation completed" } else { "Waiting for external completion" }.into();
                             }
-                            if interaction.is_none() && (app.pilot() || next.request_scoped()) { show_interaction(&mut app, &next); interaction = Some(next); }
+                             if editing.is_none() && interaction.is_none() && (app.pilot() || next.request_scoped()) { editor_prefix = None; show_interaction(&mut app, &next); interaction = Some(next); }
                              else if queued.len() < 128 { queued.push_back(next); }
                              // Dropping an overflow request safely cancels it at the daemon boundary.
                         }
@@ -1327,13 +1631,54 @@ pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error + Sen
                           Some(event) = keys.recv() => {
                              let key = match event {
                                  Event::Key(key) => key,
-                                 Event::Mouse(mouse) => { handle_mouse(&mut app, mouse); continue; }
+                                  Event::Mouse(mouse) => {
+                                      if matches!(mouse.kind, MouseEventKind::Down(_)) { editor_prefix = None; }
+                                      handle_mouse(&mut app, mouse); dirty = true; continue;
+                                  }
+                                  Event::Paste(value) => { editor_prefix = None; paste(&mut app, &interaction, &value); dirty = true; continue; }
+                                  Event::FocusLost => {
+                                      editor_prefix = None;
+                                      app.editor.cancel_drag();
+                                      if let Some(view) = app.transcript() { view.clear_selection(); }
+                                      dirty = true;
+                                      continue;
+                                  }
                                  // The next draw recalculates wrapping and click targets after a resize.
-                                 _ => continue,
-                             };
+                                  _ => { dirty = true; continue; },
+                              };
+                              dirty = true;
+                              if key.kind == KeyEventKind::Release { continue; }
+                              if let Some(command) = clipboard::command(key) { editor_prefix = None; clipboard_request(&mut app, &interaction, command, &clipboard); continue; }
+                              let prefix = editor_prefix.take().is_some_and(|started| started.elapsed() < Duration::from_secs(2));
+                              if app.page == Page::Chat && app.dialog.is_none() && app.picker.is_none() {
+                                  if prefix && key.code == KeyCode::Char('e') && key.modifiers == KeyModifiers::CONTROL {
+                                      match external_editor::Prepared::new(app.active.clone(), app.input.clone()) {
+                                          Ok(prepared) => {
+                                              app.editor.cancel_drag();
+                                              if let Some(view) = app.transcript() { view.clear_selection(); }
+                                              let (sent, paused) = oneshot::channel();
+                                              if reader_control.send(ReaderControl::Pause(sent)).is_ok() && paused.await.is_ok() {
+                                                  while keys.try_recv().is_ok() {}
+                                                  if let Err(error) = guard.suspend() {
+                                                      let _ = guard.resume();
+                                                      let _ = reader_control.send(ReaderControl::Resume);
+                                                      app.status = format!("Could not hand terminal to editor: {error}; retry after checking the terminal");
+                                                  } else { editing = Some(external_editor::Task(tokio::spawn(prepared.run()))); }
+                                              }
+                                          }
+                                          Err(error) => app.status = error.to_string(),
+                                      }
+                                      continue;
+                                  }
+                                  if key.code == KeyCode::Char('x') && key.modifiers == KeyModifiers::CONTROL {
+                                      editor_prefix = Some(std::time::Instant::now());
+                                      app.status = "Ctrl-X: press Ctrl-E to edit the draft externally".into();
+                                      continue;
+                                  }
+                              }
                              let before = app.active.clone();
                              let declined_url = if key.code == KeyCode::Esc { interaction.as_ref().and_then(Interaction::url_id) } else { None };
-                             if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) { url_flows.clear(); }
+                              if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL { url_flows.clear(); }
                              if handle_key(&cx, &options.address, &mut app, key, &mut interaction, ack_tx.clone(), created_tx.clone()).await { quit = true; break; }
                              if let Some(id) = declined_url { url_flows.remove(&id); app.status = "External elicitation declined".into(); }
                              if before != app.active {
@@ -1342,10 +1687,12 @@ pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error + Sen
                              }
                          },
                     }
+                    dirty = true;
                 }
                 Ok(())
             }).await;
         app.connected = false;
+        editor_prefix = None;
         app.picker = None;
         // A disconnected form draft must never reappear as an ordinary chat prompt.
         if app.dialog.take().is_some() {
@@ -1355,7 +1702,10 @@ pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error + Sen
             break;
         }
         app.status = format!("Disconnected ({result:?}); reconnecting to the same Hive session…");
-        terminal.draw(|frame| app.show(frame))?;
+        if editing.is_none() {
+            restore_draft(&mut app);
+            terminal.draw(|frame| app.show(frame))?;
+        }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
     keys.close();
@@ -1366,6 +1716,119 @@ pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error + Sen
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "requires a controlling PTY; run this test inside a terminal"]
+    async fn a_real_terminal_can_be_handed_to_a_child_and_restored_after_failure() {
+        let cooked = std::process::Command::new("stty")
+            .arg("-g")
+            .stdin(std::process::Stdio::inherit())
+            .output()
+            .unwrap();
+        assert!(cooked.status.success());
+        let mut guard = TerminalGuard::enter().unwrap();
+        assert!(crossterm::terminal::is_raw_mode_enabled().unwrap());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))
+                .unwrap();
+        terminal
+            .draw(|frame| {
+                frame.set_cursor_position((2, 2));
+            })
+            .unwrap();
+        let (sender, mut keys) = mpsc::unbounded_channel();
+        let (control, controls) = std::sync::mpsc::channel();
+        let reader = tokio::task::spawn_blocking(move || terminal_reader(sender, controls));
+        let (sent, paused) = oneshot::channel();
+        control.send(ReaderControl::Pause(sent)).unwrap();
+        paused.await.unwrap();
+        guard.suspend().unwrap();
+        assert!(!crossterm::terminal::is_raw_mode_enabled().unwrap());
+        let child = std::process::Command::new("stty")
+            .arg("-g")
+            .stdin(std::process::Stdio::inherit())
+            .output()
+            .unwrap();
+        assert_eq!(child.stdout, cooked.stdout);
+        // Even a failed editor must be followed by a full display/input restoration.
+        assert!(
+            !tokio::process::Command::new("sh")
+                .args(["-c", "exit 7"])
+                .status()
+                .await
+                .unwrap()
+                .success()
+        );
+        guard.resume().unwrap();
+        terminal.clear().unwrap();
+        control.send(ReaderControl::Resume).unwrap();
+        assert!(crossterm::terminal::is_raw_mode_enabled().unwrap());
+        eprintln!("HIVE_PTY_PASTE_READY");
+        let pasted = tokio::time::timeout(Duration::from_secs(5), keys.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(pasted, Event::Paste(ref value) if value == "one\ntwo"));
+        keys.close();
+        reader.await.unwrap();
+        guard.suspend().unwrap();
+        let restored = std::process::Command::new("stty")
+            .arg("-g")
+            .stdin(std::process::Stdio::inherit())
+            .output()
+            .unwrap();
+        assert_eq!(restored.stdout, cooked.stdout);
+    }
+
+    #[tokio::test]
+    async fn reader_pause_acknowledges_exclusive_terminal_ownership_until_resume() {
+        let (keys, mut receiver) = mpsc::unbounded_channel();
+        let (control, controls) = std::sync::mpsc::channel();
+        let (sent, paused) = oneshot::channel();
+        control.send(ReaderControl::Pause(sent)).unwrap();
+        let worker = std::thread::spawn(move || {
+            controlled_reader(keys, controls, || Some(Event::FocusGained))
+        });
+        paused.await.unwrap();
+        assert!(receiver.try_recv().is_err());
+        control.send(ReaderControl::Resume).unwrap();
+        assert!(matches!(receiver.recv().await, Some(Event::FocusGained)));
+        receiver.close();
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn multiline_paste_is_inserted_as_data_without_admitting_a_prompt() {
+        let mut app = App {
+            page: Page::Chat,
+            input: "draft ".into(),
+            ..Default::default()
+        };
+        paste(&mut app, &None, "one\r\ntwo\u{1b}[31m\u{3}");
+        assert_eq!(app.input, "draft one\ntwo[31m");
+        assert!(app.pending.is_empty());
+    }
+
+    #[test]
+    fn questions_preserve_the_chat_draft_and_never_paste_permission_approval() {
+        let (sender, _receiver) = oneshot::channel();
+        let interaction = Interaction::Permission(
+            v2::RequestPermissionRequest::new(v2::SessionId::new("one"), "Permission", vec![]),
+            sender,
+        );
+        let mut app = App {
+            input: "unsent draft".into(),
+            ..Default::default()
+        };
+        show_interaction(&mut app, &interaction);
+        paste(&mut app, &Some(interaction), "1\n");
+        assert!(app.input.is_empty());
+        app.input = "private answer".into();
+        app.dialog = None;
+        restore_draft(&mut app);
+        assert_eq!(app.input, "unsent draft");
+    }
 
     #[test]
     fn closing_the_keyboard_receiver_stops_an_idle_reader_without_another_key() {

@@ -64,7 +64,7 @@ impl Clipboard {
         })
     }
 
-    fn worker<F>(make: impl FnOnce() -> F + Send + 'static) -> Self
+    pub(crate) fn worker<F>(make: impl FnOnce() -> F + Send + 'static) -> Self
     where
         F: FnMut(&Operation) -> Result<Option<String>, ClipboardError>,
     {

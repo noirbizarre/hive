@@ -182,12 +182,22 @@ async fn runtime_fixture() {
     });
     eprintln!("HIVE_RUNTIME_READY http://{address}");
     let create = std::env::var_os("HIVE_RUNTIME_CREATE").is_some();
-    run(Options {
-        address: address.to_string(),
-        transport: "ws".into(),
-        agent: create.then(|| "fixture".into()),
-        session: (!create).then(|| "hive-fixture".into()),
-    })
+    let clipboard = clipboard::Clipboard::worker(|| {
+        |_: &clipboard::Operation| {
+            Err(clipboard::ClipboardError::Backend(
+                "fixture clipboard unavailable".into(),
+            ))
+        }
+    });
+    run_with_clipboard(
+        Options {
+            address: address.to_string(),
+            transport: "ws".into(),
+            agent: create.then(|| "fixture".into()),
+            session: (!create).then(|| "hive-fixture".into()),
+        },
+        clipboard,
+    )
     .await
     .unwrap();
     server.abort();

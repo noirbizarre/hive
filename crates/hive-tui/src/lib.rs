@@ -1425,6 +1425,13 @@ async fn editor_completion(
 }
 
 pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_with_clipboard(options, clipboard::Clipboard::new()).await
+}
+
+async fn run_with_clipboard(
+    options: Options,
+    mut clipboard: clipboard::Clipboard,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut app = App {
         cwd: std::env::current_dir()?,
         all: true,
@@ -1448,7 +1455,6 @@ pub async fn run(options: Options) -> Result<(), Box<dyn std::error::Error + Sen
     let (keys_tx, mut keys) = mpsc::unbounded_channel();
     let (reader_control, controls) = std::sync::mpsc::channel();
     let reader = tokio::task::spawn_blocking(move || terminal_reader(keys_tx, controls));
-    let mut clipboard = clipboard::Clipboard::new();
     let mut editing = None;
     let mut editor_prefix: Option<std::time::Instant> = None;
     let http = reqwest::Client::builder()
@@ -1724,12 +1730,6 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires a controlling PTY; run this test inside a terminal"]
     async fn a_real_terminal_can_be_handed_to_a_child_and_restored_after_failure() {
-        let cooked = std::process::Command::new("stty")
-            .arg("-g")
-            .stdin(std::process::Stdio::inherit())
-            .output()
-            .unwrap();
-        assert!(cooked.status.success());
         let mut guard = TerminalGuard::enter().unwrap();
         assert!(crossterm::terminal::is_raw_mode_enabled().unwrap());
         let mut terminal =
@@ -1749,11 +1749,19 @@ mod tests {
         guard.suspend().unwrap();
         assert!(!crossterm::terminal::is_raw_mode_enabled().unwrap());
         let child = std::process::Command::new("stty")
-            .arg("-g")
+            .arg("-a")
             .stdin(std::process::Stdio::inherit())
             .output()
             .unwrap();
-        assert_eq!(child.stdout, cooked.stdout);
+        assert!(child.status.success());
+        let settings = String::from_utf8(child.stdout).unwrap();
+        let flags = settings
+            .split(|ch: char| ch.is_whitespace() || ch == ';')
+            .collect::<Vec<_>>();
+        // The PTY parent checks the full snapshot; this child must receive cooked, echoing input.
+        for flag in ["icanon", "echo", "isig"] {
+            assert!(flags.contains(&flag), "{settings}");
+        }
         // Even a failed editor must be followed by a full display/input restoration.
         assert!(
             !tokio::process::Command::new("sh")
@@ -1776,12 +1784,7 @@ mod tests {
         keys.close();
         reader.await.unwrap();
         guard.suspend().unwrap();
-        let restored = std::process::Command::new("stty")
-            .arg("-g")
-            .stdin(std::process::Stdio::inherit())
-            .output()
-            .unwrap();
-        assert_eq!(restored.stdout, cooked.stdout);
+        assert!(!crossterm::terminal::is_raw_mode_enabled().unwrap());
     }
 
     #[tokio::test]

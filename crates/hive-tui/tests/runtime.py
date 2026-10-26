@@ -18,6 +18,13 @@ import urllib.request
 from terminal_screen import Screen
 
 
+def settings(fd):
+    values = termios.tcgetattr(fd)
+    # BSD may mark input for reprocessing after tcsetattr; PENDIN is not an application mode.
+    values[3] &= ~getattr(termios, "PENDIN", 0)
+    return values
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix="hive terminal fixture ") as directory:
         directory = Path(directory)
@@ -42,15 +49,13 @@ def main():
         pid, master = pty.fork()
         if pid == 0:
             env = dict(os.environ, VISUAL=f'"{sys.executable}" "{editor}"')
-            # Never read or write the developer's real desktop clipboard during an automated test.
-            env.pop("DISPLAY", None)
-            env.pop("WAYLAND_DISPLAY", None)
+            # The child injects a failing clipboard backend rather than touching the native clipboard.
             env["XDG_RUNTIME_DIR"] = str(directory)
             if create:
                 env["HIVE_RUNTIME_CREATE"] = "1"
             os.execve(sys.argv[1], [sys.argv[1], "terminal_tests::runtime_fixture", "--ignored", "--exact", "--nocapture"], env)
         fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
-        original = termios.tcgetattr(master)
+        original = settings(master)
         output = bytearray()
         screen = Screen()
         address = None
@@ -193,7 +198,7 @@ def main():
                     break
             else:
                 raise AssertionError("TUI failed to shut down")
-            assert termios.tcgetattr(master) == original, "terminal modes were not restored"
+            assert settings(master) == original, "terminal modes were not restored"
         except BaseException:
             sys.stderr.write(output.decode(errors="replace"))
             raise

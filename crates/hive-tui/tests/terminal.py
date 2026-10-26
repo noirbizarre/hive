@@ -12,6 +12,13 @@ import termios
 import time
 
 
+def settings(fd):
+    values = termios.tcgetattr(fd)
+    # BSD may mark input for reprocessing after tcsetattr; PENDIN is not an application mode.
+    values[3] &= ~getattr(termios, "PENDIN", 0)
+    return values
+
+
 def main():
     pid, master = pty.fork()
     if pid == 0:
@@ -22,7 +29,7 @@ def main():
         os.execvp(command[0], command)
 
     fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
-    original = termios.tcgetattr(master)
+    original = settings(master)
     output = bytearray()
     pasted = False
     cursor_queries = 0
@@ -53,7 +60,7 @@ def main():
         _, status = os.waitpid(pid, 0)
         assert os.waitstatus_to_exitcode(status) == 0, "terminal lifecycle test failed"
         assert pasted, "test never requested bracketed paste"
-        assert termios.tcgetattr(master) == original, "terminal modes were not restored"
+        assert settings(master) == original, "terminal modes were not restored"
         for sequence in [b"\x1b[?1049h", b"\x1b[?1049l", b"\x1b[?2004h", b"\x1b[?2004l", b"\x1b[?25h"]:
             assert sequence in output, f"missing terminal transition {sequence!r}"
     except BaseException:

@@ -283,9 +283,13 @@ async fn main() -> agent_client_protocol::Result<()> {
                         notify(
                             &cx,
                             &request.session_id,
-                            v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(
-                                v2::IdleStateUpdate::new(),
-                            )),
+                            v2::SessionUpdate::StateUpdate(
+                                if std::env::var("HIVE_MOCK_RESTORE").as_deref() == Ok("blocked") {
+                                    v2::StateUpdate::RequiresAction(v2::RequiresActionStateUpdate::new())
+                                } else {
+                                    v2::StateUpdate::Idle(v2::IdleStateUpdate::new())
+                                },
+                            ),
                         )?;
                     }
                     let model = state
@@ -399,6 +403,19 @@ async fn main() -> agent_client_protocol::Result<()> {
                         )?;
                     }
                     responder.respond(v2::SetSessionConfigOptionResponse::new(options))?;
+                    if value.to_string() == "fast"
+                        && let Ok(mode) = std::env::var("HIVE_MOCK_FOREGROUND")
+                    {
+                        // Configuration triggers external work without a Hive prompt reservation hiding admission bugs.
+                        if mode == "running" {
+                            notify(&cx, &request.session_id, v2::SessionUpdate::StateUpdate(
+                                v2::StateUpdate::Running(v2::RunningStateUpdate::new()),
+                            ))?;
+                        }
+                        notify(&cx, &request.session_id, v2::SessionUpdate::StateUpdate(
+                            v2::StateUpdate::RequiresAction(v2::RequiresActionStateUpdate::new()),
+                        ))?;
+                    }
                     if std::env::var("HIVE_MOCK_SETTINGS").as_deref() == Ok("post-response") {
                         let mut state = state.lock().map_err(|_| Error::internal_error())?;
                         state.settings.insert(

@@ -453,7 +453,7 @@ impl Worker {
                     turn.seen_busy = true;
                 }
                 let foreign =
-                    self.turn.is_none() && self.control.lock().is_ok_and(|state| !state.running);
+                    self.turn.is_none() && self.control.lock().is_ok_and(|state| !state.busy());
                 if foreign {
                     // Work Hive did not start. Hive cannot lock the native client out, so it
                     // blocks its own prompts and tells every client why.

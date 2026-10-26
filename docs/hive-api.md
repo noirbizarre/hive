@@ -143,12 +143,14 @@ connection that created each session:
 | `cwd` | Original session working directory |
 | `title` | First accepted nonempty text prompt, normalized and limited to 120 characters; initially null |
 | `lastActivityAt` | Unix milliseconds of last observed accepted prompt/update; initially null |
-| `activity` | `unknown`, `running`, or `idle` foreground state |
+| `activity` | `unknown`, `running`, `requires_action`, or `idle` foreground state |
 | `origin` | `hive` or `adopted` |
 | `nativeId` | OpenCode native ID for server profiles, otherwise null |
 | `externalActivity` | Native OpenCode client is driving foreground work |
 
 Activity timestamps are not proof of ongoing work. Unknown is not idle.
+`requires_action` is blocked active foreground work. ACP attachment/list
+`running` booleans are true for both `running` and `requires_action`.
 Foreground state does not describe every tool, plan, or late background task.
 For those, use `_hive_activity` and the atomic `activitySnapshot` on `/acp`.
 See [live execution activity](compatibility.md#live-execution-activity).

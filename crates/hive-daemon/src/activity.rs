@@ -95,10 +95,12 @@ impl Activity {
             v2::SessionUpdate::StateUpdate(state) => {
                 let value = serde_json::to_value(state).ok()?;
                 let status = value.get("state")?.as_str()?;
-                if !matches!(status, "running" | "idle" | "requires_action") {
-                    return None;
-                }
-                self.foreground = status.into();
+                // Future native states must not leave stale known foreground evidence behind.
+                self.foreground = if matches!(status, "running" | "idle" | "requires_action") {
+                    status.into()
+                } else {
+                    "unknown".into()
+                };
                 Some(json!({"kind": "foreground", "state": value, "source": "acp-v2"}))
             }
             // This extension is accepted only with a stable task ID. Unknown provider

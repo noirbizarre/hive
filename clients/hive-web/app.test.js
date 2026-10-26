@@ -131,6 +131,25 @@ test('idle always ends foreground work without inventing an outcome from unrepor
   }
 });
 
+test('native snapshot and normalized foreground keep blocked work busy and fence stale replay', () => {
+  const state = conversation();
+  for (const [index, foreground] of ['requires_action', 'running', 'requires_action', 'idle'].entries()) {
+    state.apply(update(index + 1, { sessionUpdate: 'state_update', state: foreground }).params);
+    assert.equal(state.runningNow, foreground !== 'idle');
+    assert.equal(state.activity.foreground, foreground);
+  }
+  state.reconcile({ version: 1, seq: 10, foreground: 'requires_action' });
+  assert.equal(state.runningNow, true);
+  state.apply(update(5, { sessionUpdate: 'state_update', state: 'idle' }).params);
+  assert.equal(state.runningNow, true, 'old replay cannot undo attachment evidence');
+  state.skip(11);
+  for (const [index, foreground] of ['idle', 'requires_action', '_future'].entries()) {
+    state.apply(update(index + 11, { sessionUpdate: '_hive_activity', kind: 'foreground', state: { state: foreground } }).params);
+    assert.equal(state.runningNow, foreground === 'requires_action');
+    assert.equal(state.activity.foreground, foreground === '_future' ? 'unknown' : foreground);
+  }
+});
+
 test('an inbound request cannot resolve an outbound request with the same id', async () => {
   const sockets = transport((socket, message) => {
     if (!message.method || message.method === 'session/prompt') return false;

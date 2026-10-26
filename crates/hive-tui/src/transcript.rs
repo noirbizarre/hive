@@ -828,6 +828,28 @@ mod tests {
     }
 
     #[test]
+    fn null_message_patches_invalidate_cached_text_for_every_speaker() {
+        let mut conversation = Conversation::default();
+        let mut view = Transcript::default();
+        let mut terminal = Terminal::new(TestBackend::new(80, 18)).unwrap();
+        for kind in ["user_message", "agent_message", "agent_thought"] {
+            update(
+                &mut conversation,
+                json!({"sessionUpdate":kind,"messageId":"same","content":[{"type":"text","text":"Obsolete text"}]}),
+            );
+            draw(&mut view, &conversation, &mut terminal);
+            assert!(screen(&terminal).contains("Obsolete text"));
+            update(
+                &mut conversation,
+                json!({"sessionUpdate":kind,"messageId":"same","content":null}),
+            );
+            draw(&mut view, &conversation, &mut terminal);
+            assert!(!screen(&terminal).contains("Obsolete text"));
+        }
+        assert_eq!(conversation.lines.len(), 3);
+    }
+
+    #[test]
     fn tools_are_one_line_until_clicked_and_details_decode_text_instead_of_dumping_events() {
         let mut conversation = Conversation::default();
         update(

@@ -3,6 +3,7 @@ export function conversation() {
   const lines = [];
   const messages = new Map();
   const tools = new Map();
+  const toolStates = new Map();
   let seq = 0;
   let running = false;
   let generation = 0;
@@ -88,21 +89,33 @@ export function conversation() {
     } else if (kind === 'agent_message' || kind === 'user_message' || kind === 'agent_thought') {
       const speaker = kind === 'agent_thought' ? 'thought' : kind.startsWith('agent') ? 'agent' : 'user';
       const line = upsert(messages, `${speaker}:${update.messageId}`, speaker,
-        (update.content || []).map(block => block.text || `[${block.type || 'content'}]`).join('\n'), true);
+        (update.content || []).map(block => block.text ?? `[${block.type || 'content'}]`).join('\n'),
+        // Metadata-only patches reserve a slot without erasing streamed text.
+        Object.hasOwn(update, 'content'));
       if (speaker === 'thought') { line.active = false; if (activeThought === line) activeThought = undefined; }
     } else if (kind === 'tool_call_update' || kind === 'tool_call_content_chunk' || kind.startsWith('_hive_v1_tool')) {
       const tool = update.tool || update;
       const id = tool.toolCallId || 'tool';
-      const previous = tools.has(id) ? lines[tools.get(id)] : undefined;
-      const content = tool.content ?? tool.rawOutput;
+      const stored = toolStates.get(id) || {};
+      if (kind === 'tool_call_content_chunk') {
+        // A chunk starts a new content array after a clear, just like daemon materialization.
+        if (!Array.isArray(stored.content)) stored.content = [];
+        stored.content.push(structuredClone(tool.content));
+      } else {
+        // Keep field presence independent of display defaults and explicit nulls.
+        Object.assign(stored, structuredClone(tool));
+      }
+      toolStates.set(id, stored);
+      // Empty/cleared structured content falls back only to the current raw output.
+      const content = Array.isArray(stored.content) && stored.content.length ? stored.content : stored.rawOutput;
       const readable = value => typeof value === 'string' ? value
         : Array.isArray(value) ? value.map(block => block.content?.text ?? block.text ?? JSON.stringify(block, null, 2)).join('\n')
         : JSON.stringify(value, null, 2);
-      // Status-only patches must not erase the original title or completed output.
-      const line = upsert(tools, id, 'tool', content == null ? '' : readable(content), content != null && kind !== 'tool_call_content_chunk');
-      line.title = tool.title ?? previous?.title ?? 'Tool activity';
-      line.status = tool.status ?? previous?.status ?? 'unknown';
-      if (tool.rawInput != null) line.input = readable(tool.rawInput);
+      const line = upsert(tools, id, 'tool', content == null ? '' : readable(content), true);
+      line.title = stored.title ?? 'Tool activity';
+      line.status = stored.status ?? 'unknown';
+      if (stored.rawInput != null) line.input = readable(stored.rawInput);
+      else delete line.input;
     } else if (kind === 'plan_update' && (snapshot ? number >= planSnapshot.seq : number > planSnapshot.seq) && typeof update.plan?.planId === 'string') {
       // Full snapshot upserts share a boundary; ordinary replay must be strictly newer.
       // ACP itemized updates replace the entire ordered plan, never merge entries by position.
@@ -142,7 +155,7 @@ export function conversation() {
     apply,
     restore(events, through) {
       // Snapshot entries are full upserts, not a contiguous subset of the live event log.
-      finishThought(); lines.length = 0; messages.clear(); tools.clear();
+      finishThought(); lines.length = 0; messages.clear(); tools.clear(); toolStates.clear();
       for (const event of events) apply(event, true);
       seq = through; gap = false;
     },

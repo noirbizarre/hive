@@ -8,6 +8,7 @@ import App from './App.vue';
 import InteractionCard from './InteractionCard.vue';
 import TranscriptView from './TranscriptView.vue';
 import SessionNavigation from './SessionNavigation.vue';
+import { conversation } from './client.js';
 
 const session = { sessionId: 'hive-tui', cwd: '/workspace', agent: 'pi', title: 'Review parser', activity: 'idle', controlOwner: 'other', generation: 3 };
 const options = [{ configId: 'model', name: 'Model', category: 'model', type: 'select', currentValue: 'fast', options: [{ name: 'Provider', options: [{ value: 'fast', name: 'Fast' }, { value: 'careful', name: 'Careful' }] }] }];
@@ -42,6 +43,24 @@ beforeEach(() => {
   });
 });
 afterEach(() => { wrapper?.unmount(); document.body.innerHTML = ''; vi.unstubAllGlobals(); });
+
+test('cleared message and tool patches remove previously displayed content', async () => {
+  const view = conversation();
+  let seq = 0;
+  const apply = update => view.apply({ update, _meta: { hive: { seq: ++seq } } });
+  apply({ sessionUpdate: 'agent_message', messageId: 'answer', content: [{ type: 'text', text: 'Obsolete answer' }] });
+  apply({ sessionUpdate: 'tool_call_update', toolCallId: 'call', title: 'Obsolete title', rawInput: 'Obsolete input', rawOutput: 'Obsolete output' });
+  render(TranscriptView, { state: { session, lines: view.lines } });
+  expect(wrapper.text()).toContain('Obsolete answer');
+  expect(wrapper.text()).toContain('Obsolete input');
+  expect(wrapper.text()).toContain('Obsolete output');
+  apply({ sessionUpdate: 'agent_message', messageId: 'answer', content: null });
+  apply({ sessionUpdate: 'tool_call_update', toolCallId: 'call', title: null, rawInput: null, rawOutput: null, content: [] });
+  apply({ sessionUpdate: 'tool_call_update', toolCallId: 'call', status: 'completed' });
+  await wrapper.setProps({ state: { session, lines: view.lines } });
+  expect(wrapper.text()).not.toContain('Obsolete');
+  expect(wrapper.text()).toContain('Tool activity');
+});
 
 test('only executing work spins and historical thinking never reactivates with a later turn', async () => {
   const statuses = ['in_progress', 'pending', 'queued', 'completed', 'failed', 'cancelled', 'future', undefined];

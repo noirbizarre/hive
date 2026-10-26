@@ -34,13 +34,29 @@ adoption. Confirm the wire version after upgrades and keep initialization,
 prompting, and recovery evidence separate in the
 [compatibility matrix](../acp-compatibility.md#installed-agent-capability-matrix-2026-10-11).
 
-### Model selection and provider errors
+### Mode and model selection
 
 When OpenCode advertises ACP session configuration, choose **Provider / Model**
 in the browser or press `Ctrl-P` in the TUI. Create the session first to discover
 its choices; no inference is required for discovery. The selected model belongs
 to OpenCode, independently of Hive's `opencode` backend profile. Hive forwards
 changes only from the pilot of an idle session.
+
+Use **Session Mode** in the browser or `Ctrl-G` in the TUI to select an advertised
+primary agent, such as Build or Plan. Custom primary agents can also appear;
+Hive preserves the catalog rather than hard-coding two modes. Model and mode
+can both be changed between turns after the session has started.
+
+Source inspection of OpenCode 1.19.4 confirms mode discovery through
+`configOptions` and native `session/set_config_option`. Older legacy-only agents
+use Hive's `session/set_mode` bridge. The selected value is agent-owned, not
+Hive's backend default or an inference from a plan. Agent-reported changes
+refresh attached clients; OpenCode versions differ in which external changes
+produce notifications. The no-inference settings probe passed with installed
+OpenCode 1.19.4 on 2026-10-26, including change, restoration, and attachment.
+See the [mode compatibility reference](../acp-compatibility.md#session-modes-and-agent-settings).
+
+### Provider errors
 
 An expired-key error requires creating a new API key in OpenCode Console and
 replacing it in the client or secret store. Signing in again does not renew an

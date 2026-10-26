@@ -16,6 +16,10 @@ struct State {
     #[serde(default)]
     models: HashMap<String, String>,
     #[serde(default)]
+    modes: HashMap<String, String>,
+    #[serde(default)]
+    settings: HashMap<String, String>,
+    #[serde(default)]
     v1_sessions: HashMap<String, (std::path::PathBuf, Vec<v1::SessionUpdate>)>,
     #[serde(default)]
     restores: Vec<String>,
@@ -39,18 +43,62 @@ fn model_options(current: &str) -> Vec<v2::SessionConfigOption> {
     }])).expect("valid mock configuration")
 }
 
-fn v1_model_options(current: &str) -> Vec<v1::SessionConfigOption> {
-    model_options(current)
+fn session_options(state: &State, id: &str) -> Vec<v2::SessionConfigOption> {
+    let mut options = model_options(state.models.get(id).map(String::as_str).unwrap_or("fast"));
+    if std::env::var_os("HIVE_MOCK_SETTINGS").is_some() {
+        for (config, category, name) in [
+            ("mode", "mode", "Approval preset"),
+            (
+                "collaboration_mode",
+                "collaboration_mode",
+                "Collaboration mode",
+            ),
+        ] {
+            let current = state
+                .settings
+                .get(&format!("{id}:{config}"))
+                .map(String::as_str)
+                .unwrap_or("default");
+            options.push(serde_json::from_value(serde_json::json!({
+                "configId":config,"category":category,"name":name,"type":"select","currentValue":current,
+                "options":[{"value":"default","name":"Default"},{"value":"plan","name":"Plan"},{"value":"rejected","name":"Unavailable"}]
+            })).expect("valid native settings"));
+        }
+    }
+    options
+}
+
+fn v1_options(options: Vec<v2::SessionConfigOption>) -> Vec<v1::SessionConfigOption> {
+    options
         .into_iter()
         .map(|option| {
             let mut value = serde_json::to_value(option).expect("configuration serializes");
             value["id"] = value.as_object_mut().unwrap().remove("configId").unwrap();
             for choice in value["options"].as_array_mut().unwrap() {
-                choice["group"] = choice.as_object_mut().unwrap().remove("groupId").unwrap();
+                if let Some(group) = choice.as_object_mut().unwrap().remove("groupId") {
+                    choice["group"] = group;
+                }
             }
             serde_json::from_value(value).expect("valid v1 configuration")
         })
         .collect()
+}
+
+fn v1_model_options(current: &str) -> Vec<v1::SessionConfigOption> {
+    v1_options(model_options(current))
+}
+
+fn legacy_modes(current: &str) -> Option<v1::SessionModeState> {
+    std::env::var_os("HIVE_MOCK_MODES").map(|_| {
+        serde_json::from_value(serde_json::json!({
+            "currentModeId": current, "availableModes": [
+                {"id":"build", "name":"Build", "description":"Execute work"},
+                {"id":"plan", "name":"Plan", "description":"Plan work"},
+                {"id":"rejected", "name":"Unavailable"}
+            ]
+        }))
+        .expect("valid mock modes")
+    })
 }
 
 fn save(state: &State) -> agent_client_protocol::Result<()> {
@@ -137,10 +185,12 @@ async fn main() -> agent_client_protocol::Result<()> {
                     // handled this response, so such an idle was either dropped or, on a loaded
                     // machine, arrived after the client's first prompt and closed that turn with
                     // no usage. Tests could not tell the two outcomes apart.
-                    responder.respond(
-                        v2::NewSessionResponse::new(id.clone())
-                            .config_options(model_options("fast")),
-                    )
+                    responder.respond(v2::NewSessionResponse::new(id.clone()).config_options(
+                        session_options(
+                            &*state.lock().map_err(|_| Error::internal_error())?,
+                            &id.to_string(),
+                        ),
+                    ))
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -242,9 +292,16 @@ async fn main() -> agent_client_protocol::Result<()> {
                         .get(&request.session_id.to_string())
                         .cloned()
                         .unwrap_or_else(|| "fast".into());
-                    responder.respond(
-                        v2::ResumeSessionResponse::new().config_options(model_options(&model)),
-                    )?;
+                    responder.respond(v2::ResumeSessionResponse::new().config_options(
+                        if std::env::var_os("HIVE_MOCK_SETTINGS").is_some() {
+                            session_options(
+                                &*state.lock().map_err(|_| Error::internal_error())?,
+                                &request.session_id.to_string(),
+                            )
+                        } else {
+                            model_options(&model)
+                        },
+                    ))?;
                     if std::env::var("HIVE_MOCK_RESTORE").as_deref() == Ok("live") {
                         // No sleeps: these messages must follow the response even if its waiter has not run.
                         notify(
@@ -280,8 +337,15 @@ async fn main() -> agent_client_protocol::Result<()> {
                     let v2::SessionConfigOptionValue::Id { value } = request.value else {
                         return responder.respond_with_error(invalid("expected an id"));
                     };
-                    if request.config_id.to_string() != "model"
-                        || !["fast", "careful"].contains(&value.to_string().as_str())
+                    let config = request.config_id.to_string();
+                    let valid = if config == "model" {
+                        ["fast", "careful"].contains(&value.to_string().as_str())
+                    } else {
+                        std::env::var_os("HIVE_MOCK_SETTINGS").is_some()
+                            && ["mode", "collaboration_mode"].contains(&config.as_str())
+                            && ["default", "plan"].contains(&value.to_string().as_str())
+                    };
+                    if !valid
                         || request
                             .meta
                             .as_ref()
@@ -291,18 +355,25 @@ async fn main() -> agent_client_protocol::Result<()> {
                             "invalid choice or leaked Hive credentials",
                         ));
                     }
-                    {
+                    let options = {
                         let mut state = state.lock().map_err(|_| Error::internal_error())?;
                         if !state.sessions.contains_key(&request.session_id) {
                             return responder
                                 .respond_with_error(invalid("unknown downstream session"));
                         }
-                        state
-                            .models
-                            .insert(request.session_id.to_string(), value.to_string());
+                        if config == "model" {
+                            state
+                                .models
+                                .insert(request.session_id.to_string(), value.to_string());
+                        } else {
+                            state.settings.insert(
+                                format!("{}:{config}", request.session_id),
+                                value.to_string(),
+                            );
+                        }
                         save(&state)?;
-                    }
-                    let options = model_options(&value.to_string());
+                        session_options(&state, &request.session_id.to_string())
+                    };
                     if std::env::var_os("HIVE_MOCK_PAUSE_CONFIG").is_some() {
                         notify(
                             &cx,
@@ -324,7 +395,22 @@ async fn main() -> agent_client_protocol::Result<()> {
                             )),
                         )?;
                     }
-                    responder.respond(v2::SetSessionConfigOptionResponse::new(options))
+                    responder.respond(v2::SetSessionConfigOptionResponse::new(options))?;
+                    if std::env::var("HIVE_MOCK_SETTINGS").as_deref() == Ok("post-response") {
+                        let mut state = state.lock().map_err(|_| Error::internal_error())?;
+                        state.settings.insert(
+                            format!("{}:collaboration_mode", request.session_id),
+                            "default".into(),
+                        );
+                        notify(
+                            &cx,
+                            &request.session_id,
+                            v2::SessionUpdate::ConfigOptionUpdate(v2::ConfigOptionUpdate::new(
+                                session_options(&state, &request.session_id.to_string()),
+                            )),
+                        )?;
+                    }
+                    Ok(())
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -533,7 +619,6 @@ async fn main() -> agent_client_protocol::Result<()> {
 
 async fn serve_v1() -> agent_client_protocol::Result<()> {
     let state = Arc::new(Mutex::new(load()));
-    let models = Arc::new(Mutex::new(HashMap::<String, String>::new()));
     Agent
         .builder()
         .on_receive_request(
@@ -574,8 +659,15 @@ async fn serve_v1() -> agent_client_protocol::Result<()> {
                         .v1_sessions
                         .insert(id.clone(), (request.cwd, Vec::new()));
                     save(&state)?;
+                    let legacy = legacy_modes("build");
                     responder.respond(
-                        v1::NewSessionResponse::new(id).config_options(v1_model_options("fast")),
+                        v1::NewSessionResponse::new(id.clone())
+                            .config_options(if legacy.is_some() {
+                                None
+                            } else {
+                                Some(v1_options(session_options(&state, &id)))
+                            })
+                            .modes(legacy),
                     )
                 }
             },
@@ -605,7 +697,18 @@ async fn serve_v1() -> agent_client_protocol::Result<()> {
                     }
                     state.restores.push("v1:load".into());
                     save(&state)?;
-                    responder.respond(v1::LoadSessionResponse::new())?;
+                    let mode = state
+                        .modes
+                        .get(&request.session_id.to_string())
+                        .map(String::as_str)
+                        .unwrap_or("build");
+                    responder.respond(
+                        v1::LoadSessionResponse::new()
+                            .modes(legacy_modes(mode))
+                            .config_options(std::env::var_os("HIVE_MOCK_SETTINGS").map(|_| {
+                                v1_options(session_options(&state, &request.session_id.to_string()))
+                            })),
+                    )?;
                     if std::env::var("HIVE_MOCK_RESTORE").as_deref() == Ok("live") {
                         cx.send_notification(v1::SessionNotification::new(
                             request.session_id.clone(),
@@ -648,23 +751,35 @@ async fn serve_v1() -> agent_client_protocol::Result<()> {
                     }
                     state.restores.push("v1:resume".into());
                     save(&state)?;
-                    responder.respond(v1::ResumeSessionResponse::new())
+                    let mode = state
+                        .modes
+                        .get(&request.session_id.to_string())
+                        .map(String::as_str)
+                        .unwrap_or("build");
+                    responder.respond(v1::ResumeSessionResponse::new().modes(legacy_modes(mode)))
                 }
             },
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
             {
-                let models = models.clone();
+                let state = state.clone();
                 async move |request: v1::SetSessionConfigOptionRequest,
                             responder: Responder<v1::SetSessionConfigOptionResponse>,
                             cx: agent_client_protocol::ConnectionTo<Client>| {
                     let v1::SessionConfigOptionValue::ValueId { value } = request.value else {
                         return responder.respond_with_error(invalid("expected an id"));
                     };
+                    let config = request.config_id.to_string();
+                    let valid = if config == "model" {
+                        ["fast", "careful"].contains(&value.to_string().as_str())
+                    } else {
+                        std::env::var_os("HIVE_MOCK_SETTINGS").is_some()
+                            && ["mode", "collaboration_mode"].contains(&config.as_str())
+                            && ["default", "plan"].contains(&value.to_string().as_str())
+                    };
                     if !request.session_id.to_string().starts_with("mock-v1-")
-                        || request.config_id.to_string() != "model"
-                        || !["fast", "careful"].contains(&value.to_string().as_str())
+                        || !valid
                         || request
                             .meta
                             .as_ref()
@@ -672,11 +787,21 @@ async fn serve_v1() -> agent_client_protocol::Result<()> {
                     {
                         return responder.respond_with_error(invalid("invalid downstream request"));
                     }
-                    models
-                        .lock()
-                        .map_err(|_| Error::internal_error())?
-                        .insert(request.session_id.to_string(), value.to_string());
-                    let options = v1_model_options(&value.to_string());
+                    let options = {
+                        let mut state = state.lock().map_err(|_| Error::internal_error())?;
+                        if config == "model" {
+                            state
+                                .models
+                                .insert(request.session_id.to_string(), value.to_string());
+                        } else {
+                            state.settings.insert(
+                                format!("{}:{config}", request.session_id),
+                                value.to_string(),
+                            );
+                        }
+                        save(&state)?;
+                        v1_options(session_options(&state, &request.session_id.to_string()))
+                    };
                     if std::env::var_os("HIVE_MOCK_PAUSE_CONFIG").is_some() {
                         // A standard update crosses the compatibility adapter without requiring a test-only gateway extension.
                         cx.send_notification(v1::SessionNotification::new(
@@ -689,13 +814,73 @@ async fn serve_v1() -> agent_client_protocol::Result<()> {
                     }
                     if value.to_string() == "careful" {
                         cx.send_notification(v1::SessionNotification::new(
-                            request.session_id,
+                            request.session_id.clone(),
                             v1::SessionUpdate::ConfigOptionUpdate(v1::ConfigOptionUpdate::new(
                                 options.clone(),
                             )),
                         ))?;
                     }
-                    responder.respond(v1::SetSessionConfigOptionResponse::new(options))
+                    responder.respond(v1::SetSessionConfigOptionResponse::new(options))?;
+                    if std::env::var("HIVE_MOCK_SETTINGS").as_deref() == Ok("post-response") {
+                        let mut state = state.lock().map_err(|_| Error::internal_error())?;
+                        state.settings.insert(
+                            format!("{}:collaboration_mode", request.session_id),
+                            "default".into(),
+                        );
+                        cx.send_notification(v1::SessionNotification::new(
+                            request.session_id.clone(),
+                            v1::SessionUpdate::ConfigOptionUpdate(v1::ConfigOptionUpdate::new(
+                                v1_options(session_options(
+                                    &state,
+                                    &request.session_id.to_string(),
+                                )),
+                            )),
+                        ))?;
+                    }
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = state.clone();
+                async move |request: v1::SetSessionModeRequest,
+                            responder: Responder<v1::SetSessionModeResponse>,
+                            cx: agent_client_protocol::ConnectionTo<Client>| {
+                    let mut state = state.lock().map_err(|_| Error::internal_error())?;
+                    if legacy_modes("build").is_none()
+                        || !state
+                            .v1_sessions
+                            .contains_key(&request.session_id.to_string())
+                        || !["build", "plan"].contains(&request.mode_id.to_string().as_str())
+                        || request
+                            .meta
+                            .as_ref()
+                            .is_some_and(|meta| meta.contains_key("hive"))
+                    {
+                        return responder
+                            .respond_with_error(invalid("invalid native mode request"));
+                    }
+                    // Optional notification reports a different mode to exercise acknowledgement ordering.
+                    let current = if std::env::var("HIVE_MOCK_MODES").as_deref() == Ok("notify") {
+                        "build".to_owned()
+                    } else {
+                        request.mode_id.to_string()
+                    };
+                    state
+                        .modes
+                        .insert(request.session_id.to_string(), current.clone());
+                    save(&state)?;
+                    if std::env::var("HIVE_MOCK_MODES").as_deref() == Ok("notify") {
+                        cx.send_notification(v1::SessionNotification::new(
+                            request.session_id,
+                            v1::SessionUpdate::CurrentModeUpdate(v1::CurrentModeUpdate::new(
+                                current,
+                            )),
+                        ))?;
+                    }
+                    responder.respond(v1::SetSessionModeResponse::new())
                 }
             },
             agent_client_protocol::on_receive_request!(),

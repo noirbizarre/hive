@@ -191,6 +191,7 @@ struct Control {
     pricing: Pricing,
     selected_model: Option<String>,
     config_options: Vec<v2::SessionConfigOption>,
+    legacy_config: session_config::Legacy,
     configuring: bool,
     /// Set while a native client (not Hive) is driving the session. Hive prompts are refused
     /// meanwhile: OpenCode cannot arbitrate between clients, so Hive must not add a second writer.
@@ -284,6 +285,7 @@ impl Control {
             pricing,
             selected_model: None,
             config_options: Vec::new(),
+            legacy_config: session_config::Legacy::default(),
             configuring: false,
             external_activity: false,
             native: None,
@@ -348,6 +350,7 @@ impl Control {
             pricing,
             selected_model: None,
             config_options: Vec::new(),
+            legacy_config: session_config::Legacy::default(),
             configuring: false,
             external_activity: false,
             native: None,
@@ -1850,15 +1853,16 @@ fn forward(
 }
 
 async fn restore_history(
-    request: PreparedRequest<Vec<v2::SessionConfigOption>>,
+    request: PreparedRequest<session_config::Discovery>,
     control: Arc<Mutex<Control>>,
 ) -> agent_client_protocol::Result<Vec<v2::SessionConfigOption>> {
     let (tx, rx) = oneshot::channel();
     // Install the barrier before publication: block_task alone lets post-response live
     // notifications overtake the task that ends historical ingestion.
     request.on_receiving_result(async move |result| {
-        let result = result.and_then(|options| {
+        let result = result.and_then(|discovery| {
             let mut state = control.lock().map_err(|_| Error::internal_error())?;
+            let options = state.legacy_config.discover(discovery)?;
             state.selected_model = selected_model(&options);
             state.config_options = options.clone();
             state.finish_history();
@@ -2374,7 +2378,7 @@ async fn run_agent(
                     .additional_directories(request.additional_directories)
                     .mcp_servers(request.mcp_servers)
                     .replay_from(v2::ReplayFrom::Start(v2::ReplayFromStart::new())))
-                    .map(|response| Ok(response.config_options));
+                    .map(|response| Ok(session_config::Discovery { options: Some(response.config_options), modes: None }));
                 match restore_history(prepared, control.clone()).await {
                     Ok(options) => (v2::NewSessionResponse::new(hive_id.clone()).config_options(options), id),
                     Err(error) => {
@@ -2420,10 +2424,10 @@ async fn run_agent(
                                 continue;
                             }
                             // Publish under the ownership lock, establishing dispatch-before-takeover ordering.
-                            cx.send_request(change.request.clone()).block_task()
+                            let request = cx.prepare_request(change.request.clone());
+                            change.dispatch(request, hive_id.clone(), |_, response| Ok(response.config_options))?
                         };
-                        let result = pending.await.map(|response| response.config_options).map_err(|_| session_config::failed());
-                        change.finish(&hive_id, result);
+                        let _ = pending.await;
                     }
                     Command::Prompt(mut request, generation, key) => {
                         request.session_id = downstream_id.clone();
@@ -2534,8 +2538,14 @@ async fn run_v1_agent(
                     let source = notification.update.clone();
                     match notification.update {
                         v1::SessionUpdate::ConfigOptionUpdate(update) => {
-                            let options = session_config::from_v1(update.config_options)?;
-                            forward(&control, &hive_id, v2::SessionUpdate::ConfigOptionUpdate(v2::ConfigOptionUpdate::new(options)))?;
+                            let mut state = control.lock().map_err(|_| Error::internal_error())?;
+                            let options = state.legacy_config.discover(session_config::Discovery::v1(Some(update.config_options), None)?)?;
+                            session_config::publish(&mut state, &hive_id, options)?;
+                        }
+                        v1::SessionUpdate::CurrentModeUpdate(update) => {
+                            let mut state = control.lock().map_err(|_| Error::internal_error())?;
+                            let options = state.legacy_config.observe(update.current_mode_id)?;
+                            session_config::publish(&mut state, &hive_id, options)?;
                         }
                         v1::SessionUpdate::UsageUpdate(update) => {
                             if !control.lock().map_err(|_| Error::internal_error())?.hydrating {
@@ -2694,7 +2704,7 @@ async fn run_v1_agent(
                 let result = if capabilities.load_session {
                     tracing::info!(protocol = "v1", method = "session/load", replay = "start", "restoring agent history");
                     let prepared = cx.prepare_request(v1::LoadSessionRequest::new(id.clone(), request.cwd.0))
-                        .map(|response| session_config::from_v1(response.config_options.unwrap_or_default()));
+                        .map(|response| session_config::Discovery::v1(response.config_options, response.modes));
                     restore_history(prepared, control.clone()).await
                 } else if capabilities.session_capabilities.resume.is_some() {
                     if let Ok(mut state) = control.lock() {
@@ -2704,7 +2714,7 @@ async fn run_v1_agent(
                     }
                     tracing::warn!(protocol = "v1", method = "session/resume", diagnostic_code = "hive::transcript::unsupported", "agent can resume context but cannot restore history");
                     let prepared = cx.prepare_request(v1::ResumeSessionRequest::new(id.clone(), request.cwd.0))
-                        .map(|response| session_config::from_v1(response.config_options.unwrap_or_default()));
+                        .map(|response| session_config::Discovery::v1(response.config_options, response.modes));
                     restore_history(prepared, control.clone()).await
                 } else {
                     let _ = ready.send(Err(format!("{}; agent also lacks session/resume, so the saved session is orphaned", transcript::RestoreError::Unsupported)));
@@ -2723,7 +2733,11 @@ async fn run_v1_agent(
                 (id, options)
             } else {
                 match cx.send_request(v1::NewSessionRequest::new(request.cwd.0)).block_task().await {
-                    Ok(response) => (response.session_id, session_config::from_v1(response.config_options.unwrap_or_default())?),
+                    Ok(response) => {
+                        let mut state = control.lock().map_err(|_| Error::internal_error())?;
+                        let options = state.legacy_config.discover(session_config::Discovery::v1(response.config_options, response.modes)?)?;
+                        (response.session_id, options)
+                    },
                     Err(error) => {
                         tracing::warn!(code = ?error.code, "v1 session/new failed");
                         let _ = ready.send(Err("v1 session/new failed; check agent availability".into()));
@@ -2744,6 +2758,31 @@ async fn run_v1_agent(
             while let Some(command) = rx.recv().await {
                 match command {
                     Command::Configure(change) => {
+                        let legacy = control.lock().map_err(|_| Error::internal_error())?.legacy_config.route(&change.request);
+                        if legacy.is_some() {
+                            let v2::SessionConfigOptionValue::Id { value } = &change.request.value else {
+                                change.finish(&hive_id, Err(Error::invalid_params()));
+                                continue;
+                            };
+                            let mode = v1::SessionModeId::new(value.to_string());
+                            let pending = {
+                                let state = control.lock().map_err(|_| Error::internal_error())?;
+                                if state.generation != change.generation {
+                                    drop(state);
+                                    change.finish(&hive_id, Err(Error::invalid_request().data("controller was superseded; take control before changing configuration")));
+                                    continue;
+                                }
+                                let Some(revision) = state.legacy_config.route(&change.request) else {
+                                    drop(state);
+                                    change.finish(&hive_id, Err(Error::invalid_request().data("agent configuration changed; inspect current choices and retry")));
+                                    continue;
+                                };
+                                let request = cx.prepare_request(v1::SetSessionModeRequest::new(downstream_id.clone(), mode.clone()).meta(change.request.meta.clone()));
+                                change.dispatch(request, hive_id.clone(), move |state, _| state.legacy_config.acknowledge(revision, mode))?
+                            };
+                            let _ = pending.await;
+                            continue;
+                        }
                         let request = session_config::to_v1(&change.request, &downstream_id)?;
                         let pending = {
                             let state = control.lock().map_err(|_| Error::internal_error())?;
@@ -2752,13 +2791,11 @@ async fn run_v1_agent(
                                 change.finish(&hive_id, Err(Error::invalid_request().data("controller was superseded; take control before changing configuration")));
                                 continue;
                             }
-                            cx.send_request(request).block_task()
+                            change.dispatch(cx.prepare_request(request), hive_id.clone(), |state, response| {
+                                state.legacy_config.discover(session_config::Discovery::v1(Some(response.config_options), None)?)
+                            })?
                         };
-                        let result = match pending.await {
-                            Ok(response) => session_config::from_v1(response.config_options),
-                            Err(_) => Err(session_config::failed()),
-                        };
-                        change.finish(&hive_id, result);
+                        let _ = pending.await;
                     }
                     Command::Prompt(request, generation, key) => {
                         if !current(&control, generation) {
@@ -3636,6 +3673,7 @@ mod control_tests {
             pricing: Pricing::default(),
             selected_model: None,
             config_options: Vec::new(),
+            legacy_config: session_config::Legacy::default(),
             configuring: false,
             external_activity: false,
             native: None,

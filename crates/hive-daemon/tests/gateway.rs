@@ -213,6 +213,348 @@ async fn browser_origins_accept_localhost_on_the_listener_port_and_reject_other_
 }
 
 #[tokio::test]
+async fn mode_notifications_after_the_setter_response_cannot_be_rolled_back() {
+    for version in [AgentVersion::V1, AgentVersion::V2] {
+        let command = format!(
+            "{}{}",
+            env!("CARGO_BIN_EXE_hive-test-agent"),
+            if version == AgentVersion::V1 {
+                " v1"
+            } else {
+                ""
+            }
+        );
+        let mut config = config_with_agent("mock", &command, version);
+        config
+            .agents
+            .get_mut("mock")
+            .unwrap()
+            .env
+            .insert("HIVE_MOCK_SETTINGS".into(), "post-response".into());
+        let (address, server) = start_gateway(config).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        timeout(Duration::from_secs(15), Client.v2().on_receive_notification(
+            async move |update: v2::UpdateSessionNotification, _: V2ConnectionTo<Agent>| { tx.send(update).map_err(Error::into_internal_error) },
+            agent_client_protocol::on_receive_notification!(),
+        ).connect_with(HttpClient::new(format!("ws://{address}")).unwrap(), async move |cx| {
+            cx.send_request(v2::InitializeRequest::new(ProtocolVersion::V2, v2::Implementation::new("settings-order-test", "1"))).block_task().await?;
+            let cwd = std::env::current_dir().map_err(Error::into_internal_error)?;
+            let opened = cx.send_request(v2::NewSessionRequest::new(cwd.clone())).block_task().await?;
+            cx.send_request(v2::SetSessionConfigOptionRequest::new(opened.session_id.clone(), v2::SessionConfigId::new("collaboration_mode"), v2::SessionConfigOptionValue::Id { value: v2::SessionConfigValueId::new("plan") }).meta(opened.meta)).block_task().await?;
+            // The mock changes back immediately after replying, before the setter task can wake.
+            let mut observed = Vec::new();
+            while observed.len() < 2 {
+                if let v2::SessionUpdate::ConfigOptionUpdate(update) = rx.recv().await.ok_or_else(Error::internal_error)?.update {
+                    observed.push(serde_json::to_value(update.config_options).unwrap()[2]["currentValue"].clone());
+                }
+            }
+            assert_eq!(observed, vec![serde_json::json!("plan"), serde_json::json!("default")]);
+            let attached = cx.send_request(v2::ResumeSessionRequest::new(opened.session_id, cwd)).block_task().await?;
+            assert_eq!(serde_json::to_value(attached.config_options).unwrap()[2]["currentValue"], "default");
+            Ok::<_, Error>(())
+        })).await.unwrap().unwrap();
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn modes_are_rediscovered_from_the_original_session_after_daemon_restart() {
+    for (version, legacy) in [
+        (AgentVersion::V1, true),
+        (AgentVersion::V1, false),
+        (AgentVersion::V2, false),
+    ] {
+        let dir = std::env::temp_dir().join(format!("hive-mode-recovery-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let database = dir.join("hive/sessions.db");
+        let agent_state = dir.join("agent.json");
+        let command = format!(
+            "{}{}",
+            env!("CARGO_BIN_EXE_hive-test-agent"),
+            if version == AgentVersion::V1 {
+                " v1"
+            } else {
+                ""
+            }
+        );
+        let mut config = config_with_agent("mock", &command, version);
+        let profile = config.agents.get_mut("mock").unwrap();
+        profile
+            .env
+            .insert("HIVE_MOCK_STATE".into(), agent_state.display().to_string());
+        profile.env.insert(
+            if legacy {
+                "HIVE_MOCK_MODES"
+            } else {
+                "HIVE_MOCK_SETTINGS"
+            }
+            .into(),
+            "silent".into(),
+        );
+        let mut identity: Option<v2::SessionId> = None;
+        for recovering in [false, true] {
+            let broker = hive_daemon::Broker::persistent(config.clone(), database.clone()).unwrap();
+            if recovering {
+                broker.reconcile().await;
+            }
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let router = hive_daemon::router(broker.clone());
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+            let saved_id = identity.clone();
+            let id = timeout(
+                Duration::from_secs(15),
+                Client.v2().connect_with(
+                    HttpClient::new(format!("ws://{address}")).unwrap(),
+                    async move |cx| {
+                        cx.send_request(v2::InitializeRequest::new(
+                            ProtocolVersion::V2,
+                            v2::Implementation::new("mode-recovery", "1"),
+                        ))
+                        .block_task()
+                        .await?;
+                        let cwd = std::env::current_dir().map_err(Error::into_internal_error)?;
+                        if let Some(id) = saved_id {
+                            let response = cx
+                                .send_request(v2::ResumeSessionRequest::new(id.clone(), cwd))
+                                .block_task()
+                                .await?;
+                            let options = serde_json::to_value(response.config_options).unwrap();
+                            let mode = options
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .find(|option| option["category"] == "mode")
+                                .unwrap();
+                            assert_eq!(mode["currentValue"], "plan");
+                            Ok::<_, Error>(id)
+                        } else {
+                            let response = cx
+                                .send_request(v2::NewSessionRequest::new(cwd))
+                                .block_task()
+                                .await?;
+                            let mode = response
+                                .config_options
+                                .iter()
+                                .find(|option| {
+                                    serde_json::to_value(option).unwrap()["category"] == "mode"
+                                })
+                                .unwrap();
+                            cx.send_request(
+                                v2::SetSessionConfigOptionRequest::new(
+                                    response.session_id.clone(),
+                                    mode.config_id.clone(),
+                                    v2::SessionConfigOptionValue::Id {
+                                        value: v2::SessionConfigValueId::new("plan"),
+                                    },
+                                )
+                                .meta(response.meta),
+                            )
+                            .block_task()
+                            .await?;
+                            Ok(response.session_id)
+                        }
+                    },
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            identity = Some(id);
+            broker.shutdown().await;
+            server.abort();
+        }
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&agent_state).unwrap()).unwrap();
+        assert_eq!(
+            saved[if version == AgentVersion::V1 {
+                "v1_sessions"
+            } else {
+                "sessions"
+            }]
+            .as_object()
+            .unwrap()
+            .len(),
+            1
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn native_modes_and_collaboration_settings_remain_independent_and_change_between_turns() {
+    for version in [AgentVersion::V1, AgentVersion::V2] {
+        let command = format!(
+            "{}{}",
+            env!("CARGO_BIN_EXE_hive-test-agent"),
+            if version == AgentVersion::V1 {
+                " v1"
+            } else {
+                ""
+            }
+        );
+        let mut config = config_with_agent("mock", &command, version);
+        config
+            .agents
+            .get_mut("mock")
+            .unwrap()
+            .env
+            .insert("HIVE_MOCK_SETTINGS".into(), "1".into());
+        let (address, server) = start_gateway(config).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        timeout(
+            Duration::from_secs(15),
+            Client
+                .v2()
+                .on_receive_notification(
+                    async move |update: v2::UpdateSessionNotification, _: V2ConnectionTo<Agent>| {
+                        tx.send(update).map_err(Error::into_internal_error)
+                    },
+                    agent_client_protocol::on_receive_notification!(),
+                )
+                .connect_with(
+                    HttpClient::new(format!("ws://{address}")).unwrap(),
+                    async move |cx| {
+                        cx.send_request(v2::InitializeRequest::new(
+                            ProtocolVersion::V2,
+                            v2::Implementation::new("native-settings-test", "1"),
+                        ))
+                        .block_task()
+                        .await?;
+                        let cwd = std::env::current_dir().map_err(Error::into_internal_error)?;
+                        let opened = cx
+                            .send_request(v2::NewSessionRequest::new(cwd.clone()))
+                            .block_task()
+                            .await?;
+                        assert_eq!(opened.config_options.len(), 3);
+                        cx.send_request(
+                            v2::PromptRequest::new(
+                                opened.session_id.clone(),
+                                vec!["first turn".into()],
+                            )
+                            .meta(controlled(&opened.meta, "first")),
+                        )
+                        .block_task()
+                        .await?;
+                        while !matches!(
+                            rx.recv().await.ok_or_else(Error::internal_error)?.update,
+                            v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(_))
+                        ) {}
+                        let mut snapshot = opened.config_options.clone();
+                        for (config, value) in [
+                            ("model", "careful"),
+                            ("collaboration_mode", "plan"),
+                            ("mode", "plan"),
+                        ] {
+                            let setter = |value: &str| {
+                                v2::SetSessionConfigOptionRequest::new(
+                                    opened.session_id.clone(),
+                                    v2::SessionConfigId::new(config),
+                                    v2::SessionConfigOptionValue::Id {
+                                        value: v2::SessionConfigValueId::new(value.to_owned()),
+                                    },
+                                )
+                                .meta(opened.meta.clone())
+                            };
+                            assert!(
+                                cx.send_request(setter("rejected"))
+                                    .block_task()
+                                    .await
+                                    .is_err()
+                            );
+                            snapshot = cx
+                                .send_request(setter(value))
+                                .block_task()
+                                .await?
+                                .config_options;
+                            let current = serde_json::to_value(&snapshot).unwrap();
+                            assert_eq!(
+                                current
+                                    .as_array()
+                                    .unwrap()
+                                    .iter()
+                                    .find(|option| option["configId"] == config)
+                                    .unwrap()["currentValue"],
+                                value
+                            );
+                        }
+                        let current = serde_json::to_value(&snapshot).unwrap();
+                        assert_eq!(current[0]["currentValue"], "careful");
+                        assert_eq!(current[2]["category"], "collaboration_mode");
+                        let (observer_tx, mut observer_rx) = mpsc::unbounded_channel();
+                        Client.v2().on_receive_notification(
+                            async move |update: v2::UpdateSessionNotification, _: V2ConnectionTo<Agent>| { observer_tx.send(update).map_err(Error::into_internal_error) },
+                            agent_client_protocol::on_receive_notification!(),
+                        ).connect_with(HttpClient::new(format!("http://{address}")).unwrap(), async |observer| {
+                            observer.send_request(v2::InitializeRequest::new(ProtocolVersion::V2, v2::Implementation::new("settings-observer", "1"))).block_task().await?;
+                            let mut meta = v2::Meta::new(); meta.insert("hive".into(), serde_json::json!({"mode":"observe"}));
+                            observer.send_request(v2::ResumeSessionRequest::new(opened.session_id.clone(), cwd.clone()).meta(meta)).block_task().await?;
+                            snapshot = cx.send_request(v2::SetSessionConfigOptionRequest::new(opened.session_id.clone(), v2::SessionConfigId::new("collaboration_mode"), v2::SessionConfigOptionValue::Id { value: v2::SessionConfigValueId::new("default") }).meta(opened.meta.clone())).block_task().await?.config_options;
+                            // A response-only setter must still publish to another client and transport.
+                            loop {
+                                let update = observer_rx.recv().await.ok_or_else(Error::internal_error)?;
+                                if let v2::SessionUpdate::ConfigOptionUpdate(update) = update.update
+                                    && update.config_options == snapshot { break; }
+                            }
+                            Ok::<_, Error>(())
+                        }).await?;
+                        let attached = cx
+                            .send_request(v2::ResumeSessionRequest::new(opened.session_id, cwd))
+                            .block_task()
+                            .await?;
+                        assert_eq!(attached.config_options, snapshot);
+                        Ok::<_, Error>(())
+                    },
+                ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        server.abort();
+    }
+}
+
+#[tokio::test]
+async fn legacy_modes_use_the_native_setter_and_reconcile_acknowledgements_and_observers() {
+    for behavior in ["silent", "notify"] {
+        for transport in ["ws", "http"] {
+            let command = format!("{} v1", env!("CARGO_BIN_EXE_hive-test-agent"));
+            let mut config = config_with_agent("mock", &command, AgentVersion::V1);
+            config
+                .agents
+                .get_mut("mock")
+                .unwrap()
+                .env
+                .insert("HIVE_MOCK_MODES".into(), behavior.into());
+            let (address, server) = start_gateway(config).await;
+            timeout(Duration::from_secs(15), Client.v2().connect_with(HttpClient::new(format!("{transport}://{address}")).unwrap(), async move |cx| {
+                cx.send_request(v2::InitializeRequest::new(ProtocolVersion::V2, v2::Implementation::new("mode-test", "1"))).block_task().await?;
+                let cwd = std::env::current_dir().map_err(Error::into_internal_error)?;
+                let opened = cx.send_request(v2::NewSessionRequest::new(cwd.clone())).block_task().await?;
+                assert_eq!(opened.config_options.len(), 1);
+                let option = &opened.config_options[0];
+                assert_eq!(serde_json::to_value(option).unwrap()["currentValue"], "build");
+                let setter = |value: &str| v2::SetSessionConfigOptionRequest::new(opened.session_id.clone(), option.config_id.clone(), v2::SessionConfigOptionValue::Id { value: v2::SessionConfigValueId::new(value.to_owned()) }).meta(opened.meta.clone());
+                assert!(cx.send_request(setter("unknown")).block_task().await.is_err());
+                assert!(cx.send_request(setter("rejected")).block_task().await.is_err());
+                let changed = cx.send_request(setter("plan")).block_task().await?;
+                let expected = if behavior == "notify" { "build" } else { "plan" };
+                assert_eq!(serde_json::to_value(&changed.config_options).unwrap()[0]["currentValue"], expected);
+                let attached = cx.send_request(v2::ResumeSessionRequest::new(opened.session_id.clone(), cwd).meta({
+                    let mut meta = opened.meta.clone().unwrap(); meta.get_mut("hive").unwrap()["mode"] = serde_json::json!("relinquish"); meta
+                })).block_task().await?;
+                assert_eq!(attached.config_options, changed.config_options);
+                // The observing attachment cannot mutate even though it can see the current mode.
+                let mut request = setter("build"); request.meta = attached.meta;
+                assert!(cx.send_request(request).block_task().await.is_err());
+                Ok::<_, Error>(())
+            })).await.unwrap().unwrap();
+            server.abort();
+        }
+    }
+}
+
+#[tokio::test]
 async fn model_choices_survive_translation_setters_rejection_and_observer_attachment() {
     for version in [AgentVersion::V1, AgentVersion::V2] {
         for transport in ["ws", "http"] {

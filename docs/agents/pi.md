@@ -41,6 +41,14 @@ The adapter runs tools itself rather than delegating filesystem/terminal work
 to Hive. Nonempty MCP declarations are not supported by Hive's v1 adapter.
 Pi extension slash commands are not available through this path.
 
+Source inspection of `pi-acp` 0.0.34 shows model and **thinking level** session
+configuration. Use `Ctrl-P` for models and `Ctrl-G` for thinking level in the
+TUI, or the labelled browser controls, including between later turns. The
+adapter also advertises legacy modes for the same thinking levels; Hive prefers
+its native configuration to avoid a duplicate mode selector. Thinking level is
+not a Plan/Build mode, and `--mode rpc` selects Pi's transport. Live settings
+changes remain unverified for this installation.
+
 Native Pi-session adoption is separate planned work. An adapter advertising
 session loading does not mean Hive can import arbitrary native Pi sessions.
 See [development probes](../development.md#real-agent-compatibility-probes)

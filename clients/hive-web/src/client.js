@@ -588,7 +588,7 @@ export function connect(url, onChange = () => {}) {
     },
     async configure(configId, value) {
       await ready();
-      if (!selected || (desired && desired.sessionId !== selected.sessionId) || owner?.role !== 'pilot' || history.runningNow || configuring || creating || recoveryRequired || uncertain) throw new Error('Take control of an idle session before changing its model');
+      if (!selected || (desired && desired.sessionId !== selected.sessionId) || owner?.role !== 'pilot' || history.runningNow || configuring || creating || recoveryRequired || uncertain) throw new Error('Take control of an idle session before changing its configuration');
       const target = selected.sessionId;
       const version = openVersion;
       const epoch = connectionEpoch;

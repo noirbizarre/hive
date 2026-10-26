@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted, ref, unref, watch } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, unref, watch } from 'vue';
 import Button from 'openvue/button';
 import Select from 'openvue/select';
 import Textarea from 'openvue/textarea';
@@ -17,6 +17,7 @@ const sessions = ref([]), recent = ref([]), agents = ref([]);
 const loading = ref(true), listError = ref(''), providerError = ref(''), error = ref('');
 const drawer = ref(false), navigation = ref(true), text = ref(''), backend = ref(''), sending = ref(false);
 const mobileMenu = ref();
+const configFailures = ref({});
 let feed;
 let deepLink = new URLSearchParams(location.search).get('session');
 const pilot = computed(() => state.value.role === 'pilot' && state.value.connected && !state.value.gap);
@@ -35,7 +36,26 @@ const interactionKey = computed(() => JSON.stringify([state.value.interaction?.i
 const configOptions = computed(() => (state.value.configOptions || []).filter(option => option.type === 'select'));
 // Normalize mixed grouped/ungrouped choices without changing daemon option values.
 const groups = option => (option.options || []).map(choice => Array.isArray(choice.options) ? { ...choice, name: choice.name || choice.group, items: choice.options } : { name: option.name, items: [choice] });
+const hasChoices = option => groups(option).some(group => group.items.some(item => typeof item.value === 'string'));
+// Select keeps an internal optimistic value; its visible label must remain agent-confirmed even on rejection.
+const currentLabel = option => groups(option).flatMap(group => group.items).find(item => item.value === option.currentValue)?.name ?? String(option.currentValue ?? 'Unavailable');
 async function action(operation) { error.value = ''; try { return await operation(); } catch (failure) { error.value = failure.message; } }
+async function configure(option, value) {
+  const session = state.value.session?.sessionId;
+  await action(async () => {
+    try { await props.client.configure(option.configId, value); }
+    catch (failure) {
+      if (state.value.session?.sessionId === session) {
+        // Reset Select's internal selection too, without remounting unrelated controls or the composer.
+        const id = `config-${option.configId}`, focused = document.activeElement?.id === id;
+        configFailures.value[option.configId] = (configFailures.value[option.configId] || 0) + 1;
+        await nextTick();
+        if (focused) document.getElementById(id)?.focus();
+      }
+      throw failure;
+    }
+  });
+}
 async function open(session) { drawer.value = false; await action(() => props.client.open(session)); }
 function providers({ agents: inventory, defaultAgent }) {
   providerError.value = '';
@@ -103,9 +123,11 @@ onBeforeUnmount(() => { feed?.close(); props.client.close(); });
         <label class="config-field" for="agent">Hive backend<Select :model-value="state.session ? selected?.agent || state.session.agent || backend : backend" input-id="agent" placeholder="Default backend" :options="[{ id: '', name: 'Default backend' }, ...agents]" option-label="name" option-value="id" :disabled="Boolean(state.session) || busy" @update:model-value="value => backend = value" /></label>
         <Button v-if="!state.session" id="create" label="Create session" :loading="state.creating" :disabled="!state.connected || busy || Boolean(providerError)" @click="action(() => client.create(backend))" />
         <label v-for="option in configOptions" :key="option.configId" class="config-field" :for="`config-${option.configId}`">{{ option.category === 'model' ? 'Provider / Model' : option.name }}
-          <Select :input-id="`config-${option.configId}`" :model-value="option.currentValue" :options="groups(option)" option-group-label="name" option-group-children="items" option-label="name" option-value="value" :disabled="configDisabled" @update:model-value="value => action(() => client.configure(option.configId, value))" />
+          <Select :key="configFailures[option.configId] || 0" :input-id="`config-${option.configId}`" :model-value="option.currentValue" :aria-label="currentLabel(option)" :placeholder="String(option.currentValue ?? 'Unavailable')" :title="option.description" :options="groups(option)" option-group-label="name" option-group-children="items" option-label="name" option-value="value" :disabled="configDisabled || !hasChoices(option)" @update:model-value="value => configure(option, value)">
+            <template #value>{{ currentLabel(option) }}</template>
+          </Select>
         </label>
-        <p v-if="!configOptions.length" class="config-hint">{{ state.session ? 'This backend does not expose model selection' : 'Create a session, then choose its model before sending.' }}</p>
+        <p v-if="!configOptions.length" class="config-hint">{{ state.session ? 'This backend does not expose session configuration' : 'Create a session to choose its model and settings. You can change them between turns.' }}</p>
         <Button v-if="state.session && !pilot" id="control" label="Take control" severity="secondary" outlined :loading="state.takingControl" :disabled="!state.connected || state.recoveryRequired || busy || state.gap" @click="action(() => client.takeControl())" />
       </section>
       <div class="notices">

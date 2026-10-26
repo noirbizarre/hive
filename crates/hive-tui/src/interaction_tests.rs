@@ -28,14 +28,17 @@ async fn connected(body: impl AsyncFnOnce(V2ConnectionTo<Agent>) -> Result<(), E
             >,
                    _: V2ConnectionTo<Client>| {
                 assert_eq!(request.session_id.to_string(), "hive-test");
-                assert_eq!(request.config_id.to_string(), "model");
+                assert!(
+                    ["model", "collaboration_mode"]
+                        .contains(&request.config_id.to_string().as_str())
+                );
                 assert_eq!(request.meta.unwrap()["hive"]["token"], "test");
                 let v2::SessionConfigOptionValue::Id { value } = request.value else {
                     return Err(Error::invalid_params());
                 };
                 responder.respond(v2::SetSessionConfigOptionResponse::new(vec![
                     v2::SessionConfigOption::select(
-                        v2::SessionConfigId::new("model"),
+                        request.config_id,
                         "Model",
                         value,
                         vec![v2::SessionConfigSelectOption::new(
@@ -217,6 +220,38 @@ async fn submitted_prompts_wait_for_the_authoritative_echo_and_identical_prompts
 }
 
 #[tokio::test]
+async fn session_settings_have_their_own_picker_and_send_native_identifiers() {
+    connected(async |cx| {
+        let mut app = App { connected: true, ..App::default() };
+        app.select_session("hive-test".into());
+        let state = app.conversations.entry("hive-test".into()).or_default();
+        state.generation = 1;
+        state.config_options = serde_json::from_value(json!([
+            {"configId":"model","name":"Model","category":"model","type":"select","currentValue":"fast","options":[{"value":"fast","name":"Fast"}]},
+            {"configId":"collaboration_mode","name":"Collaboration mode","category":"collaboration_mode","type":"select","currentValue":"default","options":[{"value":"default","name":"Default"},{"value":"plan","name":"Plan"}]}
+        ])).unwrap();
+        app.owner = Some([("hive".into(), json!({"role":"pilot","generation":1,"token":"test"}))].into_iter().collect());
+        app.input = "keep draft".into();
+        key(&cx, &mut app, &mut None, KeyCode::Char('p'), KeyModifiers::CONTROL).await;
+        assert_eq!(app.picker.as_ref().unwrap().choices.len(), 1);
+        assert_eq!(app.config_choices()[0].0, "model");
+        press(&cx, &mut app, &mut None, KeyCode::Esc).await;
+        key(&cx, &mut app, &mut None, KeyCode::Char('g'), KeyModifiers::CONTROL).await;
+        assert_eq!(app.picker.as_ref().unwrap().kind, picker::Kind::Settings);
+        assert!(app.config_choices().iter().all(|choice| choice.0 == "collaboration_mode"));
+        text(&cx, &mut app, &mut None, "Plan").await;
+        press(&cx, &mut app, &mut None, KeyCode::Enter).await;
+        let (id, result) = app.configuration.take().unwrap().await.unwrap();
+        let response = result.unwrap();
+        assert_eq!(serde_json::to_value(&response.config_options).unwrap()[0]["currentValue"], "plan");
+        configuration_result(&mut app, id, Ok(response));
+        assert!(app.picker.is_none());
+        assert_eq!(app.input, "keep draft");
+        Ok(())
+    }).await;
+}
+
+#[tokio::test]
 async fn the_model_picker_preserves_provider_labels_and_sends_the_advertised_value_with_ownership()
 {
     connected(async |cx| {
@@ -270,7 +305,7 @@ async fn dismissing_search_preserves_the_draft_and_no_matches_cannot_submit() {
         let state = app.conversations.entry("hive-test".into()).or_default();
         state.generation = 1;
         state.config_options = serde_json::from_value(json!([{
-            "configId":"model", "name":"Model", "type":"select", "currentValue":"fast",
+            "configId":"model", "name":"Model", "category":"model", "type":"select", "currentValue":"fast",
             "options":[{"value":"fast","name":"Fast"}]
         }]))
         .unwrap();

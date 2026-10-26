@@ -35,15 +35,18 @@ fn owner(seq: u64) -> v2::Meta {
 }
 
 fn choices() -> Vec<v2::SessionConfigOption> {
-    vec![v2::SessionConfigOption::select(
-        "model",
-        "Model",
-        "fast",
-        vec![
-            v2::SessionConfigSelectOption::new("fast", "Fast"),
-            v2::SessionConfigSelectOption::new("careful", "Careful"),
-        ],
-    )]
+    vec![
+        v2::SessionConfigOption::select(
+            "model",
+            "Model",
+            "fast",
+            vec![
+                v2::SessionConfigSelectOption::new("fast", "Fast"),
+                v2::SessionConfigSelectOption::new("careful", "Careful"),
+            ],
+        )
+        .category(v2::SessionConfigOptionCategory::Model),
+    ]
 }
 
 impl Fixture {

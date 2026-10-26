@@ -44,7 +44,7 @@ session is idle. A previous pilot becomes read-only after takeover.
 
 For a fresh session, choose a **Hive backend**, then **Create session**. This
 discovers the agent's configuration without sending a prompt. Choose its
-**Provider / Model** before sending the first message. Provider names and model
+**Provider / Model** before sending the first message or between later turns. Provider names and model
 choices come from the agent; the Hive backend selects the agent process or
 server, not its model provider.
 
@@ -54,6 +54,18 @@ active turn or pending configuration change. Changes become visible to other
 clients and are restored on attachment from the daemon's authoritative state.
 Backends without advertised configuration show an unsupported-selection message.
 The OpenCode server adapter currently requires configuring models in OpenCode.
+
+Other advertised settings appear alongside Provider / Model with their agent's
+labels. These can also be changed throughout an idle session. OpenCode exposes
+Session Mode, Claude exposes permission mode, current Codex adapters expose both
+approval and collaboration modes, and Pi exposes thinking level. An empty
+catalog is disabled. A failed change displays an error and retains the confirmed
+selection; agent-reported changes update all attached clients. Reconnect does
+not resend an uncertain settings change.
+
+Current mode is independent of configured defaults and displayed plans. See
+[session configuration compatibility](../acp-compatibility.md#session-modes-and-agent-settings)
+for adapter versions, protocol mapping, and notification limitations.
 
 Only the pilot can cancel or answer session-scoped permission/input requests.
 Forms use labelled controls with validation errors. URL consent does not itself

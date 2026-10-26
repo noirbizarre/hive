@@ -114,6 +114,49 @@ async fn erase(cx: &V2ConnectionTo<Agent>, app: &mut App, pending: &mut Option<I
 }
 
 #[tokio::test]
+async fn editing_and_session_switches_preserve_unicode_carets_without_submitting_pasted_lines() {
+    connected(async |cx| {
+        let mut app = App::default();
+        app.select_session("one".into());
+        text(&cx, &mut app, &mut None, "a👩‍💻z").await;
+        press(&cx, &mut app, &mut None, KeyCode::Left).await;
+        key(&cx, &mut app, &mut None, KeyCode::Left, KeyModifiers::SHIFT).await;
+        assert_eq!(app.editor.selected().as_deref(), Some("👩‍💻"));
+        paste(&mut app, &None, "界\r\nnext");
+        assert_eq!(app.input, "a界\nnextz");
+        let caret = app.editor.caret;
+        key(&cx, &mut app, &mut None, KeyCode::Enter, KeyModifiers::ALT).await;
+        assert_eq!(app.input, "a界\nnext\nz");
+        assert!(app.pending.is_empty());
+        press(&cx, &mut app, &mut None, KeyCode::Left).await;
+        app.select_session("two".into());
+        text(&cx, &mut app, &mut None, "other draft").await;
+        app.select_session("one".into());
+        assert_eq!(app.editor.caret, caret);
+        assert_eq!(app.input, "a界\nnext\nz");
+        key(
+            &cx,
+            &mut app,
+            &mut None,
+            KeyCode::Char('k'),
+            KeyModifiers::CONTROL,
+        )
+        .await;
+        key(
+            &cx,
+            &mut app,
+            &mut None,
+            KeyCode::Char('C'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        )
+        .await;
+        assert_eq!(app.input, "a界\nnext\nz");
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn submitted_prompts_wait_for_the_authoritative_echo_and_identical_prompts_stay_distinct() {
     connected(async |cx| {
         let mut app = App {

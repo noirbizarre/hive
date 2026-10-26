@@ -29,10 +29,18 @@ so the same sessions are available in the Web UI and other ACP clients.
 | `Ctrl-P` | Open/close the provider/model configuration picker |
 | `Ctrl-H` | Relinquish control while observing |
 | Enter in composer | Send the typed prompt |
+| `Alt-Enter` | Insert a newline without sending |
+| Left / Right, Up / Down in composer | Move by character or wrapped row |
+| Shift + arrows | Extend the prompt selection |
+| `Ctrl-A` | Select the entire prompt |
+| Backspace / Delete | Delete the selection or previous/next character |
+| `Alt-C` / `Alt-V` / `Alt-X` | Copy selection / paste / cut prompt selection |
+| `Ctrl-X`, then `Ctrl-E` | Open the prompt in an external editor |
 | Page Up / Page Down | Scroll conversation history |
 | Home / End | Jump to the oldest message / resume following live output |
 | Mouse wheel over conversation | Scroll history |
 | Click a tool summary | Expand/collapse formatted tool details |
+| Drag over conversation text | Select text for copying |
 | `Ctrl-Up` / `Ctrl-Down` | Select the previous/next tool call |
 | `Ctrl-O` | Expand/collapse the selected tool (latest visible tool by default) |
 | `Ctrl-C` | Cancel foreground work |
@@ -43,6 +51,61 @@ so the same sessions are available in the Web UI and other ACP clients.
 
 Recovery acknowledgement requires checking the downstream state first. See
 [sessions and handoff](sessions.md) for what these operations guarantee.
+
+## Edit and paste prompts
+
+The composer shows the cursor and scrolls to keep it visible while editing long
+or multiline prompts. Arrow movement and deletion respect Unicode characters,
+including combining accents and emoji sequences. Each session retains its draft,
+cursor, and prompt selection. Answering an agent question preserves the chat
+draft separately from the answer.
+
+Use `Alt-Enter` to add a newline and Enter to send. Bracketed paste and `Alt-V`
+insert multiline text as one edit: pasted newlines never send a prompt or
+confirm an agent question. Pasting into a form text field or model search
+replaces newlines with spaces; permission choices do not accept pasted input.
+Pastes and external-editor imports are limited to 8 MiB per operation.
+
+Drag over the conversation to select text, or click in the composer and use
+Shift-arrows or `Ctrl-A`. `Alt-C` copies the most recently focused selection;
+`Alt-X` cuts only a prompt selection. Copies use rendered plain text, preserve
+logical line breaks and code indentation, and omit soft-wrap newlines and screen
+padding. Expand a tool before selecting its details. Dragging on a tool summary
+selects text; clicking and releasing toggles it. Selecting history pauses live
+following; End resumes it. Reflow preserves selections, but a rewrite of selected
+content clears the selection so copying cannot silently use stale text.
+
+`Ctrl-Shift-C`, `Ctrl-Shift-V`, and `Ctrl-Shift-X` also work when the terminal
+delivers those distinct key combinations. Some terminals intercept them or send
+the same key as plain Control; use the Alt bindings in that case. `Ctrl-C`
+continues to cancel foreground work. Terminal-native paste also works through
+bracketed paste; hold Shift to use terminal-native mouse selection where needed.
+
+Clipboard actions use the system clipboard of the machine running Hive. Over
+SSH this may be the remote machine's clipboard. If no desktop clipboard service
+is available, Hive reports the failure and leaves the draft intact; terminal
+copy/paste remains available.
+
+## Use an external editor
+
+Press `Ctrl-X`, then `Ctrl-E` to edit the current prompt in a temporary Markdown
+file. Hive chooses the first nonempty value of `$VISUAL`, then `$EDITOR`, and
+falls back to `vi`. For example:
+
+```sh
+EDITOR='code --wait' hive tui
+```
+
+The editor command accepts quoted executable paths and arguments. It runs
+directly, without shell expansion or pipelines; use a wrapper executable for
+shell logic. GUI editors need their wait option so Hive knows when editing has
+finished. While the editor owns the terminal, Hive continues receiving agent
+updates and queues incoming questions.
+
+A successful exit loads the edited file as an unsent draft, including an empty
+file. Enter still sends the prompt. An editor launch failure, nonzero exit, or
+invalid UTF-8 preserves the original draft and reports an error. Hive restores
+the terminal and cursor before accepting input again.
 
 ## Choose a provider and model
 

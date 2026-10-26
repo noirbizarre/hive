@@ -20,6 +20,8 @@ pub struct ConversationLine {
 
 #[derive(Default)]
 pub struct Conversation {
+    pub transcript_epoch: u64,
+    pub lines_revision: u64,
     pub lines: Vec<ConversationLine>,
     messages: HashMap<String, usize>,
     tools: HashMap<String, usize>,
@@ -56,6 +58,7 @@ impl Conversation {
     pub fn begin_transcript(&mut self, through: u64) {
         // The request must succeed before queued snapshot notifications can replace this view.
         *self = Self {
+            transcript_epoch: self.transcript_epoch.wrapping_add(1),
             seq: through,
             snapshot_through: Some(through),
             ..Self::default()
@@ -91,6 +94,7 @@ impl Conversation {
 
     #[cfg(test)]
     pub fn push_user(&mut self, text: String) {
+        self.lines_revision = self.lines_revision.wrapping_add(1);
         self.lines.push(ConversationLine {
             kind: LineKind::User,
             text: format!("You: {text}"),
@@ -100,6 +104,7 @@ impl Conversation {
     }
 
     pub fn push_notice(&mut self, text: String) {
+        self.lines_revision = self.lines_revision.wrapping_add(1);
         self.lines.push(ConversationLine {
             kind: LineKind::Notice,
             text,
@@ -117,6 +122,7 @@ impl Conversation {
     }
 
     fn upsert(&mut self, key: String, kind: LineKind, text: &str, replace: bool) {
+        self.lines_revision = self.lines_revision.wrapping_add(1);
         let indexes = if kind == LineKind::Tool {
             &mut self.tools
         } else {
@@ -149,6 +155,7 @@ impl Conversation {
         let Some(id) = value["toolCallId"].as_str() else {
             return;
         };
+        self.lines_revision = self.lines_revision.wrapping_add(1);
         let index = *self.tools.entry(id.to_owned()).or_insert_with(|| {
             self.lines.push(ConversationLine {
                 kind: LineKind::Tool,

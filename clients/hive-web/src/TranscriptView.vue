@@ -2,6 +2,8 @@
 import { computed, nextTick, ref, watch } from 'vue';
 import Button from 'openvue/button';
 import MarkdownMessage from './MarkdownMessage.vue';
+import ActivityIndicator from './ActivityIndicator.vue';
+import { executing, live, working } from './activity.js';
 const props = defineProps({ state: { type: Object, required: true } });
 const viewport = ref();
 const following = ref(true);
@@ -45,15 +47,15 @@ watch(() => props.state, async (state, previous) => {
       </div>
       <!-- Reducer lines only append within a session; indices preserve open tools during chunks. -->
       <template v-for="(line, index) in state.lines" :key="`${state.session?.sessionId}:${index}`">
-        <details v-if="line.kind === 'tool'" class="tool-message"><summary>{{ line.title || 'Tool activity' }} <span v-if="line.status">· {{ line.status }}</span></summary><pre v-if="line.input">{{ line.input }}</pre><pre v-if="line.text">{{ line.text }}</pre><p v-else class="muted">No output reported</p></details>
+        <details v-if="line.kind === 'tool'" class="tool-message"><summary><ActivityIndicator v-if="live(state) && line.status === 'in_progress'" />{{ line.title || 'Tool activity' }} <span v-if="line.status">· {{ line.status }}</span></summary><pre v-if="line.input">{{ line.input }}</pre><pre v-if="line.text">{{ line.text }}</pre><p v-else class="muted">No output reported</p></details>
         <article v-else class="message" :class="line.kind">
-          <div class="message-speaker">{{ line.kind === 'user' ? 'You' : line.kind === 'agent' ? 'Agent' : 'Session notice' }}</div>
+          <div class="message-speaker"><ActivityIndicator v-if="line.kind === 'thought' && line.active && live(state) && !state.interaction && state.activity?.foreground !== 'requires_action'" />{{ line.kind === 'user' ? 'You' : line.kind === 'agent' ? 'Agent' : line.kind === 'thought' ? 'Thinking' : 'Session notice' }}</div>
           <MarkdownMessage v-if="line.kind === 'user' || line.kind === 'agent'" :text="line.text" />
           <div v-else class="message-text">{{ line.text }}</div>
         </article>
       </template>
       <details v-if="state.session" class="activity-panel" open>
-        <summary>Activity · {{ state.activity?.session || 'active' }} / {{ state.activity?.foreground || 'unknown' }}</summary>
+        <summary><ActivityIndicator v-if="working(state)" />Activity · {{ state.activity?.session || 'active' }} / {{ state.activity?.foreground || 'unknown' }}</summary>
         <section aria-label="Plans">
           <h3>Plans <small>{{ planSupport }} · {{ planObservation }}</small></h3>
           <p v-if="!Object.keys(plans).length" class="muted">No reported plans</p>
@@ -61,7 +63,7 @@ watch(() => props.state, async (state, previous) => {
             <h4>{{ id }}</h4>
             <template v-if="plan.type === 'items' || (!plan.type && Array.isArray(plan.entries))">
               <p v-if="!plan.entries.length" class="muted">Empty plan</p>
-              <p v-for="(entry, i) in plan.entries" :key="i">{{ entry.status }} · {{ entry.priority }} · {{ entry.content }}</p>
+              <p v-for="(entry, i) in plan.entries" :key="i"><ActivityIndicator v-if="live(state) && entry.status === 'in_progress'" />{{ entry.status }} · {{ entry.priority }} · {{ entry.content }}</p>
             </template>
             <template v-else><p>Unsupported plan content type: {{ plan.type }}</p><pre>{{ JSON.stringify(plan, null, 2) }}</pre></template>
           </div>
@@ -70,7 +72,7 @@ watch(() => props.state, async (state, previous) => {
           <h3>{{ label }} <small>{{ state.activity?.support?.[key] || 'unknown' }}</small></h3>
           <p v-if="!Object.keys(state.activity?.[key] || {}).length" class="muted">No reported {{ label.toLowerCase() }}</p>
           <div v-for="(item, id) in state.activity?.[key] || {}" :key="id" class="activity-item">
-            {{ item.title || id }} · {{ item.status || 'unknown' }}
+            <ActivityIndicator v-if="live(state) && (key === 'tasks' ? executing(item.status) : item.status === 'in_progress')" />{{ item.title || id }} · {{ item.status || 'unknown' }}
           </div>
         </div>
       </details>

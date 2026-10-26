@@ -330,6 +330,78 @@ test('replay folds chunks into full messages without duplicating them', () => {
   assert.equal(history.runningNow, false);
 });
 
+test('only live thinking blocks remain active until conversational output or idle completes them', () => {
+  const history = conversation();
+  let seq = 0;
+  const apply = value => history.apply(update(++seq, value).params);
+  const thought = messageId => ({ sessionUpdate: 'agent_thought_chunk', messageId, content: { type: 'text', text: 'Reasoning' } });
+  apply(thought('first'));
+  apply({ sessionUpdate: '_hive_usage', session: { turns: 1 } });
+  assert.equal(history.lines[0].active, true);
+  apply(thought('second'));
+  assert.equal(history.lines[0].active, false);
+  assert.equal(history.lines[1].active, true);
+  apply({ sessionUpdate: 'agent_thought', messageId: 'second', content: [] });
+  assert.equal(history.lines[1].active, false);
+  apply(thought('third'));
+  apply({ sessionUpdate: 'tool_call_update', toolCallId: 'read', status: 'in_progress' });
+  assert.equal(history.lines[2].active, false);
+  apply(thought('fourth'));
+  apply({ sessionUpdate: 'state_update', state: 'idle' });
+  apply({ sessionUpdate: 'state_update', state: 'running' });
+  assert.equal(history.lines.filter(line => line.active).length, 0);
+  history.restore([update(seq, { sessionUpdate: 'agent_thought', messageId: 'restored', content: [{ type: 'text', text: 'Saved thought' }] }).params], seq);
+  assert.equal(history.lines[0].active, false);
+  apply(thought('restored'));
+  assert.equal(history.lines[0].active, true);
+  apply({ sessionUpdate: 'agent_message_chunk', messageId: 'answer', content: { type: 'text', text: 'Answer' } });
+  assert.equal(history.lines[0].active, false);
+});
+
+test('opening stays busy through attachment and clears on failure including same session recovery', async () => {
+  let held;
+  const sockets = transport((socket, message, result) => {
+    if (message.method === 'session/resume') { held = () => socket.receive({ id: message.id, result }); return false; }
+  });
+  const client = connect('ws://localhost/acp');
+  const opening = client.open(session);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(client.state().session.sessionId, session.sessionId);
+  assert.equal(client.state().opening, true);
+  held(); await opening;
+  assert.equal(client.state().opening, false);
+  const taking = client.takeControl();
+  assert.equal(client.state().opening, true);
+  held(); await taking;
+  assert.equal(client.state().opening, false);
+  const failed = client.open({ ...session, sessionId: 'missing' });
+  await new Promise(resolve => setImmediate(resolve));
+  // Opening another session first relinquishes the current pilot.
+  held();
+  await new Promise(resolve => setImmediate(resolve));
+  const request = sockets[0].sent.at(-1);
+  sockets[0].receive({ id: request.id, error: { message: 'Attachment failed' } });
+  await assert.rejects(failed, /Attachment failed/);
+  assert.equal(client.state().opening, false);
+  client.close();
+});
+
+test('stopping waits for authoritative idle and disconnect clears cancellation animation', async () => {
+  const sockets = transport();
+  const client = connect('ws://localhost/acp');
+  await client.open(session); await client.takeControl(); await client.prompt('work');
+  assert.equal(client.cancel(), true);
+  assert.equal(client.state().stopping, true);
+  assert.equal(client.state().running, true);
+  sockets[0].receive(update(1, { sessionUpdate: 'state_update', state: 'idle' }));
+  assert.equal(client.state().stopping, false);
+  assert.equal(client.state().running, false);
+  await client.prompt('more'); client.cancel();
+  sockets[0].close();
+  assert.equal(client.state().stopping, false);
+  client.close();
+});
+
 test('usage snapshots and repricing events replace totals without adding a replayed turn', () => {
   const view = conversation();
   view.reconcileUsage({ turns: 1, tokens: { totalTokens: 120 }, actualSessionCost: null }, 4);

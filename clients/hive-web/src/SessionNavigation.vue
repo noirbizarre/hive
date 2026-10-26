@@ -2,6 +2,7 @@
 import { computed, ref } from 'vue';
 import InputText from 'openvue/inputtext';
 import Button from 'openvue/button';
+import ActivityIndicator from './ActivityIndicator.vue';
 const props = defineProps({ sessions: Array, state: Object, recent: Array, loading: Boolean, error: String, listId: { type: String, default: 'sessions' } });
 defineEmits(['open', 'refresh']);
 const search = ref('');
@@ -20,14 +21,14 @@ function ownership(session) {
   <nav aria-label="Sessions" class="session-navigation">
     <div class="rail-heading"><h2>Sessions</h2><span class="count">{{ sessions.length }}</span></div>
     <InputText v-model="search" type="search" aria-label="Search sessions" placeholder="Search sessions…" class="session-search" />
-    <p v-if="loading" role="status" class="rail-state">Loading sessions…</p>
+    <p v-if="loading" role="status" class="rail-state"><ActivityIndicator />Loading sessions…</p>
     <div v-else-if="error" class="rail-state" role="alert"><p>{{ error }}</p><Button label="Retry session list" size="small" severity="secondary" @click="$emit('refresh')" /></div>
     <p v-else-if="!sessions.length" class="rail-state">No sessions yet. Create a session to get started.</p>
     <p v-else-if="!ordered.length" class="rail-state">No sessions match your search.</p>
     <ul :id="listId" class="session-list">
       <li v-for="session in ordered" :key="session.sessionId">
         <button type="button" :data-session-id="session.sessionId" :aria-current="session.sessionId === state.session?.sessionId ? 'page' : undefined" @click="$emit('open', session)">
-          <span class="session-title">{{ session.title || session.sessionId }}</span>
+          <span class="session-title"><ActivityIndicator v-if="state.connected && state.opening && state.pendingSession === session.sessionId && !state.interaction" />{{ session.title || session.sessionId }}</span>
           <span class="session-meta">{{ session.agent || 'Unknown backend' }} <span>·</span> {{ session.lifecycle && session.lifecycle !== 'active' ? session.lifecycle : session.activity || 'unknown' }}</span>
           <span v-if="session.sessionId === state.session?.sessionId && state.interaction" class="attention">Needs attention</span>
           <span class="session-owner">{{ ownership(session) }}</span>

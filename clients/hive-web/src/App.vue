@@ -10,6 +10,7 @@ import { catalog } from './client.js';
 import SessionNavigation from './SessionNavigation.vue';
 import TranscriptView from './TranscriptView.vue';
 import InteractionCard from './InteractionCard.vue';
+import ActivityIndicator from './ActivityIndicator.vue';
 
 const props = defineProps({ client: { type: Object, required: true }, state: { type: Object, required: true } });
 const state = computed(() => unref(props.state));
@@ -121,14 +122,14 @@ onBeforeUnmount(() => { feed?.close(); props.client.close(); });
       </header>
       <section class="configuration-bar" aria-label="Session configuration">
         <label class="config-field" for="agent">Hive backend<Select :model-value="state.session ? selected?.agent || state.session.agent || backend : backend" input-id="agent" placeholder="Default backend" :options="[{ id: '', name: 'Default backend' }, ...agents]" option-label="name" option-value="id" :disabled="Boolean(state.session) || busy" @update:model-value="value => backend = value" /></label>
-        <Button v-if="!state.session" id="create" label="Create session" :loading="state.creating" :disabled="!state.connected || busy || Boolean(providerError)" @click="action(() => client.create(backend))" />
+        <Button v-if="!state.session" id="create" label="Create session" :loading="state.connected && state.creating && !state.interaction" :disabled="!state.connected || busy || Boolean(providerError)" @click="action(() => client.create(backend))" />
         <label v-for="option in configOptions" :key="option.configId" class="config-field" :for="`config-${option.configId}`">{{ option.category === 'model' ? 'Provider / Model' : option.name }}
           <Select :key="configFailures[option.configId] || 0" :input-id="`config-${option.configId}`" :model-value="option.currentValue" :aria-label="currentLabel(option)" :placeholder="String(option.currentValue ?? 'Unavailable')" :title="option.description" :options="groups(option)" option-group-label="name" option-group-children="items" option-label="name" option-value="value" :disabled="configDisabled || !hasChoices(option)" @update:model-value="value => configure(option, value)">
-            <template #value>{{ currentLabel(option) }}</template>
+            <template #value><ActivityIndicator v-if="state.connected && state.configuring && !state.interaction" />{{ currentLabel(option) }}</template>
           </Select>
         </label>
         <p v-if="!configOptions.length" class="config-hint">{{ state.session ? 'This backend does not expose session configuration' : 'Create a session to choose its model and settings. You can change them between turns.' }}</p>
-        <Button v-if="state.session && !pilot" id="control" label="Take control" severity="secondary" outlined :loading="state.takingControl" :disabled="!state.connected || state.recoveryRequired || busy || state.gap" @click="action(() => client.takeControl())" />
+        <Button v-if="state.session && !pilot" id="control" label="Take control" severity="secondary" outlined :loading="state.connected && state.takingControl && !state.interaction" :disabled="!state.connected || state.recoveryRequired || busy || state.gap" @click="action(() => client.takeControl())" />
       </section>
       <div class="notices">
         <!-- Coverage survives transient transport messages and never blocks available content. -->
@@ -138,8 +139,8 @@ onBeforeUnmount(() => { feed?.close(); props.client.close(); });
         </Message>
         <Message v-if="providerError" severity="error" :closable="false">{{ providerError }} <Button label="Retry backends" size="small" @click="feed.refresh()" /></Message>
         <Message v-if="error" severity="error" :closable="false" role="alert">{{ error }}</Message>
-        <Message v-if="state.gap" severity="warn" :closable="false">Earlier history is unavailable. <Button label="Attach without earlier history" :disabled="!state.connected || busy" @click="action(() => client.attachWithoutHistory())" /></Message>
-        <Message v-if="state.recoveryRequired" severity="warn" :closable="false">Work was interrupted. Inspect the agent state before continuing. <Button label="Acknowledge recovery" :disabled="!state.connected || state.gap || busy" @click="action(() => client.acknowledgeRecovery())" /></Message>
+        <Message v-if="state.gap" severity="warn" :closable="false">Earlier history is unavailable. <Button label="Attach without earlier history" :loading="state.connected && state.opening && !state.interaction" :disabled="!state.connected || busy" @click="action(() => client.attachWithoutHistory())" /></Message>
+        <Message v-if="state.recoveryRequired" severity="warn" :closable="false">Work was interrupted. Inspect the agent state before continuing. <Button label="Acknowledge recovery" :loading="state.connected && state.opening && !state.interaction" :disabled="!state.connected || state.gap || busy" @click="action(() => client.acknowledgeRecovery())" /></Message>
         <Message v-else-if="state.uncertain" severity="warn" :closable="false">The prompt has not been acknowledged. Retrying uses its original content and key. <Button label="Retry original prompt" :disabled="!pilot || busy || !state.connected" @click="send(true)" /></Message>
       </div>
       <TranscriptView :state="state" />
@@ -148,7 +149,7 @@ onBeforeUnmount(() => { feed?.close(); props.client.close(); });
         <form id="prompt" class="composer surface" @submit.prevent="send()">
           <label for="composer" class="sr-only">Message your agent</label>
           <Textarea id="composer" v-model="text" name="text" rows="3" placeholder="What would you like to work on?" :disabled="!state.connected || state.gap || state.opening" aria-describedby="composer-help" @input="typing" />
-          <div class="composer-footer"><span id="composer-help">{{ blocked || 'Ready to send · Your session stays with the daemon' }}</span><div class="actions"><Button id="cancel" label="Stop" severity="secondary" text :disabled="!pilot || !state.running" @click="client.cancel()" /><Button id="send" type="submit" label="Send message ↑" :loading="sending" :disabled="Boolean(blocked) || !text.trim()" /></div></div>
+          <div class="composer-footer"><span id="composer-help"><ActivityIndicator v-if="state.connected && state.opening && !state.interaction" />{{ blocked || 'Ready to send · Your session stays with the daemon' }}</span><div class="actions"><Button id="cancel" :label="state.stopping ? 'Stopping' : 'Stop'" severity="secondary" text :loading="state.connected && state.stopping" :disabled="!pilot || !state.running || state.stopping" @click="client.cancel()" /><Button id="send" type="submit" label="Send message ↑" :loading="state.connected && sending && !state.interaction" :disabled="Boolean(blocked) || !text.trim()" /></div></div>
         </form>
         <p id="status" class="transport-status" role="status" aria-live="polite">{{ state.status }}</p>
       </div>

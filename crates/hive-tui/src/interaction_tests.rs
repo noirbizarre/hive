@@ -22,6 +22,16 @@ async fn connected(body: impl AsyncFnOnce(V2ConnectionTo<Agent>) -> Result<(), E
             agent_client_protocol::on_receive_notification!(),
         )
         .on_receive_request(
+            async |_: v2::ResumeSessionRequest, responder: agent_client_protocol::Responder<v2::ResumeSessionResponse>, _: V2ConnectionTo<Client>| {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                responder.respond(v2::ResumeSessionResponse::new().meta(v2::Meta::from_iter([("hive".into(), json!({
+                    "generation":1,"role":"pilot","pilot":true,"token":"test","running":false,
+                    "activitySnapshot":{"version":1,"seq":0,"session":"active","foreground":"idle"}
+                }))])))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
             async |request: v2::SetSessionConfigOptionRequest,
                    responder: agent_client_protocol::Responder<
                 v2::SetSessionConfigOptionResponse,
@@ -114,6 +124,117 @@ async fn erase(cx: &V2ConnectionTo<Agent>, app: &mut App, pending: &mut Option<I
     while !app.input.is_empty() {
         press(cx, app, pending, KeyCode::Backspace).await;
     }
+}
+
+#[tokio::test]
+async fn delayed_control_actions_keep_frames_and_input_responses_responsive() {
+    connected(async |cx| {
+        use ratatui::{Terminal, backend::TestBackend};
+        let mut app = App { connected: true, ..App::default() };
+        app.select_session("hive-test".into());
+        tokio::time::timeout(Duration::from_millis(20), key(&cx, &mut app, &mut None, KeyCode::Char('t'), KeyModifiers::CONTROL)).await.unwrap();
+        assert!(app.session_operation.is_some());
+        text(&cx, &mut app, &mut None, "draft during takeover").await;
+        assert_eq!(app.input, "draft during takeover");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| app.show(frame)).unwrap();
+        assert!(app.animation_visible);
+        app.animation_phase = 1;
+        terminal.draw(|frame| app.show(frame)).unwrap();
+        assert!(terminal.backend().buffer().content.iter().any(|cell| cell.symbol() == "⠙"));
+
+        let (question, answer) = form(json!({"mode":"form","requestId":1,"message":"Configure", "requestedSchema":{"type":"object","properties":{}}}));
+        assert!(question.request_scoped());
+        show_interaction(&mut app, &question);
+        let mut pending = Some(question);
+        terminal.draw(|frame| app.show(frame)).unwrap();
+        assert!(!app.animation_visible);
+        press(&cx, &mut app, &mut pending, KeyCode::Enter).await;
+        assert!(matches!(answer.await.unwrap().action, v2::ElicitationAction::Accept(_)));
+        assert!(pending.is_none());
+        assert_eq!(app.input, "draft during takeover");
+        assert!(app.session_operation.is_some());
+        let result = operation_completion(&mut app.session_operation).await.unwrap();
+        app.session_operation = None;
+        assert!(!result.relinquished);
+        let SessionOutcome::Resume { id, response } = result.outcome else { panic!("expected attachment"); };
+        apply_resume(&mut app, id, response.unwrap()).unwrap();
+        terminal.draw(|frame| app.show(frame)).unwrap();
+        assert!(!app.animation_visible);
+        assert!(app.pilot());
+        Ok(())
+    }).await;
+}
+
+#[test]
+fn switching_sessions_preserves_destination_permissions_received_before_the_attachment_response() {
+    let mut app = App {
+        connected: true,
+        ..App::default()
+    };
+    app.select_session("previous".into());
+    let (previous, mut previous_answer) = permission();
+    let Interaction::Permission(mut previous_request, previous_tx) = previous else {
+        unreachable!()
+    };
+    previous_request.session_id = "previous".into();
+    let mut interaction = Some(Interaction::Permission(previous_request, previous_tx));
+    show_interaction(&mut app, interaction.as_ref().unwrap());
+    let (destination, mut destination_answer) = permission();
+    let Interaction::Permission(mut destination_request, destination_tx) = destination else {
+        unreachable!()
+    };
+    destination_request.session_id = "destination".into();
+    let destination = Interaction::Permission(destination_request, destination_tx);
+    assert!(!destination.available(&app));
+    let mut queued = VecDeque::from([destination]);
+    app.select_session("destination".into());
+    app.owner = Some(v2::Meta::from_iter([(
+        "hive".into(),
+        json!({"role":"pilot","generation":1,"token":"destination-token"}),
+    )]));
+    app.conversations
+        .entry("destination".into())
+        .or_default()
+        .generation = 1;
+    reconcile_interactions(&mut app, &mut interaction, &mut queued);
+    assert!(interaction.is_none());
+    assert!(previous_answer.try_recv().is_err());
+    assert!(matches!(
+        destination_answer.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    assert_eq!(queued.len(), 1);
+    assert!(queued[0].available(&app));
+    interaction = queued.pop_front();
+    show_interaction(&mut app, interaction.as_ref().unwrap());
+    reconcile_interactions(&mut app, &mut interaction, &mut queued);
+    assert!(interaction.is_some());
+    assert!(app.dialog.is_some());
+    assert!(matches!(
+        destination_answer.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+}
+
+#[test]
+fn failed_history_attachment_keeps_the_target_available_for_explicit_live_only_recovery() {
+    let mut app = App::default();
+    app.select_session("previous".into());
+    app.input = "old draft".into();
+    let result = SessionOperationResult {
+        relinquished: true,
+        outcome: SessionOutcome::Resume {
+            id: "target".into(),
+            response: Err(Error::invalid_params().data("hive::transcript::history_missing")),
+        },
+    };
+    assert!(apply_session_result(&mut app, result, "Opening conversation").is_none());
+    assert_eq!(app.active.as_deref(), Some("target"));
+    assert_eq!(app.drafts["previous"], "old draft");
+    assert!(app.owner.is_none());
+    assert!(!app.skip_replay);
+    assert!(app.status.contains("Ctrl-R"));
 }
 
 #[tokio::test]

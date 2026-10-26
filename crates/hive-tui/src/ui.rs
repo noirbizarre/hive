@@ -68,6 +68,10 @@ pub struct App {
     pub suspended_draft: Option<String>,
     pub status: String,
     pub connected: bool,
+    pub animation_phase: usize,
+    pub animation_visible: bool,
+    pub submitting: std::collections::HashSet<String>,
+    pub stopping: Option<String>,
     pub pending: HashMap<String, (String, String)>,
     pub drafts: HashMap<String, String>,
     pub dialog: Option<String>,
@@ -79,9 +83,20 @@ pub struct App {
             Result<v2::SetSessionConfigOptionResponse, String>,
         )>,
     >,
+    pub session_operation: Option<crate::SessionOperation>,
 }
 
 impl App {
+    fn activity_live(&self) -> bool {
+        self.connected
+            && !self
+                .conversation()
+                .is_some_and(|c| c.gap || c.activity["session"] == "ended")
+    }
+
+    fn work_marker(&self, active: bool) -> Span<'static> {
+        crate::activity::marker(active && self.activity_live())
+    }
     pub fn config_choices(&self) -> Vec<(String, String, String)> {
         self.choices_for(
             self.picker
@@ -310,6 +325,8 @@ impl App {
             self.render_sidebar(frame, columns[1], theme);
         }
         self.render_picker(frame, theme);
+        self.animation_visible =
+            crate::activity::finish(frame, self.animation_phase, self.connected);
     }
 
     fn render_picker(&mut self, frame: &mut Frame, theme: Theme) {
@@ -404,7 +421,10 @@ impl App {
         }
         frame.render_widget(
             Paragraph::new(vec![
-                Line::styled(&picker.message, theme.warning()),
+                Line::from(vec![
+                    crate::activity::marker(picker.pending && self.dialog.is_none()),
+                    Span::styled(picker.message.clone(), theme.warning()),
+                ]),
                 Line::styled(
                     "↑↓ select · Enter apply · Esc close · Ctrl-Q quit",
                     theme.muted(),
@@ -596,6 +616,7 @@ impl App {
             return;
         }
         let body = Block::default().padding(Padding::horizontal(3));
+        let live = self.activity_live();
         if let Some(id) = self.active.as_ref()
             && let Some(conversation) = self.conversations.get(id)
         {
@@ -603,6 +624,8 @@ impl App {
                 conversation,
                 frame,
                 body.inner(area),
+                live,
+                self.dialog.is_some(),
             );
             if let Some(view) = self.transcripts.get_mut(id)
                 && view.selection_invalidated
@@ -747,7 +770,15 @@ impl App {
         // Browsing older messages must not hide a new connection or submission error.
         let history_status = format!("History · End live · {}", self.status);
         let mut lines = vec![Line::from(vec![
-            Span::styled("  ▪ ", theme.accent()),
+            crate::activity::marker(
+                self.dialog.is_none()
+                    && (self.configuration.is_some()
+                        || self.active.as_ref().is_some_and(|id| {
+                            self.submitting.contains(id) || self.stopping.as_ref() == Some(id)
+                        })
+                        || self.session_operation.is_some()),
+            ),
+            Span::styled(" ▪ ", theme.accent()),
             Span::styled(
                 if history && !self.status.is_empty() {
                     &history_status
@@ -773,14 +804,20 @@ impl App {
                         "disconnected"
                     },
                     if self.pilot() { "pilot" } else { "observer" },
-                    if self.conversation().is_some_and(|c| c.running) {
-                        "running"
-                    } else {
-                        "idle"
-                    }
+                    self.conversation()
+                        .map_or("unknown", |c| c.foreground.as_str())
                 ),
                 theme.muted(),
             ));
+        }
+        if compact
+            && self.dialog.is_none()
+            && self
+                .conversation()
+                .is_some_and(|c| c.foreground == "running")
+            && let Some(line) = lines.get_mut(1)
+        {
+            line.spans.insert(0, self.work_marker(true));
         }
         frame.render_widget(Paragraph::new(lines), area);
     }
@@ -807,14 +844,19 @@ impl App {
             Line::default(),
             Line::styled("Control", theme.muted()),
             Line::styled(role, theme.text()),
-            Line::styled(
-                if self.conversation().is_some_and(|c| c.running) {
-                    "Running"
-                } else {
-                    "Idle"
-                },
-                theme.text(),
-            ),
+            Line::from(vec![
+                self.work_marker(
+                    self.dialog.is_none()
+                        && self
+                            .conversation()
+                            .is_some_and(|c| c.foreground == "running"),
+                ),
+                Span::styled(
+                    self.conversation()
+                        .map_or("unknown", |c| c.foreground.as_str()),
+                    theme.text(),
+                ),
+            ]),
             Line::styled(
                 if self.connected {
                     "Connected"
@@ -867,14 +909,23 @@ impl App {
                 lines.push(Line::styled(format!("{label} · {status}"), theme.text()));
                 if let Some(items) = activity[field].as_object() {
                     for (id, item) in items {
-                        lines.push(Line::styled(
-                            format!(
-                                "  {} · {}",
-                                item["status"].as_str().unwrap_or("unknown"),
-                                item["title"].as_str().unwrap_or(id)
+                        lines.push(Line::from(vec![
+                            self.work_marker(if field == "tasks" {
+                                crate::activity::executing(
+                                    item["status"].as_str().unwrap_or_default(),
+                                )
+                            } else {
+                                item["status"] == "in_progress"
+                            }),
+                            Span::styled(
+                                format!(
+                                    " {} · {}",
+                                    item["status"].as_str().unwrap_or("unknown"),
+                                    item["title"].as_str().unwrap_or(id)
+                                ),
+                                theme.text(),
                             ),
-                            theme.text(),
-                        ));
+                        ]));
                     }
                 }
             }
@@ -918,15 +969,18 @@ impl App {
                         lines.push(Line::styled("  Empty plan", theme.muted()));
                     }
                     for entry in entries {
-                        lines.push(Line::styled(
-                            format!(
-                                "  {} · {} · {}",
-                                entry["status"].as_str().unwrap_or("?"),
-                                entry["priority"].as_str().unwrap_or("?"),
-                                entry["content"].as_str().unwrap_or("?")
+                        lines.push(Line::from(vec![
+                            self.work_marker(entry["status"] == "in_progress"),
+                            Span::styled(
+                                format!(
+                                    " {} · {} · {}",
+                                    entry["status"].as_str().unwrap_or("?"),
+                                    entry["priority"].as_str().unwrap_or("?"),
+                                    entry["content"].as_str().unwrap_or("?")
+                                ),
+                                theme.text(),
                             ),
-                            theme.text(),
-                        ));
+                        ]));
                     }
                 } else {
                     lines.push(Line::styled(
@@ -1381,6 +1435,51 @@ mod tests {
         // No fixed background should override terminal transparency or a light theme.
         assert!(buffer.content().iter().all(|cell| cell.bg == Color::Reset));
         assert!(buffer.content().iter().any(|cell| cell.fg == Color::Cyan));
+    }
+
+    #[test]
+    fn background_work_animates_after_foreground_idle_but_stale_and_waiting_work_stays_static() {
+        let mut app = App {
+            page: Page::Chat,
+            active: Some("one".into()),
+            connected: true,
+            ..App::default()
+        };
+        let mut conversation = Conversation::default();
+        conversation.snapshot(&serde_json::json!({"version":1,"seq":1,"session":"active","foreground":"idle","tasks":{"job":{"title":"Index","status":"running"}}}));
+        app.conversations.insert("one".into(), conversation);
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| app.show(frame)).unwrap();
+        assert!(app.animation_visible);
+        assert!(screen(&terminal).contains('⠋'));
+        for status in [
+            "pending",
+            "queued",
+            "requires_action",
+            "completed",
+            "failed",
+            "cancelled",
+            "future",
+        ] {
+            app.conversations.get_mut("one").unwrap().activity["tasks"]["job"]["status"] =
+                status.into();
+            terminal.draw(|frame| app.show(frame)).unwrap();
+            assert!(!app.animation_visible, "{status}");
+        }
+        app.conversations.get_mut("one").unwrap().activity["tasks"]["job"]["status"] =
+            "running".into();
+        // No sidebar and no transcript marker means off-screen activity needs no animation redraw.
+        terminal = Terminal::new(TestBackend::new(50, 20)).unwrap();
+        terminal.draw(|frame| app.show(frame)).unwrap();
+        assert!(!app.animation_visible);
+        terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        app.connected = false;
+        terminal.draw(|frame| app.show(frame)).unwrap();
+        assert!(!app.animation_visible);
+        app.connected = true;
+        app.conversations.get_mut("one").unwrap().activity["session"] = "ended".into();
+        terminal.draw(|frame| app.show(frame)).unwrap();
+        assert!(!app.animation_visible);
     }
 
     #[test]

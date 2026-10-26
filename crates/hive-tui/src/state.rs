@@ -7,6 +7,7 @@ pub enum LineKind {
     User,
     Agent,
     Tool,
+    Thought,
     Notice,
 }
 
@@ -28,6 +29,8 @@ pub struct Conversation {
     pub seq: u64,
     snapshot_through: Option<u64>,
     pub running: bool,
+    pub foreground: String,
+    pub active_thought: Option<usize>,
     pub generation: u64,
     pub pilot_present: bool,
     pub activity: serde_json::Value,
@@ -68,6 +71,7 @@ impl Conversation {
     pub fn snapshot(&mut self, value: &serde_json::Value) {
         let seq = value["seq"].as_u64().unwrap_or(0);
         if seq >= self.activity_seq && value["version"] == 1 {
+            self.foreground = value["foreground"].as_str().unwrap_or("unknown").into();
             self.activity = value.clone();
             self.activity_seq = seq;
         }
@@ -132,6 +136,7 @@ impl Conversation {
             LineKind::User => "You",
             LineKind::Agent => "Agent",
             LineKind::Tool => "Tool",
+            LineKind::Thought => "Thinking",
             LineKind::Notice => "Notice",
         };
         let index = *indexes.entry(key).or_insert_with(|| {
@@ -243,23 +248,41 @@ impl Conversation {
             v2::SessionUpdate::ConfigOptionUpdate(update) => {
                 self.config_snapshot(update.config_options, seq)
             }
-            v2::SessionUpdate::AgentMessageChunk(chunk) => self.upsert(
-                format!("agent:{}", chunk.message_id),
-                LineKind::Agent,
-                &content_text(&chunk.content),
-                false,
-            ),
-            v2::SessionUpdate::AgentThoughtChunk(chunk) => self.upsert(
-                format!("thought:{}", chunk.message_id),
-                LineKind::Notice,
-                &content_text(&chunk.content),
-                false,
-            ),
+            v2::SessionUpdate::AgentMessageChunk(chunk) => {
+                self.active_thought = None;
+                self.upsert(
+                    format!("agent:{}", chunk.message_id),
+                    LineKind::Agent,
+                    &content_text(&chunk.content),
+                    false,
+                )
+            }
+            v2::SessionUpdate::AgentThoughtChunk(chunk) => {
+                let key = format!("thought:{}", chunk.message_id);
+                self.upsert(
+                    format!("thought:{}", chunk.message_id),
+                    LineKind::Thought,
+                    &content_text(&chunk.content),
+                    false,
+                );
+                // Restored snapshots lack per-block execution metadata; only live chunks establish it.
+                if !snapshot {
+                    self.active_thought = self.messages.get(&key).copied();
+                }
+            }
             v2::SessionUpdate::AgentThought(message) => {
+                if self.active_thought
+                    == self
+                        .messages
+                        .get(&format!("thought:{}", message.message_id))
+                        .copied()
+                {
+                    self.active_thought = None;
+                }
                 if let Some(text) = message_content(&message.content) {
                     self.upsert(
                         format!("thought:{}", message.message_id),
-                        LineKind::Notice,
+                        LineKind::Thought,
                         &text,
                         true,
                     );
@@ -272,6 +295,7 @@ impl Conversation {
                 false,
             ),
             v2::SessionUpdate::AgentMessage(message) => {
+                self.active_thought = None;
                 if let Some(text) = message_content(&message.content) {
                     self.upsert(
                         format!("agent:{}", message.message_id),
@@ -292,19 +316,27 @@ impl Conversation {
                 }
             }
             v2::SessionUpdate::ToolCallUpdate(tool) => {
+                self.active_thought = None;
                 self.tool(serde_json::to_value(tool).unwrap_or_default(), false);
             }
             v2::SessionUpdate::ToolCallContentChunk(chunk) => {
+                self.active_thought = None;
                 self.tool(serde_json::to_value(chunk).unwrap_or_default(), true);
             }
-            v2::SessionUpdate::StateUpdate(v2::StateUpdate::Running(_)) => self.running = true,
+            v2::SessionUpdate::StateUpdate(v2::StateUpdate::Running(_)) => {
+                self.running = true;
+                self.foreground = "running".into();
+            }
             // Blocked foreground work still needs a later idle confirmation, including cancellation.
             v2::SessionUpdate::StateUpdate(v2::StateUpdate::RequiresAction(_)) => {
-                self.running = true
+                self.running = true;
+                self.foreground = "requires_action".into();
             }
             v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(idle)) => {
                 let was_running = self.running;
                 self.running = false;
+                self.foreground = "idle".into();
+                self.active_thought = None;
                 if was_running && matches!(idle.stop_reason, Some(v2::StopReason::Cancelled)) {
                     self.push_notice("Turn cancelled".into());
                 }
@@ -344,6 +376,8 @@ impl Conversation {
                     let kind = value["kind"].as_str().unwrap_or_default();
                     if kind == "foreground" {
                         self.activity["foreground"] = value["state"]["state"].clone();
+                        self.foreground =
+                            value["state"]["state"].as_str().unwrap_or("unknown").into();
                     }
                     if kind == "session" {
                         self.activity["session"] = value["status"].clone();
@@ -374,6 +408,7 @@ impl Conversation {
             v2::SessionUpdate::Other(other)
                 if other.session_update.starts_with("_hive_v1_tool") =>
             {
+                self.active_thought = None;
                 self.tool(other.fields["tool"].clone(), false);
             }
             _ => {}
@@ -417,6 +452,55 @@ mod tests {
         let mut meta = v2::Meta::new();
         meta.insert("hive".into(), serde_json::json!({"seq": seq}));
         v2::UpdateSessionNotification::new(v2::SessionId::new("hive-test"), update).meta(meta)
+    }
+
+    #[test]
+    fn thinking_tracks_only_the_live_block_and_ends_on_output_or_idle() {
+        let mut conversation = Conversation::default();
+        let thought = |id: &str| {
+            serde_json::from_value(serde_json::json!({"sessionUpdate":"agent_thought_chunk","messageId":id,"content":{"type":"text","text":"Reasoning"}})).unwrap()
+        };
+        conversation.apply(event(1, thought("first")));
+        assert_eq!(conversation.lines[0].kind, LineKind::Thought);
+        assert_eq!(conversation.active_thought, Some(0));
+        conversation.apply(event(
+            2,
+            v2::SessionUpdate::Other(v2::OtherSessionUpdate::new("_hive_usage", BTreeMap::new())),
+        ));
+        assert_eq!(conversation.active_thought, Some(0));
+        conversation.apply(event(3, thought("second")));
+        assert_eq!(conversation.active_thought, Some(1));
+        conversation.apply(event(4, serde_json::from_value(serde_json::json!({"sessionUpdate":"agent_thought","messageId":"second","content":[]})).unwrap()));
+        assert_eq!(conversation.active_thought, None);
+        conversation.apply(event(5, thought("third")));
+        conversation.apply(event(
+            6,
+            v2::SessionUpdate::ToolCallUpdate(v2::ToolCallUpdate::new("read")),
+        ));
+        assert_eq!(conversation.active_thought, None);
+        conversation.apply(event(7, thought("fourth")));
+        conversation.apply(event(
+            8,
+            serde_json::from_value(
+                serde_json::json!({"sessionUpdate":"state_update","state":"idle"}),
+            )
+            .unwrap(),
+        ));
+        conversation.apply(event(
+            9,
+            serde_json::from_value(
+                serde_json::json!({"sessionUpdate":"state_update","state":"running"}),
+            )
+            .unwrap(),
+        ));
+        assert_eq!(conversation.active_thought, None);
+        conversation.begin_transcript(10);
+        let mut snapshot = event(10, thought("restored"));
+        snapshot.meta.as_mut().unwrap().get_mut("hive").unwrap()["snapshot"] = true.into();
+        conversation.apply(snapshot);
+        assert_eq!(conversation.active_thought, None);
+        conversation.apply(event(11, thought("restored")));
+        assert_eq!(conversation.active_thought, Some(0));
     }
 
     #[test]

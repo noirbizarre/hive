@@ -178,6 +178,15 @@ The transcript follows your terminal's foreground/background and ANSI colors.
 Session details collapse in narrow terminals. Unknown activity remains unknown,
 and an attention marker reflects only questions visible to this client.
 
+Spinners mark executing tools, tasks, plan entries, live thinking, foreground
+work, and pending asynchronous actions. Queued work and requests awaiting your
+input stay static. Session and control actions keep the interface responsive
+while waiting; cancellation shows **Stopping** until the agent confirms idle.
+Background tasks can continue after foreground work ends. Disconnected or ended
+sessions do not animate stale activity. Restored thinking stays static until
+new live thinking arrives for that block. Animation preserves transcript
+selection, copied text, scroll position, and expanded tool details.
+
 Messages render Markdown headings, emphasis, lists, links, tables, and code
 blocks. Tool calls start collapsed as a single line with the tool name (or
 category), status, and a short action summary. Click that line to inspect input,

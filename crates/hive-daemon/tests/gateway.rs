@@ -363,6 +363,9 @@ async fn modes_are_rediscovered_from_the_original_session_after_daemon_restart()
             identity = Some(id);
             broker.shutdown().await;
             server.abort();
+            // Windows cannot delete the database until cancellation releases the server's broker clone.
+            let _ = server.await;
+            drop(broker);
         }
         let saved: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&agent_state).unwrap()).unwrap();

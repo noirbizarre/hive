@@ -32,7 +32,7 @@ See [getting started](../getting-started.md) for the full sequence.
 This launches a separate ACP process per Hive session. It is not native-session
 adoption. Confirm the wire version after upgrades and keep initialization,
 prompting, and recovery evidence separate in the
-[compatibility matrix](../acp-compatibility.md#installed-agent-capability-matrix-2026-10-11).
+[Known agents matrix](../acp-compatibility.md#known-agents).
 
 ### Mode and model selection
 

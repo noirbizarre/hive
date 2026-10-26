@@ -207,7 +207,7 @@ and fail if attachment returns no conversation. A failed load does not establish
 be reopened via their own CLI or server. Hive adopts native IDs only through an
 `opencode-server` profile (below), never an ACP one: record native-CLI reopen,
 direct ACP attachment and Hive's live-worker resume as **separate** results in the
-[capability matrix](acp-compatibility.md#installed-agent-capability-matrix-2026-10-11).
+[Known agents matrix](acp-compatibility.md#known-agents).
 
 For optional tool calls/results, permission requests, user-input requests,
 cancel, and disconnect while generation is active, inspect a deliberately

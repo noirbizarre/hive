@@ -28,7 +28,7 @@ opencode auth login
 
 Select and configure a model in OpenCode itself. Hive does not install agents,
 log in to providers, or choose provider credentials for you. Compatibility is
-version-dependent: see the [recorded evidence](acp-compatibility.md#installed-agent-capability-matrix-2026-10-11).
+version-dependent: see the [Known agents evidence](acp-compatibility.md#known-agents).
 
 If you want to try Hive without an account or model, use the
 [mock-agent option](#try-without-a-model) instead.

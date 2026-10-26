@@ -41,7 +41,7 @@ nav = [
   ] },
   { "Reference" = [
     { "CLI" = "reference/cli.md" },
-    { "ACP compatibility" = "acp-compatibility.md" },
+    { "ACP compatibility matrix" = "acp-compatibility.md" },
     { "Transports" = "transports.md" },
     { "Operational HTTP API" = "hive-api.md" },
   ] },

@@ -30,7 +30,7 @@ lets you try the workflow without a model account.
   using the same daemon-owned sessions.
 
 Agent capabilities and real-world verification vary. Check the
-[compatibility evidence](acp-compatibility.md) rather than assuming every profile
+[ACP / ACPv2 compatibility matrix](acp-compatibility.md) for layer-by-layer support and evidence before assuming every profile
 supports every operation.
 
 ## Current boundaries

@@ -34,7 +34,7 @@ initialize with protocol version 1, so declaring only v2 fails.
 
 Only initialization is recorded as verified for this installation. Full prompt
 turns, streaming, tool events, cancellation, and reconnect remain unverified.
-The [compatibility matrix](../acp-compatibility.md#installed-agent-capability-matrix-2026-10-11)
+The [Known agents matrix](../acp-compatibility.md#known-agents)
 and [Pi protocol notes](../acp-compatibility.md#pi) retain the exact evidence.
 
 The adapter runs tools itself rather than delegating filesystem/terminal work

@@ -2,6 +2,7 @@
 
 import errno
 import faulthandler
+from concurrent.futures import ThreadPoolExecutor
 import fcntl
 import json
 import os
@@ -54,6 +55,8 @@ def main():
             env["XDG_RUNTIME_DIR"] = str(directory)
             if create:
                 env["HIVE_RUNTIME_CREATE"] = "1"
+            else:
+                env.pop("HIVE_RUNTIME_CREATE", None)
             os.execve(sys.argv[1], [sys.argv[1], "terminal_tests::runtime_fixture", "--ignored", "--exact", "--nocapture"], env)
         fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
         os.set_blocking(master, False)
@@ -65,6 +68,8 @@ def main():
         address = None
         cursor_queries = 0
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        # Start threads only in the parent, after fork; macOS forbids inherited runtime locks.
+        http = ThreadPoolExecutor(max_workers=1)
 
         def pump():
             nonlocal address, cursor_queries
@@ -93,13 +98,21 @@ def main():
                     return
             raise AssertionError("TUI fixture did not reach the expected state")
 
+        def request(path, data=None):
+            def fetch():
+                with opener.open(urllib.request.Request(f"{address}{path}", data=data), timeout=5) as response:
+                    return json.load(response)
+            result = http.submit(fetch)
+            # BSD PTY buffers can fill in one redraw; never wait for the peer without draining output.
+            while not result.done():
+                pump()
+            return result.result()
+
         def state():
-            with opener.open(f"{address}/fixture", timeout=5) as response:
-                return json.load(response)
+            return request("/fixture")
 
         def action(name):
-            with opener.open(urllib.request.Request(f"{address}/fixture/{name}", data=b""), timeout=5) as response:
-                return json.load(response)
+            return request(f"/fixture/{name}", data=b"")
 
         def send(value):
             os.write(master, value)
@@ -216,9 +229,15 @@ def main():
             raise
         finally:
             if pid is not None:
-                os.killpg(pid, signal.SIGKILL)
-                os.waitpid(pid, 0)
+                for kill in (os.killpg, os.kill):
+                    try:
+                        kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
             os.close(master)
+            if pid is not None:
+                os.waitpid(pid, 0)
+            http.shutdown(wait=True)
             faulthandler.cancel_dump_traceback_later()
 
 

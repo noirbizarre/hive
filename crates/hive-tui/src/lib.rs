@@ -1508,14 +1508,17 @@ async fn run_with_clipboard(
                     }
                     if let Some(receiver) = app.configuration.as_mut() {
                         match receiver.try_recv() {
-                            Ok((id, result)) => {
-                                app.configuration = None;
-                                 configuration_result(&mut app, id, result);
+                             Ok((id, result)) => {
+                                 app.configuration = None;
+                                  configuration_result(&mut app, id, result);
+                                  // A background result can arrive after the last dirty frame was drawn.
+                                  dirty = true;
                             }
                              Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
                                  app.configuration = None;
                                  let id = app.active.clone().unwrap_or_default();
-                                 configuration_result(&mut app, id, Err("Configuration interrupted; reopen the session to inspect its current model".into()));
+                                  configuration_result(&mut app, id, Err("Configuration interrupted; reopen the session to inspect its current model".into()));
+                                  dirty = true;
                              }
                             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
                         }

@@ -1357,23 +1357,7 @@ impl Broker {
         let control = entry.control.clone();
         let id = request.session_id.clone();
         let subscriber = client_id.to_owned();
-        tokio::spawn(async move {
-            cx.incoming_closed().await;
-            if let Ok(mut state) = control.lock() {
-                let removed = state.subscribers.remove(&subscriber).is_some();
-                state.client_capabilities.remove(&subscriber);
-                if state.pilot.as_deref() == Some(&subscriber) {
-                    state.pilot = None;
-                    state.generation += 1;
-                    state.token = uuid::Uuid::new_v4().to_string();
-                    let _ = state.changed.send(state.generation);
-                    state.notify();
-                    let _ = forward_locked(&mut state, &id, None);
-                } else if removed {
-                    state.notify();
-                }
-            }
-        });
+        watch_attachment(cx, control, id, subscriber);
         Ok(response)
     }
 
@@ -1748,23 +1732,7 @@ impl Broker {
             let control = entry_control.clone();
             let subscriber = client_id.clone();
             let id = hive_id.clone();
-            tokio::spawn(async move {
-                cx.incoming_closed().await;
-                if let Ok(mut state) = control.lock() {
-                    let removed = state.subscribers.remove(&subscriber).is_some();
-                    state.client_capabilities.remove(&subscriber);
-                    if state.pilot.as_deref() == Some(&subscriber) {
-                        state.pilot = None;
-                        state.generation += 1;
-                        state.token = uuid::Uuid::new_v4().to_string();
-                        let _ = state.changed.send(state.generation);
-                        state.notify();
-                        let _ = forward_locked(&mut state, &id, None);
-                    } else if removed {
-                        state.notify();
-                    }
-                }
-            });
+            watch_attachment(cx, control, id, subscriber);
         }
         match interactions::startup(&entry_control, ready_rx).await {
             Ok(Ok(Ok((mut response, downstream_id)))) => {
@@ -2358,7 +2326,7 @@ async fn run_agent(
         }, agent_client_protocol::on_receive_notification!())
         .connect_with(agent, async move |cx| {
             let initialized = cx
-                .send_request(v2::InitializeRequest::new(
+                .send_initialize(v2::InitializeRequest::new(
                     ProtocolVersion::V2,
                     v2::Implementation::new("hive", env!("CARGO_PKG_VERSION")),
                 ).capabilities(v2::ClientCapabilities::new().elicitation(
@@ -2369,9 +2337,14 @@ async fn run_agent(
                 .block_task()
                 .await;
             match initialized {
-                Ok(response) if response.protocol_version == ProtocolVersion::V2 && response.capabilities.session.is_some() => {
+                Ok(agent_client_protocol::InitializeOutcome::Initialized(response)) if response.protocol_version == ProtocolVersion::V2 && response.capabilities.session.is_some() => {
                     tracing::info!(protocol = "v2", session = true, "agent capabilities negotiated");
                     if let Ok(mut state) = control.lock() { state.history_status.restoration = Restoration::Supported; }
+                }
+                Ok(agent_client_protocol::InitializeOutcome::LowerVersion(_)) => {
+                    // The configured adapter stays authoritative even when the peer offers v1.
+                    let _ = ready.send(Err("agent selected ACPv1 but the profile declares ACPv2; set its versions to [\"v1\"] or upgrade the agent".into()));
+                    return Ok(());
                 }
                 Ok(_) => {
                     let _ =
@@ -3089,6 +3062,40 @@ pub fn router_with_origin(broker: Broker, origin: Option<&str>) -> Router {
         )
 }
 
+/// Independent observers must also release ownership when a driver fails without EOF.
+async fn upstream_ended(cx: &V2ConnectionTo<Client>) {
+    tokio::select! {
+        _ = cx.incoming_closed() => {},
+        _ = cx.terminated() => {},
+    }
+}
+
+/// Share attachment cleanup so creation and resume preserve the same ownership fence.
+fn watch_attachment(
+    cx: V2ConnectionTo<Client>,
+    control: Arc<Mutex<Control>>,
+    id: v2::SessionId,
+    subscriber: String,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        upstream_ended(&cx).await;
+        if let Ok(mut state) = control.lock() {
+            let removed = state.subscribers.remove(&subscriber).is_some();
+            state.client_capabilities.remove(&subscriber);
+            if state.pilot.as_deref() == Some(&subscriber) {
+                state.pilot = None;
+                state.generation += 1;
+                state.token = uuid::Uuid::new_v4().to_string();
+                let _ = state.changed.send(state.generation);
+                state.notify();
+                let _ = forward_locked(&mut state, &id, None);
+            } else if removed {
+                state.notify();
+            }
+        }
+    })
+}
+
 fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client> {
     let client_id = uuid::Uuid::new_v4().to_string();
     Agent
@@ -3109,13 +3116,13 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
                     let capabilities = capabilities.clone();
                     let client_id = client_id.clone();
                     let connection = cx.clone();
-                    cx.spawn(async move {
-                        connection.incoming_closed().await;
+                    // A connection-scoped task is dropped before termination is published.
+                    tokio::spawn(async move {
+                        upstream_ended(&connection).await;
                         if let Ok(mut capabilities) = capabilities.lock() {
                             capabilities.remove(&client_id);
                         }
-                        Ok(())
-                    })?;
+                    });
                     responder.respond(
                         v2::InitializeResponse::new(
                             request.protocol_version,
@@ -3692,6 +3699,199 @@ mod control_tests {
             configuring: false,
             external_activity: false,
             native: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_the_gateway_driver_releases_capabilities_without_waiting_for_eof() {
+        let broker = Broker::new(Config::default());
+        let (ready, initialized) = oneshot::channel();
+        let driver = tokio::spawn(Client.v2().connect_with(
+            gateway_agent(broker.clone()),
+            async move |cx| {
+                cx.send_initialize(v2::InitializeRequest::new(
+                    ProtocolVersion::V2,
+                    v2::Implementation::new("termination-test", "1"),
+                ))
+                .block_task()
+                .await?;
+                let _ = ready.send(());
+                // Keep the foreground alive so abort exercises driver drop, not local shutdown.
+                std::future::pending::<agent_client_protocol::Result<()>>().await
+            },
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(2), initialized)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(broker.client_capabilities.lock().unwrap().len(), 1);
+        driver.abort();
+        assert!(driver.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !broker.client_capabilities.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("termination must release initialization capabilities even without EOF");
+    }
+
+    #[tokio::test]
+    async fn driver_drop_releases_only_its_attachment_and_fences_a_pilot_once() {
+        async fn connected() -> (
+            V2ConnectionTo<Client>,
+            tokio::task::JoinHandle<agent_client_protocol::Result<()>>,
+            mpsc::UnboundedReceiver<v2::UpdateSessionNotification>,
+        ) {
+            let (connections, mut connected) = mpsc::unbounded_channel();
+            let (updates, notifications) = mpsc::unbounded_channel();
+            let (ready, initialized) = oneshot::channel();
+            let agent = Agent.v2().on_receive_request(
+                async move |request: v2::InitializeRequest,
+                            responder: Responder<v2::InitializeResponse>,
+                            cx: V2ConnectionTo<Client>| {
+                    connections.send(cx).map_err(Error::into_internal_error)?;
+                    responder.respond(
+                        v2::InitializeResponse::new(
+                            request.protocol_version,
+                            v2::Implementation::new("fixture", "1"),
+                        )
+                        .capabilities(
+                            v2::AgentCapabilities::new().session(v2::SessionCapabilities::new()),
+                        ),
+                    )
+                },
+                agent_client_protocol::on_receive_request!(),
+            );
+            let driver = tokio::spawn(
+                Client
+                    .v2()
+                    .on_receive_notification(
+                        async move |update: v2::UpdateSessionNotification,
+                                    _: V2ConnectionTo<Agent>| {
+                            updates.send(update).map_err(Error::into_internal_error)
+                        },
+                        agent_client_protocol::on_receive_notification!(),
+                    )
+                    .connect_with(agent, async move |cx| {
+                        cx.send_initialize(v2::InitializeRequest::new(
+                            ProtocolVersion::V2,
+                            v2::Implementation::new("drop-test", "1"),
+                        ))
+                        .block_task()
+                        .await?;
+                        let _ = ready.send(());
+                        std::future::pending::<agent_client_protocol::Result<()>>().await
+                    }),
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(2), initialized)
+                .await
+                .unwrap()
+                .unwrap();
+            (connected.recv().await.unwrap(), driver, notifications)
+        }
+
+        for observe in [false, true] {
+            let control = Arc::new(Mutex::new(detached()));
+            let id = v2::SessionId::new("retained");
+            let (pilot, pilot_driver, pilot_updates) = connected().await;
+            let (observer, observer_driver, observer_updates) = connected().await;
+            {
+                let mut state = control.lock().unwrap();
+                state.pilot = Some("pilot".into());
+                for (name, cx) in [("pilot", pilot.clone()), ("observer", observer.clone())] {
+                    state.subscribers.insert(name.into(), cx);
+                    state
+                        .client_capabilities
+                        .insert(name.into(), v2::ClientCapabilities::new());
+                }
+            }
+            let (
+                target,
+                target_driver,
+                survivor_driver,
+                mut survivor_updates,
+                target_name,
+                survivor_name,
+            ) = if observe {
+                (
+                    observer,
+                    observer_driver,
+                    pilot_driver,
+                    pilot_updates,
+                    "observer",
+                    "pilot",
+                )
+            } else {
+                (
+                    pilot,
+                    pilot_driver,
+                    observer_driver,
+                    observer_updates,
+                    "pilot",
+                    "observer",
+                )
+            };
+            // Duplicate observers model repeated attachment; join both to prove exactly-once fencing.
+            let first = watch_attachment(
+                target.clone(),
+                control.clone(),
+                id.clone(),
+                target_name.into(),
+            );
+            let second = watch_attachment(target, control.clone(), id.clone(), target_name.into());
+            target_driver.abort();
+            assert!(target_driver.await.unwrap_err().is_cancelled());
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                first.await.unwrap();
+                second.await.unwrap();
+            })
+            .await
+            .expect("both cleanup observers must finish before checking ownership");
+            {
+                let mut state = control.lock().unwrap();
+                assert_eq!(state.generation, 1 + u64::from(!observe));
+                assert_eq!(state.pilot.as_deref(), observe.then_some("pilot"));
+                assert_eq!(
+                    state
+                        .subscribers
+                        .keys()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>(),
+                    [survivor_name]
+                );
+                assert_eq!(
+                    state
+                        .client_capabilities
+                        .keys()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>(),
+                    [survivor_name]
+                );
+                forward_locked(
+                    &mut state,
+                    &id,
+                    Some(v2::SessionUpdate::AgentMessageChunk(v2::ContentChunk::new(
+                        "still attached".into(),
+                        v2::MessageId::new("survivor"),
+                    ))),
+                )
+                .unwrap();
+            }
+            // A retained map entry alone is insufficient: its connection must still deliver updates.
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                while let Some(update) = survivor_updates.recv().await {
+                    if matches!(update.update, v2::SessionUpdate::AgentMessageChunk(_)) {
+                        return;
+                    }
+                }
+                panic!("the surviving attachment disconnected");
+            })
+            .await
+            .unwrap();
+            assert!(!survivor_driver.is_finished());
+            survivor_driver.abort();
+            assert!(survivor_driver.await.unwrap_err().is_cancelled());
         }
     }
 

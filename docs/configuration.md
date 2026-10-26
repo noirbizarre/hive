@@ -186,7 +186,7 @@ than fabricated zero costs. If cache counts are reported without confirmed
 inclusive-input semantics, ordinary input cost can remain unknown.
 
 Provider-reported cumulative costs and estimates are distinct. Read the
-[usage contract](acp-compatibility.md#token-usage-and-costs) for aggregation rules.
+[usage contract](compatibility.md#token-usage-and-costs) for aggregation rules.
 
 ## Runtime locations
 

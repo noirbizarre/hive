@@ -9,7 +9,7 @@ use serde_json::Value;
 use super::{error::OpencodeError, http::Client};
 
 /// Oldest OpenCode this adapter is tested against (see the capability matrix in
-/// docs/acp-compatibility.md). Older servers lack routes the adapter relies on.
+/// docs/compatibility.md). Older servers lack routes the adapter relies on.
 pub(crate) const MINIMUM: &str = "1.19.0";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

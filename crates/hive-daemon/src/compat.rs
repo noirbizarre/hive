@@ -11,7 +11,7 @@ use std::{
 };
 
 use agent_client_protocol::{
-    Client,
+    Client, InitializeOutcome,
     schema::{ProtocolVersion, v1, v2},
 };
 use hive_protocol::AgentVersion;
@@ -293,7 +293,7 @@ async fn probe_v2(agent: crate::Downstream) -> Result<CapabilityReport, CompatEr
         .v2()
         .connect_with(agent, async move |cx| {
             let response = cx
-                .send_request(v2::InitializeRequest::new(
+                .send_initialize(v2::InitializeRequest::new(
                     ProtocolVersion::V2,
                     v2::Implementation::new("hive", env!("CARGO_PKG_VERSION")),
                 ))
@@ -304,7 +304,15 @@ async fn probe_v2(agent: crate::Downstream) -> Result<CapabilityReport, CompatEr
         .await
         .map_err(|_| CompatError::InitializeFailed)?
         .map_err(|_| CompatError::InitializeFailed)
-        .and_then(report_v2)
+        .and_then(|outcome| match outcome {
+            InitializeOutcome::Initialized(response) => report_v2(response),
+            // A valid downgrade is diagnostic evidence, never permission to ignore the profile.
+            InitializeOutcome::LowerVersion(mismatch) => Err(CompatError::ProtocolMismatch {
+                declared: "v2",
+                negotiated: negotiated(&mismatch.selected),
+            }),
+            _ => Err(CompatError::InitializeFailed),
+        })
 }
 
 fn report_v1(response: v1::InitializeResponse) -> Result<CapabilityReport, CompatError> {

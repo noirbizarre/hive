@@ -64,7 +64,7 @@ selection; agent-reported changes update all attached clients. Reconnect does
 not resend an uncertain settings change.
 
 Current mode is independent of configured defaults and displayed plans. See
-[session configuration compatibility](../acp-compatibility.md#session-modes-and-agent-settings)
+[session configuration compatibility](../compatibility.md#session-modes-and-agent-settings)
 for adapter versions, protocol mapping, and notification limitations.
 
 Only the pilot can cancel or answer session-scoped permission/input requests.
@@ -123,7 +123,7 @@ has not emitted one; it is not an unsupported-agent claim. Unknown content types
 show a generic text view, and empty plans are explicitly labelled. Plans remain
 visible after idle and reconnect, even when their original events have expired.
 After daemon restart, recovery depends on whether the agent replays its plans.
-See the [native plan contract](../acp-compatibility.md#native-acpv2-plans).
+See the [native plan contract](../compatibility.md#native-acpv2-plans).
 
 ## Browser smoke checklist
 

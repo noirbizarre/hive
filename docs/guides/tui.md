@@ -143,7 +143,7 @@ change; restart rediscovers settings from the original agent session.
 
 Mode is agent-dependent: a selected Plan mode is separate from a plan in the
 transcript or an agent's configured default. Unsupported or empty catalogs
-cannot submit changes. See [session configuration compatibility](../acp-compatibility.md#session-modes-and-agent-settings).
+cannot submit changes. See [session configuration compatibility](../compatibility.md#session-modes-and-agent-settings).
 
 ## Answer agent questions
 
@@ -201,7 +201,7 @@ observed” does not mean unsupported. Empty plans and unfamiliar content types 
 explicitly labelled; unfamiliar content is displayed generically. Reconnect
 restores current plans independently of the bounded event history. After daemon
 restart, only plans replayed by the agent can be restored. See the
-[native plan contract](../acp-compatibility.md#native-acpv2-plans).
+[native plan contract](../compatibility.md#native-acpv2-plans).
 
 Page Up/Down and the mouse wheel browse the retained conversation history. Home
 jumps to the beginning; End returns to the latest output and resumes automatic

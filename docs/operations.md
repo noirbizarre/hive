@@ -139,7 +139,7 @@ is not billable usage, and turn aggregates are not individual model-call records
 Optional models.dev mappings produce estimates. Price lookup failure does not
 block token tracking. Provider-reported costs remain separate from estimates.
 See [pricing configuration](configuration.md#pricing) and the
-[usage reference](acp-compatibility.md#token-usage-and-costs).
+[usage reference](compatibility.md#token-usage-and-costs).
 
 ## Trust boundary
 

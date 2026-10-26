@@ -50,11 +50,10 @@ async fn a_profile_declaring_the_wrong_protocol_gets_an_actionable_diagnostic() 
     let error = probe_initialize(&profile(MOCK, &["v1"], AgentVersion::V2))
         .await
         .unwrap_err();
-    // This mock rejects a v2 handshake outright; an agent that downgrades (as pi-acp does)
-    // yields `protocol_mismatch` instead, which the unit tests cover.
+    // The SDK validates the lower selection without silently switching Hive's adapter.
     assert_eq!(
         error.code().unwrap().to_string(),
-        "hive::compat::initialize_failed"
+        "hive::compat::protocol_mismatch"
     );
     assert!(
         error.help().is_some(),

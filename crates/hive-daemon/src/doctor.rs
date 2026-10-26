@@ -24,7 +24,7 @@ use crate::{
     persistence, runtime_base,
 };
 
-/// Node.js major version `pi-acp` needs (see docs/acp-compatibility.md).
+/// Node.js major version `pi-acp` needs (see docs/compatibility.md).
 const PI_NODE_MAJOR: u32 = 22;
 
 /// A stuck `node --version` must not hang the whole report.

@@ -1540,6 +1540,11 @@ fn configuration_result(
     }
 }
 
+/// EOF must wake the foreground before the driver can publish its termination.
+async fn gateway_disconnected(cx: &V2ConnectionTo<Agent>) {
+    cx.incoming_closed().await;
+}
+
 async fn interaction_client<R>(
     updates: mpsc::UnboundedSender<v2::UpdateSessionNotification>,
     interactions: mpsc::UnboundedSender<Interaction>,
@@ -1879,7 +1884,7 @@ async fn run_with_clipboard(
                              if flow.0 { app.status = "External elicitation completed".into(); }
                          }
                           Some(result) = created_rx.recv() => { apply_created(&mut app, result); reconcile_interactions(&mut app, &mut interaction, &mut queued); }
-                         _ = cx.incoming_closed() => break,
+                         _ = gateway_disconnected(&cx) => break,
                           _ = catalog_tick.tick() => {
                               app.refresh_requested = true;
                          }
@@ -2163,6 +2168,27 @@ mod tests {
         assert_eq!(app.selected, 0);
         assert_eq!(app.active.as_deref(), Some("existing"));
         assert_eq!(app.input, "unsent draft");
+    }
+
+    #[tokio::test]
+    async fn the_tui_foreground_returns_on_eof_without_waiting_for_driver_termination() {
+        let (transport, peer) = agent_client_protocol::Channel::duplex();
+        let (updates, _) = mpsc::unbounded_channel();
+        let (interactions, _) = mpsc::unbounded_channel();
+        let (completions, _) = mpsc::unbounded_channel();
+        // Keep the outbound receiver open: only incoming EOF should release the foreground.
+        drop(peer.tx);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            interaction_client(updates, interactions, completions, transport, async |cx| {
+                gateway_disconnected(&cx).await;
+                Ok(())
+            }),
+        )
+        .await
+        .expect("waiting for termination inside the foreground would deadlock EOF")
+        .unwrap();
+        drop(peer.rx);
     }
 
     #[tokio::test]

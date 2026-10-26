@@ -1433,6 +1433,128 @@ async fn start_gateway(config: Config) -> (SocketAddr, tokio::task::JoinHandle<(
     (address, server)
 }
 
+/// Bypass the client's typed negotiation guard to exercise the gateway's wire boundary.
+async fn raw_initialize(url: &str, params: serde_json::Value) -> serde_json::Value {
+    use agent_client_protocol::ConnectTo;
+
+    let (mut channel, driver) =
+        ConnectTo::<Client>::into_channel_and_future(HttpClient::new(url).unwrap());
+    let driver = tokio::spawn(driver.unwrap());
+    let request = serde_json::json!({
+        "jsonrpc": "2.0", "id": "negotiation", "method": "initialize", "params": params
+    });
+    let response = raw_exchange(&mut channel, request).await;
+    driver.abort();
+    response
+}
+
+async fn raw_exchange(
+    channel: &mut agent_client_protocol::Channel,
+    request: serde_json::Value,
+) -> serde_json::Value {
+    use agent_client_protocol::TransportFrame;
+    use tokio_stream::StreamExt;
+
+    channel
+        .tx
+        .unbounded_send(TransportFrame::parse_json(&request.to_string()))
+        .unwrap();
+    let response = timeout(Duration::from_secs(5), channel.rx.next())
+        .await
+        .unwrap()
+        .unwrap();
+    serde_json::from_str(&response.to_json().unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn failed_websocket_negotiation_cannot_create_a_session_and_can_be_retried() {
+    use agent_client_protocol::ConnectTo;
+
+    let config = config_with_agent(
+        "mock",
+        env!("CARGO_BIN_EXE_hive-test-agent"),
+        AgentVersion::V2,
+    );
+    let (address, server) = start_gateway(config).await;
+    let (mut channel, driver) = ConnectTo::<Client>::into_channel_and_future(
+        HttpClient::new(format!("ws://{address}")).unwrap(),
+    );
+    let driver = tokio::spawn(driver.unwrap());
+    let mut initialize = serde_json::json!({"jsonrpc":"2.0", "id":1, "method":"initialize", "params":{
+        "protocolVersion":1, "info":{"name":"retry-test","version":"1"}, "capabilities":{}
+    }});
+    assert_eq!(
+        raw_exchange(&mut channel, initialize.clone()).await["error"]["code"],
+        -32022
+    );
+    let blocked = raw_exchange(&mut channel, serde_json::json!({
+        "jsonrpc":"2.0", "id":2, "method":"session/new", "params":{"cwd":std::env::current_dir().unwrap()}
+    })).await;
+    assert!(blocked.get("error").is_some(), "{blocked}");
+    assert!(
+        summaries(address).await["sessions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    initialize["params"]["protocolVersion"] = 2.into();
+    assert_eq!(
+        raw_exchange(&mut channel, initialize).await["result"]["protocolVersion"],
+        2
+    );
+    driver.abort();
+    server.abort();
+}
+
+#[tokio::test]
+async fn gateway_negotiation_errors_and_future_versions_match_the_draft_over_both_transports() {
+    let (address, server) = start_gateway(Config::default()).await;
+    for url in [format!("ws://{address}"), format!("http://{address}")] {
+        let params = |version| {
+            serde_json::json!({
+                "protocolVersion": version, "info": {"name": "wire-test", "version": "1"},
+                "capabilities": {}
+            })
+        };
+        let rejected = raw_initialize(&url, params(serde_json::json!(1))).await;
+        assert_eq!(rejected["id"], "negotiation");
+        assert_eq!(rejected["error"]["code"], -32022);
+        assert_eq!(
+            rejected["error"]["data"],
+            serde_json::json!({"requested": 1, "supported": [2]})
+        );
+        for version in [
+            serde_json::Value::Null,
+            serde_json::json!("2"),
+            serde_json::json!(2.5),
+            serde_json::json!(-1),
+            serde_json::json!(65536),
+        ] {
+            let rejected = raw_initialize(&url, params(version)).await;
+            assert_eq!(rejected["id"], "negotiation");
+            assert_eq!(rejected["error"]["code"], -32602, "{rejected}");
+        }
+        let mut missing = params(serde_json::json!(2));
+        missing.as_object_mut().unwrap().remove("protocolVersion");
+        assert_eq!(raw_initialize(&url, missing).await["error"]["code"], -32602);
+        for version in [2, 3] {
+            let accepted = raw_initialize(&url, params(serde_json::json!(version))).await;
+            assert_eq!(accepted["result"]["protocolVersion"], 2, "{accepted}");
+            assert_eq!(
+                accepted["result"]["capabilities"]["session"],
+                serde_json::json!({})
+            );
+        }
+    }
+    assert!(
+        summaries(address).await["sessions"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    server.abort();
+}
+
 #[test]
 fn earlier_conversations_restore_once_under_the_original_identity_for_both_acp_versions() {
     for (version, mode) in [
@@ -3335,6 +3457,19 @@ async fn simultaneous_resume_requests_are_serialized_into_distinct_owners() {
     );
     let (address, server) = start_gateway(config).await;
     let id = create_and_prompt(&format!("ws://{address}"), None, "initial", "Echo: initial").await;
+    // The creator's disconnect legitimately fences its generation before either racer attaches.
+    let generation = timeout(Duration::from_secs(5), async {
+        loop {
+            let catalog = summaries(address).await;
+            let session = &catalog["sessions"][0];
+            if session["controlOwner"].is_null() {
+                break session["generation"].as_u64().unwrap();
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
     let takeover = |url: String, id: v2::SessionId, gate: std::sync::Arc<tokio::sync::Barrier>| async move {
         Client
@@ -3354,18 +3489,28 @@ async fn simultaneous_resume_requests_are_serialized_into_distinct_owners() {
                     ))
                     .block_task()
                     .await?;
-                Ok(resumed.meta.unwrap()["hive"]["generation"]
+                let generation = resumed.meta.unwrap()["hive"]["generation"]
                     .as_u64()
-                    .unwrap())
+                    .unwrap();
+                // Neither racer may disconnect and rotate control before the other resumes.
+                gate.wait().await;
+                Ok(generation)
             })
             .await
             .unwrap()
     };
-    let (first, second) = tokio::join!(
-        takeover(format!("ws://{address}"), id.clone(), barrier.clone()),
-        takeover(format!("http://{address}"), id, barrier),
+    let (first, second) = timeout(Duration::from_secs(10), async {
+        tokio::join!(
+            takeover(format!("ws://{address}"), id.clone(), barrier.clone()),
+            takeover(format!("http://{address}"), id, barrier),
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        [first.min(second), first.max(second)],
+        [generation + 1, generation + 2]
     );
-    assert_eq!([first.min(second), first.max(second)], [2, 3]);
     server.abort();
 }
 

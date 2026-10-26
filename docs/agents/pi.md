@@ -34,8 +34,8 @@ initialize with protocol version 1, so declaring only v2 fails.
 
 Only initialization is recorded as verified for this installation. Full prompt
 turns, streaming, tool events, cancellation, and reconnect remain unverified.
-The [Known agents matrix](../acp-compatibility.md#known-agents)
-and [Pi protocol notes](../acp-compatibility.md#pi) retain the exact evidence.
+The [Known agents matrix](../compatibility.md#known-agents)
+and [Pi protocol notes](../compatibility.md#pi) retain the exact evidence.
 
 The adapter runs tools itself rather than delegating filesystem/terminal work
 to Hive. Nonempty MCP declarations are not supported by Hive's v1 adapter.

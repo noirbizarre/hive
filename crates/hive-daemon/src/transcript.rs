@@ -63,6 +63,8 @@ pub struct Transcript {
     entries: Vec<Value>,
     indices: HashMap<String, usize>,
     limited: bool,
+    // Idle snapshots may repeat the previous failure; only a new active interval rearms this latch.
+    native_failure_reported: bool,
 }
 
 impl Transcript {
@@ -75,7 +77,28 @@ impl Transcript {
             .any(|key| key.starts_with("user_message:") || key.starts_with("agent_message:"))
     }
 
-    pub fn ingest(&mut self, update: &v2::SessionUpdate) -> agent_client_protocol::Result<()> {
+    /// Returns a controlled companion for the caller to ingest/publish through the ordinary path.
+    pub fn ingest(
+        &mut self,
+        update: &v2::SessionUpdate,
+    ) -> agent_client_protocol::Result<Option<v2::SessionUpdate>> {
+        match update {
+            v2::SessionUpdate::StateUpdate(
+                v2::StateUpdate::Running(_) | v2::StateUpdate::RequiresAction(_),
+            ) => self.native_failure_reported = false,
+            v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(idle)) => {
+                if let Some(v2::StopReason::Error(reason)) = &idle.stop_reason
+                    && !self.native_failure_reported
+                {
+                    self.native_failure_reported = true;
+                    // First-seen idle errors provide last-reported context, not proof of a new completion.
+                    return Ok(Some(hive_protocol::AgentFailure::native(
+                        reason.error.as_deref(),
+                    )));
+                }
+            }
+            _ => {}
+        }
         let mut value = serde_json::to_value(update).map_err(Error::into_internal_error)?;
         let kind = value["sessionUpdate"]
             .as_str()
@@ -112,7 +135,7 @@ impl Transcript {
             if matches!(kind.as_str(), "_hive_error" | "_hive_opencode_error") {
                 self.entries.push(value);
             }
-            return Ok(());
+            return Ok(None);
         }
         let chunk = kind.ends_with("_chunk");
         // Normalize chunks to full-message upserts; speaker namespaces prevent user/agent ID collisions.
@@ -193,7 +216,7 @@ impl Transcript {
                 }
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     pub fn updates(&self) -> agent_client_protocol::Result<Vec<v2::SessionUpdate>> {

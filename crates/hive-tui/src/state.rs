@@ -298,9 +298,14 @@ impl Conversation {
                 self.tool(serde_json::to_value(chunk).unwrap_or_default(), true);
             }
             v2::SessionUpdate::StateUpdate(v2::StateUpdate::Running(_)) => self.running = true,
+            // Blocked foreground work still needs a later idle confirmation, including cancellation.
+            v2::SessionUpdate::StateUpdate(v2::StateUpdate::RequiresAction(_)) => {
+                self.running = true
+            }
             v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(idle)) => {
+                let was_running = self.running;
                 self.running = false;
-                if matches!(idle.stop_reason, Some(v2::StopReason::Cancelled)) {
+                if was_running && matches!(idle.stop_reason, Some(v2::StopReason::Cancelled)) {
                     self.push_notice("Turn cancelled".into());
                 }
             }
@@ -651,6 +656,57 @@ mod tests {
         assert_eq!(conversation.lines.len(), 1);
         assert!(conversation.lines[0].text.contains("Create a new API key"));
         assert!(!conversation.lines[0].text.contains("sk-do-not-echo"));
+        assert!(!conversation.running);
+    }
+
+    #[test]
+    fn native_failure_companions_render_once_and_history_does_not_stop_current_work() {
+        let mut conversation = Conversation::default();
+        let native: v2::SessionUpdate = serde_json::from_value(serde_json::json!({
+            "sessionUpdate":"state_update", "state":"idle", "stopReason":"error",
+            "error":{"code":-32603,"message":"sk-must-not-leak","data":"sk-must-not-leak"}
+        }))
+        .unwrap();
+        let diagnostic = hive_protocol::AgentFailure::native(None);
+        conversation.apply(event(
+            1,
+            v2::SessionUpdate::StateUpdate(v2::StateUpdate::Running(v2::RunningStateUpdate::new())),
+        ));
+        conversation.apply(event(2, native.clone()));
+        assert!(!conversation.running);
+        conversation.apply(event(3, diagnostic.clone()));
+        assert!(!conversation.apply(event(3, diagnostic.clone())));
+        conversation.apply(event(4, native));
+        assert_eq!(conversation.lines.len(), 1);
+        assert!(conversation.lines[0].text.contains("foreground failure"));
+        assert!(!conversation.lines[0].text.contains("sk-must-not-leak"));
+        conversation.begin_transcript(2048);
+        conversation.running = true;
+        let mut historical = event(2048, diagnostic);
+        historical.meta.as_mut().unwrap().get_mut("hive").unwrap()["snapshot"] = true.into();
+        assert!(conversation.apply(historical));
+        assert!(conversation.running);
+        assert_eq!(conversation.lines.len(), 1);
+    }
+
+    #[test]
+    fn repeated_cancelled_snapshots_do_not_confirm_additional_cancellations() {
+        let mut conversation = Conversation::default();
+        let cancelled = v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(
+            v2::IdleStateUpdate::new().stop_reason(v2::StopReason::Cancelled),
+        ));
+        conversation.apply(event(1, cancelled.clone()));
+        assert!(conversation.lines.is_empty());
+        conversation.apply(event(
+            2,
+            serde_json::from_value(serde_json::json!({
+            "sessionUpdate":"state_update", "state":"requires_action"}))
+            .unwrap(),
+        ));
+        assert!(conversation.running);
+        conversation.apply(event(3, cancelled.clone()));
+        conversation.apply(event(4, cancelled));
+        assert_eq!(conversation.lines.len(), 1);
         assert!(!conversation.running);
     }
 

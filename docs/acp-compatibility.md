@@ -294,6 +294,13 @@ synthetic v2 message ID. Its completed prompt response generates a v2 idle
 update. V1 tool calls are preserved as `_hive_v1_tool_call`/`_hive_v1_tool_update`
 events. Permissions and supported elicitation are forwarded to the pilot.
 
+| Stop/failure path | Hive behavior | Deterministic verification |
+| --- | --- | --- |
+| V1 successful prompt result | Preserves `end_turn`, `max_tokens`, `max_turn_requests`, `refusal`, and `cancelled` as equivalent v2 idle reasons; future non-equivalent SDK reasons fall back to `_v1_stop` | Daemon mapping unit test and gateway stop-reason regression |
+| V1 forwarded cancellation | Only a downstream `cancelled` result confirms cancellation; a different result or RPC failure keeps its own outcome | Gateway in-flight cancellation regression |
+| Native v2 idle/error | Forwards native state and emits one controlled `_hive_error` companion for both clients | Gateway, daemon projection, and client reducer regressions |
+| Repeated idle/error snapshots | Retains last-reported failure context once per foreground interval/idle episode, without adding completions | Daemon projection and client replay regressions |
+
 V2 permissions and
 session-scoped form/URL elicitation are forwarded to the pilot with a 120-second
 total decision deadline. Request-scoped elicitation follows a uniquely mapped,
@@ -363,6 +370,18 @@ Post-admission ACPv1 prompt failures produce a sequenced `_hive_error` update
 before idle. Its version, source, operation, stable diagnostic code, message
 and help contain controlled diagnostics rather than arbitrary provider data.
 Both clients render these failures, including on replay.
+
+Native v2 `state_update` with `state: "idle"` and `stopReason: "error"`
+also generates a sequenced `_hive_error`, after the native state update, with
+`source: "acp-v2"` and `operation: "foreground"`. Known expired-key messages
+produce the established actionable diagnostic. Missing, malformed, or unknown
+error details produce `hive::agent::foreground_failed` with controlled message
+and help. Arbitrary downstream messages, error data, and metadata are never
+copied into these displayed/retained failure entries. Native protocol updates
+are still forwarded unchanged; this is a presentation/history guarantee, not
+redaction of the raw ACP stream. Existing `_hive_opencode_error` rendering is
+preserved. Idle always ends foreground work, including when the stop reason is
+omitted, malformed, or unknown; an unreported outcome does not imply success.
 
 ACPv2 `session/new` has no standard agent selector. Hive reserves
 `_meta.hive.agent` for a profile ID in **client-to-Hive** requests. Hive removes
@@ -689,7 +708,8 @@ ordered after replay. A partially delivered replay must be retried using the
 last actually processed sequence.
 
 Full transcript snapshots are independent of this bounded ring. They contain
-full message/tool upserts in first-appearance order. Snapshot notifications carry
+full message/tool upserts and controlled failure entries in first-appearance
+order. Snapshot notifications carry
 `_meta.hive.snapshot: true` and share a boundary sequence; they are not contiguous
 incremental events. The resume response's `_meta.hive.snapshotThroughSeq` gives
 that boundary. Stage marked entries until the response succeeds, replace the
@@ -697,6 +717,16 @@ conversation view, set the incremental cursor to this boundary, then process
 queued ordinary events above it. Do not append ring chunks to the snapshot or
 advance past takeover events emitted after snapshot capture. Current activity,
 usage, configuration and running state come from the attachment response.
+
+Failure entries are separate from live state synchronization: snapshots do not
+replay historical running/idle transitions. Rebuilding failure history cannot
+stop current foreground work or repeat usage accounting. Incremental replay
+retains each controlled failure's original sequence for client deduplication.
+Repeated idle snapshots do not append extra failures; a new `running` or
+`requires_action` interval permits a new failure even with identical details.
+A first-seen idle/error can supply last-reported failure context, without
+establishing a newly observed completion. The TUI likewise does not turn repeated
+idle/cancelled snapshots into additional cancellation notices.
 
 The WebUI rebuilds from `start` on reload
 and retains the cursor alongside rendered history only while the page is
@@ -710,6 +740,11 @@ IDs group consecutive chunks by speaker; v1 cannot provide exact native message
 identities or distinguish consecutive same-speaker messages without a boundary.
 Hive cannot reconstruct content the agent no longer retains, and a successful
 ACPv2 `start` response only establishes replay of the agent's retained history.
+Failure entries survive incremental-ring eviction while Hive remains alive.
+After restart, they can only be reconstructed from downstream replay evidence;
+a final idle/error snapshot is last-reported context, not proof of complete
+failure history. Historical failure import remains silent and does not
+acknowledge interrupted work.
 
 The shared `transcript` object in new/resume `_meta.hive`, session summaries and
 `_hive_control` updates identifies agent ownership, projection source, restoration

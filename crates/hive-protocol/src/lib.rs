@@ -12,6 +12,8 @@ pub enum AgentFailure {
     ExpiredKey,
     #[error("The downstream agent failed the prompt")]
     Prompt,
+    #[error("The downstream agent reported a foreground failure")]
+    Foreground,
 }
 
 impl AgentFailure {
@@ -28,6 +30,7 @@ impl AgentFailure {
         match self {
             Self::ExpiredKey => "hive::agent::expired_key",
             Self::Prompt => "hive::agent::prompt_failed",
+            Self::Foreground => "hive::agent::foreground_failed",
         }
     }
 
@@ -36,24 +39,39 @@ impl AgentFailure {
             Self::ExpiredKey => {
                 "Create a new API key in OpenCode Console and replace it in your client or secret store; signing in again does not renew the key"
             }
-            Self::Prompt => {
+            Self::Prompt | Self::Foreground => {
                 "Check the agent's provider credentials and model configuration, and its logs; then send a new prompt"
             }
         }
     }
 
     pub fn update(self, source: &str) -> v2::SessionUpdate {
+        self.update_for(source, "session/prompt")
+    }
+
+    fn update_for(self, source: &str, operation: &str) -> v2::SessionUpdate {
         v2::SessionUpdate::Other(v2::OtherSessionUpdate::new(
             "_hive_error",
             std::collections::BTreeMap::from([
                 ("version".into(), serde_json::json!(1)),
                 ("source".into(), serde_json::json!(source)),
-                ("operation".into(), serde_json::json!("session/prompt")),
+                ("operation".into(), serde_json::json!(operation)),
                 ("code".into(), serde_json::json!(self.code())),
                 ("message".into(), serde_json::json!(self.to_string())),
                 ("help".into(), serde_json::json!(self.help())),
             ]),
         ))
+    }
+
+    /// Projects a native failure into safe display/history fields, without retaining provider payloads.
+    pub fn native(error: Option<&v2::Error>) -> v2::SessionUpdate {
+        // Inspect only the message for known diagnostics; data and metadata can contain credentials.
+        let failure = match error.map(|error| Self::classify(&error.message)) {
+            Some(Self::ExpiredKey) => Self::ExpiredKey,
+            _ => Self::Foreground,
+        };
+        // Native foreground work can be agent-initiated, so do not attribute it to a prompt request.
+        failure.update_for("acp-v2", "foreground")
     }
 }
 

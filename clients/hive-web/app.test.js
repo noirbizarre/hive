@@ -97,6 +97,40 @@ test('browser and native form validation obey the same conformance cases', () =>
   }
 });
 
+test('native failure companions remain visible once and restoring failure history preserves active work', () => {
+  const state = conversation();
+  const native = { sessionUpdate: 'state_update', state: 'idle', stopReason: 'error',
+    error: { code: -32603, message: 'sk-must-not-leak', data: { token: 'sk-must-not-leak' } } };
+  const diagnostic = { sessionUpdate: '_hive_error', version: 1, source: 'acp-v2', operation: 'foreground',
+    code: 'hive::agent::foreground_failed', message: 'The downstream agent reported a foreground failure',
+    help: "Check the agent's provider credentials and model configuration, and its logs; then send a new prompt" };
+  state.apply(update(1, { sessionUpdate: 'state_update', state: 'requires_action' }).params);
+  assert.equal(state.runningNow, true);
+  state.apply(update(2, native).params);
+  assert.equal(state.runningNow, false);
+  assert.equal(state.apply(update(3, diagnostic).params), true);
+  assert.equal(state.apply(update(3, diagnostic).params), false);
+  state.apply(update(4, native).params);
+  assert.equal(state.lines.length, 1);
+  assert.match(state.lines[0].text, /foreground failure/);
+  assert.doesNotMatch(JSON.stringify(state.lines), /sk-must-not-leak/);
+  state.running(true);
+  state.restore([update(2048, diagnostic).params, update(2048, diagnostic).params], 2048);
+  // Distinct historical failures may share the boundary and have identical diagnostics.
+  assert.equal(state.lines.length, 2);
+  assert.equal(state.runningNow, true);
+});
+
+test('idle always ends foreground work without inventing an outcome from unreported reasons', () => {
+  for (const stopReason of [undefined, null, {}, '_future', 'future']) {
+    const state = conversation();
+    state.running(true);
+    state.apply(update(1, { sessionUpdate: 'state_update', state: 'idle', stopReason }).params);
+    assert.equal(state.runningNow, false);
+    assert.deepEqual(state.lines, []);
+  }
+});
+
 test('an inbound request cannot resolve an outbound request with the same id', async () => {
   const sockets = transport((socket, message) => {
     if (!message.method || message.method === 'session/prompt') return false;
@@ -373,13 +407,17 @@ test('transcript coverage survives older replay and live updates without blockin
   assert.deepEqual(view.transcript, partial);
 });
 
-test('failed snapshot attachments discard staged messages and unsupported replay offers explicit live-only attachment', async () => {
+test('failed snapshot attachments discard staged messages and failures before explicit live-only attachment', async () => {
   let rejected = false;
   const sockets = transport((socket, message) => {
     if (message.method !== 'session/resume' || !message.params.replayFrom) return;
     const event = update(2048, { sessionUpdate: 'agent_message', messageId: 'uncommitted', content: [{ type: 'text', text: 'discard' }] });
     event.params._meta.hive.snapshot = true;
     socket.receive(event);
+    const failure = update(2048, { sessionUpdate: '_hive_error', source: 'acp-v2',
+      message: 'Uncommitted failure', help: 'Check the agent logs' });
+    failure.params._meta.hive.snapshot = true;
+    socket.receive(failure);
     socket.receive(update(2049, { sessionUpdate: '_hive_control', generation: 1, pilot: false,
       transcript: { completeness: 'partial', warnings: [{ message: 'Uncommitted status' }] } }));
     queueMicrotask(() => {
@@ -398,6 +436,7 @@ test('failed snapshot attachments discard staged messages and unsupported replay
   assert.equal(client.state().gap, false);
   assert.equal(sockets[0].sent.at(-1).params.replayFrom, undefined);
   assert.equal(client.state().lines.some(line => line.text === 'discard'), false);
+  assert.equal(client.state().lines.some(line => line.text.includes('Uncommitted failure')), false);
   client.close();
 });
 

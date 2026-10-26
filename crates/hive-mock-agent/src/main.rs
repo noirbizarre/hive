@@ -23,6 +23,9 @@ struct State {
     v1_sessions: HashMap<String, (std::path::PathBuf, Vec<v1::SessionUpdate>)>,
     #[serde(default)]
     restores: Vec<String>,
+    // Pending responders are process-local; restart fixtures must not persist transport handles.
+    #[serde(skip)]
+    pending_v1: HashMap<String, (Responder<v1::PromptResponse>, String)>,
 }
 
 fn load() -> State {
@@ -478,6 +481,16 @@ async fn main() -> agent_client_protocol::Result<()> {
                             v2::RunningStateUpdate::new(),
                         )),
                     )?;
+                    if text.contains("native-failure") {
+                        let idle: v2::SessionUpdate = serde_json::from_value(serde_json::json!({
+                            "sessionUpdate":"state_update", "state":"idle", "stopReason":"error",
+                            "error":{"code":-32603,"message":"synthetic sk-must-not-leak", "data":{"token":"sk-must-not-leak"}}
+                        })).map_err(Error::into_internal_error)?;
+                        // Repeated current-state reports are not two failed turns.
+                        notify(&cx, &request.session_id, idle.clone())?;
+                        notify(&cx, &request.session_id, idle)?;
+                        return Ok(());
+                    }
                     if text.contains("activity-sequence") {
                         notify(
                             &cx,
@@ -930,6 +943,21 @@ async fn serve_v1() -> agent_client_protocol::Result<()> {
                                 .data("synthetic failure with secret sk-must-not-leak"),
                         );
                     }
+                    if text.contains("wait-for-cancel") {
+                        state
+                            .lock()
+                            .map_err(|_| Error::internal_error())?
+                            .pending_v1
+                            .insert(request.session_id.to_string(), (responder, text));
+                        // Readiness follows registration, so the test can cancel without a timing race.
+                        cx.send_notification(v1::SessionNotification::new(
+                            request.session_id,
+                            v1::SessionUpdate::AgentMessageChunk(v1::ContentChunk::new(
+                                "ready-for-cancel".into(),
+                            )),
+                        ))?;
+                        return Ok(());
+                    }
                     let reply = v1::SessionUpdate::AgentMessageChunk(v1::ContentChunk::new(
                         format!("Echo: {text}").into(),
                     ));
@@ -946,7 +974,16 @@ async fn serve_v1() -> agent_client_protocol::Result<()> {
                         save(&state)?;
                     }
                     cx.send_notification(v1::SessionNotification::new(request.session_id, reply))?;
-                    let mut response = v1::PromptResponse::new(v1::StopReason::EndTurn);
+                    let reason = if text.contains("stop-max-tokens") {
+                        v1::StopReason::MaxTokens
+                    } else if text.contains("stop-max-turn-requests") {
+                        v1::StopReason::MaxTurnRequests
+                    } else if text.contains("stop-refusal") {
+                        v1::StopReason::Refusal
+                    } else {
+                        v1::StopReason::EndTurn
+                    };
+                    let mut response = v1::PromptResponse::new(reason);
                     if text.contains("usage-fixture") {
                         response = response
                             .usage(v1::Usage::new(120, 80, 40).cached_read_tokens(Some(20)));
@@ -955,6 +992,36 @@ async fn serve_v1() -> agent_client_protocol::Result<()> {
                 }
             },
             agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_notification(
+            {
+                let state = state.clone();
+                async move |request: v1::CancelNotification,
+                            _cx: agent_client_protocol::ConnectionTo<Client>| {
+                    let pending = state
+                        .lock()
+                        .map_err(|_| Error::internal_error())?
+                        .pending_v1
+                        .remove(&request.session_id.to_string());
+                    if let Some((responder, text)) = pending {
+                        if text.contains("cancel-error") {
+                            responder.respond_with_error(
+                                Error::internal_error().data("sk-must-not-leak"),
+                            )?;
+                        } else {
+                            // Sending cancel does not prove cancellation: the downstream outcome does.
+                            let reason = if text.contains("cancel-end-turn") {
+                                v1::StopReason::EndTurn
+                            } else {
+                                v1::StopReason::Cancelled
+                            };
+                            responder.respond(v1::PromptResponse::new(reason))?;
+                        }
+                    }
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_notification!(),
         )
         .connect_to(Stdio::new())
         .await

@@ -102,7 +102,8 @@ export function conversation() {
     } else if (kind === '_hive_error' || kind === '_hive_opencode_error') {
       lines.push({ kind: 'notice', text: `${update.message || 'Agent failed'} — ${update.help || 'Check the agent provider credentials, model configuration and logs'}` });
     } else if (kind === 'state_update') {
-      if (update.state === 'running') running = true;
+      // Waiting for user action is active foreground work until the agent confirms idle.
+      if (update.state === 'running' || update.state === 'requires_action') running = true;
       if (update.state === 'idle') running = false;
     } else if (kind === '_hive_control') {
       generation = update.generation;

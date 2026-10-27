@@ -292,6 +292,8 @@ async fn process_death_preserves_receipts_uncertainty_and_original_identity_on_b
             reopened.shutdown().await;
             server.abort();
             let _ = server.await;
+            // Shutdown stops workers; drop the broker too so Windows can remove SQLite's files.
+            drop(reopened);
             std::fs::remove_dir_all(base).unwrap();
         }
     }

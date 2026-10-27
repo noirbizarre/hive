@@ -1061,6 +1061,8 @@ mod tests {
             Some((fingerprint, Some(PromptOutcome::DispatchPossible {})))
         );
         assert!(store.records().unwrap()[0].uncertain);
+        // Windows cannot unlink the database while SQLite still owns its handles.
+        drop(store);
         std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
     }
 
@@ -1137,6 +1139,7 @@ mod tests {
                 )
                 .unwrap();
             assert!(session.uncertain, "new intent raises a new incident");
+            drop(store);
             std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
         }
     }
@@ -1186,6 +1189,7 @@ mod tests {
                 )
                 .is_err()
         );
+        drop(store);
         std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
     }
 }

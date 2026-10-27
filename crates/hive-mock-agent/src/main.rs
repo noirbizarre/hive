@@ -569,6 +569,22 @@ async fn main() -> agent_client_protocol::Result<()> {
                         notify(&cx, &request.session_id, idle)?;
                         return Ok(());
                     }
+                    if text.contains("tool-content-sequence") {
+                        for (id, content) in [
+                            ("replacement", serde_json::json!([{"type":"content","content":{"type":"text","text":"replacement"}}])),
+                            ("empty", serde_json::json!([])),
+                            ("null", serde_json::Value::Null),
+                        ] {
+                            for update in [
+                                serde_json::json!({"sessionUpdate":"tool_call_content_chunk","toolCallId":id,"content":{"type":"content","content":{"type":"text","text":"obsolete"}}}),
+                                serde_json::json!({"sessionUpdate":"tool_call_update","toolCallId":id,"title":"Read","status":"in_progress"}),
+                                serde_json::json!({"sessionUpdate":"tool_call_update","toolCallId":id,"content":content}),
+                                serde_json::json!({"sessionUpdate":"tool_call_content_chunk","toolCallId":id,"content":{"type":"content","content":{"type":"text","text":"later"}}}),
+                            ] {
+                                notify(&cx, &request.session_id, serde_json::from_value(update).map_err(Error::into_internal_error)?)?;
+                            }
+                        }
+                    }
                     if text.contains("activity-sequence") {
                         notify(
                             &cx,

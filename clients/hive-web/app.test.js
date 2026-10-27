@@ -732,6 +732,32 @@ test('activity snapshots reconcile missed tools and later task updates without r
   assert.equal(view.seq, 15);
 });
 
+test('tool activity replacements agree with snapshots without reviving obsolete chunks on replay', () => {
+  for (const content of [[{ type: 'content', content: { type: 'text', text: 'replacement' } }], [], null]) {
+    const stale = { toolCallId: 'call', status: 'in_progress', chunks: [{ content: 'obsolete' }], chunksTruncated: true };
+    const replacement = { toolCallId: 'call', status: 'in_progress', ...(content === null ? {} : { content }) };
+    const later = { ...replacement, chunks: [{ content: 'later' }] };
+    const activity = tool => ({ sessionUpdate: '_hive_activity', kind: 'tool', toolCallId: 'call', tool });
+    const view = conversation();
+    view.apply(update(1, activity(stale)).params);
+    view.apply(update(2, activity(replacement)).params);
+    assert.deepEqual(view.activity.tools.call, replacement);
+    view.apply(update(3, activity(later)).params);
+    assert.deepEqual(view.activity.tools.call, later);
+    const attached = conversation();
+    attached.reconcile(view.activity);
+    attached.apply(update(1, activity(stale)).params);
+    attached.apply(update(2, activity(replacement)).params);
+    attached.apply(update(3, activity(later)).params);
+    assert.deepEqual(attached.activity, view.activity);
+    const newer = { ...later, chunks: [...later.chunks, { content: 'newest' }] };
+    view.apply(update(4, activity(newer)).params);
+    attached.apply(update(4, activity(newer)).params);
+    assert.deepEqual(attached.activity, view.activity);
+    assert.equal(view.lines.length, 0, 'normalized tool events must not duplicate transcript output');
+  }
+});
+
 test('a resume snapshot is applied before activity that arrives before its acknowledgement', async () => {
   const sockets = transport((socket, message, result) => {
     if (message.method === 'session/resume') {

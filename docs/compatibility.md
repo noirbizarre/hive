@@ -683,7 +683,7 @@ pilot relinquishes control. Another client must explicitly take over.
 
 All
 attached clients receive live updates, including a sequenced `_hive_control`
-event with `generation` and pilot presence but no token. `session/list` includes
+event with `generation`, pilot presence and `recoveryRequired`, but no token. `session/list` includes
 profile, running, generation, pilot presence and observer count in each entry's
 `_meta.hive`, along with the shared `title`, `lifecycle`, `activity`,
 `lastActivityAt` and `controlOwner` summary fields. The owner is an ephemeral
@@ -719,7 +719,8 @@ prompt or configuration change is rejected during running or `requires_action`
 foreground work (not merely until its prompt response), including blocked-first
 and restored blocked sessions. Compatibility `running` booleans include both
 active states, while catalog `activity` preserves their distinction. Unknown
-foreground remains unknown and retains the existing admission policy.
+foreground remains unknown; an uncertain prompt additionally fences new work
+until recovery is explicitly acknowledged.
 
 Prompts additionally require `_meta.hive.key`, a nonempty client-generated
 idempotency key scoped to the Hive session. Retrying the *same key and content*
@@ -728,8 +729,9 @@ including after takeover. The same key with changed content fails.
 
 A rejected prompt that was never dispatched retains its error under that key.
 Use a new key for a newly intended prompt. Do not blindly send a new key after
-losing an acknowledgement. Reconnect and retry the existing key while this daemon
-is alive.
+losing an acknowledgement. Reconnect, observe the original session, and explicitly
+retrieve its existing receipt using the original key/content. This never queues
+another downstream execution, including after daemon restart.
 
 Reservations and confirmed responses survive restart. An interrupted
 key remains reserved and is never redispatched. After inspecting the agent's
@@ -747,11 +749,36 @@ Request-level control credentials and keys are not part of the content hash.
 
 Durable successful outcomes retain only `messageId`; arbitrary response `_meta`
 is not persisted. A matching retry after restart reconstructs that minimal
-acknowledgement. Failed requests retain a failure marker and return a controlled
-previous-failure diagnostic rather than the original downstream error text.
+acknowledgement. Proven pre-dispatch rejections and uncertain delivery remain
+distinct; transport errors do not establish execution failure. Controlled
+terminal evidence is separate from acceptance. An idle observed before the
+receipt and a receipt observed before idle converge on the same durable state
+when both are reliably correlated. Replayed history and usage cannot supply a
+missing receipt or terminal result.
 Normal live acknowledgements and in-memory retries may still include protocol
-metadata. Schema 2 migrates earlier journal rows without releasing pending keys;
+metadata. Schema 3 preserves schema-2 fingerprints/receipts, adds evidence and
+durable recovery acknowledgement, and conservatively fences legacy ambiguity;
 see [storage and backups](operations.md#storage-and-backups).
+
+### Prompt recovery diagnostics
+
+JSON-RPC errors use standard ACP error categories and a controlled
+`error.data.hive` object with `version: 1`, `code`, `message`, `help`,
+`recoveryRequired` and `retry: "receipt_only"`. Match `code`, not message text.
+
+| Stable code | Meaning / next action |
+| --- | --- |
+| `hive::prompt::outcome_uncertain` | Original outcome is unknown; never redispatch this key. Inspect the session and external effects; acknowledge if required. |
+| `hive::prompt::not_dispatched` | This attempt provably did not publish. Keep its key reserved; use a new key for new intent. |
+| `hive::prompt::key_conflict` | Original key has different content; retrieve with original content or submit new intent under a new key. |
+| `hive::session::recovery_required` | Observe first; explicitly acknowledge via `session/resume` before taking control for new work. |
+| `hive::prompt::journal_failed` | Evidence could not be persisted/read; new work is blocked. Repair storage and inspect the original session. |
+
+After recovery acknowledgement, looking up an uncertain key still returns
+`outcome_uncertain`, with `recoveryRequired: false`. This does not raise the old
+incident again. Acknowledgement neither changes the old outcome nor skips replay,
+proves idle, or certifies transcript completeness. Clients retain original pending
+identity across transport loss and reject stale asynchronous receipt results.
 
 ## Replay cursors
 

@@ -228,7 +228,7 @@ impl Store {
         let version: u32 = db
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(wrap)?;
-        if version > 2 {
+        if version > 3 {
             return Err(StoreError::Future { path, version });
         }
         if version == 0 {
@@ -281,6 +281,12 @@ impl Store {
             migration
                 .pragma_update(None, "user_version", 2)
                 .map_err(wrap)?;
+            migration.commit().map_err(wrap)?;
+        }
+        if version < 3 {
+            let migration = db.transaction().map_err(wrap)?;
+            // Old null/failed rows cannot prove whether publication occurred. Leave them intact.
+            migration.execute_batch("ALTER TABLE prompts ADD COLUMN terminal TEXT; ALTER TABLE prompts ADD COLUMN recovery_ack INTEGER NOT NULL DEFAULT 0; PRAGMA user_version=3;").map_err(wrap)?;
             migration.commit().map_err(wrap)?;
         }
         // A future schema or failed migration must not change the existing journal mode.
@@ -379,8 +385,8 @@ impl Store {
         )
         .map_err(|e| self.sql(e))?;
         tx.execute(
-            "INSERT INTO prompts (session_id,key,content,content_fingerprint) VALUES (?1,?2,'',?3)",
-            params![record.id, key, fingerprint.as_str()],
+            "INSERT INTO prompts (session_id,key,content,content_fingerprint,result) VALUES (?1,?2,'',?3,?4)",
+            params![record.id, key, fingerprint.as_str(), PromptOutcome::Reserved {}.encode().map_err(|e| self.journal(e))?],
         )
         .map_err(|e| self.sql(e))?;
         tx.commit().map_err(|e| self.sql(e))?;
@@ -393,15 +399,19 @@ impl Store {
         key: &str,
     ) -> Result<Option<(Fingerprint, Option<PromptOutcome>)>, StoreError> {
         let db = self.connection.lock().expect("store lock poisoned");
-        let row: Option<(String, Option<String>)> = db
+        let row: Option<(String, Option<String>, Option<String>, u32)> = db
             .query_row(
-                "SELECT content_fingerprint,result FROM prompts WHERE session_id=?1 AND key=?2",
+                "SELECT content_fingerprint,result,terminal,recovery_ack FROM prompts WHERE session_id=?1 AND key=?2",
                 params![id, key],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
             .map_err(|e| self.sql(e))?;
-        row.map(|(fingerprint, result)| {
+        row.map(|(fingerprint, result, terminal, acknowledged)| {
+            PromptOutcome::validate_terminal(terminal.as_deref()).map_err(|e| self.journal(e))?;
+            if acknowledged > 1 {
+                return Err(self.journal(JournalError::Outcome));
+            }
             Ok((
                 Fingerprint::parse(fingerprint).map_err(|e| self.journal(e))?,
                 result
@@ -414,6 +424,7 @@ impl Store {
         .transpose()
     }
 
+    #[cfg(test)]
     pub fn finish_prompt(
         &self,
         id: &str,
@@ -429,6 +440,142 @@ impl Store {
                 params![id, key, result],
             )
             .map_err(|e| self.sql(e))?;
+        Ok(())
+    }
+
+    /// Commits evidence and the outstanding-risk flag together, before callers publish either.
+    pub fn transition(
+        &self,
+        record: &mut Record,
+        key: &str,
+        outcome: Option<&PromptOutcome>,
+        terminal: Option<&str>,
+    ) -> Result<(), StoreError> {
+        PromptOutcome::validate_terminal(terminal).map_err(|e| self.journal(e))?;
+        let mut db = self.connection.lock().expect("store lock poisoned");
+        let tx = db.transaction().map_err(|e| self.sql(e))?;
+        let result = outcome
+            .map(PromptOutcome::encode)
+            .transpose()
+            .map_err(|e| self.journal(e))?;
+        // A newly lost response after an earlier risk acknowledgement is a new incident.
+        let changed = tx.execute("UPDATE prompts SET recovery_ack=CASE WHEN json_extract(?3,'$.status')='uncertain' AND COALESCE(json_extract(result,'$.status'),'')!='uncertain' THEN 0 ELSE recovery_ack END,result=COALESCE(?3,result),terminal=COALESCE(?4,terminal) WHERE session_id=?1 AND key=?2", params![record.id, key, result, terminal]).map_err(|e| self.sql(e))?;
+        if changed != 1 {
+            return Err(self.sql(rusqlite::Error::QueryReturnedNoRows));
+        }
+        let mut next = record.clone();
+        next.uncertain = Self::outstanding(&tx, &record.id).map_err(|e| self.sql(e))?;
+        let json = serde_json::to_string(&next).map_err(|source| StoreError::Decode {
+            path: self.path.clone(),
+            source,
+        })?;
+        tx.execute(
+            "UPDATE sessions SET record=?2 WHERE id=?1",
+            params![record.id, json],
+        )
+        .map_err(|e| self.sql(e))?;
+        tx.commit().map_err(|e| self.sql(e))?;
+        *record = next;
+        Ok(())
+    }
+
+    fn outstanding(db: &Connection, id: &str) -> rusqlite::Result<bool> {
+        db.query_row("SELECT EXISTS(SELECT 1 FROM prompts WHERE session_id=?1 AND recovery_ack=0 AND (result IS NULL OR NOT (json_extract(result,'$.status') IN ('not_dispatched','cancelled') OR (json_extract(result,'$.status')='acknowledged' AND terminal IS NOT NULL))))", [id], |row| row.get(0))
+    }
+
+    pub fn acknowledge(&self, record: &Record) -> Result<(), StoreError> {
+        let mut db = self.connection.lock().expect("store lock poisoned");
+        let tx = db.transaction().map_err(|e| self.sql(e))?;
+        tx.execute(
+            "UPDATE prompts SET recovery_ack=1 WHERE session_id=?1",
+            [&record.id],
+        )
+        .map_err(|e| self.sql(e))?;
+        let json = serde_json::to_string(record).map_err(|source| StoreError::Decode {
+            path: self.path.clone(),
+            source,
+        })?;
+        tx.execute(
+            "UPDATE sessions SET record=?2 WHERE id=?1",
+            params![record.id, json],
+        )
+        .map_err(|e| self.sql(e))?;
+        tx.commit().map_err(|e| self.sql(e))
+    }
+
+    pub fn interrupt(&self, record: &mut Record, key: &str) -> Result<(), StoreError> {
+        let mut db = self.connection.lock().expect("store lock poisoned");
+        let tx = db.transaction().map_err(|e| self.sql(e))?;
+        // Keep a known receipt, but a newly lost execution boundary is a fresh recovery incident.
+        tx.execute(
+            "UPDATE prompts SET recovery_ack=0 WHERE session_id=?1 AND key=?2",
+            params![record.id, key],
+        )
+        .map_err(|e| self.sql(e))?;
+        let mut next = record.clone();
+        next.uncertain = true;
+        let json = serde_json::to_string(&next).map_err(|source| StoreError::Decode {
+            path: self.path.clone(),
+            source,
+        })?;
+        tx.execute(
+            "UPDATE sessions SET record=?2 WHERE id=?1",
+            params![record.id, json],
+        )
+        .map_err(|e| self.sql(e))?;
+        tx.commit().map_err(|e| self.sql(e))?;
+        *record = next;
+        Ok(())
+    }
+
+    /// Only new reservations have a write-ahead boundary proving that no request was published.
+    pub fn recover_prompts(&self) -> Result<(), StoreError> {
+        for mut record in self.records()? {
+            let rows = {
+                let db = self.connection.lock().expect("store lock poisoned");
+                let mut statement = db
+                    .prepare("SELECT key FROM prompts WHERE session_id=?1")
+                    .map_err(|e| self.sql(e))?;
+                statement
+                    .query_map([&record.id], |row| row.get::<_, String>(0))
+                    .map_err(|e| self.sql(e))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| self.sql(e))?
+            };
+            let mut unsent = Vec::new();
+            for key in rows {
+                let (_, result) = self
+                    .prompt(&record.id, &key)?
+                    .ok_or_else(|| self.journal(JournalError::Outcome))?;
+                if matches!(result, Some(PromptOutcome::Reserved {})) {
+                    unsent.push(key);
+                }
+            }
+            // Reconcile once per session, avoiding a full risk scan and fsync for every old key.
+            let mut db = self.connection.lock().expect("store lock poisoned");
+            let tx = db.transaction().map_err(|e| self.sql(e))?;
+            let settled = PromptOutcome::NotDispatched {}
+                .encode()
+                .map_err(|e| self.journal(e))?;
+            for key in unsent {
+                tx.execute(
+                    "UPDATE prompts SET result=?3 WHERE session_id=?1 AND key=?2",
+                    params![record.id, key, settled],
+                )
+                .map_err(|e| self.sql(e))?;
+            }
+            record.uncertain = Self::outstanding(&tx, &record.id).map_err(|e| self.sql(e))?;
+            let json = serde_json::to_string(&record).map_err(|source| StoreError::Decode {
+                path: self.path.clone(),
+                source,
+            })?;
+            tx.execute(
+                "UPDATE sessions SET record=?2 WHERE id=?1",
+                params![record.id, json],
+            )
+            .map_err(|e| self.sql(e))?;
+            tx.commit().map_err(|e| self.sql(e))?;
+        }
         Ok(())
     }
 }
@@ -493,7 +640,7 @@ mod tests {
         let db = Connection::open(&path).unwrap();
         // Recreate the exact schema-1 journal; registry JSON is deliberately untouched.
         db.execute_batch(
-            "ALTER TABLE prompts DROP COLUMN content_fingerprint; PRAGMA user_version=1;",
+            "ALTER TABLE prompts DROP COLUMN content_fingerprint; ALTER TABLE prompts DROP COLUMN terminal; ALTER TABLE prompts DROP COLUMN recovery_ack; PRAGMA user_version=1;",
         )
         .unwrap();
         (path, db)
@@ -540,13 +687,13 @@ mod tests {
             );
             assert_eq!(
                 store.prompt("one", "failed").unwrap(),
-                Some((fingerprint, Some(PromptOutcome::Failed {})))
+                Some((fingerprint, Some(PromptOutcome::Uncertain {})))
             );
             let db = store.connection.lock().unwrap();
             assert_eq!(
                 db.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
                     .unwrap(),
-                2
+                3
             );
             assert_eq!(
                 db.query_row("SELECT record FROM sessions", [], |row| row
@@ -751,7 +898,7 @@ mod tests {
         assert_eq!(store.records().unwrap().len(), 2);
         assert_eq!(
             store.prompt("one", "key").unwrap(),
-            Some((fingerprint, None))
+            Some((fingerprint, Some(PromptOutcome::Reserved {})))
         );
         assert!(store.prompt("two", "key").unwrap().is_none());
         store.remove("one").unwrap();
@@ -861,7 +1008,7 @@ mod tests {
         assert_eq!(
             db.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
                 .unwrap(),
-            2
+            3
         );
         drop(db);
         std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
@@ -878,6 +1025,167 @@ mod tests {
         let store = Store::open(path.clone()).unwrap();
         assert_eq!(store.records().unwrap().len(), 120);
         drop(store);
+        std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn only_write_ahead_reservations_prove_non_dispatch_after_restart() {
+        let path = temporary();
+        let store = Store::open(path.clone()).unwrap();
+        let mut session = record("one");
+        store.save(&session).unwrap();
+        let fingerprint = Fingerprint::content(&[]).unwrap();
+        store
+            .reserve_prompt(&session, "unsent", &fingerprint)
+            .unwrap();
+        store
+            .reserve_prompt(&session, "possible", &fingerprint)
+            .unwrap();
+        store
+            .transition(
+                &mut session,
+                "possible",
+                Some(&PromptOutcome::DispatchPossible {}),
+                None,
+            )
+            .unwrap();
+        drop(store);
+        let store = Store::open(path.clone()).unwrap();
+        store.recover_prompts().unwrap();
+        assert_eq!(
+            store.prompt("one", "unsent").unwrap(),
+            Some((fingerprint.clone(), Some(PromptOutcome::NotDispatched {})))
+        );
+        assert_eq!(
+            store.prompt("one", "possible").unwrap(),
+            Some((fingerprint, Some(PromptOutcome::DispatchPossible {})))
+        );
+        assert!(store.records().unwrap()[0].uncertain);
+        std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn receipt_and_terminal_evidence_commute_without_resolving_ambiguous_delivery() {
+        for terminal_first in [false, true] {
+            let path = temporary();
+            let store = Store::open(path.clone()).unwrap();
+            let mut session = record("one");
+            store.save(&session).unwrap();
+            store
+                .reserve_prompt(&session, "key", &Fingerprint::content(&[]).unwrap())
+                .unwrap();
+            store
+                .transition(
+                    &mut session,
+                    "key",
+                    Some(&PromptOutcome::DispatchPossible {}),
+                    None,
+                )
+                .unwrap();
+            let acknowledgement = PromptOutcome::Acknowledged {
+                message_id: "receipt".into(),
+            };
+            if terminal_first {
+                store
+                    .transition(&mut session, "key", None, Some("failed"))
+                    .unwrap();
+                assert!(session.uncertain);
+                store
+                    .transition(&mut session, "key", Some(&acknowledgement), None)
+                    .unwrap();
+            } else {
+                store
+                    .transition(&mut session, "key", Some(&acknowledgement), None)
+                    .unwrap();
+                assert!(session.uncertain);
+                store
+                    .transition(&mut session, "key", None, Some("failed"))
+                    .unwrap();
+            }
+            assert!(!session.uncertain);
+            store
+                .transition(
+                    &mut session,
+                    "key",
+                    Some(&PromptOutcome::Uncertain {}),
+                    None,
+                )
+                .unwrap();
+            assert!(
+                session.uncertain,
+                "idle alone cannot reconstruct an acceptance receipt"
+            );
+            session.uncertain = false;
+            store.acknowledge(&session).unwrap();
+            drop(store);
+            let store = Store::open(path.clone()).unwrap();
+            store.recover_prompts().unwrap();
+            assert!(!store.records().unwrap()[0].uncertain);
+            assert!(matches!(
+                store.prompt("one", "key").unwrap().unwrap().1,
+                Some(PromptOutcome::Uncertain {})
+            ));
+            store
+                .reserve_prompt(&session, "new", &Fingerprint::content(&[]).unwrap())
+                .unwrap();
+            store
+                .transition(
+                    &mut session,
+                    "new",
+                    Some(&PromptOutcome::DispatchPossible {}),
+                    None,
+                )
+                .unwrap();
+            assert!(session.uncertain, "new intent raises a new incident");
+            std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn failed_evidence_transactions_do_not_publish_or_forget_risk() {
+        let path = temporary();
+        let store = Store::open(path.clone()).unwrap();
+        let mut session = record("one");
+        store.save(&session).unwrap();
+        store
+            .reserve_prompt(&session, "key", &Fingerprint::content(&[]).unwrap())
+            .unwrap();
+        store
+            .transition(
+                &mut session,
+                "key",
+                Some(&PromptOutcome::DispatchPossible {}),
+                None,
+            )
+            .unwrap();
+        store.connection.lock().unwrap().execute_batch("CREATE TRIGGER fail_session_update BEFORE UPDATE ON sessions BEGIN SELECT RAISE(ABORT,'injected storage failure'); END;").unwrap();
+        assert!(
+            store
+                .transition(
+                    &mut session,
+                    "key",
+                    Some(&PromptOutcome::Acknowledged {
+                        message_id: "receipt".into()
+                    }),
+                    Some("completed")
+                )
+                .is_err()
+        );
+        assert!(session.uncertain);
+        assert!(matches!(
+            store.prompt("one", "key").unwrap().unwrap().1,
+            Some(PromptOutcome::DispatchPossible {})
+        ));
+        assert!(
+            store
+                .transition(
+                    &mut session,
+                    "missing",
+                    Some(&PromptOutcome::NotDispatched {}),
+                    None
+                )
+                .is_err()
+        );
         std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
     }
 }

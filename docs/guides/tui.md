@@ -47,11 +47,15 @@ so the same sessions are available in the Web UI and other ACP clients.
 | `Ctrl-C` | Cancel foreground work |
 | `Ctrl-R` | Accept live-only attachment after a history gap |
 | `Ctrl-Y` | Acknowledge interrupted work and take control |
+| `Ctrl-L` | Explicitly retrieve a pending prompt receipt with its original key |
 | Esc | Close a configuration picker, or quit outside dialogs |
 | `Ctrl-Q` | Quit without closing the session (outside agent questions) |
 
 Recovery acknowledgement requires checking the downstream state first. See
 [sessions and handoff](sessions.md) for what these operations guarantee.
+Reconnect observes the original session without resending pending prompts; use
+`Ctrl-T` to take control. `Ctrl-Y` does not stop running work or skip missing
+history. Receipt lookup never dispatches reserved work a second time.
 
 ## Edit and paste prompts
 

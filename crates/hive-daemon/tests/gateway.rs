@@ -14,6 +14,8 @@ use tokio::{
 
 #[path = "support/interactions.rs"]
 mod interactions;
+#[path = "support/recovery.rs"]
+mod recovery;
 
 fn controlled(meta: &Option<v2::Meta>, key: &str) -> v2::Meta {
     let mut value = meta.clone().unwrap();
@@ -3016,7 +3018,7 @@ async fn a_restart_reattaches_the_original_downstream_session_without_creating_a
                         .data
                         .unwrap()
                         .to_string()
-                        .contains("prompt outcome is uncertain after restart"),
+                        .contains("hive::prompt::outcome_uncertain"),
                     "a matching interrupted key must never be resent"
                 );
                 meta.get_mut("hive").unwrap()["key"] = "failed".into();
@@ -3030,7 +3032,7 @@ async fn a_restart_reattaches_the_original_downstream_session_without_creating_a
                         .data
                         .unwrap()
                         .to_string()
-                        .contains("prompt previously failed")
+                        .contains("hive::prompt::outcome_uncertain")
                 );
                 Ok(())
             },

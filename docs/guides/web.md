@@ -75,7 +75,10 @@ mean external authentication completed.
 
 WebSocket reconnect resumes observation of the original session. It does not
 automatically resend prompts. If a prompt acknowledgement is uncertain, use the
-explicit retry action, which retains the original prompt key.
+**Retrieve original receipt** action, which retains the original prompt key and
+content. It never redispatches reserved work. If recovery acknowledgement is
+required, inspect the agent and external effects first. Acknowledgement permits
+new intent without claiming that earlier work completed or stopped.
 
 If session creation lost its acknowledgement, select the original session from
 the catalog before prompting again. Creating another could start a second agent.
@@ -88,7 +91,8 @@ acknowledgement button before new work. See [session recovery](../operations.md#
 ## Local browser data
 
 Pending uncertain prompts, including their text and stable keys, are stored in
-browser localStorage. Recently visited session navigation is client-local.
+browser localStorage. Explicitly acknowledged unresolved prompts retain a local
+recovery record with their original key/content. Recently visited session navigation is client-local.
 Hive's daemon catalog remains authoritative; the browser is not a durable
 transcript archive.
 

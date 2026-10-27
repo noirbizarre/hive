@@ -192,7 +192,7 @@ def main():
             wait(lambda: screen.contains("Message"))
             send(b"\x1b[200~survives handoff\x1b[201~")
             # Global session/control keys must remain usable without consuming the editable draft.
-            for keys, count in [(b"\x1b[104;5u", 1), (b"\x14", 1), (b"\x12", 1), (b"\x19", 2)]:
+            for keys, count in [(b"\x1b[104;5u", 1), (b"\x14", 1), (b"\x12", 1), (b"\x19", 1)]:
                 resumes = state()["resumes"]
                 send(keys)
                 wait(lambda: state()["resumes"] >= resumes + count)

@@ -93,6 +93,10 @@ fn canonical(value: &Value, bytes: &mut Vec<u8>) -> serde_json::Result<()> {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Outcome {
+    Reserved {},
+    DispatchPossible {},
+    NotDispatched {},
+    Uncertain {},
     Acknowledged {
         #[serde(rename = "messageId")]
         message_id: v2::MessageId,
@@ -102,13 +106,23 @@ pub enum Outcome {
 }
 
 impl Outcome {
+    pub fn validate_terminal(value: Option<&str>) -> Result<(), JournalError> {
+        match value {
+            None | Some("completed" | "cancelled" | "refused" | "failed" | "terminal") => Ok(()),
+            _ => Err(JournalError::Outcome),
+        }
+    }
+
     pub fn recorded(result: &Result<v2::PromptResponse, PromptFailure>) -> Self {
         match result {
             Ok(response) => Self::Acknowledged {
                 message_id: response.message_id.clone(),
             },
             Err(PromptFailure::Cancelled) => Self::Cancelled {},
-            Err(PromptFailure::Failed(_)) => Self::Failed {},
+            Err(PromptFailure::NotDispatched) => Self::NotDispatched {},
+            Err(
+                PromptFailure::Failed(_) | PromptFailure::Storage | PromptFailure::Uncertain { .. },
+            ) => Self::Uncertain {},
         }
     }
 
@@ -130,7 +144,14 @@ impl Outcome {
         match self {
             Self::Acknowledged { message_id } => Ok(v2::PromptResponse::new(message_id)),
             Self::Cancelled {} => Err(PromptFailure::Cancelled),
-            Self::Failed {} => Err("prompt previously failed; this key will not be sent again; inspect agent state before submitting new work with a new key".into()),
+            Self::NotDispatched {} => Err(PromptFailure::NotDispatched),
+            // Legacy failures and reservations lack proof of non-insertion.
+            Self::Failed {}
+            | Self::Reserved {}
+            | Self::DispatchPossible {}
+            | Self::Uncertain {} => Err(
+                "prompt outcome is uncertain; inspect agent state and acknowledge recovery".into(),
+            ),
         }
     }
 }
@@ -264,7 +285,7 @@ mod tests {
         assert_eq!(response.message_id.to_string(), "original");
         assert!(response.meta.is_none());
         let failed = Outcome::legacy(r#"{"Err":"private downstream payload"}"#).unwrap();
-        assert_eq!(failed.encode().unwrap(), r#"{"status":"failed"}"#);
+        assert_eq!(failed.encode().unwrap(), r#"{"status":"uncertain"}"#);
         assert!(
             !failed
                 .into_response()

@@ -290,6 +290,7 @@ pub(crate) async fn run_opencode_agent(
             break;
         }
     }
+    crate::abandon_prompts(&worker.control);
 }
 
 fn same_directory(native: &str, requested: &str) -> bool {
@@ -391,15 +392,31 @@ impl Worker {
                     complete(
                         &self.control,
                         &key,
-                        Err("controller was superseded before prompt dispatch; resume with a new key".into()),
+                        Err(crate::PromptFailure::NotDispatched),
                     );
                 } else if self.turn.is_some() {
                     complete(
                         &self.control,
                         &key,
-                        Err("session already has foreground work".into()),
+                        Err(crate::PromptFailure::NotDispatched),
                     );
                 } else {
+                    let marked = match self.control.lock() {
+                        Ok(mut state) => {
+                            // Check ownership again at the durable publication boundary.
+                            if state.generation != generation || state.closing {
+                                Err(crate::PromptFailure::NotDispatched)
+                            } else {
+                                crate::mark_dispatch(&mut state, &key)
+                                    .map_err(|_| crate::PromptFailure::Storage)
+                            }
+                        }
+                        Err(_) => Err(crate::PromptFailure::Storage),
+                    };
+                    if let Err(failure) = marked {
+                        complete(&self.control, &key, Err(failure));
+                        return false;
+                    }
                     match self.native.prompt(&request.prompt).await {
                         Ok(()) => {
                             self.turn = Some(Turn {
@@ -581,14 +598,15 @@ impl Worker {
 
     fn finish(&mut self) {
         let stop = if self.failure.is_some() {
-            v2::StopReason::Other(v2::OtherStopReason::new(
+            Some(v2::StopReason::Other(v2::OtherStopReason::new(
                 "_opencode_error",
                 Default::default(),
-            ))
+            )))
         } else if self.closing.is_some() {
-            v2::StopReason::Cancelled
+            Some(v2::StopReason::Cancelled)
         } else {
-            v2::StopReason::EndTurn
+            // Native idle is foreground evidence, not a certificate of successful execution.
+            None
         };
         if let Some(closing) = &mut self.closing {
             closing.result = Some(if self.failure.is_some() {
@@ -608,9 +626,9 @@ impl Worker {
             .lock()
             .map(|mut state| std::mem::take(&mut state.external_activity))
             .unwrap_or(false);
-        self.state_update(v2::StateUpdate::Idle(
-            v2::IdleStateUpdate::new().stop_reason(stop),
-        ));
+        let mut idle = v2::IdleStateUpdate::new();
+        idle.stop_reason = stop;
+        self.state_update(v2::StateUpdate::Idle(idle));
         if external {
             self.activity(json!({"kind": "external", "active": false, "source": "opencode"}));
         }
@@ -654,12 +672,12 @@ impl Worker {
             && !turn.seen_busy
             && turn.started.elapsed() >= IDLE_GRACE
         {
-            // Admitted but never started (for example rejected after the 204): end the turn
-            // visibly instead of leaving the session "running" forever.
-            self.failure = Some(
-                "OpenCode never started the prompt; check its model and provider configuration"
-                    .into(),
-            );
+            // An unseen busy interval may have completed between polls; absence is not rejection.
+            if let Ok(mut state) = self.control.lock() {
+                state.recovery_required = true;
+                let _ = crate::forward_locked(&mut state, &self.hive_id, None);
+                state.notify();
+            }
             self.finish();
         }
         // v2 has no verified permission events, and on either flavor a request the pilot left

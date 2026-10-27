@@ -312,6 +312,88 @@ test('an interrupted session only acknowledges recovery after an explicit user a
   client.close();
 });
 
+test('recovery acknowledgement preserves running work and unavailable history independently', async () => {
+  const sockets = transport((socket, message, result) => {
+    if (message.method !== 'session/resume') return;
+    if (message.params.replayFrom) {
+      queueMicrotask(() => socket.receive({ id: message.id, error: { code: -32600, data: 'hive::transcript::unsupported' } }));
+      return false;
+    }
+    return { _meta: { hive: { ...result._meta.hive, running: true, recoveryRequired: false } } };
+  });
+  localStorage.setItem(`hive.pending.${session.sessionId}`, JSON.stringify({ key: 'original', text: 'do work' }));
+  const client = connect('ws://localhost/acp');
+  await assert.rejects(client.open({ ...session, recovery: 'recovery_required' }), /unsupported/);
+  assert.equal(client.state().gap, true);
+  await client.acknowledgeRecovery();
+  assert.equal(sockets[0].sent.at(-1).params.replayFrom, undefined);
+  assert.equal(client.state().running, true);
+  assert.equal(client.state().gap, true);
+  assert.equal(client.state().uncertain, undefined);
+  assert.equal(JSON.parse(localStorage.getItem(`hive.recovery.${session.sessionId}`)).key, 'original');
+  assert.equal(sockets[0].sent.some(message => message.method === 'session/prompt'), false);
+  client.close();
+});
+
+test('typed uncertainty retains the original key and blocks new work without parsing messages', async () => {
+  let submitted;
+  const sockets = transport((_, message) => { if (message.method === 'session/prompt') { submitted = message; return false; } });
+  const client = connect('ws://localhost/acp');
+  await client.open(session); await client.takeControl();
+  const pending = client.prompt('original content');
+  await new Promise(resolve => setImmediate(resolve));
+  sockets[0].receive({ id: submitted.id, error: { code: -32600, data: { hive: {
+    version: 1, code: 'hive::prompt::outcome_uncertain', message: 'Controlled explanation', help: 'Observe first', recoveryRequired: true,
+  } } } });
+  await assert.rejects(pending, /Controlled explanation/);
+  assert.equal(client.state().recoveryRequired, true);
+  assert.equal(client.state().uncertain.key, submitted.params._meta.hive.key);
+  await assert.rejects(client.prompt('new intent'), /acknowledge recovery/);
+  assert.equal(sockets[0].sent.filter(message => message.method === 'session/prompt').length, 1);
+  client.close();
+});
+
+test('receipt lookup recovers a lost recovery acknowledgement without claiming execution started', async () => {
+  const sockets = transport((socket, message) => {
+    if (message.method !== 'session/prompt') return;
+    queueMicrotask(() => socket.receive({ id: message.id, error: { code: -32600, data: { hive: {
+      version: 1, code: 'hive::prompt::outcome_uncertain', message: 'Still unknown', recoveryRequired: false,
+    } } } }));
+    return false;
+  });
+  localStorage.setItem(`hive.pending.${session.sessionId}`, JSON.stringify({ key: 'original', text: 'content' }));
+  const client = connect('ws://localhost/acp');
+  await client.open(session); await client.takeControl();
+  await assert.rejects(client.prompt('content'), /Still unknown/);
+  assert.equal(client.state().uncertain, undefined);
+  assert.equal(client.state().recoveryRequired, false);
+  assert.equal(client.state().running, false);
+  assert.equal(JSON.parse(localStorage.getItem(`hive.recovery.${session.sessionId}`)).key, 'original');
+  assert.equal(sockets[0].sent.filter(message => message.method === 'session/prompt').length, 1);
+  client.close();
+});
+
+test('a delayed prompt receipt cannot discard another sessions pending key', async () => {
+  const submitted = [];
+  const sockets = transport((_, message) => { if (message.method === 'session/prompt') { submitted.push(message); return false; } });
+  const client = connect('ws://localhost/acp');
+  await client.open(session); await client.takeControl();
+  const first = client.prompt('first');
+  await new Promise(resolve => setImmediate(resolve));
+  const other = { ...session, sessionId: 'other' };
+  await client.open(other); await client.takeControl();
+  const second = client.prompt('second');
+  await new Promise(resolve => setImmediate(resolve));
+  sockets[0].receive({ id: submitted[0].id, result: { messageId: 'first-receipt' } });
+  await first;
+  assert.equal(client.state().uncertain.key, submitted[1].params._meta.hive.key);
+  assert.equal(JSON.parse(localStorage.getItem('hive.pending.other')).text, 'second');
+  sockets[0].receive({ id: submitted[1].id, result: { messageId: 'second-receipt' } });
+  await second;
+  assert.equal(client.state().uncertain, undefined);
+  client.close();
+});
+
 test('a new browser session is created only on its first prompt', async () => {
   const sockets = transport();
   const client = connect('ws://localhost/acp');

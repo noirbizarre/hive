@@ -23,6 +23,8 @@ struct State {
     v1_sessions: HashMap<String, (std::path::PathBuf, Vec<v1::SessionUpdate>)>,
     #[serde(default)]
     restores: Vec<String>,
+    #[serde(default)]
+    executions: HashMap<String, u64>,
     // Pending responders are process-local; restart fixtures must not persist transport handles.
     #[serde(skip)]
     pending_v1: HashMap<String, (Responder<v1::PromptResponse>, String)>,
@@ -518,6 +520,38 @@ async fn main() -> agent_client_protocol::Result<()> {
                             "private".into(),
                             serde_json::json!("acknowledgement metadata sentinel"),
                         )]));
+                    }
+                    if text.starts_with("recovery-") {
+                        let user = v2::SessionUpdate::UserMessage(v2::UserMessage::new(user_id.clone()).content(request.prompt.clone()));
+                        {
+                            let mut state = state.lock().map_err(|_| Error::internal_error())?;
+                            *state.executions.entry(text.clone()).or_default() += 1;
+                            state.sessions.get_mut(&request.session_id).unwrap().1.push(user.clone());
+                            // This fixture's durable acceptance is the test barrier, before any receipt.
+                            save(&state)?;
+                        }
+                        if text == "recovery-accepted-lost-ack" {
+                            std::process::exit(77);
+                        }
+                        if text != "recovery-completed-lost-ack" {
+                            responder.respond(acknowledgement)?;
+                        } else {
+                            // Retain the responder until process death, without sending a receipt.
+                            state.lock().map_err(|_| Error::internal_error())?.pending_v2.insert(request.session_id.clone(), (responder, Some(user_id)));
+                        }
+                        notify(&cx, &request.session_id, user)?;
+                        notify(&cx, &request.session_id, v2::SessionUpdate::StateUpdate(v2::StateUpdate::Running(v2::RunningStateUpdate::new())))?;
+                        if text == "recovery-hold" {
+                            return Ok(());
+                        }
+                        let snapshot = v2::SessionUpdate::AgentMessage(v2::AgentMessage::new(agent_id).content(vec!["Durable result without a delivered terminal response".into()]));
+                        {
+                            let mut state = state.lock().map_err(|_| Error::internal_error())?;
+                            state.sessions.get_mut(&request.session_id).unwrap().1.push(snapshot);
+                            save(&state)?;
+                        }
+                        // Lose either the acceptance receipt or terminal event after durable work.
+                        std::process::exit(77);
                     }
                     if text == "close-before-insertion" {
                         {

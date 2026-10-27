@@ -30,6 +30,13 @@ Validate replies and reject stale deliveries. Treat URL consent separately from
 external completion. Use shared validation fixtures to keep native and browser
 implementations aligned without assuming they execute the same code.
 
+Provider adapters publishing a decision over a second transport retain a receipt
+of the validated interaction epoch and pilot generation, and recheck it at
+publication admission. OpenCode server leave-Plan approval uses this fence before
+answering its native question; an already dispatched HTTP answer cannot be
+retracted by a later cancellation. See the
+[provider-specific contract](../compatibility.md#opencode-leave-plan-confirmation).
+
 ## Consequences
 
 - Handoff remains possible without authorizing an old pilot's response.

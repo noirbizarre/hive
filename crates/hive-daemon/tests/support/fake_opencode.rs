@@ -63,6 +63,7 @@ pub enum Script {
 #[derive(Clone)]
 struct Session {
     id: String,
+    parent: Option<String>,
     title: String,
     directory: String,
 }
@@ -85,12 +86,16 @@ struct Data {
     fail_abort: bool,
     hold_abort: bool,
     stale_idle_on_abort: bool,
+    fail_question_reply: bool,
+    hold_question_read: bool,
+    question_read_held: bool,
 }
 
 struct Inner {
     state: Mutex<Data>,
     v1_events: broadcast::Sender<String>,
     v2_events: broadcast::Sender<String>,
+    question_read_release: tokio::sync::Notify,
 }
 
 #[derive(Clone)]
@@ -117,9 +122,13 @@ pub async fn start(options: Options) -> (Fake, String) {
             fail_abort: false,
             hold_abort: false,
             stale_idle_on_abort: false,
+            fail_question_reply: false,
+            hold_question_read: false,
+            question_read_held: false,
         }),
         v1_events,
         v2_events,
+        question_read_release: tokio::sync::Notify::new(),
     }));
     let router = Router::new()
         .route("/global/health", get(health))
@@ -128,6 +137,7 @@ pub async fn start(options: Options) -> (Fake, String) {
         .route("/session/status", get(status))
         .route("/session/{id}", get(get_session))
         .route("/session/{id}/message", get(messages))
+        .route("/session/{id}/message/{message}", get(get_message))
         .route("/session/{id}/prompt_async", post(prompt_async))
         .route("/session/{id}/abort", post(abort))
         .route("/event", get(event_stream))
@@ -206,6 +216,7 @@ impl Fake {
     pub fn add_session(&self, id: &str, title: &str, directory: &str) {
         self.state().sessions.push(Session {
             id: id.into(),
+            parent: None,
             title: title.into(),
             directory: directory.into(),
         });
@@ -304,6 +315,58 @@ impl Fake {
         let request = json!({"id": id, "sessionID": session, "questions": questions});
         self.state().questions.push(request.clone());
         self.emit(json!({"type": "question.asked", "properties": request}));
+    }
+
+    /// The referenced message exists before its tool SSE announcement, as on native attach.
+    pub fn ask_plan_exit(&self, session: &str, id: &str) -> Value {
+        self.ask_tool_question(session, id, "plan_exit")
+    }
+
+    pub fn ask_tool_question(&self, session: &str, id: &str, tool: &str) -> Value {
+        let request = json!({"id": id, "sessionID": session,
+            "tool": {"messageID": format!("msg_{id}"), "callID": format!("call_{id}")},
+            "questions": [{"header": "Build Agent", "question": "Review .opencode/plans/approved.md before switching to Build.",
+                "options": [{"label": "Yes"}, {"label": "No"}], "custom": false}]});
+        self.state().messages.push((session.into(), json!({
+            "info": {"id": format!("msg_{id}"), "sessionID": session, "role": "assistant"},
+            "parts": [{"type": "text", "text": "First inspect the parser, then fix its error handling."},
+                {"type": "reasoning", "text": "PRIVATE REASONING"},
+                {"type": "tool", "id": format!("part_{id}"), "messageID": format!("msg_{id}"),
+                "sessionID": session, "callID": format!("call_{id}"), "tool": tool, "state": {"status": "running", "input": {}}}]
+        })));
+        self.state().questions.push(request.clone());
+        self.emit(json!({"type": "question.asked", "properties": request}));
+        request
+    }
+
+    pub fn make_child(&self, id: &str, parent: &str) {
+        self.state()
+            .sessions
+            .iter_mut()
+            .find(|s| s.id == id)
+            .unwrap()
+            .parent = Some(parent.into());
+    }
+
+    pub fn answer_question_natively(&self, session: &str, id: &str) {
+        self.state().questions.retain(|q| q["id"] != id);
+        self.emit(json!({"type": "question.replied", "properties": {"sessionID": session, "requestID": id}}));
+    }
+
+    pub fn fail_question_reply(&self, fail: bool) {
+        self.state().fail_question_reply = fail;
+    }
+
+    pub fn hold_next_question_read(&self) {
+        self.state().hold_question_read = true;
+    }
+
+    pub fn question_read_held(&self) -> bool {
+        self.state().question_read_held
+    }
+
+    pub fn release_question_read(&self) {
+        self.0.question_read_release.notify_one();
     }
 
     /// `(request id, "reply" | "reject", body)`.
@@ -450,7 +513,7 @@ fn message(session: &str, id: &str, role: &str, part: &str, text: &str) -> Value
 }
 
 fn session_json(session: &Session) -> Value {
-    json!({"id": session.id, "title": session.title, "directory": session.directory,
+    json!({"id": session.id, "parentID": session.parent, "title": session.title, "directory": session.directory,
         "time": {"created": 1, "updated": 2}})
 }
 
@@ -553,6 +616,7 @@ async fn create_session(State(fake): State<Fake>, Query(scope): Query<Scope>) ->
     let n = fake.next();
     let session = Session {
         id: format!("ses_new{n}"),
+        parent: None,
         title: format!("New session - {n}"),
         directory: scope.directory.unwrap_or_default(),
     };
@@ -595,6 +659,22 @@ async fn messages(State(fake): State<Fake>, Path(id): Path<String>) -> Response 
             .collect::<Vec<_>>(),
     )
     .into_response()
+}
+
+async fn get_message(
+    State(fake): State<Fake>,
+    Path((id, message)): Path<(String, String)>,
+) -> Response {
+    fake.log(format!("GET /session/{id}/message/{message}"));
+    let state = fake.state();
+    match state
+        .messages
+        .iter()
+        .find(|(session, value)| *session == id && value["info"]["id"] == message)
+    {
+        Some((_, value)) => Json(value.clone()).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 async fn prompt_async(
@@ -672,6 +752,15 @@ async fn reply_permission(
 }
 
 async fn list_questions(State(fake): State<Fake>) -> Json<Value> {
+    let hold = {
+        let mut state = fake.state();
+        let hold = std::mem::take(&mut state.hold_question_read);
+        state.question_read_held |= hold;
+        hold
+    };
+    if hold {
+        fake.0.question_read_release.notified().await;
+    }
     Json(Value::Array(fake.state().questions.clone()))
 }
 
@@ -679,14 +768,18 @@ async fn reply_question(
     State(fake): State<Fake>,
     Path(id): Path<String>,
     Json(body): Json<Value>,
-) -> Json<bool> {
+) -> Response {
     fake.log(format!("POST /question/{id}/reply"));
     let mut state = fake.state();
     state
         .question_replies
         .push((id.clone(), "reply".into(), body));
+    // A failed publication is deliberately ambiguous: the request remains pending.
+    if state.fail_question_reply {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
     state.questions.retain(|q| q["id"] != id);
-    Json(true)
+    Json(true).into_response()
 }
 
 async fn reject_question(State(fake): State<Fake>, Path(id): Path<String>) -> Json<bool> {
@@ -712,6 +805,7 @@ async fn v2_create(State(fake): State<Fake>, Json(body): Json<Value>) -> Json<Va
     let n = fake.next();
     let session = Session {
         id: format!("ses_v2new{n}"),
+        parent: None,
         title: format!("New session - {n}"),
         directory: body["location"]["directory"]
             .as_str()

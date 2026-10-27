@@ -707,6 +707,57 @@ fn permission() -> (
 }
 
 #[tokio::test]
+async fn leave_plan_context_and_actions_are_visible_and_enter_alone_cannot_approve() {
+    connected(async |cx| {
+        let request = v2::RequestPermissionRequest::new(
+            v2::SessionId::new("session"),
+            "OpenCode: leave Plan mode?",
+            vec![
+                v2::PermissionOption::new(
+                    "stay",
+                    "Stay in Plan / refine the plan",
+                    v2::PermissionOptionKind::RejectOnce,
+                ),
+                v2::PermissionOption::new(
+                    "approve",
+                    "Leave Plan and start implementing",
+                    v2::PermissionOptionKind::AllowOnce,
+                ),
+            ],
+        )
+        .description("Available plan context: fix the parser");
+        let (tx, mut rx) = oneshot::channel();
+        let interaction = Interaction::Permission(request, tx);
+        let mut app = App::default();
+        show_interaction(&mut app, &interaction);
+        let dialog = app.dialog.as_deref().unwrap();
+        for expected in [
+            "leave Plan mode?",
+            "fix the parser",
+            "Stay in Plan",
+            "start implementing",
+        ] {
+            assert!(dialog.contains(expected));
+        }
+        assert!(!dialog.contains("allow_always"));
+        let mut pending = Some(interaction);
+        press(&cx, &mut app, &mut pending, KeyCode::Enter).await;
+        assert!(matches!(
+            rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        text(&cx, &mut app, &mut pending, "2").await;
+        press(&cx, &mut app, &mut pending, KeyCode::Enter).await;
+        assert_eq!(
+            serde_json::to_value(rx.await.unwrap()).unwrap()["outcome"]["optionId"],
+            "approve"
+        );
+        Ok(())
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn permission_keys_require_a_listed_choice_and_escape_never_approves() {
     connected(async |cx| {
         let mut app = App::default();

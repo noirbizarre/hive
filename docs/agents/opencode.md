@@ -93,6 +93,40 @@ The retained real-server probe covers OpenCode 1.19.3 on v1 routes. The adapter
 rejects reported versions below 1.19.0. The `/api/*` preview has separate stores
 and narrower evidence. See the [server capability matrix](../compatibility.md#capability-and-version-matrix).
 
+### Approve leaving Plan mode
+
+On server v1 routes, a native `plan_exit` question with verified session,
+message and tool-call identity appears in both clients as **OpenCode: leave
+Plan mode?**. Choose **Leave Plan and start implementing** to authorize this
+transition once, or **Stay in Plan / refine the plan** to reject the native
+question. The latter lets the agent continue refining; it does not send free-text
+feedback. In the TUI, enter the displayed option number and press Enter.
+
+The confirmation shows the provider's plan reference and any available visible
+assistant text in the correlated message. Excerpts are bounded and labeled;
+they are not a guaranteed full-plan preview. Hive does not read a referenced
+plan file from the daemon's filesystem.
+
+Only the explicit approval sends OpenCode's native Yes answer. OpenCode owns
+the subsequent Build continuation; Hive does not infer a mode change from the
+tool call. Declining, timing out, an unsupported client, or cancelling never
+counts as approval. Cancelled requests remain unapproved and are suppressed for
+the current attachment. A pilot disconnect can transfer the pending confirmation
+to the next pilot. Stream reconnect or an uncertain reply requires reconciliation
+and fresh confirmation. Cancellation before publication admission prevents the
+answer; an HTTP request already dispatched cannot be retracted.
+
+Child-session transitions are unsupported and rejected when attached directly.
+A child's request is never promoted to a parent's confirmation. Native OpenCode
+clients can still answer independently; Hive cannot exclude them.
+
+This behavior is covered by deterministic gateway and client tests using the
+OpenCode 1.19.4 source contract, not a retained real-provider inference probe.
+For that version, `opencode acp` does not expose the built-in `plan_exit` tool
+or forward native questions. Hive cannot manufacture its missing continuation.
+The server preview v2 question flow is also unsupported. Neither path receives
+an implicit approval from Hive.
+
 ## Discover and adopt a native session
 
 Native adoption is currently an integration/API workflow. The supplied clients

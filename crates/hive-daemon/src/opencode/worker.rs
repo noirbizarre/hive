@@ -75,6 +75,78 @@ struct Worker {
     announced: bool,
     pending: Arc<Mutex<HashMap<String, AbortOnDrop>>>,
     closing: Option<Closing>,
+    child: bool,
+    plan_exits: Arc<Mutex<PlanExits>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ApprovalState {
+    Waiting,
+    Publishing,
+    Settled,
+    Cancelled,
+    Retry,
+}
+
+struct Approval {
+    token: uuid::Uuid,
+    state: ApprovalState,
+}
+
+impl Approval {
+    fn complete(&mut self, token: uuid::Uuid, state: ApprovalState) -> bool {
+        // Abort is cooperative: a finishing task must preserve withdrawal and settlement.
+        if self.token != token
+            || !matches!(
+                self.state,
+                ApprovalState::Waiting | ApprovalState::Publishing
+            )
+        {
+            return false;
+        }
+        self.state = state;
+        true
+    }
+}
+
+struct PlanExits {
+    online: bool,
+    // Keep terminal identities for this attachment so late replay cannot recreate consent.
+    requests: HashMap<String, Approval>,
+}
+
+impl PlanExits {
+    fn withdraw(&mut self, terminal: bool, pending: &mut HashMap<String, AbortOnDrop>) {
+        if !terminal {
+            self.online = false;
+        }
+        for (id, approval) in &mut self.requests {
+            if approval.state == ApprovalState::Waiting
+                || (terminal
+                    && !matches!(
+                        approval.state,
+                        ApprovalState::Settled | ApprovalState::Cancelled
+                    ))
+            {
+                approval.state = if terminal {
+                    ApprovalState::Cancelled
+                } else {
+                    ApprovalState::Retry
+                };
+                pending.remove(id);
+            }
+        }
+    }
+
+    fn reconcile(&mut self, listed: &HashSet<String>) {
+        self.requests.retain(|id, approval| {
+            if !listed.contains(id) {
+                approval.state = ApprovalState::Settled;
+            }
+            // A fresh confirmation after an uncertain attempt requires a successful native read.
+            !(approval.state == ApprovalState::Retry && self.online)
+        });
+    }
 }
 
 struct Closing {
@@ -249,6 +321,11 @@ pub(crate) async fn run_opencode_agent(
         announced: false,
         pending: Arc::new(Mutex::new(HashMap::new())),
         closing: None,
+        child: session.parent.is_some(),
+        plan_exits: Arc::new(Mutex::new(PlanExits {
+            online: true,
+            requests: HashMap::new(),
+        })),
     };
     if started_busy {
         // The native session was mid-turn when Hive attached: surface it as external work.
@@ -269,12 +346,14 @@ pub(crate) async fn run_opencode_agent(
                     worker.events(mapped).await;
                 }
                 Some(Stream::Dropped) => {
+                    worker.withdraw_approvals(false);
                     worker.connection("lost");
                     if let Some(closing) = &mut worker.closing {
                         closing.result = Some(Err("OpenCode event stream disconnected before termination was confirmed; inspect the native session and retry close".into()));
                     }
                 }
                 Some(Stream::Reconnected) => {
+                    worker.plan_exits.lock().expect("approval state is not poisoned").online = true;
                     worker.connection("restored");
                     worker.reconcile().await;
                 }
@@ -290,6 +369,12 @@ pub(crate) async fn run_opencode_agent(
             break;
         }
     }
+    worker.withdraw_approvals(true);
+    worker
+        .pending
+        .lock()
+        .expect("pending state is not poisoned")
+        .clear();
     crate::abandon_prompts(&worker.control);
 }
 
@@ -350,6 +435,15 @@ async fn run_events(
 }
 
 impl Worker {
+    fn withdraw_approvals(&self, terminal: bool) {
+        let mut approvals = self
+            .plan_exits
+            .lock()
+            .expect("approval state is not poisoned");
+        let mut pending = self.pending.lock().expect("pending state is not poisoned");
+        approvals.withdraw(terminal, &mut pending);
+    }
+
     fn state_update(&self, update: v2::StateUpdate) {
         let _ = forward(
             &self.control,
@@ -444,6 +538,7 @@ impl Worker {
             }
             Command::Cancel(epoch) => {
                 if epoch == 0 || current(&self.control, epoch) {
+                    self.withdraw_approvals(true);
                     // Also aborts an external turn: cancelling is a deliberate controller action.
                     if let Err(error) = self.native.abort().await {
                         tracing::warn!(code = error.code(), "OpenCode abort failed");
@@ -458,6 +553,7 @@ impl Worker {
                     ));
                     false
                 } else if self.turn.is_some() || self.native_busy {
+                    self.withdraw_approvals(true);
                     match self.native.abort().await {
                         Ok(()) => {
                             // HTTP acceptance is not an SSE barrier: keep receiving final updates through terminal idle.
@@ -587,6 +683,11 @@ impl Worker {
             Mapped::Permission(ask) => self.permission(ask),
             Mapped::Question(ask) => self.question(ask),
             Mapped::Resolved(id) => {
+                if let Ok(mut approvals) = self.plan_exits.lock()
+                    && let Some(approval) = approvals.requests.get_mut(&id)
+                {
+                    approval.state = ApprovalState::Settled;
+                }
                 // Answered natively first: stop asking Hive's pilot, and never reply twice.
                 if let Ok(mut pending) = self.pending.lock() {
                     pending.remove(&id);
@@ -702,6 +803,9 @@ impl Worker {
         if let Ok(mut pending) = self.pending.lock() {
             pending.retain(|id, _| listed.contains(id));
         }
+        if let Ok(mut approvals) = self.plan_exits.lock() {
+            approvals.reconcile(&listed);
+        }
         for item in items {
             self.apply(item);
         }
@@ -756,6 +860,10 @@ impl Worker {
         if ask.id.is_empty() || self.is_pending(&ask.id) {
             return;
         }
+        if ask.tool.is_some() {
+            self.tool_question(ask);
+            return;
+        }
         let Some(request) = map::elicitation(&self.hive_id, &ask) else {
             tracing::warn!("OpenCode question could not be expressed as an ACP form");
             return;
@@ -790,6 +898,71 @@ impl Worker {
         });
     }
 
+    fn tool_question(&self, ask: QuestionAsk) {
+        let epoch = self
+            .control
+            .lock()
+            .expect("session state is not poisoned")
+            .interaction_epoch;
+        let token = uuid::Uuid::new_v4();
+        {
+            let mut approvals = self
+                .plan_exits
+                .lock()
+                .expect("approval state is not poisoned");
+            // Bound replay suppression without evicting a decision that might still be replayed.
+            if !approvals.online || approvals.requests.contains_key(&ask.id) {
+                return;
+            }
+            if approvals.requests.len() >= 1024 {
+                drop(approvals);
+                let error = OpencodeError::PlanApproval {
+                    reason: "interaction replay capacity exhausted",
+                };
+                let _ = forward(
+                    &self.control,
+                    &self.hive_id,
+                    v2::SessionUpdate::Other(v2::OtherSessionUpdate::new(
+                        "_hive_opencode_error",
+                        BTreeMap::from([("message".into(), json!(error.wire()))]),
+                    )),
+                );
+                return;
+            }
+            approvals.requests.insert(
+                ask.id.clone(),
+                Approval {
+                    token,
+                    state: ApprovalState::Waiting,
+                },
+            );
+        }
+        let (native, control, approvals, pending, hive_id, child) = (
+            self.native.clone(),
+            self.control.clone(),
+            self.plan_exits.clone(),
+            self.pending.clone(),
+            self.hive_id.clone(),
+            self.child,
+        );
+        self.track(ask.id.clone(), async move {
+            let result = answer_tool_question(&native, control.clone(), approvals.clone(), &hive_id, &ask, epoch, token, child).await;
+            if let Err(error) = &result {
+                tracing::warn!(code = error.code(), "OpenCode question could not be confirmed; inspect the native session before retrying");
+                let _ = forward(&control, &hive_id, v2::SessionUpdate::Other(v2::OtherSessionUpdate::new(
+                    "_hive_opencode_error", BTreeMap::from([("message".into(), json!(error.wire()))]),
+                )));
+            }
+            let mut ledger = approvals.lock().expect("approval state is not poisoned");
+            if let Some(approval) = ledger.requests.get_mut(&ask.id)
+                && approval.complete(token, result.unwrap_or(ApprovalState::Retry))
+                && approval.state == ApprovalState::Retry
+                && let Ok(mut pending) = pending.lock() {
+                pending.remove(&ask.id);
+            }
+        });
+    }
+
     fn is_pending(&self, id: &str) -> bool {
         self.pending
             .lock()
@@ -806,9 +979,144 @@ impl Worker {
     }
 }
 
+// The tool identity is fetched independently of SSE ordering and the bounded history import.
+#[allow(clippy::too_many_arguments)]
+async fn answer_tool_question(
+    native: &Native,
+    control: Arc<Mutex<Control>>,
+    approvals: Arc<Mutex<PlanExits>>,
+    hive_id: &v2::SessionId,
+    ask: &QuestionAsk,
+    epoch: u64,
+    token: uuid::Uuid,
+    child: bool,
+) -> Result<ApprovalState, OpencodeError> {
+    if ask.session != native.id {
+        return Ok(ApprovalState::Cancelled);
+    }
+    let message = native
+        .message(&ask.tool.as_ref().expect("tool-linked question").0)
+        .await?;
+    let is_plan = map::plan_exit(ask, &message).map_err(|what| OpencodeError::Protocol { what })?;
+    if !is_plan {
+        let Some(request) = map::elicitation(hive_id, ask) else {
+            return Ok(ApprovalState::Cancelled);
+        };
+        let response = crate::interactions::elicitation_at(control, request, epoch).await;
+        match response.action {
+            v2::ElicitationAction::Accept(accepted) => {
+                native
+                    .reply_question(
+                        &ask.id,
+                        map::answers(ask, &accepted.content.unwrap_or_default()),
+                    )
+                    .await?
+            }
+            v2::ElicitationAction::Decline => native.reject_question(&ask.id).await?,
+            _ => return Ok(ApprovalState::Retry),
+        }
+        return Ok(ApprovalState::Settled);
+    }
+    if child {
+        // Native child orchestration is unsupported: never authorize a parent through a child.
+        native.reject_question(&ask.id).await?;
+        return Err(OpencodeError::PlanApproval {
+            reason: "child-session transition rejected",
+        });
+    }
+    let request = map::leave_plan_permission(hive_id.clone(), ask, &message);
+    let (response, receipt) =
+        crate::interactions::permission_receipt(control.clone(), request, epoch).await;
+    let (Some(receipt), v2::RequestPermissionOutcome::Selected(selected)) =
+        (receipt, response.outcome)
+    else {
+        return Ok(ApprovalState::Cancelled);
+    };
+    let approve = match selected.option_id.to_string().as_str() {
+        "approve" => true,
+        "stay" => false,
+        _ => return Ok(ApprovalState::Cancelled),
+    };
+    // Native-first resolution may race the pilot; a successful read is required before dispatch.
+    if !native
+        .pending()
+        .await?
+        .iter()
+        .any(|item| matches!(item, Mapped::Question(current) if current == ask))
+    {
+        return Ok(ApprovalState::Settled);
+    }
+    {
+        let state = control.lock().expect("session state is not poisoned");
+        let mut ledger = approvals.lock().expect("approval state is not poisoned");
+        let online = ledger.online;
+        let Some(attempt) = ledger.requests.get_mut(&ask.id) else {
+            return Ok(ApprovalState::Cancelled);
+        };
+        if state.interaction_epoch != receipt.epoch
+            || state.generation != receipt.generation
+            || state.closing
+            || state.activity.session == "ended"
+            || !online
+            || attempt.token != token
+            || attempt.state != ApprovalState::Waiting
+        {
+            return Ok(ApprovalState::Cancelled);
+        }
+        // Publication admission linearizes against cancellation; HTTP already dispatched cannot be retracted.
+        attempt.state = ApprovalState::Publishing;
+    }
+    if approve {
+        native
+            .reply_question(&ask.id, vec![vec!["Yes".into()]])
+            .await?;
+    } else {
+        native.reject_question(&ask.id).await?;
+    }
+    Ok(ApprovalState::Settled)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::same_directory;
+    use super::*;
+
+    #[test]
+    fn a_finishing_cancelled_task_cannot_suppress_reconnection_or_overwrite_its_replacement() {
+        let token = uuid::Uuid::new_v4();
+        let mut ledger = PlanExits {
+            online: true,
+            requests: HashMap::from([(
+                "question".into(),
+                Approval {
+                    token,
+                    state: ApprovalState::Waiting,
+                },
+            )]),
+        };
+        // Reproduce withdrawal after the final native read but before synchronous task completion.
+        ledger.withdraw(false, &mut HashMap::new());
+        assert!(
+            !ledger
+                .requests
+                .get_mut("question")
+                .unwrap()
+                .complete(token, ApprovalState::Cancelled)
+        );
+        assert!(ledger.requests["question"].state == ApprovalState::Retry);
+        ledger.online = true;
+        ledger.reconcile(&HashSet::from(["question".into()]));
+        assert!(
+            !ledger.requests.contains_key("question"),
+            "the pending request can be offered again"
+        );
+
+        let mut replacement = Approval {
+            token: uuid::Uuid::new_v4(),
+            state: ApprovalState::Waiting,
+        };
+        assert!(!replacement.complete(token, ApprovalState::Settled));
+        assert!(replacement.state == ApprovalState::Waiting);
+    }
 
     #[test]
     fn a_trailing_slash_does_not_make_a_directory_different() {

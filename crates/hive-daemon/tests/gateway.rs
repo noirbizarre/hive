@@ -1587,101 +1587,121 @@ async fn configuration_reserves_admission_and_a_takeover_after_dispatch_keeps_th
 #[tokio::test]
 async fn provider_turn_usage_and_missing_usage_are_isolated_and_not_charged_on_retry() {
     for version in [AgentVersion::V1, AgentVersion::V2] {
-        let command = if version == AgentVersion::V1 {
-            format!("{} v1", env!("CARGO_BIN_EXE_hive-test-agent"))
-        } else {
-            env!("CARGO_BIN_EXE_hive-test-agent").into()
-        };
-        let (address, server) = start_gateway(config_with_agent("mock", &command, version)).await;
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let client = HttpClient::new(format!("ws://{address}")).unwrap();
-        timeout(
-            Duration::from_secs(15),
-            Client
-                .v2()
-                .on_receive_notification(
-                    async move |update: v2::UpdateSessionNotification, _: V2ConnectionTo<Agent>| {
-                        tx.send(update).map_err(Error::into_internal_error)
-                    },
-                    agent_client_protocol::on_receive_notification!(),
-                )
-                .connect_with(client, async move |cx| {
-                    cx.send_request(v2::InitializeRequest::new(
-                        ProtocolVersion::V2,
-                        v2::Implementation::new("usage-test", "1"),
-                    ))
-                    .block_task()
-                    .await?;
-                    let cwd = std::env::current_dir().map_err(Error::into_internal_error)?;
-                    let opened = cx
-                        .send_request(v2::NewSessionRequest::new(cwd))
-                        .block_task()
-                        .await?;
-                    let id = opened.session_id;
-                    let meta = opened.meta;
-                    assert!(
-                        meta.as_ref().unwrap()["hive"]["usageSnapshot"]["tokens"]["totalTokens"]
-                            .is_null()
-                    );
-                    let prompt = || {
-                        v2::PromptRequest::new(id.clone(), vec!["usage-fixture".into()])
-                            .meta(controlled(&meta, "billed"))
-                    };
-                    cx.send_request(prompt()).block_task().await?;
-                    let first = timeout(Duration::from_secs(8), async {
-                        while let Some(update) = rx.recv().await {
-                            if update.session_id == id
-                                && let v2::SessionUpdate::Other(other) = update.update
-                                && other.session_update == "_hive_usage"
-                                && other.fields["turn"]["id"] == "billed"
-                            {
-                                return other.fields;
-                            }
-                        }
-                        panic!("usage stream ended")
-                    })
-                    .await
-                    .map_err(Error::into_internal_error)?;
-                    assert_eq!(
-                        first["turn"]["tokens"]["inputTokens"], 80,
-                        "billed turn event: {first:?}"
-                    );
-                    assert_eq!(first["turn"]["tokens"]["cachedReadTokens"], 20);
-                    assert_eq!(first["session"]["turns"], 1);
-                    cx.send_request(prompt()).block_task().await?;
-                    assert_eq!(summaries(address).await["sessions"][0]["usage"]["turns"], 1);
-                    cx.send_request(
-                        v2::PromptRequest::new(id.clone(), vec!["usage-missing".into()])
-                            .meta(controlled(&meta, "missing")),
-                    )
-                    .block_task()
-                    .await?;
-                    let second = timeout(Duration::from_secs(8), async {
-                        while let Some(update) = rx.recv().await {
-                            if update.session_id == id
-                                && let v2::SessionUpdate::Other(other) = update.update
-                                && other.session_update == "_hive_usage"
-                                && other.fields["turn"]["id"] == "missing"
-                            {
-                                return other.fields;
-                            }
-                        }
-                        panic!("usage stream ended")
-                    })
-                    .await
-                    .map_err(Error::into_internal_error)?;
-                    assert!(second["turn"]["tokens"].is_null());
-                    assert_eq!(second["session"]["reportedTurns"], 1);
-                    assert_eq!(second["session"]["turns"], 2);
-                    assert!(second["session"]["tokens"]["totalTokens"].is_null());
-                    Ok::<_, Error>(())
-                }),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        server.abort();
+        check_provider_turn_usage(version, false).await;
     }
+}
+
+#[tokio::test]
+async fn an_idle_after_dispatch_preserves_usage_and_does_not_fence_the_next_prompt() {
+    check_provider_turn_usage(AgentVersion::V2, true).await;
+}
+
+async fn check_provider_turn_usage(version: AgentVersion, early_idle: bool) {
+    let command = if version == AgentVersion::V1 {
+        format!("{} v1", env!("CARGO_BIN_EXE_hive-test-agent"))
+    } else {
+        env!("CARGO_BIN_EXE_hive-test-agent").into()
+    };
+    let (address, server) = start_gateway(config_with_agent("mock", &command, version)).await;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let client = HttpClient::new(format!("ws://{address}")).unwrap();
+    timeout(
+        Duration::from_secs(15),
+        Client
+            .v2()
+            .on_receive_notification(
+                async move |update: v2::UpdateSessionNotification, _: V2ConnectionTo<Agent>| {
+                    tx.send(update).map_err(Error::into_internal_error)
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(client, async move |cx| {
+                cx.send_request(v2::InitializeRequest::new(
+                    ProtocolVersion::V2,
+                    v2::Implementation::new("usage-test", "1"),
+                ))
+                .block_task()
+                .await?;
+                let cwd = std::env::current_dir().map_err(Error::into_internal_error)?;
+                let opened = cx
+                    .send_request(v2::NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?;
+                let id = opened.session_id;
+                let meta = opened.meta;
+                assert!(
+                    meta.as_ref().unwrap()["hive"]["usageSnapshot"]["tokens"]["totalTokens"]
+                        .is_null()
+                );
+                let prompt = || {
+                    v2::PromptRequest::new(
+                        id.clone(),
+                        vec![if early_idle {
+                            "early-idle usage-fixture".into()
+                        } else {
+                            "usage-fixture".into()
+                        }],
+                    )
+                    .meta(controlled(&meta, "billed"))
+                };
+                cx.send_request(prompt()).block_task().await?;
+                let first = timeout(Duration::from_secs(8), async {
+                    while let Some(update) = rx.recv().await {
+                        if update.session_id == id
+                            && let v2::SessionUpdate::Other(other) = update.update
+                            && other.session_update == "_hive_usage"
+                            && other.fields["turn"]["id"] == "billed"
+                        {
+                            return other.fields;
+                        }
+                    }
+                    panic!("usage stream ended")
+                })
+                .await
+                .map_err(Error::into_internal_error)?;
+                assert_eq!(
+                    first["turn"]["tokens"]["inputTokens"], 80,
+                    "billed turn event: {first:?}"
+                );
+                assert_eq!(first["turn"]["tokens"]["cachedReadTokens"], 20);
+                assert_eq!(first["session"]["turns"], 1);
+                assert_ne!(
+                    summaries(address).await["sessions"][0]["recovery"],
+                    "recovery_required"
+                );
+                cx.send_request(prompt()).block_task().await?;
+                assert_eq!(summaries(address).await["sessions"][0]["usage"]["turns"], 1);
+                cx.send_request(
+                    v2::PromptRequest::new(id.clone(), vec!["usage-missing".into()])
+                        .meta(controlled(&meta, "missing")),
+                )
+                .block_task()
+                .await?;
+                let second = timeout(Duration::from_secs(8), async {
+                    while let Some(update) = rx.recv().await {
+                        if update.session_id == id
+                            && let v2::SessionUpdate::Other(other) = update.update
+                            && other.session_update == "_hive_usage"
+                            && other.fields["turn"]["id"] == "missing"
+                        {
+                            return other.fields;
+                        }
+                    }
+                    panic!("usage stream ended")
+                })
+                .await
+                .map_err(Error::into_internal_error)?;
+                assert!(second["turn"]["tokens"].is_null());
+                assert_eq!(second["session"]["reportedTurns"], 1);
+                assert_eq!(second["session"]["turns"], 2);
+                assert!(second["session"]["tokens"]["totalTokens"].is_null());
+                Ok::<_, Error>(())
+            }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    server.abort();
 }
 
 async fn next_revision(stream: &mut reqwest::Response, pending: &mut String) -> u64 {
@@ -3860,6 +3880,13 @@ async fn declared_http_and_websocket_agents_are_reached_through_the_sdk() {
                            cx: V2ConnectionTo<Client>| {
                         responder
                             .respond(v2::PromptResponse::new(v2::MessageId::new("remote-user")))?;
+                        // A prompt receipt is not the active-state boundary required before completion.
+                        cx.send_notification(v2::UpdateSessionNotification::new(
+                            request.session_id.clone(),
+                            v2::SessionUpdate::StateUpdate(v2::StateUpdate::Running(
+                                v2::RunningStateUpdate::new(),
+                            )),
+                        ))?;
                         cx.send_notification(v2::UpdateSessionNotification::new(
                             request.session_id.clone(),
                             v2::SessionUpdate::AgentMessageChunk(v2::ContentChunk::new(
@@ -4716,6 +4743,13 @@ async fn permission_and_form_and_url_elicitation_reach_the_current_pilot() {
                            responder: Responder<v2::PromptResponse>,
                            cx: V2ConnectionTo<Client>| {
                         responder.respond(v2::PromptResponse::new(v2::MessageId::new("user")))?;
+                        // Permission/elicitation requests alone do not establish foreground work.
+                        cx.send_notification(v2::UpdateSessionNotification::new(
+                            r.session_id.clone(),
+                            v2::SessionUpdate::StateUpdate(v2::StateUpdate::RequiresAction(
+                                v2::RequiresActionStateUpdate::new(),
+                            )),
+                        ))?;
                         tokio::spawn(async move {
                             let result: agent_client_protocol::Result<()> = async {
                                 let choice = cx

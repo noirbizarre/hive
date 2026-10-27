@@ -878,6 +878,30 @@ aggregates, not individual model-call records: individual retries, sub-agent
 calls, billable provider IDs and provider-specific token categories cannot be
 inferred. The context-window `used` field is a gauge, not billable tokens.
 
+Turn completion requires an observed foreground boundary: after dispatch, the
+agent reports `running` or `requires_action`, followed by `idle`. An initial or
+repeated idle arriving before that active state is a session snapshot, not the
+pending prompt's completion; Hive ignores it without releasing prompt admission
+or requiring recovery. This follows the pinned [v2 lifecycle][v2-prompt], which
+allows initial state after `session/new` and requires active-state reporting.
+Neither the prompt response nor content/background updates substitute for it.
+
+A terminal idle may omit both stop reason and usage: Hive still records the
+turn, with null tokens when unreported. A native v2 agent that emits only idle
+without first reporting an active state violates that lifecycle; Hive cannot
+attribute its idle to the prompt, so admission remains reserved and no turn is
+recorded. Pi through `pi-acp` and OpenCode ACP use Hive's v1 adapter, which
+synthesizes the active boundary; the OpenCode server adapter supports bare idle
+after observed running. These adapter/source checks do not expand the retained
+real-agent runtime evidence described in the agent sections.
+
+Regressions include `a_pre_work_idle_preserves_admission_and_the_real_turn_usage`
+and `a_bare_idle_after_foreground_work_records_one_turn_without_tokens` in
+`crates/hive-daemon/src/lib.rs`, and
+`an_idle_after_dispatch_preserves_usage_and_does_not_fence_the_next_prompt` in
+[gateway tests][gateway-tests]. The gateway fixture emits its early idle only
+after receiving the downstream prompt, so the ordering is deterministic.
+
 Each accepted turn ends with one sequenced `session/update` extension
 `sessionUpdate: "_hive_usage"` containing `version: 1`, `scope: "turn"`,
 `source: "acp"`, `turn: { id, agent, timestamp, tokens, estimate }` and

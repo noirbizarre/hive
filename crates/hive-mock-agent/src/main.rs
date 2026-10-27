@@ -514,6 +514,12 @@ async fn main() -> agent_client_protocol::Result<()> {
                             v2::MessageId::new(format!("agent-{seq}")),
                         )
                     };
+                    if text.contains("early-idle") {
+                        // Receipt of the prompt proves dispatch, making the late startup snapshot deterministic.
+                        notify(&cx, &request.session_id, v2::SessionUpdate::StateUpdate(
+                            v2::StateUpdate::Idle(v2::IdleStateUpdate::new()),
+                        ))?;
+                    }
                     let mut acknowledgement = v2::PromptResponse::new(user_id.clone());
                     if std::env::var_os("HIVE_MOCK_ACK_META").is_some() {
                         acknowledgement = acknowledgement.meta(v2::Meta::from_iter([(

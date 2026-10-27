@@ -2164,18 +2164,9 @@ fn forward_locked(
             .and_then(|key| state.prompts.get(key))
             .is_some_and(|prompt| prompt.saw_work)
     {
-        let dispatched = state
-            .active_turn
-            .as_ref()
-            .and_then(|key| state.prompts.get(key))
-            .is_some_and(|prompt| prompt.dispatched);
-        if !dispatched {
-            // A delayed startup/previous-turn idle cannot release queued foreground admission.
-            return Ok(());
-        }
-        // Idle without a live execution boundary describes the session, not this prompt's result.
-        state.recovery_required = true;
-        recovery_changed(state);
+        // Dispatch alone cannot correlate a delayed startup/previous-turn idle with this prompt.
+        // Wait for running/requires_action so the snapshot cannot release admission or fence it.
+        return Ok(());
     }
     // Token streaming must not clone warning strings on every chunk.
     let previous_history = (
@@ -4576,6 +4567,124 @@ mod control_tests {
             assert!(state.usage.turns.is_empty());
             assert_eq!(state.active_turn.as_deref(), Some("interrupted"));
         }
+    }
+
+    #[test]
+    fn a_pre_work_idle_preserves_admission_and_the_real_turn_usage() {
+        for dispatched in [false, true] {
+            for active in ["running", "requires_action"] {
+                let mut state = detached();
+                let id = v2::SessionId::new("early-idle");
+                state.foreground_reservation = Some("first".into());
+                state.active_turn = Some("first".into());
+                state.prompts.insert(
+                    "first".into(),
+                    PromptRecord {
+                        fingerprint: prompt_journal::Fingerprint::content(&[]).unwrap(),
+                        dispatched,
+                        saw_work: false,
+                        result: None,
+                        waiters: Vec::new(),
+                    },
+                );
+                let idle = v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(
+                    v2::IdleStateUpdate::new(),
+                ));
+                // Inject the snapshot directly so dispatch ordering never depends on scheduling.
+                forward_locked(&mut state, &id, Some(idle)).unwrap();
+                assert_eq!(state.active_turn.as_deref(), Some("first"));
+                assert_eq!(state.foreground_reservation.as_deref(), Some("first"));
+                assert!(state.busy());
+                assert!(!state.recovery_required);
+                assert!(state.usage.turns.is_empty());
+                assert!(state.events.is_empty());
+
+                state.prompts.get_mut("first").unwrap().dispatched = true;
+                let started = serde_json::from_value(serde_json::json!({
+                    "sessionUpdate":"state_update", "state":active
+                }))
+                .unwrap();
+                forward_locked(&mut state, &id, Some(started)).unwrap();
+                let finished = v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(
+                    v2::IdleStateUpdate::new().usage(v2::Usage::new(12, 8, 4)),
+                ));
+                forward_locked(&mut state, &id, Some(finished.clone())).unwrap();
+                forward_locked(&mut state, &id, Some(finished)).unwrap();
+                assert!(state.active_turn.is_none());
+                assert!(state.foreground_reservation.is_none());
+                assert!(!state.busy());
+                assert!(!state.recovery_required);
+                assert_eq!(state.usage.summary().turns, 1);
+                assert_eq!(state.usage.summary().tokens.total_tokens, Some(12));
+                let turns: Vec<_> = state
+                    .events
+                    .iter()
+                    .filter_map(|(_, event)| match event {
+                        v2::SessionUpdate::Other(other)
+                            if other.session_update == "_hive_usage"
+                                && !other.fields["turn"].is_null() =>
+                        {
+                            Some(&other.fields["turn"])
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(turns.len(), 1);
+                assert_eq!(turns[0]["id"], "first");
+                assert_eq!(turns[0]["tokens"]["inputTokens"], 8);
+                assert_eq!(turns[0]["tokens"]["outputTokens"], 4);
+            }
+        }
+    }
+
+    #[test]
+    fn a_bare_idle_after_foreground_work_records_one_turn_without_tokens() {
+        let mut state = detached();
+        let id = v2::SessionId::new("bare-idle");
+        state.foreground_reservation = Some("bare".into());
+        state.active_turn = Some("bare".into());
+        state.prompts.insert(
+            "bare".into(),
+            PromptRecord {
+                fingerprint: prompt_journal::Fingerprint::content(&[]).unwrap(),
+                dispatched: true,
+                saw_work: false,
+                result: None,
+                waiters: Vec::new(),
+            },
+        );
+        forward_locked(
+            &mut state,
+            &id,
+            Some(v2::SessionUpdate::StateUpdate(v2::StateUpdate::Running(
+                v2::RunningStateUpdate::new(),
+            ))),
+        )
+        .unwrap();
+        let idle =
+            v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(v2::IdleStateUpdate::new()));
+        forward_locked(&mut state, &id, Some(idle.clone())).unwrap();
+        forward_locked(&mut state, &id, Some(idle)).unwrap();
+        assert!(state.active_turn.is_none());
+        assert!(state.foreground_reservation.is_none());
+        assert!(!state.busy());
+        assert!(!state.recovery_required);
+        assert_eq!(state.usage.summary().turns, 1);
+        assert_eq!(state.usage.summary().reported_turns, 0);
+        let turns: Vec<_> = state
+            .events
+            .iter()
+            .filter_map(|(_, event)| match event {
+                v2::SessionUpdate::Other(other)
+                    if other.session_update == "_hive_usage" && !other.fields["turn"].is_null() =>
+                {
+                    Some(&other.fields["turn"])
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(turns.len(), 1);
+        assert!(turns[0]["tokens"].is_null());
     }
 
     #[test]

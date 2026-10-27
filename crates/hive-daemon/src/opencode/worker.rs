@@ -955,11 +955,10 @@ impl Worker {
             }
             let mut ledger = approvals.lock().expect("approval state is not poisoned");
             if let Some(approval) = ledger.requests.get_mut(&ask.id)
-                && approval.complete(token, match result {
-                    Ok(state) => state,
-                    Err(_) => ApprovalState::Retry,
-                }) {
-                if approval.state == ApprovalState::Retry && let Ok(mut pending) = pending.lock() { pending.remove(&ask.id); }
+                && approval.complete(token, result.unwrap_or(ApprovalState::Retry))
+                && approval.state == ApprovalState::Retry
+                && let Ok(mut pending) = pending.lock() {
+                pending.remove(&ask.id);
             }
         });
     }

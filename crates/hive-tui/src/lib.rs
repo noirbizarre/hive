@@ -514,9 +514,6 @@ fn start_resume(
     if !app.skip_replay && !acknowledge {
         request = request.replay_from(replay);
     }
-    if acknowledge {
-        app.skip_replay = true;
-    }
     let (sent, result) = oneshot::channel();
     let label = if acknowledge {
         "Acknowledging recovery"
@@ -537,18 +534,7 @@ fn start_resume(
                 peer.send_request(previous).block_task().await?;
                 relinquished = true;
             }
-            let response = peer.send_request(request).block_task().await?;
-            if acknowledge {
-                // Recovery acknowledgement and live-only attachment remain separate daemon operations.
-                peer.send_request(
-                    v2::ResumeSessionRequest::new(v2::SessionId::new(id.clone()), cwd)
-                        .meta(hive_meta("pilot", response.meta.as_ref())),
-                )
-                .block_task()
-                .await
-            } else {
-                Ok(response)
-            }
+            peer.send_request(request).block_task().await
         }
         .await;
         let _ = sent.send(SessionOperationResult {
@@ -625,9 +611,18 @@ fn apply_session_result(
     }
     match result.outcome {
         SessionOutcome::Resume { id, response } => {
+            let mut acknowledged = false;
+            let acknowledged_id = id.clone();
+            let previous_gap = app
+                .conversations
+                .get(&id)
+                .is_some_and(|conversation| conversation.gap);
             match response {
                 Ok(response) => match apply_resume(app, id, response) {
-                    Ok(()) => app.status = format!("{label} complete"),
+                    Ok(()) => {
+                        acknowledged = label == "Acknowledging recovery";
+                        app.status = format!("{label} complete");
+                    }
                     Err(error) => {
                         app.skip_replay = false;
                         app.status = resume_failure(&error);
@@ -641,6 +636,21 @@ fn apply_session_result(
                         app.select_session(id);
                     }
                     app.status = resume_failure(&error);
+                }
+            }
+            if acknowledged {
+                app.submitting.remove(&acknowledged_id);
+                if let Some((key, _)) = app.pending.remove(&acknowledged_id) {
+                    app.conversations
+                        .entry(acknowledged_id.clone())
+                        .or_default()
+                        .push_notice(format!(
+                            "[Recovery acknowledged for {key}; outcome remains unresolved]"
+                        ));
+                }
+                // Acknowledgement has no authority to certify or skip missing history.
+                if previous_gap {
+                    app.conversations.entry(acknowledged_id).or_default().gap = true;
                 }
             }
             None
@@ -684,8 +694,23 @@ fn apply_created(app: &mut App, result: Result<v2::NewSessionResponse, String>) 
 fn apply_update(app: &mut App, update: v2::UpdateSessionNotification) -> bool {
     let id = update.session_id.to_string();
     let current = app.active.as_ref() == Some(&id);
+    let recovery = match &update.update {
+        v2::SessionUpdate::Other(other) if other.session_update == "_hive_control" => other
+            .fields
+            .get("recoveryRequired")
+            .and_then(serde_json::Value::as_bool),
+        _ => None,
+    };
     let state = app.conversations.entry(id.clone()).or_default();
     let applied = state.apply(update);
+    if applied
+        && current
+        && let Some(required) = recovery
+        && let Some(owner) = &mut app.owner
+    {
+        owner.entry("hive").or_insert_with(|| serde_json::json!({}))["recoveryRequired"] =
+            required.into();
+    }
     if app.stopping.as_ref() == Some(&id)
         && (!state.running || state.activity["session"] == "ended")
     {
@@ -846,11 +871,63 @@ fn show_interaction(app: &mut App, interaction: &Interaction) {
     }
 }
 
-fn send_prompt(
-    cx: &V2ConnectionTo<Agent>,
-    app: &App,
-    acks: mpsc::UnboundedSender<(String, Result<(), String>)>,
-) {
+type PromptAck = (String, String, agent_client_protocol::Result<()>);
+
+fn apply_prompt_ack(app: &mut App, (id, key, result): PromptAck) {
+    // A late receipt belongs to its original intent, never to a newer draft in that session.
+    if !app.pending.get(&id).is_some_and(|pending| pending.0 == key) {
+        return;
+    }
+    app.submitting.remove(&id);
+    match result {
+        Ok(()) => {
+            app.pending.remove(&id);
+        }
+        Err(error) => {
+            let diagnostic = error.data.as_ref().and_then(|data| data.get("hive"));
+            if diagnostic.is_some_and(|data| {
+                data["code"] == "hive::prompt::outcome_uncertain"
+                    && data["recoveryRequired"] == false
+            }) {
+                // A lost recovery response does not require acknowledging the same incident again.
+                app.pending.remove(&id);
+                app.conversations
+                    .entry(id.clone())
+                    .or_default()
+                    .push_notice(format!(
+                        "[Recovery already acknowledged for {key}; outcome remains unresolved]"
+                    ));
+            }
+            let rejected = diagnostic
+                .is_some_and(|data| data["code"] == "hive::prompt::not_dispatched")
+                || error.code == Error::request_cancelled().code;
+            if rejected && let Some((_, text)) = app.pending.remove(&id) {
+                app.drafts.insert(id.clone(), text);
+            }
+            if app.active.as_deref() != Some(&id) {
+                return;
+            }
+            if rejected {
+                if app.input.is_empty() && app.dialog.is_none() && app.suspended_draft.is_none() {
+                    app.input = app.drafts.remove(&id).unwrap_or_default();
+                    app.editor = editor::PromptEditor::default();
+                }
+                app.status =
+                    "Prompt was not dispatched; edit the draft and submit new intent".into();
+            } else {
+                app.status = diagnostic.map_or_else(|| "Prompt acknowledgement uncertain; observe the session, then use Ctrl-L to retrieve its receipt".into(), |data| format!("{} — {}", data["message"].as_str().unwrap_or("Prompt uncertain"), data["help"].as_str().unwrap_or("Inspect agent state")));
+            }
+            if let Some(required) = diagnostic.and_then(|data| data["recoveryRequired"].as_bool())
+                && let Some(owner) = &mut app.owner
+                && let Some(hive) = owner.get_mut("hive")
+            {
+                hive["recoveryRequired"] = required.into();
+            }
+        }
+    }
+}
+
+fn send_prompt(cx: &V2ConnectionTo<Agent>, app: &App, acks: mpsc::UnboundedSender<PromptAck>) {
     let (Some(id), Some(owner)) = (&app.active, &app.owner) else {
         return;
     };
@@ -864,6 +941,7 @@ fn send_prompt(
     let cx = cx.clone();
     let id = id.clone();
     let content = content.clone();
+    let key = key.clone();
     tokio::spawn(async move {
         let result = cx
             .send_request(
@@ -872,7 +950,7 @@ fn send_prompt(
             )
             .block_task()
             .await;
-        let _ = acks.send((id, result.map(|_| ()).map_err(|e| e.to_string())));
+        let _ = acks.send((id, key, result.map(|_| ())));
     });
 }
 
@@ -882,7 +960,7 @@ async fn handle_key(
     app: &mut App,
     key: event::KeyEvent,
     interaction: &mut Option<Interaction>,
-    acks: mpsc::UnboundedSender<(String, Result<(), String>)>,
+    acks: mpsc::UnboundedSender<PromptAck>,
     _created: mpsc::UnboundedSender<Result<v2::NewSessionResponse, String>>,
 ) -> bool {
     if key.kind == KeyEventKind::Release {
@@ -1209,6 +1287,16 @@ async fn handle_key(
                 start_resume(cx, app, id, cwd, "pilot", true);
             }
         }
+        (KeyCode::Char('l'), true) => {
+            if let Some(id) = &app.active
+                && app.pending.contains_key(id)
+                && app.pilot()
+                && !app.submitting.contains(id)
+            {
+                app.submitting.insert(id.clone());
+                send_prompt(cx, app, acks);
+            }
+        }
         (KeyCode::Char('c'), true) => {
             if let (Some(id), Some(owner)) = (&app.active, &app.owner)
                 && app.pilot()
@@ -1280,6 +1368,10 @@ async fn handle_key(
             Page::Chat => {
                 if !app.input.trim().is_empty()
                     && app.pilot()
+                    && !app
+                        .owner
+                        .as_ref()
+                        .is_some_and(|owner| owner["hive"]["recoveryRequired"] == true)
                     && app.configuration.is_none()
                     && !app.conversation().is_some_and(|c| c.running)
                     && app
@@ -1415,6 +1507,10 @@ fn apply_configuration(cx: &V2ConnectionTo<Agent>, app: &mut App) {
     }
     if !app.connected
         || !app.pilot()
+        || app
+            .owner
+            .as_ref()
+            .is_some_and(|owner| owner["hive"]["recoveryRequired"] == true)
         || app.conversation().is_some_and(|state| state.running)
         || app
             .active
@@ -1747,6 +1843,7 @@ async fn run_with_clipboard(
         .timeout(Duration::from_secs(5))
         .build()?;
     let mut quit = false;
+    let mut connected_once = false;
     while !quit {
         let url = format!("{}://{}", options.transport, options.address);
         let (updates_tx, mut updates) = mpsc::unbounded_channel();
@@ -1758,7 +1855,9 @@ async fn run_with_clipboard(
                     .capabilities(v2::ClientCapabilities::new().elicitation(v2::ElicitationCapabilities::new()
                         .form(v2::ElicitationFormCapabilities::new()).url(v2::ElicitationUrlCapabilities::new()))))
                     .block_task().await?;
-                app.connected = true;
+                 let reconnecting = connected_once;
+                 connected_once = true;
+                 app.connected = true;
                  if let Err(error) = refresh(&options.address, &mut app).await { app.status = error; }
                 if app.page == Page::Profiles && app.active.is_none() {
                     app.profile_selected = options.agent.as_ref().and_then(|agent| app.profiles.iter().position(|id| id == agent)).unwrap_or(0);
@@ -1766,13 +1865,12 @@ async fn run_with_clipboard(
                 let initial = app.active.clone().or_else(|| options.session.clone());
                 if let Some(id) = initial {
                      let cwd = app.sessions.iter().find(|s| s.session_id == id).map_or_else(|| app.cwd.clone(), |s| s.cwd.clone());
-                    let mode = if app.owner.as_ref().is_some_and(|m| m["hive"]["role"] == "observer") { "observe" } else { "pilot" };
+                     let mode = if reconnecting { "observe" } else { "pilot" };
                      if let Err(error) = resume(&cx, &mut app, id, cwd, mode).await { app.status = resume_failure(&error); }
                 }
-                  let (ack_tx, mut ack_rx) = mpsc::unbounded_channel::<(String, Result<(), String>)>();
+                   let (ack_tx, mut ack_rx) = mpsc::unbounded_channel::<PromptAck>();
                   let (created_tx, mut created_rx) = mpsc::unbounded_channel::<Result<v2::NewSessionResponse, String>>();
-                // The previous acknowledgement may have been lost; the original key is safe to retry.
-                 if app.active.as_ref().is_some_and(|id| app.pending.contains_key(id)) && app.pilot() { if let Some(id) = &app.active { app.submitting.insert(id.clone()); } send_prompt(&cx, &app, ack_tx.clone()); }
+                 // Observe after reconnect; Ctrl-L explicitly retrieves a pending receipt.
                   let mut interaction: Option<Interaction> = None;
                   let mut queued = VecDeque::<Interaction>::new();
                   let mut url_flows = BTreeMap::<String, (bool, bool, tokio::time::Instant)>::new();
@@ -1913,13 +2011,7 @@ async fn run_with_clipboard(
                              else if queued.len() < 128 { queued.push_back(next); }
                              // Dropping an overflow request safely cancels it at the daemon boundary.
                         }
-                          Some((id, result)) = ack_rx.recv() => {
-                              app.submitting.remove(&id);
-                             match result { Ok(()) => { app.pending.remove(&id); }, Err(error) => {
-                                 app.status = format!("Prompt acknowledgement uncertain: {error}; retry with the same key after reconnect");
-                                 if error.contains("stale") && app.active.as_deref() == Some(&id) { app.owner = None; }
-                             }}
-                         }
+                           Some(acknowledgement) = ack_rx.recv() => apply_prompt_ack(&mut app, acknowledgement),
                           Some(event) = keys.recv() => {
                              let key = match event {
                                  Event::Key(key) => key,

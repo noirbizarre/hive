@@ -93,11 +93,13 @@ A lost prompt acknowledgement does not prove the agent did nothing. Hive clients
 use stable prompt keys so an identical retry does not dispatch the same work
 twice. Do not submit a new prompt just to compensate for a lost acknowledgement.
 
-The Web UI offers an explicit uncertain-prompt retry action. After a
+The Web UI offers **Retrieve original receipt**; the TUI uses `Ctrl-L` after
+taking control with `Ctrl-T`. Both preserve the original key/content. After a
 daemon restart, an interrupted key remains reserved and is never resent.
 Inspect the agent's state first. If the recovered session requires acknowledgement,
 use `Ctrl-Y` in the TUI or the browser's recovery button to allow **new** work.
-This does not certify that old work completed or undo any effects it had.
+This does not certify that old work completed, stopped, or undo any effects it
+had. Acknowledgement is independent of history replay and completeness.
 
 ## Permissions and input
 

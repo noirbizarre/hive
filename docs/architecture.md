@@ -201,7 +201,7 @@ back to `$HOME/.local/state/hive/sessions.sqlite3`.
 | Durable | Volatile |
 | --- | --- |
 | Hive/downstream IDs, profile and adapter choices | Worker/process and upstream connections |
-| Request keys, content fingerprints, acknowledgement IDs/failure markers | Prompt bodies and conversation replay payloads |
+| Request keys, content fingerprints, acknowledgement IDs, dispatch/terminal evidence | Prompt bodies and conversation replay payloads |
 | Recovery metadata and sequence reservations | Pilot tokens and activity snapshots |
 | Usage ledger | Process-local pricing cache |
 
@@ -221,6 +221,15 @@ canonical fingerprint compares content before and after restart. Durable retries
 reconstruct message-ID-only acknowledgements or controlled failure diagnostics;
 they do not recover conversation content. See
 [ADR-009](adr/009-agent-owned-history-and-session-registry.md).
+
+Schema 3 adds a durable boundary before downstream publication: a new-format
+reservation that never crossed it proves non-dispatch; a crossed boundary without
+a receipt remains uncertain. Journal/session transitions are transactional, and
+terminal evidence is distinct from receipt and recovery acknowledgement. Neither
+history restoration nor idle alone reconstructs a missing result. Per-request
+acknowledgement markers preserve accepted risk across restart while retaining
+keys and allowing a new incident to fence work again. See
+[ADR-010](adr/010-prompt-delivery-evidence-and-recovery.md).
 
 See [ADR-003](adr/003-durable-session-catalog-and-conservative-recovery.md) and
 [operations](operations.md) for recovery, pruning, privacy, and backups.

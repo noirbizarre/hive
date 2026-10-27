@@ -65,7 +65,8 @@ to `$HOME/.local/state/hive/sessions.sqlite3`. It uses SQLite WAL.
 Persisted data includes session identities, downstream IDs, profile/adapter
 choices, titles, usage bookkeeping, and a minimal request journal. The journal
 holds request keys, versioned SHA-256 content fingerprints, and acknowledgements
-(message IDs) or failure markers. It does not hold prompt bodies, arbitrary
+(message IDs), dispatch/terminal evidence and recovery acknowledgement markers.
+It does not hold prompt bodies, arbitrary
 acknowledgement metadata, downstream error text, or assistant transcripts.
 Titles and other registry metadata can still contain user-derived text;
 fingerprints are not encryption. Keep the database and backups private.
@@ -79,7 +80,11 @@ retention/fallback policy; see [ADR-009](adr/009-agent-owned-history-and-session
 Schema version 2 upgrades earlier journals transactionally: it fingerprints each
 legacy prompt, blanks its body, and reduces results to message IDs or failure
 markers without releasing pending reservations. Invalid legacy rows abort the
-upgrade rather than dropping requests. Older Hive binaries refuse schema 2.
+upgrade rather than dropping requests. Schema 3 adds write-ahead dispatch,
+controlled terminal evidence and per-request recovery acknowledgements. Older
+Hive binaries refuse unsupported schemas. Legacy null/failed outcomes cannot
+prove non-dispatch: upgrading may require a one-time explicit acknowledgement,
+even if an older daemon had cleared its session uncertainty flag.
 This removes bodies and arbitrary result payloads from logical journal columns;
 old pages/WAL files and backups may still contain previous data. Migration does
 not compact the database or delete backups.
@@ -128,7 +133,35 @@ warning when earlier completed work is recorded. An agent outage does not produc
 an offline transcript: fix availability and restart Hive to retry restoration.
 
 Acknowledgement permits new prompt keys. It neither resends the interrupted key
-nor proves its effects completed.
+nor proves its effects completed, stopped, or are fully represented in history.
+Running or blocked work still prevents concurrent new prompts. Both clients can
+acknowledge without replaying history; skipping missing history is a separate
+choice. The TUI reconnects as an observer; take control with `Ctrl-T` and use
+`Ctrl-L` to explicitly retrieve a pending receipt with its original key/content.
+The browser provides **Retrieve original receipt**. Neither client automatically
+resubmits a pending prompt after reconnect.
+
+### Prompt evidence and recovery actions
+
+| Evidence | What Hive can establish | Recovery behavior |
+| --- | --- | --- |
+| New-format reservation before dispatch marker | Hive did not publish this attempt | Keep key reserved; submit new intent with a new key |
+| Dispatch marker without a receipt | Acceptance/execution may have happened | Keep uncertain; inspect and acknowledge before new work |
+| Recorded `messageId` | Original acknowledgement is available | Same-key lookup returns it; it does not prove completion |
+| Correlated live running/idle and recorded receipt | Foreground termination was observed | Retain controlled terminal reason, if supplied |
+| Replayed messages or current idle, without reliable prompt correlation | Session/history state only | Do not reconstruct the original result or clear uncertainty |
+
+A crash between the dispatch marker and actual publication remains conservatively
+uncertain. Generic transport failures after possible publication are also
+uncertain, rather than proof that the prompt failed to execute. A later idle
+cannot repair a missing receipt. Native OpenCode idle is not reported as successful
+completion merely because no failure was observed.
+
+Request errors carry versioned structured guidance in `error.data.hive`; see
+[the diagnostic contract](compatibility.md#prompt-recovery-diagnostics).
+An acknowledged recovery incident remains acknowledged across another restart,
+while a newly lost outcome raises a new fence. Do not delete journal reservations
+to retry work: that would remove duplicate-execution protection.
 
 ## Usage and costs
 

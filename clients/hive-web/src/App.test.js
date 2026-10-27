@@ -365,7 +365,7 @@ test('reconnect recovery and expired history actions never silently send a promp
   await flushPromises(); expect(client.prompt).not.toHaveBeenCalled();
   expect(wrapper.get('#send').element.disabled).toBe(true);
   publish({ connected: true, role: 'pilot' }); await nextTick();
-  await wrapper.findAll('button').find(button => button.text() === 'Retry original prompt').trigger('click');
+  await wrapper.findAll('button').find(button => button.text() === 'Retrieve original receipt').trigger('click');
   await flushPromises(); expect(client.prompt).toHaveBeenCalledWith('original', 'pi');
   publish({ gap: true, uncertain: undefined }); await nextTick();
   await wrapper.findAll('button').find(button => button.text() === 'Attach without earlier history').trigger('click');

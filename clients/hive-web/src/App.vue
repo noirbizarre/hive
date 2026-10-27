@@ -141,8 +141,8 @@ onBeforeUnmount(() => { feed?.close(); props.client.close(); });
         <Message v-if="providerError" severity="error" :closable="false">{{ providerError }} <Button label="Retry backends" size="small" @click="feed.refresh()" /></Message>
         <Message v-if="error" severity="error" :closable="false" role="alert">{{ error }}</Message>
         <Message v-if="state.gap" severity="warn" :closable="false">Earlier history is unavailable. <Button label="Attach without earlier history" :loading="state.connected && state.opening && !state.interaction" :disabled="!state.connected || busy" @click="action(() => client.attachWithoutHistory())" /></Message>
-        <Message v-if="state.recoveryRequired" severity="warn" :closable="false">Work was interrupted. Inspect the agent state before continuing. <Button label="Acknowledge recovery" :loading="state.connected && state.opening && !state.interaction" :disabled="!state.connected || state.gap || busy" @click="action(() => client.acknowledgeRecovery())" /></Message>
-        <Message v-else-if="state.uncertain" severity="warn" :closable="false">The prompt has not been acknowledged. Retrying uses its original content and key. <Button label="Retry original prompt" :disabled="!pilot || busy || !state.connected" @click="send(true)" /></Message>
+        <Message v-if="state.recoveryRequired" severity="warn" :closable="false">Work was interrupted. Inspect the agent state before continuing. <Button label="Acknowledge recovery" :loading="state.connected && state.opening && !state.interaction" :disabled="!state.connected || busy" @click="action(() => client.acknowledgeRecovery())" /></Message>
+        <Message v-else-if="state.uncertain" severity="warn" :closable="false">The prompt has not been acknowledged. Receipt lookup uses its original content and key. <Button label="Retrieve original receipt" :disabled="!pilot || busy || !state.connected" @click="send(true)" /></Message>
       </div>
       <TranscriptView :state="state" />
       <div class="composer-area">

@@ -213,6 +213,8 @@ struct NativeMeta {
 
 struct PromptRecord {
     fingerprint: prompt_journal::Fingerprint,
+    dispatched: bool,
+    saw_work: bool,
     result: Option<Result<v2::PromptResponse, PromptFailure>>,
     waiters: Vec<oneshot::Sender<Result<v2::PromptResponse, PromptFailure>>>,
 }
@@ -221,6 +223,12 @@ struct PromptRecord {
 pub(crate) enum PromptFailure {
     #[error("prompt cancelled before insertion")]
     Cancelled,
+    #[error("prompt was not dispatched; submit new intent with a new key")]
+    NotDispatched,
+    #[error("cannot persist prompt evidence; inspect agent state and acknowledge recovery")]
+    Storage,
+    #[error("prompt outcome remains uncertain; this key will not execute again")]
+    Uncertain { recovery_required: bool },
     #[error("{0}")]
     Failed(String),
 }
@@ -241,7 +249,14 @@ impl PromptFailure {
     fn wire(self) -> Error {
         match self {
             Self::Cancelled => Error::request_cancelled(),
-            Self::Failed(message) => Error::internal_error().data(message),
+            Self::NotDispatched => {
+                hive_protocol::recovery::RecoveryError::NotDispatched.wire(false)
+            }
+            Self::Storage => hive_protocol::recovery::RecoveryError::Storage.wire(true),
+            Self::Failed(_) => hive_protocol::recovery::RecoveryError::Uncertain.wire(true),
+            Self::Uncertain { recovery_required } => {
+                hive_protocol::recovery::RecoveryError::Uncertain.wire(recovery_required)
+            }
         }
     }
 }
@@ -447,6 +462,10 @@ impl Control {
             BTreeMap::from([
                 ("generation".into(), serde_json::json!(self.generation)),
                 ("pilot".into(), serde_json::json!(self.pilot.is_some())),
+                (
+                    "recoveryRequired".into(),
+                    serde_json::json!(self.recovery_required),
+                ),
                 ("transcript".into(), serde_json::json!(self.history_status)),
             ]),
         ))
@@ -1025,6 +1044,7 @@ impl Broker {
 
     pub fn persistent(registry: Config, path: PathBuf) -> Result<Self, persistence::StoreError> {
         let store = Arc::new(Store::open(path)?);
+        store.recover_prompts()?;
         // Retain interrupted keys indefinitely; only definitely non-resumable old records age out.
         store.prune(now_millis().saturating_sub(90 * 24 * 60 * 60 * 1000))?;
         let mut broker = Self::new(registry);
@@ -1222,11 +1242,22 @@ impl Broker {
             .map_err(Error::into_internal_error)?;
         if let Some(record) = state.prompts.get_mut(&key) {
             if record.fingerprint != fingerprint {
-                return Err(Error::invalid_params()
-                    .data("prompt key was used with different content; choose a new key"));
+                return Err(hive_protocol::recovery::RecoveryError::KeyConflict
+                    .wire(state.recovery_required));
             }
             if let Some(result) = &record.result {
-                let _ = tx.send(result.clone());
+                let mut result = result.clone();
+                if matches!(
+                    result,
+                    Err(PromptFailure::Failed(_)
+                        | PromptFailure::Storage
+                        | PromptFailure::Uncertain { .. })
+                ) {
+                    result = Err(PromptFailure::Uncertain {
+                        recovery_required: state.recovery_required,
+                    });
+                }
+                let _ = tx.send(result);
             } else {
                 record.waiters.push(tx);
             }
@@ -1242,23 +1273,46 @@ impl Broker {
             });
             return Ok(rx);
         }
-        if let Some(store) = &state.store
-            && let Some((stored_fingerprint, result)) = store
-                .prompt(&request.session_id.to_string(), &key)
-                .map_err(storage_error)?
-        {
+        let persisted = state
+            .store
+            .as_ref()
+            .map(|store| store.prompt(&request.session_id.to_string(), &key))
+            .transpose();
+        let persisted = match persisted {
+            Ok(value) => value.flatten(),
+            Err(error) => {
+                tracing::error!(%error, "cannot read prompt evidence");
+                state.recovery_required = true;
+                recovery_changed(&mut state);
+                return Err(hive_protocol::recovery::RecoveryError::Storage.wire(true));
+            }
+        };
+        if let Some((stored_fingerprint, result)) = persisted {
             if stored_fingerprint != fingerprint {
-                return Err(Error::invalid_params()
-                    .data("prompt key was used with different content; choose a new key"));
+                return Err(hive_protocol::recovery::RecoveryError::KeyConflict
+                    .wire(state.recovery_required));
             }
             if let Some(result) = result {
-                let _ = tx.send(result.into_response());
+                let mut result = result.into_response();
+                if matches!(
+                    result,
+                    Err(PromptFailure::Failed(_)
+                        | PromptFailure::Storage
+                        | PromptFailure::Uncertain { .. })
+                ) {
+                    result = Err(PromptFailure::Uncertain {
+                        recovery_required: state.recovery_required,
+                    });
+                }
+                let _ = tx.send(result);
                 return Ok(rx);
             }
-            return Err(Error::invalid_request().data("prompt outcome is uncertain after restart; never retry this key; inspect agent state and explicitly acknowledge recovery"));
+            return Err(
+                hive_protocol::recovery::RecoveryError::Uncertain.wire(state.recovery_required)
+            );
         }
         if state.recovery_required {
-            return Err(Error::invalid_request().data("session recovery requires explicit acknowledgement on session/resume before new prompts"));
+            return Err(hive_protocol::recovery::RecoveryError::Required.wire(true));
         }
         if state.external_activity {
             // Say *why* it is busy: the generic message would send users hunting for a Hive prompt.
@@ -1281,6 +1335,8 @@ impl Broker {
             key.clone(),
             PromptRecord {
                 fingerprint: fingerprint.clone(),
+                dispatched: false,
+                saw_work: false,
                 result: None,
                 waiters: vec![tx],
             },
@@ -1288,16 +1344,21 @@ impl Broker {
         state.active_turn = Some(key.clone());
         if let (Some(store), Some(record)) = (state.store.clone(), state.record.clone()) {
             let mut record = record.lock().map_err(|_| Error::internal_error())?;
-            record.uncertain = true;
-            record.last_activity_at = state.last_activity_at;
-            record.title = title.clone();
-            if let Err(error) = store.reserve_prompt(&record, &key, &fingerprint) {
+            let mut next = record.clone();
+            next.uncertain = true;
+            next.last_activity_at = state.last_activity_at;
+            next.title = title.clone();
+            if let Err(error) = store.reserve_prompt(&next, &key, &fingerprint) {
                 state.prompts.remove(&key);
                 state.active_turn = None;
                 state.rollback_foreground(&key);
                 state.recovery_required = true;
-                return Err(storage_error(error));
+                tracing::error!(%error, "cannot reserve prompt evidence");
+                drop(record);
+                recovery_changed(&mut state);
+                return Err(hive_protocol::recovery::RecoveryError::Storage.wire(true));
             }
+            *record = next;
         }
         let generation = state.generation;
         parent.prompt_key = Some(key.clone());
@@ -1310,11 +1371,11 @@ impl Broker {
             .send(Command::Prompt(request, generation, key.clone()))
             .is_err()
         {
-            state.prompts.remove(&key);
-            state.rollback_foreground(&key);
-            state.recovery_required = state.store.is_some();
+            drop(state);
+            complete(&entry.control, &key, Err(PromptFailure::NotDispatched));
+            let mut state = entry.control.lock().map_err(|_| Error::internal_error())?;
             state.last_activity_at = previous_time;
-            return Err(Error::internal_error().data("agent disconnected; create another session"));
+            return Ok(rx);
         }
         state.title = title;
         state.notify();
@@ -1386,7 +1447,7 @@ impl Broker {
             state.owner(client_id, request.meta.as_ref())?;
         }
         if state.recovery_required && mode != Some("observe") && action != Some("acknowledge") {
-            return Err(Error::invalid_request().data("interrupted generation may have produced external effects; inspect agent state and explicitly acknowledge with _meta.hive.recoveryAction = acknowledge on session/resume"));
+            return Err(hive_protocol::recovery::RecoveryError::Required.wire(true));
         }
         // Keep replay and live forwarding in one critical section: no update can cross this boundary twice.
         let snapshot_through = state.next_seq.saturating_sub(1);
@@ -1425,7 +1486,11 @@ impl Broker {
                 if action.is_some() {
                     next.uncertain = false;
                 }
-                store.save(&next).map_err(storage_error)?;
+                if action.is_some() {
+                    store.acknowledge(&next).map_err(storage_error)?;
+                } else {
+                    store.save(&next).map_err(storage_error)?;
+                }
                 *record = next;
             }
             state.generation = next_generation;
@@ -2086,6 +2151,32 @@ fn forward_locked(
 ) -> agent_client_protocol::Result<()> {
     let is_agent_update = update.is_some();
     let update = update.unwrap_or_else(|| state.status_update());
+    if !state.hydrating
+        && !state.recovery_required
+        && state.foreground_reservation.is_some()
+        && matches!(
+            &update,
+            v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(_))
+        )
+        && !state
+            .active_turn
+            .as_ref()
+            .and_then(|key| state.prompts.get(key))
+            .is_some_and(|prompt| prompt.saw_work)
+    {
+        let dispatched = state
+            .active_turn
+            .as_ref()
+            .and_then(|key| state.prompts.get(key))
+            .is_some_and(|prompt| prompt.dispatched);
+        if !dispatched {
+            // A delayed startup/previous-turn idle cannot release queued foreground admission.
+            return Ok(());
+        }
+        // Idle without a live execution boundary describes the session, not this prompt's result.
+        state.recovery_required = true;
+        recovery_changed(state);
+    }
     // Token streaming must not clone warning strings on every chunk.
     let previous_history = (
         state.history_status.source,
@@ -2148,9 +2239,43 @@ fn forward_locked(
     }
     // Commit accounting before publishing idle: a crash cannot announce a completed
     // turn while forgetting the corresponding durable tokens on restart.
-    let finished_turn = if let v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(idle)) = &update
+    if matches!(
+        &update,
+        v2::SessionUpdate::StateUpdate(
+            v2::StateUpdate::Running(_) | v2::StateUpdate::RequiresAction(_)
+        )
+    ) && let Some(prompt) = state
+        .active_turn
+        .as_ref()
+        .and_then(|key| state.prompts.get_mut(key))
+        && prompt.dispatched
+    {
+        prompt.saw_work = true;
+    }
+    let correlated = state
+        .active_turn
+        .as_ref()
+        .and_then(|key| state.prompts.get(key))
+        .is_some_and(|prompt| prompt.dispatched && prompt.saw_work);
+    let finished_turn = if correlated
+        && let v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(idle)) = &update
         && let Some(key) = state.active_turn.take()
     {
+        if let (Some(store), Some(record)) = (&state.store, &state.record) {
+            let mut record = record.lock().map_err(|_| Error::internal_error())?;
+            // Retain only controlled terminal evidence, never an arbitrary Other payload.
+            let reason = match &idle.stop_reason {
+                Some(v2::StopReason::EndTurn) => "completed",
+                Some(v2::StopReason::Cancelled) => "cancelled",
+                Some(v2::StopReason::Refusal) => "refused",
+                Some(v2::StopReason::Error(_)) => "failed",
+                _ => "terminal",
+            };
+            if let Err(error) = store.transition(&mut record, &key, None, Some(reason)) {
+                state.recovery_required = true;
+                return Err(storage_error(error));
+            }
+        }
         let turn = Turn {
             id: key,
             agent: state.agent.clone(),
@@ -2169,15 +2294,6 @@ fn forward_locked(
     };
     if let v2::SessionUpdate::StateUpdate(status) = &update {
         state.observe_state(status);
-        if matches!(status, v2::StateUpdate::Idle(_))
-            && let (Some(store), Some(record)) = (&state.store, &state.record)
-            && !state.recovery_required
-            && state.prompts.values().all(|prompt| prompt.result.is_some())
-        {
-            let mut record = record.lock().map_err(|_| Error::internal_error())?;
-            record.uncertain = false;
-            store.save(&record).map_err(storage_error)?;
-        }
     }
     publish_locked(state, id, update.clone())?;
     if is_agent_update {
@@ -2308,20 +2424,118 @@ fn complete(
         {
             return;
         }
+        let uncertain = matches!(
+            &result,
+            Err(PromptFailure::Failed(_)
+                | PromptFailure::Storage
+                | PromptFailure::Uncertain { .. })
+        );
+        if uncertain {
+            state.recovery_required = true;
+        } else if result.is_err() {
+            state.rollback_foreground(key);
+            if state.active_turn.as_deref() == Some(key) {
+                state.active_turn = None;
+            }
+            state.prompt_parents.remove(key);
+        }
         if let (Some(store), Some(record)) = (state.store.clone(), state.record.clone())
-            && let Ok(record) = record.lock()
+            && let Ok(mut record) = record.lock()
         {
-            let persisted =
-                store.finish_prompt(&record.id, key, &prompt_journal::Outcome::recorded(&result));
+            let persisted = store.transition(
+                &mut record,
+                key,
+                Some(&prompt_journal::Outcome::recorded(&result)),
+                None,
+            );
             if let Err(error) = persisted {
                 tracing::error!(%error, "cannot persist prompt result");
                 state.recovery_required = true;
-                state.finish(key, Err("cannot persist prompt outcome; inspect agent state and acknowledge recovery before new work".into()));
-                state.notify();
+                state.finish(key, Err(PromptFailure::Storage));
+                drop(record);
+                recovery_changed(&mut state);
                 return;
             }
         }
         state.finish(key, result);
+        if uncertain {
+            recovery_changed(&mut state);
+        }
+    }
+}
+
+fn recovery_changed(state: &mut Control) {
+    let id = state.record.as_ref().and_then(|record| {
+        record
+            .lock()
+            .ok()
+            .map(|record| v2::SessionId::new(record.id.clone()))
+    });
+    if let Some(id) = id {
+        let _ = forward_locked(state, &id, None);
+    }
+    state.notify();
+}
+
+/// Must run under the ownership lock before any SDK publication or native HTTP call.
+fn mark_dispatch(state: &mut Control, key: &str) -> agent_client_protocol::Result<()> {
+    if let (Some(store), Some(record)) = (&state.store, &state.record) {
+        let mut record = record.lock().map_err(|_| Error::internal_error())?;
+        if let Err(error) = store.transition(
+            &mut record,
+            key,
+            Some(&prompt_journal::Outcome::DispatchPossible {}),
+            None,
+        ) {
+            state.recovery_required = true;
+            return Err(storage_error(error));
+        }
+    }
+    if let Some(prompt) = state.prompts.get_mut(key) {
+        prompt.dispatched = true;
+    }
+    Ok(())
+}
+
+fn abandon_prompts(control: &Mutex<Control>) {
+    let pending = control
+        .lock()
+        .map(|state| {
+            state
+                .prompts
+                .iter()
+                .filter(|(_, prompt)| prompt.result.is_none())
+                .map(|(key, prompt)| (key.clone(), prompt.dispatched))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for (key, dispatched) in pending {
+        // An abandoned queue entry is provably unsent; a published request is not.
+        let failure = if dispatched {
+            "agent disconnected before its acknowledgement".into()
+        } else {
+            PromptFailure::NotDispatched
+        };
+        complete(control, &key, Err(failure));
+    }
+    if let Ok(mut state) = control.lock()
+        && state.active_turn.is_some()
+    {
+        state.recovery_required = true;
+        if let (Some(store), Some(record), Some(key)) = (
+            state.store.clone(),
+            state.record.clone(),
+            state.active_turn.clone(),
+        ) && let Ok(mut record) = record.lock()
+        {
+            if let Err(error) = store.interrupt(&mut record, &key) {
+                tracing::error!(%error, "cannot persist interrupted execution evidence");
+            }
+            let id = v2::SessionId::new(record.id.clone());
+            drop(record);
+            let _ = forward_locked(&mut state, &id, None);
+        }
+        state.notify();
     }
 }
 
@@ -2357,6 +2571,7 @@ async fn run_agent(
         }
     };
     let downstream = Arc::new(Mutex::new(None::<v2::SessionId>));
+    let cleanup = control.clone();
     let route = downstream.clone();
     let result = Client
         .v2()
@@ -2571,10 +2786,15 @@ async fn run_agent(
                             if state.generation != generation {
                                 state.rollback_foreground(&key);
                                 drop(state);
-                                complete(&control, &key, Err("controller was superseded before prompt dispatch; resume with a new key".into()));
+                                complete(&control, &key, Err(PromptFailure::NotDispatched));
                                 continue;
                             }
                             // Publication under the lock defines the dispatch-before-handoff order.
+                            if mark_dispatch(&mut state, &key).is_err() {
+                                drop(state);
+                                complete(&control, &key, Err(PromptFailure::Storage));
+                                continue;
+                            }
                             let prepared = cx.prepare_request(request);
                             let parent = state.prompt_parents.remove(&key);
                             let prepared = if let Some(parent) = &parent { prepared.forward_cancellation_from(parent.cancellation.clone()) } else { prepared };
@@ -2592,7 +2812,7 @@ async fn run_agent(
                                     Some(Command::Cancel(epoch)) if epoch == 0 || current(&control, epoch) => { let _ = cx.send_notification(v2::CancelSessionNotification::new(downstream_id.clone())); }
                                     Some(Command::Cancel(_)) => {}
                                     Some(Command::Configure(change)) => change.finish(&hive_id, Err(session_config::failed())),
-                                    Some(Command::Prompt(_, _, key)) => { complete(&control, &key, Err("session already has foreground work".into())); }
+                                    Some(Command::Prompt(_, _, key)) => { complete(&control, &key, Err(PromptFailure::NotDispatched)); }
                                     Some(Command::Close(generation, reply)) => {
                                         if generation != 0 && !current(&control, generation) {
                                             let _ = reply.send(Err("controller was superseded; resume before closing".into()));
@@ -2654,6 +2874,7 @@ async fn run_agent(
     if let Err(error) = result {
         tracing::warn!(code = ?error.code, "downstream agent connection closed");
     }
+    abandon_prompts(&cleanup);
 }
 
 /// ACPv1 prompt completion is a response, unlike v2's independent idle update.
@@ -2713,6 +2934,7 @@ async fn run_v1_agent(
         }
     };
     let route = Arc::new(Mutex::new(None::<v1::SessionId>));
+    let cleanup = control.clone();
     let notifications = route.clone();
     let message_id = Arc::new(Mutex::new(None::<v2::MessageId>));
     let chunk_message_id = message_id.clone();
@@ -3022,7 +3244,7 @@ async fn run_v1_agent(
                             .collect::<Result<Vec<_>, _>>();
                         let Ok(blocks) = blocks else {
                             if let Ok(mut state) = control.lock() { state.rollback_foreground(&key); }
-                            complete(&control, &key, Err("unsupported v2 prompt content for v1 agent".into()));
+                            complete(&control, &key, Err(PromptFailure::NotDispatched));
                             continue;
                         };
                         let (done, response) = oneshot::channel();
@@ -3030,10 +3252,15 @@ async fn run_v1_agent(
                             let mut state = control.lock().map_err(|_| Error::internal_error())?;
                             // Insertion and dispatch share the admission lock: close or takeover must win before both or after both.
                             if state.closing || state.generation != generation {
-                                let failure = if state.closing { PromptFailure::Cancelled } else { "controller was superseded before prompt dispatch; resume with a new key".into() };
+                                let failure = if state.closing { PromptFailure::Cancelled } else { PromptFailure::NotDispatched };
                                 state.rollback_foreground(&key);
                                 drop(state);
                                 complete(&control, &key, Err(failure));
+                                continue;
+                            }
+                            if mark_dispatch(&mut state, &key).is_err() {
+                                drop(state);
+                                complete(&control, &key, Err(PromptFailure::Storage));
                                 continue;
                             }
                             if let Ok(mut current) = message_id.lock() { *current = Some(v2::MessageId::new(format!("v1-agent-{}", uuid::Uuid::new_v4()))); }
@@ -3065,7 +3292,7 @@ async fn run_v1_agent(
                                      Some(Command::Cancel(epoch)) if epoch == 0 || current(&control, epoch) => { let _ = cx.send_notification(v1::CancelNotification::new(downstream_id.clone())); }
                                      Some(Command::Cancel(_)) => {}
                                      Some(Command::Configure(change)) => change.finish(&hive_id, Err(session_config::failed())),
-                                     Some(Command::Prompt(_, _, key)) => { complete(&control, &key, Err("session already has foreground work".into())); }
+                                     Some(Command::Prompt(_, _, key)) => { complete(&control, &key, Err(PromptFailure::NotDispatched)); }
                                      Some(Command::Close(generation, reply)) => {
                                          if generation != 0 && !current(&control, generation) {
                                              let _ = reply.send(Err("controller was superseded; resume before closing".into()));
@@ -3107,6 +3334,7 @@ async fn run_v1_agent(
     if let Err(error) = result {
         tracing::warn!(code = ?error.code, "v1 agent connection closed");
     }
+    abandon_prompts(&cleanup);
 }
 
 pub fn router(broker: Broker) -> Router {
@@ -4355,6 +4583,16 @@ mod control_tests {
         let mut state = detached();
         let id = v2::SessionId::new("hive-usage");
         state.active_turn = Some("one".into());
+        state.prompts.insert(
+            "one".into(),
+            PromptRecord {
+                fingerprint: prompt_journal::Fingerprint::content(&[]).unwrap(),
+                dispatched: true,
+                saw_work: true,
+                result: None,
+                waiters: Vec::new(),
+            },
+        );
         let idle = v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(
             v2::IdleStateUpdate::new().usage(v2::Usage::new(12, 8, 4)),
         ));
@@ -4379,6 +4617,42 @@ mod control_tests {
         assert!(state.events.iter().any(|(_, event)| matches!(event,
             v2::SessionUpdate::Other(other) if other.session_update == "_hive_usage" && other.fields["turn"].is_null()
         )));
+    }
+
+    #[test]
+    fn a_transport_failure_stays_fenced_even_when_the_agent_later_reports_idle() {
+        let mut state = detached();
+        state.active_turn = Some("uncertain".into());
+        state.prompts.insert(
+            "uncertain".into(),
+            PromptRecord {
+                fingerprint: prompt_journal::Fingerprint::content(&[]).unwrap(),
+                dispatched: true,
+                saw_work: true,
+                result: None,
+                waiters: Vec::new(),
+            },
+        );
+        let state = Mutex::new(state);
+        complete(
+            &state,
+            "uncertain",
+            Err("connection lost after publication".into()),
+        );
+        let mut state = state.lock().unwrap();
+        forward_locked(
+            &mut state,
+            &v2::SessionId::new("original"),
+            Some(v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(
+                v2::IdleStateUpdate::new(),
+            ))),
+        )
+        .unwrap();
+        assert!(state.recovery_required);
+        assert_eq!(
+            serde_json::to_value(state.status_update()).unwrap()["recoveryRequired"],
+            true
+        );
     }
 
     #[test]

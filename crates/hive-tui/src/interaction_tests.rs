@@ -3,6 +3,80 @@
 use super::*;
 use serde_json::{Value, json};
 
+#[test]
+fn recovery_acknowledgement_retires_pending_intent_without_stopping_work_or_skipping_history() {
+    let mut app = App {
+        active: Some("original".into()),
+        ..App::default()
+    };
+    app.pending
+        .insert("original".into(), ("key".into(), "content".into()));
+    app.conversations.entry("original".into()).or_default().gap = true;
+    let response = v2::ResumeSessionResponse::new().meta(v2::Meta::from_iter([(
+        "hive".into(),
+        json!({
+            "generation":2,"role":"pilot","token":"new","running":true,"recoveryRequired":false
+        }),
+    )]));
+    apply_session_result(
+        &mut app,
+        SessionOperationResult {
+            relinquished: false,
+            outcome: SessionOutcome::Resume {
+                id: "original".into(),
+                response: Ok(response),
+            },
+        },
+        "Acknowledging recovery",
+    );
+    assert!(!app.pending.contains_key("original"));
+    assert!(app.conversations["original"].running);
+    assert!(app.conversations["original"].gap);
+    assert!(!app.skip_replay);
+}
+
+#[test]
+fn late_receipts_cannot_retire_newer_intent_and_proven_rejections_restore_the_draft() {
+    let mut app = App {
+        active: Some("original".into()),
+        ..App::default()
+    };
+    app.pending
+        .insert("original".into(), ("new-key".into(), "new content".into()));
+    apply_prompt_ack(&mut app, ("original".into(), "old-key".into(), Ok(())));
+    assert_eq!(app.pending["original"].0, "new-key");
+    apply_prompt_ack(
+        &mut app,
+        (
+            "original".into(),
+            "new-key".into(),
+            Err(hive_protocol::recovery::RecoveryError::NotDispatched.wire(false)),
+        ),
+    );
+    assert!(!app.pending.contains_key("original"));
+    assert_eq!(app.input, "new content");
+}
+
+#[test]
+fn a_receipt_lookup_can_retire_an_already_acknowledged_recovery_after_its_response_was_lost() {
+    let mut app = App {
+        active: Some("original".into()),
+        ..App::default()
+    };
+    app.pending
+        .insert("original".into(), ("key".into(), "content".into()));
+    apply_prompt_ack(
+        &mut app,
+        (
+            "original".into(),
+            "key".into(),
+            Err(hive_protocol::recovery::RecoveryError::Uncertain.wire(false)),
+        ),
+    );
+    assert!(!app.pending.contains_key("original"));
+    assert!(!app.conversations["original"].running);
+}
+
 async fn connected(body: impl AsyncFnOnce(V2ConnectionTo<Agent>) -> Result<(), Error>) {
     let agent = Agent
         .v2()

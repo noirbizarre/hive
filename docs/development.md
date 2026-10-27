@@ -117,6 +117,15 @@ binary/version or native session ID prints `SKIP` with the missing
 prerequisite. Once a configured binary is available, a failing protocol/model
 probe is an actionable test failure.
 
+`tests/support/recovery.rs` runs a gateway subprocess and kills it while work is
+running, and uses mock process exits after persisted acceptance/completion to
+lose receipts or terminal updates. Pipe/event barriers and persisted execution
+counts verify original identity, no duplicate dispatch, explicit uncertainty,
+key conflicts and acknowledgement across repeated restarts on both transports.
+Journal tests inject SQLite transaction failures and cover the reservation versus
+dispatch boundary and both receipt/terminal arrival orders. These synthetic
+fixtures establish Hive's recovery contract, not a downstream agent's durability.
+
 Runs with model turns can consume paid model tokens. Use an
 existing empty directory as `HIVE_REAL_<AGENT>_CWD` to keep conversations
 separate from the repository (the default is the current working directory).

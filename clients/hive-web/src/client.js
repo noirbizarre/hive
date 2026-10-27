@@ -273,6 +273,7 @@ export function connect(url, onChange = () => {}) {
     urlFlows: [...urlFlows.values()], uncertain: uncertain && { ...uncertain }, recoveryRequired, takingControl: Boolean(takingControl) });
   const publish = () => onChange(snapshot());
   const errorText = error => typeof error?.data === 'string' ? error.data
+    : error?.data?.hive ? [error.data.hive.message, error.data.hive.help].filter(Boolean).join(' — ')
     : error?.data?.message ? [error.data.message, error.data.help].filter(Boolean).join(' — ')
     : error?.message || String(error);
   function ready() {
@@ -323,6 +324,7 @@ export function connect(url, onChange = () => {}) {
       return;
     }
     if (!applied) return;
+    if (message.params.update?.sessionUpdate === '_hive_control' && typeof message.params.update.recoveryRequired === 'boolean') recoveryRequired = message.params.update.recoveryRequired;
     if (!history.runningNow || history.activity.session === 'ended') stopping = false;
     if (message.params.update?.sessionUpdate === '_hive_activity' && message.params.update.kind === 'session' && message.params.update.status === 'ended') { urlFlows.clear(); clearInteractions(); }
     if (owner?.role === 'pilot' && history.generation > owner.generation) relinquished();
@@ -393,7 +395,7 @@ export function connect(url, onChange = () => {}) {
         interactionQueue = interactionQueue.filter(queued => queued.id !== item.id);
         if (interaction?.id === item.id) clearInteraction();
       }
-      if (message.error) task.reject(new Error(errorText(message.error))); else task.resolve(message.result);
+      if (message.error) task.reject(Object.assign(new Error(errorText(message.error)), { code: message.error.code, data: message.error.data })); else task.resolve(message.result);
     }
   }
   function ownership(meta) {
@@ -418,6 +420,7 @@ export function connect(url, onChange = () => {}) {
     const targetCwd = selected.cwd;
     const version = openVersion;
     const epoch = connectionEpoch;
+    const previousGap = gap;
     const attachment = Symbol('attachment');
     const params = { sessionId: selected.sessionId, cwd: selected.cwd,
       ...((mode === 'observe' || acknowledge) ? { _meta: { hive: { ...(mode === 'observe' ? { mode } : {}),
@@ -442,6 +445,7 @@ export function connect(url, onChange = () => {}) {
         return response;
       }
       const hive = ownership(response);
+      if (acknowledge) gap = previousGap;
       if (Number.isSafeInteger(hive.snapshotThroughSeq)) {
         history.restore(queuedUpdates.filter(message => message.params._meta?.hive?.snapshot).map(message => message.params), hive.snapshotThroughSeq);
         queuedUpdates = queuedUpdates.filter(message => !message.params._meta?.hive?.snapshot);
@@ -450,7 +454,7 @@ export function connect(url, onChange = () => {}) {
       history.reconcilePlans(hive.planSnapshot);
       history.reconcileUsage(hive.usageSnapshot, hive.usageSeq);
       history.reconcileConfig(response.configOptions || [], hive.configSeq || 0);
-      if (!replay) {
+      if (!replay && !acknowledge) {
         // With no retained events, move the cursor to the daemon's atomic attachment boundary.
         history.skip(hive.nextSeq);
         history.notice('[Earlier history unavailable]');
@@ -581,11 +585,16 @@ export function connect(url, onChange = () => {}) {
     },
     async attachWithoutHistory() { if (!gap) throw new Error('No history gap to skip'); return resume('observe', false); },
     async acknowledgeRecovery() {
-      if (!selected || !connected || gap || !recoveryRequired) throw new Error('Observe the recovered session before acknowledging interrupted work');
-      const response = await resume('pilot', true, true);
+      if (!selected || !connected || !recoveryRequired) throw new Error('Observe the recovered session before acknowledging interrupted work');
+      const target = selected.sessionId, version = openVersion, epoch = connectionEpoch, key = uncertain?.key;
+      const response = await resume('pilot', false, true);
+      if (selected?.sessionId !== target || version !== openVersion || epoch !== connectionEpoch || uncertain?.key !== key
+        || recoveryRequired || owner?.token !== response?._meta?.hive?.token) return response;
+      // Continuing accepts the risk; it does not establish a receipt, completion or idle.
+      if (uncertain) store?.setItem(`hive.recovery.${target}`, JSON.stringify({ ...uncertain, acknowledged: true }));
       uncertain = undefined;
-      store?.removeItem(`hive.pending.${selected.sessionId}`);
-      history.running(false);
+      store?.removeItem(`hive.pending.${target}`);
+      history.notice('[Recovery acknowledged; the earlier prompt outcome remains unresolved]');
       publish();
       return response;
     },
@@ -667,25 +676,43 @@ export function connect(url, onChange = () => {}) {
       if (configuring || creating) throw new Error('Wait for session configuration to finish');
       if (desired && desired.sessionId !== selected.sessionId) throw new Error('Wait for the selected session to open');
       if (owner?.role !== 'pilot') throw new Error('Start typing to take control first');
+      if (recoveryRequired) throw new Error('Inspect agent state and acknowledge recovery before new work');
       if (uncertain && uncertain.text !== text) throw new Error('Retry the uncertain prompt with its original text first');
       if (history.runningNow && !uncertain) throw new Error('Wait for the active generation to become idle');
       const key = uncertain?.key || crypto.randomUUID();
+      const retrieving = Boolean(uncertain);
+      const target = selected.sessionId, version = openVersion, epoch = connectionEpoch;
+      const current = () => selected?.sessionId === target && version === openVersion && epoch === connectionEpoch && uncertain?.key === key;
       uncertain = { key, text };
       store?.setItem(`hive.pending.${selected.sessionId}`, JSON.stringify(uncertain));
-      history.running(true);
+      if (!retrieving) history.running(true);
       publish();
       try {
         const result = await request('session/prompt', { sessionId: selected.sessionId, prompt: [{ type: 'text', text }],
           _meta: { hive: { generation: owner.generation, token: owner.token, key } } });
+        if (!current()) return result;
         uncertain = undefined;
-        store?.removeItem(`hive.pending.${selected.sessionId}`);
+        store?.removeItem(`hive.pending.${target}`);
         publish();
         return result;
       } catch (error) {
-        if (error.message.includes('outcome is uncertain after restart')) {
-          recoveryRequired = true;
-          status = `${error.message}; inspect agent state and acknowledge recovery`;
-        } else status = `Prompt acknowledgement uncertain: ${error.message}; retry with the same key`;
+        if (!current()) throw error;
+        const diagnostic = error.data?.hive;
+        if (typeof diagnostic?.recoveryRequired === 'boolean') recoveryRequired = diagnostic.recoveryRequired;
+        if (diagnostic?.code === 'hive::prompt::outcome_uncertain' && diagnostic.recoveryRequired === false) {
+          // The recovery action may have committed before its response was lost.
+          store?.setItem(`hive.recovery.${target}`, JSON.stringify({ ...uncertain, acknowledged: true }));
+          uncertain = undefined;
+          store?.removeItem(`hive.pending.${target}`);
+          history.notice('[Recovery already acknowledged; the earlier prompt outcome remains unresolved]');
+          status = error.message;
+        } else if (diagnostic?.code === 'hive::prompt::not_dispatched' || error.code === -32800) {
+          uncertain = undefined;
+          store?.removeItem(`hive.pending.${target}`);
+          history.running(false);
+          status = error.message;
+        } else if (diagnostic) status = error.message;
+        else status = `Prompt acknowledgement uncertain: ${error.message}; retrieve the receipt with the same key`;
         if (error.message.includes('stale')) relinquished();
         publish();
         throw error;

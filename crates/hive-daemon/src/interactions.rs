@@ -254,7 +254,26 @@ pub(super) async fn permission_at(
     request: v2::RequestPermissionRequest,
     epoch: u64,
 ) -> v2::RequestPermissionResponse {
-    let cancelled = || v2::RequestPermissionResponse::new(v2::RequestPermissionOutcome::Cancelled);
+    permission_receipt(control, request, epoch).await.0
+}
+
+/// Ownership validated with the answer, for adapters that publish through another transport.
+pub(super) struct DecisionReceipt {
+    pub epoch: u64,
+    pub generation: u64,
+}
+
+pub(super) async fn permission_receipt(
+    control: Arc<Mutex<Control>>,
+    request: v2::RequestPermissionRequest,
+    epoch: u64,
+) -> (v2::RequestPermissionResponse, Option<DecisionReceipt>) {
+    let cancelled = || {
+        (
+            v2::RequestPermissionResponse::new(v2::RequestPermissionOutcome::Cancelled),
+            None,
+        )
+    };
     let Some((_pending, epoch, mut changes)) = Pending::register(&control, epoch) else {
         return cancelled();
     };
@@ -284,7 +303,9 @@ pub(super) async fn permission_at(
                         if state.interaction_epoch != epoch { return cancelled(); }
                         if state.generation != generation { continue; }
                         match response {
-                            Ok(response) => return if validate_permission(&request, &response) { response } else { cancelled() },
+                            Ok(response) => return if validate_permission(&request, &response) {
+                                (response, Some(DecisionReceipt { epoch, generation }))
+                            } else { cancelled() },
                             // Transport EOF can fail the RPC before the disconnect watcher rotates ownership.
                             Err(error) => error.code == v1::ErrorCode::InternalError,
                         }

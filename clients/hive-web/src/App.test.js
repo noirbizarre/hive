@@ -347,6 +347,26 @@ test('permission forms preserve typed values and drafts until their fenced reque
   expect(wrapper.find('#interaction').exists()).toBe(false);
 });
 
+test('leaving Plan shows its context and requires an explicit approval button', async () => {
+  const client = { respond: vi.fn(() => true) };
+  render(InteractionCard, { interaction: { id: 'plan-exit', method: 'session/request_permission', params: {
+    title: 'OpenCode: leave Plan mode?', description: 'Available plan context: fix the parser', options: [
+      { optionId: 'stay', name: 'Stay in Plan / refine the plan', kind: 'reject_once' },
+      { optionId: 'approve', name: 'Leave Plan and start implementing', kind: 'allow_once' },
+    ],
+  } }, client });
+  expect(wrapper.text()).toContain('OpenCode: leave Plan mode?');
+  expect(wrapper.text()).toContain('fix the parser');
+  expect(wrapper.text()).toContain('Stay in Plan / refine the plan');
+  expect(wrapper.text()).not.toContain('allow_always');
+  const stay = wrapper.findAll('button').find(button => button.text().startsWith('Stay in Plan'));
+  expect(document.activeElement).toBe(stay.element);
+  await wrapper.get('form').trigger('submit');
+  expect(client.respond).not.toHaveBeenCalled();
+  await wrapper.findAll('button').find(button => button.text().startsWith('Leave Plan')).trigger('click');
+  expect(client.respond).toHaveBeenCalledExactlyOnceWith({ outcome: { outcome: 'selected', optionId: 'approve' } }, 'plan-exit');
+});
+
 test('request scoped forms render before creation and URL consent remains distinct from completion', async () => {
   const { client, publish } = application({ interaction: { id: 1, epoch: 1, requestScoped: true, method: 'elicitation/create', params: { mode: 'form', requestedSchema: { properties: { flag: { type: 'boolean', default: false } }, required: ['flag'] } } } });
   await flushPromises();

@@ -41,11 +41,15 @@ pub(crate) struct PermissionAsk {
     pub description: Option<String>,
 }
 
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct QuestionAsk {
     pub id: String,
+    pub session: String,
+    pub tool: Option<(String, String)>,
     pub items: Vec<QuestionItem>,
 }
 
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct QuestionItem {
     pub header: String,
     pub question: String,
@@ -437,8 +441,101 @@ pub(crate) fn v1_question(request: &Value) -> Option<QuestionAsk> {
         .collect::<Vec<_>>();
     Some(QuestionAsk {
         id: request["id"].as_str()?.to_owned(),
+        session: request["sessionID"].as_str().unwrap_or_default().to_owned(),
+        // Preserve malformed linkage as unresolved, rather than bypassing classification.
+        tool: request
+            .get("tool")
+            .filter(|tool| !tool.is_null())
+            .map(|tool| {
+                (
+                    tool["messageID"].as_str().unwrap_or_default().to_owned(),
+                    tool["callID"].as_str().unwrap_or_default().to_owned(),
+                )
+            }),
         items,
     })
+}
+
+/// Classify by provider-owned tool identity, never by translated question wording.
+pub(crate) fn plan_exit(ask: &QuestionAsk, message: &Value) -> Result<bool, &'static str> {
+    let Some((message_id, call_id)) = &ask.tool else {
+        return Ok(false);
+    };
+    let info = &message["info"];
+    if message_id.is_empty()
+        || call_id.is_empty()
+        || info["id"] != *message_id
+        || info["sessionID"] != ask.session
+        || info["role"] != "assistant"
+    {
+        return Err("question message identity");
+    }
+    let part = message["parts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|part| {
+            part["type"] == "tool"
+                && part["callID"] == *call_id
+                && part["messageID"] == *message_id
+                && part["sessionID"] == ask.session
+        })
+        .ok_or("question tool identity")?;
+    if part["tool"] != "plan_exit" {
+        return Ok(false);
+    }
+    if !matches!(
+        part["state"]["status"].as_str(),
+        Some("pending" | "running")
+    ) {
+        return Err("inactive plan_exit question");
+    }
+    if ask.items.len() != 1 || ask.items[0].multiple || ask.items[0].options != ["Yes", "No"] {
+        return Err("plan_exit question contract");
+    }
+    Ok(true)
+}
+
+pub(crate) fn leave_plan_permission(
+    hive_id: v2::SessionId,
+    ask: &QuestionAsk,
+    message: &Value,
+) -> v2::RequestPermissionRequest {
+    let excerpt = message["parts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|part| {
+            part["type"] == "text" && part["synthetic"] != true && part["ignored"] != true
+        })
+        .filter_map(|part| part["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let context = if excerpt.is_empty() {
+        "Plan content was not supplied; review the provider's plan reference above.".to_owned()
+    } else {
+        format!(
+            "Available plan context (assistant excerpt, not the plan file):\n{}",
+            truncate(&excerpt, 2500)
+        )
+    };
+    // The browser focuses the first action; accidental Enter must not select execution.
+    v2::RequestPermissionRequest::new(hive_id, "OpenCode: leave Plan mode?", vec![
+        v2::PermissionOption::new("stay", "Stay in Plan / refine the plan", v2::PermissionOptionKind::RejectOnce),
+        v2::PermissionOption::new("approve", "Leave Plan and start implementing", v2::PermissionOptionKind::AllowOnce),
+    ]).description(bounded_context(&format!("Approving lets OpenCode switch to Build and start implementing.\n\nProvider request:\n{}\n\n{}",
+        truncate(&ask.items[0].question, 1000), context)))
+}
+
+fn bounded_context(text: &str) -> String {
+    if text.len() <= 4096 {
+        return text.to_owned();
+    }
+    let mut end = 4096 - "\n[truncated]".len();
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n[truncated]", &text[..end])
 }
 
 pub(crate) fn v1_permission_ask(request: &Value) -> PermissionAsk {
@@ -753,5 +850,70 @@ mod tests {
         );
         assert!(summary.contains("Create a new API key in OpenCode Console"));
         assert!(!summary.contains("sk-secret"));
+    }
+
+    fn plan_fixture() -> (QuestionAsk, Value) {
+        let ask = v1_question(&json!({"id":"q", "sessionID":SESSION,
+            "tool":{"messageID":"m", "callID":"c"},
+            "questions":[{"question":"Review plan.md", "options":[{"label":"Yes"},{"label":"No"}]}]})).unwrap();
+        let message = json!({"info":{"id":"m", "sessionID":SESSION, "role":"assistant"},
+            "parts":[{"type":"tool", "messageID":"m", "sessionID":SESSION, "callID":"c",
+                "tool":"plan_exit", "state":{"status":"running"}}]});
+        (ask, message)
+    }
+
+    #[test]
+    fn plan_exit_requires_exact_message_session_call_and_question_contract() {
+        let (ask, message) = plan_fixture();
+        assert_eq!(plan_exit(&ask, &message), Ok(true));
+        for pointer in [
+            "/info/id",
+            "/info/sessionID",
+            "/info/role",
+            "/parts/0/messageID",
+            "/parts/0/sessionID",
+            "/parts/0/callID",
+            "/parts/0/state/status",
+        ] {
+            let mut invalid = message.clone();
+            *invalid.pointer_mut(pointer).unwrap() = json!("other");
+            assert!(plan_exit(&ask, &invalid).is_err(), "{pointer}");
+        }
+        let mut other_tool = message.clone();
+        other_tool["parts"][0]["tool"] = json!("question");
+        assert_eq!(
+            plan_exit(&ask, &other_tool),
+            Ok(false),
+            "identical wording is not tool identity"
+        );
+        let mut malformed = ask.clone();
+        malformed.items[0].options.clear();
+        assert!(plan_exit(&malformed, &message).is_err());
+        malformed = ask.clone();
+        malformed.items[0].multiple = true;
+        assert!(plan_exit(&malformed, &message).is_err());
+        let mut missing_link = ask;
+        missing_link.tool = None;
+        assert_eq!(plan_exit(&missing_link, &message), Ok(false));
+    }
+
+    #[test]
+    fn plan_context_is_bounded_utf8_and_never_includes_private_or_synthetic_text() {
+        let (ask, mut message) = plan_fixture();
+        let no_context = leave_plan_permission(v2::SessionId::new("h"), &ask, &message);
+        assert!(no_context.description.unwrap().contains("not supplied"));
+        message["parts"].as_array_mut().unwrap().extend([
+            json!({"type":"reasoning", "text":"SECRET"}),
+            json!({"type":"text", "synthetic":true, "text":"SECRET"}),
+            json!({"type":"text", "ignored":true, "text":"SECRET"}),
+            json!({"type":"text", "text":"界".repeat(5000)}),
+        ]);
+        let description = leave_plan_permission(v2::SessionId::new("h"), &ask, &message)
+            .description
+            .unwrap();
+        assert!(description.len() <= 4096);
+        assert!(description.ends_with("[truncated]"));
+        assert!(description.contains("assistant excerpt"));
+        assert!(!description.contains("SECRET"));
     }
 }

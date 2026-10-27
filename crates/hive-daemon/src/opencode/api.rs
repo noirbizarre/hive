@@ -64,6 +64,7 @@ impl Flavor {
 #[derive(Clone, Debug)]
 pub(crate) struct NativeSession {
     pub id: String,
+    pub parent: Option<String>,
     pub title: Option<String>,
     pub directory: String,
     pub updated: Option<u64>,
@@ -71,12 +72,19 @@ pub(crate) struct NativeSession {
 
 impl NativeSession {
     fn from_value(flavor: Flavor, value: &Value) -> Option<Self> {
+        // Malformed ancestry must not turn a child into an apparently independent root.
+        let parent = match value.get("parentID") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(parent)) if !parent.is_empty() => Some(parent.clone()),
+            _ => return None,
+        };
         let directory = match flavor {
             Flavor::V1 => &value["directory"],
             Flavor::V2 => &value["location"]["directory"],
         };
         Some(Self {
             id: value["id"].as_str()?.to_owned(),
+            parent,
             title: value["title"].as_str().map(str::to_owned),
             directory: directory.as_str().unwrap_or_default().to_owned(),
             updated: value["time"]["updated"].as_u64(),
@@ -237,6 +245,18 @@ impl Native {
                 active["data"].get(&self.id).is_some()
             }
         })
+    }
+
+    /// Resolve question linkage without depending on stream order or bounded history.
+    pub(crate) async fn message(&self, id: &str) -> Result<Value, OpencodeError> {
+        self.client
+            .json(
+                Method::GET,
+                &format!("/session/{}/message/{id}", self.id),
+                &self.scope(),
+                None,
+            )
+            .await
     }
 
     /// Recent history, mapped through `mapper` so later live events never repeat it.

@@ -152,6 +152,7 @@ Sources: [v1 tool calls][v1-tools], [v2 tool calls][v2-tools],
 | `elicitation/create`: form mode, primitive schemas/validation ([v1][v1-elicitation], [v2][v2-elicitation]) | 🟡 P | V1 session-scoped handler exists but initializer does not advertise form; v2 broker advertises form | Pilot capability checked; supported primitive validation; restricted cross-host pattern subset | Both support forms; browser rejects unsafe integers; unsupported patterns/types cancel | [Validation limits](#form-validation); [interaction broker][interactions]; [TUI tests][tui-interactions]; [Web tests][web-component-tests] |
 | URL mode and `elicitation/complete` ([v1][v1-elicitation], [v2][v2-elicitation]) | 🟡 P | V1 handlers without mode advertisement; v2 broker advertises URL | IDs remapped, early completion correlated, takeover/deadline behavior defined | Both require explicit HTTP(S) link action/consent; completion is distinct from consent | [URL completion](#url-completion); [gateway tests][gateway-tests]; [Web tests][web-component-tests] |
 | Session/request interaction scope; `accept` / `decline` / `cancel` ([v2 elicitation][v2-elicitation]) | 🟡 P | V1 session scope; native v2 live new/prompt parents mapped | Request scope requires a unique live parent; unmapped/expired/ambiguous parents cancel; session scope follows pilot | Both handle queued interactions; unsupported negotiated modes cancel | [Routing limits](#interaction-capabilities-and-fallback); [interaction broker][interactions] |
+| OpenCode `plan_exit` confirmation | 🟡 P | Server v1 native question correlated to exact tool/message/session; ACP 1.19.4 lacks the provider continuation | Explicit once-only permission-shaped decision answers the native question; child transitions rejected | Both show plan reference/available excerpt and explicit leave/stay actions | [Leave-Plan contract](#opencode-leave-plan-confirmation); deterministic `opencode.rs` and client tests |
 | `session/cancel` versus `$/cancel_request` ([v1][v1-cancel], [v2][v2-cancel]) | ✅ S | Session cancellation forwarded; v1 cancelled completion maps to standard v2 `cancelled`; RPC cancellation correlated per connection | Session cancellation withdraws decisions; RPC IDs remapped, never copied across hops | Both cancel work/questions and await authoritative idle; cancellation notice only in TUI | [Interaction broker][interactions]; `stop_reasons_and_native_failures_survive_the_gateway_and_replay` in [gateway tests][gateway-tests] |
 
 ### Configuration, discovery, usage, and compaction
@@ -1313,6 +1314,12 @@ fake server but not yet by a real OpenCode run.
 | 1.19.3 v1 | 🧪 Fake only | 🧪 Fake only | 🧪 Fake only | 🧪 Fake only | 🧪 Fake only | 🧪 Fake only |
 | 1.19.3 v2 preview | 🧪 Fake only | 🧪 Fake only (polled) | ❌ Unsupported | 🧪 Fake only | 🧪 Fake only | 🧪 Fake only |
 
+| Entry point | `plan_exit` confirmation | Evidence |
+| --- | --- | --- |
+| Server v1, OpenCode 1.x | 🧪 Deterministic tests; requires correlated native question | 1.19.4 source contract; fake gateway and both client tests |
+| `opencode acp`, 1.19.4 | ❌ Provider does not expose built-in `plan_exit` or forward native questions | Source inspection; no synthetic continuation in Hive |
+| Server `/api/*` v2 preview | ❌ Questions unsupported | No affirmative fallback |
+
 The probe printed these markers (retain them when changing a cell):
 `PROBE server=opencode version=1.19.3 api=v1`, `NATIVE discovered=true`,
 `ADOPTED … native_session_reused=true`, `FIRST text_observed=true
@@ -1355,7 +1362,41 @@ detects and refuses:
 - A permission or question answered in OpenCode first is withdrawn from Hive's
   pilot and never answered twice. One left unanswered (timeout or cancel) stays
   pending in OpenCode, where a native client can still answer it, and is offered
-  to Hive again.
+  to Hive again, except for cancelled plan-exit confirmations described below.
+
+### OpenCode leave-Plan confirmation
+
+Hive recognizes server-v1 `plan_exit` at its blocking native question, using
+`tool.messageID` and `tool.callID` to retrieve and validate the exact assistant
+message/tool part. Tool notifications alone never authorize execution. Missing
+or mismatched linkage cannot authorize a specialized transition; unresolved
+tool-linked questions wait for reconciliation rather than falling back to a
+generic approval form. Other verified tools retain normal question handling.
+
+Both clients show **OpenCode: leave Plan mode?**, the provider request/plan
+reference and a bounded visible assistant excerpt where supplied. Missing or
+truncated context is identified. Hive does not fetch an arbitrary referenced
+plan file. **Leave Plan and start implementing** sends exactly `[["Yes"]]`
+through the native question-reply endpoint. **Stay in Plan / refine the plan**
+uses the native question-rejection endpoint. No Always Allow option or default
+approval exists, and Hive does not call a mode setter or claim Build before
+provider evidence. Request-changes text is not part of this native contract.
+
+Cancellation, timeout, unavailable UI and invalid responses never send Yes.
+Cancelled identities are suppressed for the attachment; disconnect/takeover
+can transfer a waiting confirmation to the current pilot. Stream loss withdraws
+the old attempt. Reconnect and ambiguous HTTP failure require successful native
+pending-state reconciliation and a fresh confirmation. Epoch/generation and
+request identity are rechecked at publication admission. A cancellation winning
+before admission prevents dispatch; a dispatched HTTP request cannot be
+retracted. Native clients can independently answer and are not locked out.
+
+Requests from other sessions are never promoted to a parent. Directly attached
+child-session plan exits are rejected with a controlled diagnostic. Replay
+suppression is bounded to 1024 tool-linked question identities per attachment;
+exhaustion fails closed and asks the user to reconnect. This behavior has
+deterministic fake-server and TUI/Web regression coverage, not a retained
+real-provider inference probe. See the [OpenCode guide](agents/opencode.md#approve-leaving-plan-mode).
 
 ### OpenCode diagnostics
 
@@ -1378,6 +1419,7 @@ endpoint, headers, credentials or server response bodies.
 | `hive::opencode::unsupported_prompt` | Only text prompt content is forwarded. |
 | `hive::opencode::http_status` | An unexpected HTTP status. |
 | `hive::opencode::protocol` | A response did not have the expected shape. |
+| `hive::opencode::plan_approval` | A child transition or exhausted replay capacity prevents approval; inspect the native session and reconnect or refine in the parent. |
 
 ### Security and unsupported workflows
 

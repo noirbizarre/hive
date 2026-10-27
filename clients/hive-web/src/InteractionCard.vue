@@ -42,7 +42,7 @@ onBeforeUnmount(() => { if (root.value?.contains(document.activeElement) && prev
   <section id="interaction" ref="root" class="interaction surface" aria-labelledby="interaction-title">
     <div class="eyebrow">Your attention is needed</div>
     <h2 id="interaction-title">{{ params.title || params.message || 'Agent needs input' }}</h2>
-    <p v-if="params.description">{{ params.description }}</p>
+    <p v-if="params.description" class="interaction-description">{{ params.description }}</p>
     <pre v-if="params.subject">{{ JSON.stringify(params.subject, null, 2) }}</pre>
     <Message v-if="error" severity="error" :closable="false" role="alert">{{ error }}</Message>
     <form v-if="interaction.method === 'session/request_permission'" class="actions" @submit.prevent>
@@ -80,3 +80,8 @@ onBeforeUnmount(() => { if (root.value?.contains(document.activeElement) && prev
     </div>
   </section>
 </template>
+
+<style scoped>
+/* Preserve the boundaries between provider requests and plan excerpts. */
+.interaction-description { white-space: pre-wrap; overflow-wrap: anywhere; }
+</style>

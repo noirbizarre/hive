@@ -26,6 +26,7 @@ pub(crate) mod code {
     pub const UNSUPPORTED_PROMPT: &str = "hive::opencode::unsupported_prompt";
     pub const HTTP_STATUS: &str = "hive::opencode::http_status";
     pub const PROTOCOL: &str = "hive::opencode::protocol";
+    pub const PLAN_APPROVAL: &str = "hive::opencode::plan_approval";
 }
 
 #[derive(Clone, Debug, thiserror::Error, Diagnostic, PartialEq, Eq)]
@@ -150,6 +151,15 @@ pub(crate) enum OpencodeError {
         )
     )]
     Protocol { what: &'static str },
+
+    #[error("OpenCode plan approval is unavailable: {reason}")]
+    #[diagnostic(
+        code(hive::opencode::plan_approval),
+        help(
+            "keep the session in Plan mode; inspect the native session and refine the plan in its parent session, or reconnect Hive before requesting approval again"
+        )
+    )]
+    PlanApproval { reason: &'static str },
 }
 
 impl OpencodeError {
@@ -173,6 +183,7 @@ impl OpencodeError {
             Self::UnsupportedPrompt => code::UNSUPPORTED_PROMPT,
             Self::HttpStatus { .. } => code::HTTP_STATUS,
             Self::Protocol { .. } => code::PROTOCOL,
+            Self::PlanApproval { .. } => code::PLAN_APPROVAL,
         }
     }
 
@@ -252,6 +263,9 @@ mod tests {
             OpencodeError::UnsupportedPrompt,
             OpencodeError::HttpStatus { status: 500 },
             OpencodeError::Protocol { what: "payload" },
+            OpencodeError::PlanApproval {
+                reason: "unsupported child session",
+            },
         ]
     }
 

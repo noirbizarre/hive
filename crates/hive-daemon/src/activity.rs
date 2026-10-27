@@ -70,7 +70,7 @@ impl Activity {
                     .tools
                     .entry(id.clone())
                     .or_insert_with(|| json!({"toolCallId": id, "status": "pending"}));
-                // Content chunks are append-only; a later full content update replaces them.
+                // Keep only the suffix after the latest authoritative content replacement.
                 let chunks = tool
                     .as_object_mut()?
                     .entry("chunks")
@@ -131,6 +131,12 @@ impl Activity {
             *tool = json!({"toolCallId": id, "status": "pending"});
         }
         patch(tool, &value);
+        if value.get("content").is_some() {
+            // Null and empty replacements also invalidate streamed output and its loss marker.
+            let fields = tool.as_object_mut()?;
+            fields.remove("chunks");
+            fields.remove("chunksTruncated");
+        }
         let result = tool.clone();
         if matches!(
             tool["status"].as_str(),
@@ -172,6 +178,104 @@ fn patch(target: &mut Value, update: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn update(activity: &mut Activity, value: Value) -> Value {
+        activity
+            .v2(&serde_json::from_value(value).unwrap())
+            .unwrap()
+    }
+
+    fn chunk(activity: &mut Activity, text: &str) -> Value {
+        activity
+            .v2(&v2::SessionUpdate::ToolCallContentChunk(
+                v2::ToolCallContentChunk::new("call", text),
+            ))
+            .unwrap()
+    }
+
+    #[test]
+    fn explicit_content_replacements_discard_only_superseded_chunks() {
+        for content in [
+            json!([{ "type":"content", "content":{"type":"text","text":"replacement"}}]),
+            json!([]),
+            Value::Null,
+        ] {
+            let mut activity = Activity::new();
+            update(
+                &mut activity,
+                json!({"sessionUpdate":"tool_call_update","toolCallId":"call","title":"Compile","status":"in_progress"}),
+            );
+            activity.v2(&v2::SessionUpdate::ToolCallContentChunk(
+                v2::ToolCallContentChunk::new("other", "untouched"),
+            ));
+            chunk(&mut activity, "obsolete");
+            let omitted = update(
+                &mut activity,
+                json!({"sessionUpdate":"tool_call_update","toolCallId":"call","rawOutput":null}),
+            );
+            assert_eq!(omitted["tool"]["chunks"].as_array().unwrap().len(), 1);
+            let replaced = update(
+                &mut activity,
+                json!({"sessionUpdate":"tool_call_update","toolCallId":"call","content":content}),
+            );
+            let tool = &activity.tools["call"];
+            assert_eq!(&replaced["tool"], tool);
+            assert!(tool.get("chunks").is_none());
+            assert!(tool.get("chunksTruncated").is_none());
+            assert_eq!(
+                tool.get("content"),
+                if content.is_null() {
+                    None
+                } else {
+                    Some(&content)
+                }
+            );
+            assert_eq!(tool["title"], "Compile");
+            assert_eq!(tool["status"], "in_progress");
+            let later = chunk(&mut activity, "later");
+            assert_eq!(later["tool"]["chunks"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                later["tool"]["chunks"][0]["content"]["content"]["text"],
+                "later"
+            );
+            assert_eq!(
+                activity.tools["other"]["chunks"].as_array().unwrap().len(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_truncation_is_bounded_and_resets_with_each_content_replacement() {
+        let mut activity = Activity::new();
+        for _ in 0..2 {
+            for index in 0..64 {
+                chunk(&mut activity, &index.to_string());
+            }
+            assert!(activity.tools["call"].get("chunksTruncated").is_none());
+            chunk(&mut activity, "64");
+            assert_eq!(
+                activity.tools["call"]["chunks"].as_array().unwrap().len(),
+                64
+            );
+            assert_eq!(
+                activity.tools["call"]["chunks"][0]["content"]["content"]["text"],
+                "1"
+            );
+            assert_eq!(activity.tools["call"]["chunksTruncated"], true);
+            let omitted = update(
+                &mut activity,
+                json!({"sessionUpdate":"tool_call_update","toolCallId":"call","status":"completed"}),
+            );
+            assert_eq!(omitted["tool"]["chunksTruncated"], true);
+            let replaced = update(
+                &mut activity,
+                json!({"sessionUpdate":"tool_call_update","toolCallId":"call","content":[]}),
+            );
+            assert!(replaced["tool"].get("chunks").is_none());
+            assert!(replaced["tool"].get("chunksTruncated").is_none());
+        }
+    }
 
     #[test]
     fn a_tool_patch_retains_previous_fields_and_preserves_failures() {

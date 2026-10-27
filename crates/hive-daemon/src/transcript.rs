@@ -367,6 +367,52 @@ mod tests {
     }
 
     #[test]
+    fn tool_replacements_and_later_chunks_round_trip_without_superseded_content() {
+        for content in [
+            json!([{"type":"content","content":{"type":"text","text":"replacement"}}]),
+            json!([]),
+            Value::Null,
+        ] {
+            let mut transcript = Transcript::default();
+            ingest(
+                &mut transcript,
+                json!({"sessionUpdate":"tool_call_content_chunk","toolCallId":"call","content":{"type":"content","content":{"type":"text","text":"obsolete"}}}),
+            );
+            ingest(
+                &mut transcript,
+                json!({"sessionUpdate":"tool_call_update","toolCallId":"call","content":content}),
+            );
+            ingest(
+                &mut transcript,
+                json!({"sessionUpdate":"tool_call_content_chunk","toolCallId":"call","content":{"type":"content","content":{"type":"text","text":"later"}}}),
+            );
+            let updates = transcript.updates().unwrap();
+            let value = serde_json::to_value(&updates).unwrap();
+            let expected = if content.is_array() && !content.as_array().unwrap().is_empty() {
+                2
+            } else {
+                1
+            };
+            assert_eq!(value[0]["content"].as_array().unwrap().len(), expected);
+            assert_eq!(
+                value[0]["content"][expected - 1]["content"]["text"],
+                "later"
+            );
+            if expected == 2 {
+                assert_eq!(value[0]["content"][0]["content"]["text"], "replacement");
+            }
+            let mut restored = Transcript::default();
+            for update in updates {
+                restored.ingest(&update).unwrap();
+            }
+            assert_eq!(
+                serde_json::to_value(restored.updates().unwrap()).unwrap(),
+                value
+            );
+        }
+    }
+
+    #[test]
     fn historical_tool_patches_retain_fields_and_append_content_without_an_execution_path() {
         let mut transcript = Transcript::default();
         for update in [

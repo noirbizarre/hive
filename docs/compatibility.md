@@ -140,7 +140,7 @@ Sources: [v1 tool calls][v1-tools], [v2 tool calls][v2-tools],
 | --- | --- | --- | --- | --- | --- |
 | V1 `tool_call`, `tool_call_update`; v2 upsert `tool_call_update` ([v1][v1-tools], [v2][v2-tools]) | 🟡 P | V1 extension wrappers; v2 native updates | Raw events plus normalized activity and materialized tools; IDs scoped to session | Both show tool title/status/input/results and preserve omitted fields while clearing explicit nulls; rich presentation remains partial | [Activity][activity]; [transcript][transcript]; [Web reducer tests][web-tests] |
 | Tool kinds/statuses/locations, raw input/output, omitted/null patches ([v1][v1-tools], [v2][v2-tools]) | 🟡 P | V2 typed unknown values retained where schema allows; v1 retains wrapped tool payload | Daemon applies omission/null/array replacement; normalized activity strips provider metadata | Both reduce structured patches before display; nonempty content takes precedence over current raw output, with null/empty content allowing raw-output fallback | [TUI state][tui-state]; [TUI renderer][tui-transcript]; [Web reducer tests][web-tests] |
-| `tool_call_content_chunk`, embedded content/diff/terminal reference ([v2 tools][v2-tools]) | 🟡 P | Native v2 chunks; v1 tool content remains in wrappers | Transcript appends/replaces canonical content; activity keeps a separate bounded chunk buffer even after replacement | TUI shows structured details and references; Web readable/JSON output, not full rich parity | [Activity][activity]; [TUI renderer][tui-transcript]; [#67](https://github.com/noirbizarre/hive/issues/67) |
+| `tool_call_content_chunk`, embedded content/diff/terminal reference ([v2 tools][v2-tools]) | 🟡 P | Native v2 chunks; v1 tool content remains in wrappers | Transcript appends/replaces canonical content; activity keeps a bounded chunk suffix after the latest content replacement | TUI shows structured details and references; Web readable/JSON output, not full rich parity | [Activity][activity]; [TUI renderer][tui-transcript] |
 | Structured v2 diffs: add/delete/modify/move/copy; text/binary/directory/symlink; optional git patch ([v2 tools][v2-tools]) | 🟡 P | Native typed relay, not lossless reverse conversion to v1 text diffs | Preserved inside typed tool content; no filesystem operation executed by receiving a diff | TUI details and Web generic output do not implement every file-change presentation | [Transcript][transcript]; [TUI renderer][tui-transcript]; [Web][web-client] |
 | V1 `fs/read_text_file`, `fs/write_text_file` ([filesystem][v1-fs]) | ❌ U | No delegated filesystem handlers; flags not advertised | No upstream equivalent in v2; agents may still operate on files themselves | No delegated filesystem service | [V1 worker initialization][daemon] |
 | V1 `terminal/create`, `terminal/output`, `terminal/release`, `terminal/wait_for_exit`, `terminal/kill` ([terminals][v1-terminals]) | ❌ U | No delegated terminal handlers; flag not advertised | These methods were removed from v2; distinct from agent-owned display terminals | No delegated process service | [V1 worker initialization][daemon] |
@@ -290,7 +290,7 @@ infer it merely from negotiating protocol v2.
 | Prompt key/fingerprint and `recoveryAction` | ✅ S | Durable deduplication/recovery fence; no automatic redispatch; future hardening is not complete certainty about provider execution | [Ownership](#mutation-ownership-and-idempotency); [#56](https://github.com/noirbizarre/hive/issues/56) |
 | `_hive_seq`, `seq`/`nextSeq`, snapshot markers/watermarks | ✅ S | Bounded incremental ring plus materialized start snapshot; both clients handle gap decisions | [Replay cursors](#replay-cursors) |
 | `_hive_v1_tool_call`, `_hive_v1_tool_update`, `_hive_v1_plan`, `_v1_stop` | 🟡 P | Explicit compatibility wrappers for v1 tools/plans; `_v1_stop` is only a future non-equivalent stop-reason fallback, not the mapping for currently known reasons | [Tool/plan rows](#tools-terminals-plans-and-interactions), [activity](#live-execution-activity) |
-| `_hive_activity`, `_hive_task`, `activitySnapshot` | 🟡 P | Convenience tool/plan/foreground projection shown by both UIs; tool chunk buffer can retain superseded chunks; background tasks require extension IDs, not inferred subagents | [Live execution activity](#live-execution-activity); [#67](https://github.com/noirbizarre/hive/issues/67) |
+| `_hive_activity`, `_hive_task`, `activitySnapshot` | 🟡 P | Convenience tool/plan/foreground projection shown by both UIs; bounded tool chunk suffix resets on content replacement; background tasks require extension IDs, not inferred subagents | [Live execution activity](#live-execution-activity) |
 | `planSnapshot`, config snapshots/sequence, transcript status | ✅ S | Attachment state independent of bounded replay; both clients fence old replay; agent retention still determines restart completeness | [Native plans](#native-acpv2-plans), [replay](#replay-cursors), [transcript status](hive-api.md#transcript-ownership-and-status) |
 | `_hive_usage`, usage snapshot/cost estimates | 🔀 A | Hive accounting depends on agent reports and optional price identity; both UIs show available totals | [Token usage and costs](#token-usage-and-costs) |
 | `_hive_error`, `_hive_opencode_error` | ✅ S | Controlled failure diagnostics rendered by both clients, not standard `notice` support | [Protocol boundary](#protocol-boundary), [OpenCode diagnostics](#opencode-diagnostics) |
@@ -1142,9 +1142,14 @@ Tool patches follow these rules:
 - Explicit null clears a field.
 - Arrays replace previous arrays.
 - In the canonical transcript, content chunks append until a full content update
-  replaces them. The normalized activity projection instead retains a separate
-  bounded `chunks` buffer, which is not cleared by a later `content` replacement;
-  it can include superseded chunks ([#67](https://github.com/noirbizarre/hive/issues/67)).
+  replaces them. In normalized activity, `content` is the latest authoritative
+  replacement and `chunks` is a separate bounded suffix of subsequent chunk
+  envelopes. Any explicit `content` update, including `null` or `[]`, removes
+  both `chunks` and `chunksTruncated`. Null removes the `content` field; an empty
+  array retains an empty `content` array. Later chunks start a fresh suffix;
+  omitted `content` preserves the current content, suffix, and truncation flag.
+- Normalized tool events are full entity upserts: both clients replace the
+  previous tool object, so removed fields cannot survive through a client merge.
 - Top-level provider `_meta` is excluded from these convenience projections;
   native plans and `planSnapshot` preserve typed metadata.
 
@@ -1155,7 +1160,8 @@ the foreground turn or closes the session.
 
 `_meta.hive.activitySnapshot` in new/resume responses contains `{version:1,
 seq,session,foreground,tools,plans,tasks,support}` at the atomic replay/live attachment
-boundary. `seq` is the last normalized activity event. `nextSeq` remains the
+boundary. `seq` is the last produced session-update sequence at that boundary.
+`nextSeq` remains the
 first not-yet-produced *session update*.
 
 The support values for tools, plans,
@@ -1165,8 +1171,9 @@ justify an invented plan or an unsupported claim. Unrecognized provider statuses
 are preserved.
 
 Finished tools are retained up to 128 per session. Streaming chunk snapshots
-retain the latest 64 chunks and
-flag `chunksTruncated` when earlier chunks have been evicted. Raw event history
+retain the latest 64 chunks after the most recent content replacement and
+flag `chunksTruncated` when earlier chunks in that suffix have been evicted.
+A replacement resets this flag along with the chunk buffer. Raw event history
 remains bounded at 256 updates (now including normalized activity), so an
 incremental cursor can expire sooner than before. Full transcript snapshots
 are independent of these activity and ring limits.

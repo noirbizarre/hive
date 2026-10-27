@@ -427,6 +427,7 @@ impl Conversation {
                         if !self.activity[key].is_object() {
                             self.activity[key] = serde_json::json!({});
                         }
+                        // Full entity upserts must drop superseded chunks and their loss marker.
                         self.activity[key][id] = value[kind].clone();
                         let support = if key == "plans" {
                             "plans"
@@ -1029,6 +1030,54 @@ mod tests {
         ));
         assert_eq!(conversation.generation, 2);
         assert!(!conversation.pilot_present);
+    }
+
+    #[test]
+    fn tool_activity_replacements_agree_with_snapshots_without_reviving_obsolete_chunks() {
+        for content in [
+            serde_json::json!([{"type":"content","content":{"type":"text","text":"replacement"}}]),
+            serde_json::json!([]),
+            serde_json::Value::Null,
+        ] {
+            let stale = serde_json::json!({"toolCallId":"call","status":"in_progress","chunks":[{"content":"obsolete"}],"chunksTruncated":true});
+            let mut replacement = serde_json::json!({"toolCallId":"call","status":"in_progress"});
+            if !content.is_null() {
+                replacement["content"] = content;
+            }
+            let mut later = replacement.clone();
+            later["chunks"] = serde_json::json!([{"content":"later"}]);
+            let activity = |seq, tool| {
+                event(seq, serde_json::from_value(serde_json::json!({
+                "sessionUpdate":"_hive_activity","kind":"tool","toolCallId":"call","tool":tool
+            })).unwrap())
+            };
+            let mut live = Conversation::default();
+            live.apply(activity(1, stale.clone()));
+            live.apply(activity(2, replacement.clone()));
+            assert_eq!(live.activity["tools"]["call"], replacement);
+            live.apply(activity(3, later.clone()));
+            assert_eq!(live.activity["tools"]["call"], later);
+            let mut attached = Conversation::default();
+            let mut snapshot = live.activity.clone();
+            snapshot["version"] = serde_json::json!(1);
+            snapshot["seq"] = serde_json::json!(3);
+            attached.snapshot(&snapshot);
+            attached.apply(activity(1, stale));
+            attached.apply(activity(2, replacement));
+            attached.apply(activity(3, later.clone()));
+            assert_eq!(attached.activity["tools"], live.activity["tools"]);
+            later["chunks"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({"content":"newest"}));
+            live.apply(activity(4, later.clone()));
+            attached.apply(activity(4, later));
+            assert_eq!(attached.activity["tools"], live.activity["tools"]);
+            assert!(
+                live.lines.is_empty(),
+                "normalized activity must not duplicate transcript output"
+            );
+        }
     }
 
     #[test]

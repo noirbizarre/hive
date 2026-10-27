@@ -3248,6 +3248,209 @@ async fn live_tools_and_late_tasks_reach_every_observer_and_survive_live_only_re
     server.abort();
 }
 
+#[tokio::test]
+async fn tool_replacements_agree_across_live_activity_attachment_and_replay() {
+    let config = config_with_agent(
+        "mock",
+        env!("CARGO_BIN_EXE_hive-test-agent"),
+        AgentVersion::V2,
+    );
+    let (address, server) = start_gateway(config).await;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    timeout(
+        Duration::from_secs(20),
+        Client
+            .v2()
+            .on_receive_notification(
+                async move |event: v2::UpdateSessionNotification, _: V2ConnectionTo<Agent>| {
+                    tx.send(event).map_err(Error::into_internal_error)
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(
+                HttpClient::new(format!("ws://{address}")).unwrap(),
+                async move |cx| {
+                    cx.send_request(v2::InitializeRequest::new(
+                        ProtocolVersion::V2,
+                        v2::Implementation::new("tool-content-test", "1"),
+                    ))
+                    .block_task()
+                    .await?;
+                    let opened = cx
+                        .send_request(v2::NewSessionRequest::new(std::env::current_dir().unwrap()))
+                        .block_task()
+                        .await?;
+                    cx.send_request(
+                        v2::PromptRequest::new(
+                            opened.session_id.clone(),
+                            vec!["tool-content-sequence".into()],
+                        )
+                        .meta(controlled(&opened.meta, "tool-content")),
+                    )
+                    .block_task()
+                    .await?;
+                    let mut live = Vec::new();
+                    while let Some(event) = rx.recv().await {
+                        let value = serde_json::to_value(&event.update).unwrap();
+                        let done = value["sessionUpdate"] == "_hive_activity"
+                            && value["kind"] == "foreground"
+                            && value["state"]["state"] == "idle";
+                        live.push(value);
+                        if done {
+                            break;
+                        }
+                    }
+                    let reduce = |events: &[serde_json::Value]| {
+                        let mut tools = serde_json::json!({});
+                        for event in events {
+                            if event["sessionUpdate"] == "_hive_activity" && event["kind"] == "tool"
+                            {
+                                tools[event["toolCallId"].as_str().unwrap()] =
+                                    event["tool"].clone();
+                            }
+                        }
+                        tools
+                    };
+                    let tools = reduce(&live);
+                    assert_eq!(tools.as_object().unwrap().len(), 3);
+                    for id in ["replacement", "empty", "null"] {
+                        let events: Vec<_> = live
+                            .iter()
+                            .filter(|event| {
+                                event["sessionUpdate"] == "_hive_activity"
+                                    && event["toolCallId"] == id
+                            })
+                            .collect();
+                        assert_eq!(events.len(), 4);
+                        assert_eq!(
+                            events[1]["tool"]["chunks"][0]["content"]["content"]["text"],
+                            "obsolete"
+                        );
+                        assert!(events[2]["tool"].get("chunks").is_none());
+                        assert!(events[2]["tool"].get("chunksTruncated").is_none());
+                        assert_eq!(tools[id]["chunks"].as_array().unwrap().len(), 1);
+                        assert_eq!(
+                            tools[id]["chunks"][0]["content"]["content"]["text"],
+                            "later"
+                        );
+                    }
+                    assert!(tools["null"].get("content").is_none());
+                    assert_eq!(tools["empty"]["content"], serde_json::json!([]));
+                    assert_eq!(
+                        tools["replacement"]["content"][0]["content"]["text"],
+                        "replacement"
+                    );
+                    let (attached, events) =
+                        tool_attachment(address, opened.session_id.clone(), None).await;
+                    assert_eq!(attached["activitySnapshot"]["tools"], tools);
+                    assert!(
+                        !events
+                            .iter()
+                            .any(|event| event["sessionUpdate"] == "_hive_activity"
+                                && event["kind"] == "tool")
+                    );
+                    let (incremental, events) = tool_attachment(
+                        address,
+                        opened.session_id.clone(),
+                        Some(v2::ReplayFrom::Other(v2::OtherReplayFrom::new(
+                            "_hive_seq",
+                            BTreeMap::from([("seq".into(), serde_json::json!(1))]),
+                        ))),
+                    )
+                    .await;
+                    assert_eq!(incremental["activitySnapshot"]["tools"], tools);
+                    assert_eq!(reduce(&events), tools);
+                    let (full, events) = tool_attachment(
+                        address,
+                        opened.session_id,
+                        Some(v2::ReplayFrom::Start(v2::ReplayFromStart::new())),
+                    )
+                    .await;
+                    assert_eq!(full["activitySnapshot"]["tools"], tools);
+                    let calls: Vec<_> = events
+                        .iter()
+                        .filter(|event| event["sessionUpdate"] == "tool_call_update")
+                        .collect();
+                    assert_eq!(calls.len(), 3);
+                    for call in calls {
+                        let content = call["content"].as_array().unwrap();
+                        let expected = if call["toolCallId"] == "replacement" {
+                            2
+                        } else {
+                            1
+                        };
+                        assert_eq!(content.len(), expected);
+                        assert_eq!(content.last().unwrap()["content"]["text"], "later");
+                        if expected == 2 {
+                            assert_eq!(content[0]["content"]["text"], "replacement");
+                        }
+                    }
+                    Ok(())
+                },
+            ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    server.abort();
+}
+
+async fn tool_attachment(
+    address: SocketAddr,
+    id: v2::SessionId,
+    replay: Option<v2::ReplayFrom>,
+) -> (serde_json::Value, Vec<serde_json::Value>) {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let boundary = tx.clone();
+    timeout(
+        Duration::from_secs(10),
+        Client
+            .v2()
+            .on_receive_notification(
+                async move |event: v2::UpdateSessionNotification, _: V2ConnectionTo<Agent>| {
+                    tx.send(Some(event)).map_err(Error::into_internal_error)
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(
+                HttpClient::new(format!("http://{address}")).unwrap(),
+                async move |cx| {
+                    cx.send_request(v2::InitializeRequest::new(
+                        ProtocolVersion::V2,
+                        v2::Implementation::new("tool-observer", "1"),
+                    ))
+                    .block_task()
+                    .await?;
+                    let mut request =
+                        v2::ResumeSessionRequest::new(id, std::env::current_dir().unwrap()).meta(
+                            v2::Meta::from_iter([(
+                                "hive".into(),
+                                serde_json::json!({"mode":"observe"}),
+                            )]),
+                        );
+                    request.replay_from = replay;
+                    let (completed, response) = oneshot::channel();
+                    cx.prepare_request(request)
+                        .on_receiving_result(async move |result| {
+                            // Close the ordered replay batch, including any duplicate or unexpected events.
+                            let _ = boundary.send(None);
+                            let _ = completed.send(result);
+                            Ok(())
+                        })?;
+                    let response = response.await.map_err(|_| Error::internal_error())??;
+                    let mut events = Vec::new();
+                    while let Some(event) = rx.recv().await.unwrap() {
+                        events.push(serde_json::to_value(event.update).unwrap());
+                    }
+                    Ok::<_, Error>((response.meta.unwrap()["hive"].clone(), events))
+                },
+            ),
+    )
+    .await
+    .unwrap()
+    .unwrap()
+}
+
 async fn plan_attachment(
     address: SocketAddr,
     id: v2::SessionId,

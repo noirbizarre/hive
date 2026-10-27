@@ -149,6 +149,7 @@ export function conversation() {
       if (update.kind === 'session') activity.session = update.status;
       for (const [type, id, value] of [['tools', update.toolCallId, update.tool],
         ['plans', update.planId, update.plan], ['tasks', update.taskId, update.task]]) {
+        // Full entity upserts must drop fields removed by authoritative content replacements.
         if (id && value) { activity[type][id] = value; activity.support[type] = 'observed'; }
       }
       activity.seq = number;

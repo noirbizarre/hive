@@ -221,6 +221,17 @@ git tpl diff --exit-code --stat
 # Artwork tasks belong here rather than in `default` or `check`: they rewrite
 # committed binaries, so a routine run would dirty the working tree every time.
 
+[tool_alias]
+bee = "github:noirbizarre/bee"
+
+[tools.bee]
+# Keep the external test agent on the shared install/PATH and checksum-locking path.
+version = "development"
+prerelease = true
+format = "raw"
+bin = "bee"
+platforms.windows-x64 = { bin = "bee.exe" }
+
 [tasks."hive:web"]
 description = "Build and test the embedded Vue browser client"
 depends = ["hive:web:build"]
@@ -248,6 +259,11 @@ run = "cargo run -p hive-cli -- tui"
 [tasks."hive:daemon"]
 description = "Run the Hive Daemon"
 run = "cargo run -p hive-cli -- daemon"
+
+[tasks."hive:test:bee"]
+description = "Run deterministic external Bee tests"
+depends = ["hive:web:build"]
+run = "cargo test --locked -p hive-daemon --test bee"
 
 [tasks.cli]
 description = "Run the Hive CLI"

@@ -45,6 +45,26 @@ checksum = "sha256:8a4e35ab0b331c85d73567b12f2a444df187f483e5079ceffa6bda1faa2e7
 url = "https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.zip"
 url_api = "https://api.github.com/repos/koalaman/shellcheck/releases/assets/279056944"
 
+[[tools.bee]]
+version = "development"
+backend = "github:noirbizarre/bee"
+specifiers = ["development"]
+
+[tools.bee."platforms.linux-x64"]
+checksum = "sha256:508684705cb9734b975b1162ea174eb8584391f6caa41555e64705cdc0eb5ca2"
+url = "https://github.com/noirbizarre/bee/releases/download/development/bee_development_linux-amd64"
+url_api = "https://api.github.com/repos/noirbizarre/bee/releases/assets/685850656"
+
+[tools.bee."platforms.macos-arm64"]
+checksum = "sha256:b846e679aed0878d85fb178540524aadd973c2dd7bb65784a01feb2fdbc77755"
+url = "https://github.com/noirbizarre/bee/releases/download/development/bee_development_darwin-arm64"
+url_api = "https://api.github.com/repos/noirbizarre/bee/releases/assets/685850653"
+
+[tools.bee."platforms.windows-x64"]
+checksum = "sha256:c541cbf997814ca1310062da7aaa8c8d52eedc20aab9a8164f89abaec5a52d67"
+url = "https://github.com/noirbizarre/bee/releases/download/development/bee_development_windows-amd64.exe"
+url_api = "https://api.github.com/repos/noirbizarre/bee/releases/assets/685850741"
+
 [[tools.cargo-binstall]]
 version = "1.22.0"
 backend = "aqua:cargo-bins/cargo-binstall"

@@ -3,6 +3,7 @@
 ## Setup and daily checks
 
 Install Rust through rustup and development tools with `mise install`.
+This includes Bee, the deterministic external agent used by the ordinary test suite.
 See [CONTRIBUTING.md](https://github.com/noirbizarre/hive/blob/main/CONTRIBUTING.md)
 for hooks, commit conventions, and releases.
 
@@ -12,6 +13,8 @@ for hooks, commit conventions, and releases.
 | Format / check formatting | `mise run format` / `mise run format:check` |
 | Clippy | `mise run lint` |
 | Deterministic tests | `mise run test` |
+| Install Bee test agent | `mise install bee` |
+| Focused external-agent tests | `mise run hive:test:bee` |
 | Coverage | `mise run cover` |
 | Markdown / spelling | `mise run lint:md` / `mise run spell` |
 | Build / preview docs | `mise run docs:build` / `mise run docs` |
@@ -86,6 +89,64 @@ prose explanation useful without the diagram, and verify rendering after
 instant navigation as well as a full page load.
 
 ## Real-agent compatibility probes
+
+### Deterministic Bee integration tests
+
+`crates/hive-daemon/tests/bee.rs` runs in the normal Cargo/nextest suite and the
+existing Linux, Windows, and macOS CI coverage matrix. Hive launches Bee as a
+separate native ACPv2 stdio agent; typed clients connect to Hive over WebSocket
+and HTTP/SSE. Bee's [documented scenarios](https://github.com/noirbizarre/bee/blob/main/docs/scenarios.md)
+provide repeatable behavior without credentials, an LLM, or external services.
+
+Provision the executable before testing:
+
+```sh
+mise install --locked
+mise run hive:web:build
+mise exec -- cargo test --locked -p hive-daemon --test bee
+```
+
+Bee is declared in the project-specific section of `mise.toml` using mise's
+GitHub backend. The normal `mise install` and existing CI mise action install
+the host's raw executable from Bee's **`development` prerelease** and expose
+`bee` (`bee.exe` on Windows) on PATH alongside the other tools. `mise.lock`
+records platform-specific artifact URLs and checksums for the Linux x64,
+macOS ARM64, and Windows x64 CI runners. Installation needs network access;
+tests do not.
+
+The development tag is mutable, so its lockfile digests identify the tested
+artifacts even when `bee --version` still reports the same version. To adopt
+a newer development build, refresh Bee's lock entries and reinstall it:
+
+```sh
+mise lock bee --platform linux-x64,macos-arm64,windows-x64
+mise install --locked --force bee
+```
+
+Review and commit the updated lockfile alongside any compatibility changes.
+Switch `tools.bee.version` to the next numbered release when adopting it.
+
+Tests themselves never download anything. They use `HIVE_BEE_COMMAND` when set,
+otherwise `bee` on PATH. Activate mise in your shell or use `mise exec --` when
+running Cargo directly. Overrides are executable paths, including paths with spaces;
+arguments remain separate. Missing executables, invalid `--version` output,
+and protocol failures fail the test rather than silently skipping it. Inspect
+the lockfile build evidence and the printed scenario/version/transport
+and bounded event-kind/sequence trace when diagnosing failures. Test diagnostics
+do not dump control metadata, prompts, or arbitrary downstream error data.
+
+Coverage includes streamed output and idempotency, plan replacements and
+attachment snapshots, start/incremental replay, live cross-transport reconnect,
+cancellation and active close, permissions, forms/capability fallback, pending
+interaction withdrawal, accepted errors, and Hive's minimal durable prompt
+receipts/terminal evidence. Event and response boundaries synchronize assertions
+without sleeps. An isolated test flow ensures broker/process cleanup also runs
+after assertion failures and timeouts.
+
+Bee scenario sessions do not survive process restart. The synthetic recovery
+fixtures below cover restart uncertainty and downstream history retention.
+Native plan events and Hive state are checked here; existing TUI/Web tests cover
+rendering. These deterministic tests complement the opt-in paid-agent probes.
 
 ### Session settings without inference
 

@@ -46,8 +46,16 @@ async fn fixture(
                 .on_receive_request(async move |request: v2::PromptRequest, responder: Responder<v2::PromptResponse>, cx: V2ConnectionTo<Client>| {
                     let report = report.clone();
                     let peer = cx.clone();
-                    cx.spawn(async move {
-                        let permission = |title| v2::RequestPermissionRequest::new(request.session_id.clone(), title,
+                 cx.spawn(async move {
+                        if mode == "stalled-permission" {
+                            // This peer acknowledges and reports running, but ignores session cancellation.
+                            responder.respond(v2::PromptResponse::new("accepted"))?;
+                            peer.send_notification(v2::UpdateSessionNotification::new(request.session_id.clone(), v2::SessionUpdate::StateUpdate(v2::StateUpdate::Running(v2::RunningStateUpdate::new()))))?;
+                            let result = peer.send_request(v2::RequestPermissionRequest::new(request.session_id, "Never settled", vec![v2::PermissionOption::new("allow", "Allow once", v2::PermissionOptionKind::AllowOnce)])).block_task().await;
+                            report.send(json!({"syntheticResponse": result.is_ok()})).unwrap();
+                            return Ok(());
+                        }
+                         let permission = |title| v2::RequestPermissionRequest::new(request.session_id.clone(), title,
                              vec![v2::PermissionOption::new("allow", "Allow once", v2::PermissionOptionKind::AllowOnce)])
                             .description("Review this operation")
                             .subject(serde_json::from_value::<v2::RequestPermissionSubject>(json!({"type":"future_operation","context":{"preserved":true}})).unwrap())
@@ -91,7 +99,28 @@ async fn fixture(
     )
     .unwrap();
     config.agents.insert("interactions".into(), profile);
-    let (address, gateway) = start_gateway(config).await;
+    let (address, gateway) = if mode == "stalled-permission" {
+        let directory = tempfile::tempdir().unwrap();
+        let broker =
+            hive_daemon::Broker::persistent(config, directory.path().join("hive/sessions.sqlite3"))
+                .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let origin = format!("http://{address}");
+        let server = tokio::spawn(async move {
+            // The private journal must outlive the server so watchdog recovery evidence remains observable.
+            let _directory = directory;
+            axum::serve(
+                listener,
+                hive_daemon::router_with_origin(broker, Some(&origin)),
+            )
+            .await
+            .unwrap();
+        });
+        (address, server)
+    } else {
+        start_gateway(config).await
+    };
     (address, gateway, agent, reports)
 }
 
@@ -343,6 +372,100 @@ async fn session_cancellation_withdraws_a_pending_permission_without_waiting_for
     .unwrap();
     gateway.abort();
     agent.abort();
+}
+
+#[tokio::test]
+async fn an_agent_that_never_settles_a_cancelled_dialog_is_fenced_for_recovery() {
+    let (address, gateway, agent, mut reports) = fixture("stalled-permission").await;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (updates, mut events) = mpsc::unbounded_channel();
+    let result = timeout(
+        Duration::from_secs(25),
+        Client
+            .v2()
+            .on_receive_notification(
+                async move |update: v2::UpdateSessionNotification, _: V2ConnectionTo<Agent>| {
+                    updates.send(update).unwrap();
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .on_receive_request(
+                async move |_: v2::RequestPermissionRequest,
+                            responder: Responder<v2::RequestPermissionResponse>,
+                            _: V2ConnectionTo<Agent>| {
+                    tx.send(responder).unwrap();
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .connect_with(
+                HttpClient::new(format!("ws://{address}")).unwrap(),
+                async move |cx| {
+                    let opened = initialize(&cx, false).await?;
+                    cx.send_request(
+                        v2::PromptRequest::new(opened.session_id.clone(), vec!["go".into()])
+                            .meta(controlled(&opened.meta, "stalled")),
+                    )
+                    .block_task()
+                    .await?;
+                    let dialog = rx.recv().await.unwrap();
+                    cx.send_notification(
+                        v2::CancelSessionNotification::new(opened.session_id.clone())
+                            .meta(opened.meta.clone()),
+                    )?;
+                    dialog.cancellation().cancelled().await;
+                    loop {
+                        let update =
+                            serde_json::to_value(events.recv().await.unwrap().update).unwrap();
+                        if update["sessionUpdate"] == "_hive_control"
+                            && update["recoveryRequired"] == true
+                        {
+                            break;
+                        }
+                    }
+                    // An HTTP peer may retain its own session after disconnect; it must not receive fabricated consent.
+                    assert!(matches!(
+                        reports.try_recv(),
+                        Err(mpsc::error::TryRecvError::Empty)
+                    ));
+                    let unavailable = cx
+                        .send_request(v2::ResumeSessionRequest::new(
+                            opened.session_id.clone(),
+                            std::env::current_dir().unwrap(),
+                        ))
+                        .block_task()
+                        .await
+                        .unwrap_err();
+                    assert_eq!(unavailable.code, Error::invalid_request().code);
+                    assert!(
+                        unavailable
+                            .data
+                            .unwrap()
+                            .as_str()
+                            .unwrap()
+                            .contains("downstream worker exited")
+                    );
+                    assert!(
+                        cx.send_request(
+                            v2::PromptRequest::new(
+                                opened.session_id,
+                                vec!["do not redispatch".into()]
+                            )
+                            .meta(controlled(&opened.meta, "new"))
+                        )
+                        .block_task()
+                        .await
+                        .is_err()
+                    );
+                    Ok::<_, Error>(())
+                },
+            ),
+    )
+    .await;
+    gateway.abort();
+    agent.abort();
+    result.unwrap().unwrap();
 }
 
 #[tokio::test]

@@ -313,11 +313,33 @@ infer it merely from negotiating protocol v2.
    when sufficient evidence exists, and record unassessed additions explicitly.
 5. Keep real-agent claims version/date/transport-specific. Retain probe summaries as
    described below; deterministic mocks do not upgrade product evidence. Cross-agent
-   coverage remains [#45](https://github.com/noirbizarre/hive/issues/45), and programmable
-   Bee test infrastructure remains [#57](https://github.com/noirbizarre/hive/issues/57).
+    coverage remains [#45](https://github.com/noirbizarre/hive/issues/45). Programmable
+    Bee tests ([#57](https://github.com/noirbizarre/hive/issues/57)) provide independent
+    deterministic ACPv2 evidence, as described below.
 6. Check navigation, preserved anchors, Markdown/spelling and the site build:
    `mise run lint:md`, `mise run spell`, `mise run docs:build`. Run relevant existing
-   gateway/client tests when refreshing behavioral claims; real-agent probes are opt-in.
+    gateway/client tests when refreshing behavioral claims; inference probes are opt-in.
+
+### Programmable Bee evidence
+
+`crates/hive-daemon/tests/bee.rs` exercises Bee's documented `--scenario` contract
+through Hive's normal subprocess connection and client-facing WebSocket/HTTP
+transports. It is part of the ordinary suite, including the existing three-OS
+CI matrix. The normal mise setup provisions Bee's `development` prerelease;
+`mise.lock` records each platform's artifact URL and checksum. This suite was
+exercised locally on Linux with Bee 0.1.1 and the published `development` build
+(which also reports version 0.1.1). A development-channel run
+must be identified by its lockfile build evidence, not represented as a stable
+release certification. See [development setup](development.md#deterministic-bee-integration-tests).
+
+The scenarios establish streamed-output correlation, prompt-key idempotency,
+structured plan replacement and attachment state, replay/live reconnect,
+cancellation/close, permission and form interactions (including capability
+fallback), accepted-turn failures, and Hive's minimal receipt/terminal journal.
+They require no model or provider network access at execution time. Plan and
+transcript bodies remain volatile Hive state, and Bee scenario history is
+memory-only. These tests do not establish restart retention, UI rendering, or
+support for features outside Bee's documented scenario subset.
 
 ## Protocol boundary
 
@@ -342,6 +364,7 @@ events. Permissions and supported elicitation are forwarded to the pilot.
 | V1 forwarded cancellation | Only a downstream `cancelled` result confirms cancellation; a different result or RPC failure keeps its own outcome | Gateway in-flight cancellation regression |
 | Native v2 idle/error | Forwards native state and emits one controlled `_hive_error` companion for both clients | Gateway, daemon projection, and client reducer regressions |
 | Repeated idle/error snapshots | Retains last-reported failure context once per foreground interval/idle episode, without adding completions | Daemon projection and client replay regressions |
+| Native v2 interruption without terminal confirmation | After a reported running/requires-action state, a 15-second watchdog ends the connection and retains interrupted-work recovery evidence; repeated cancels do not extend it | Gateway stalled-dialog regression and paused-time watchdog test |
 
 V2 permissions and
 session-scoped form/URL elicitation are forwarded to the pilot with a 120-second

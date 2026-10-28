@@ -146,6 +146,8 @@ struct Entry {
     control: Arc<Mutex<Control>>,
 }
 
+type NativeInterruption = watch::Sender<Option<tokio::time::Instant>>;
+
 struct Control {
     // Only live hop mappings can identify a request-scoped question's original requester.
     parents: HashMap<v1::RequestId, interactions::Parent>,
@@ -180,6 +182,8 @@ struct Control {
     last_activity_at: Option<u64>,
     catalog: watch::Sender<u64>,
     closing: bool,
+    // Native v2 dialog replies share the close-admission fence with the worker's watchdog.
+    native_interruption: Option<NativeInterruption>,
     prompts: HashMap<String, PromptRecord>,
     activity: Activity,
     plans: plans::Plans,
@@ -274,6 +278,16 @@ type WorkerStartup = (
 );
 
 impl Control {
+    fn begin_close(&mut self) -> agent_client_protocol::Result<()> {
+        if self.closing {
+            return Err(Error::invalid_request().data("session close is already in progress"));
+        }
+        // Fence late-registering dialogs atomically with close admission, before the worker runs.
+        begin_native_interruption(self);
+        self.closing = true;
+        Ok(())
+    }
+
     fn recovered(
         catalog: watch::Sender<u64>,
         version: AgentVersion,
@@ -318,6 +332,7 @@ impl Control {
             last_activity_at: record.last_activity_at,
             catalog,
             closing: false,
+            native_interruption: None,
             prompts: HashMap::new(),
             activity,
             plans: plans::Plans::default(),
@@ -383,6 +398,7 @@ impl Control {
             last_activity_at: None,
             catalog,
             closing: false,
+            native_interruption: None,
             prompts: HashMap::new(),
             activity,
             plans: plans::Plans::default(),
@@ -2562,14 +2578,22 @@ async fn run_agent(
         }
     };
     let downstream = Arc::new(Mutex::new(None::<v2::SessionId>));
+    // A queued cancel/close is not yet processed by the peer. Withhold synthetic dialog
+    // replies until its terminal state, so they cannot win the race and complete the turn normally.
+    let (interrupting, interrupted) = watch::channel(None);
+    control
+        .lock()
+        .expect("session state is not poisoned")
+        .native_interruption = Some(interrupting.clone());
     let cleanup = control.clone();
     let route = downstream.clone();
-    let result = Client
+    let connection = Client
         .v2()
         .on_receive_notification(
             {
                 let control = control.clone();
                 let hive_id = hive_id.clone();
+                let interrupting = interrupting.clone();
                 async move |notification: v2::UpdateSessionNotification,
                             _cx: V2ConnectionTo<Agent>| {
                     if route.lock().map_err(|_| Error::internal_error())?.as_ref()
@@ -2579,6 +2603,7 @@ async fn run_agent(
                     }
                     let idle = matches!(notification.update, v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(_)));
                     forward(&control, &hive_id, notification.update)?;
+                    if idle { interrupting.send_replace(None); }
                     if idle && !control.lock().map_err(|_| Error::internal_error())?.hydrating { schedule_price(control.clone(), hive_id.clone()); }
                     Ok(())
                 }
@@ -2590,6 +2615,7 @@ async fn run_agent(
                 let control = control.clone();
                 let downstream = downstream.clone();
                 let hive_id = hive_id.clone();
+                let interrupting = interrupting.clone();
                 async move |mut request: v2::RequestPermissionRequest,
                    responder: Responder<v2::RequestPermissionResponse>,
                    cx: V2ConnectionTo<Agent>| {
@@ -2603,8 +2629,13 @@ async fn run_agent(
                     let control = control.clone();
                     let epoch = control.lock().map_err(|_| Error::internal_error())?.interaction_epoch;
                     let cancellation = responder.cancellation();
+                    let mut interrupted = interrupting.subscribe();
                     cx.spawn(async move {
-                        let result = cancellation.run_until_cancelled(async { Ok(interactions::permission_at(control, request, epoch).await) }).await;
+                        let result = cancellation.run_until_cancelled(async {
+                            let result = interactions::permission_at(control, request, epoch).await;
+                            let _ = interrupted.wait_for(|pending| pending.is_none()).await;
+                            Ok(result)
+                        }).await;
                         let _ = responder.respond_with_result(result);
                         Ok(())
                     })
@@ -2617,6 +2648,7 @@ async fn run_agent(
                 let control = control.clone();
                 let downstream = downstream.clone();
                 let hive_id = hive_id.clone();
+                let interrupting = interrupting.clone();
                 async move |mut request: v2::CreateElicitationRequest,
                     responder: Responder<v2::CreateElicitationResponse>,
                     cx: V2ConnectionTo<Agent>| {
@@ -2641,8 +2673,13 @@ async fn run_agent(
                     }
                     let control = control.clone();
                     let cancellation = responder.cancellation();
+                    let mut interrupted = interrupting.subscribe();
                     cx.spawn(async move {
-                        let result = cancellation.run_until_cancelled(async { Ok(interactions::elicitation_at(control, request, epoch).await) }).await;
+                        let result = cancellation.run_until_cancelled(async {
+                            let result = interactions::elicitation_at(control, request, epoch).await;
+                            let _ = interrupted.wait_for(|pending| pending.is_none()).await;
+                            Ok(result)
+                        }).await;
                         let _ = responder.respond_with_result(result);
                         Ok(())
                     })
@@ -2800,7 +2837,11 @@ async fn run_agent(
                             tokio::select! {
                                 result = &mut prompt => break result,
                                 incoming = rx.recv() => match incoming {
-                                    Some(Command::Cancel(epoch)) if epoch == 0 || current(&control, epoch) => { let _ = cx.send_notification(v2::CancelSessionNotification::new(downstream_id.clone())); }
+                                    Some(Command::Cancel(epoch)) if epoch == 0 || current(&control, epoch) => {
+                                        begin_native_interruption(&control.lock().expect("session state is not poisoned"));
+                                        let _ = cx.send_notification(v2::CancelSessionNotification::new(downstream_id.clone()));
+                                        interactions::invalidate(&mut control.lock().expect("session state is not poisoned"));
+                                    }
                                     Some(Command::Cancel(_)) => {}
                                     Some(Command::Configure(change)) => change.finish(&hive_id, Err(session_config::failed())),
                                     Some(Command::Prompt(_, _, key)) => { complete(&control, &key, Err(PromptFailure::NotDispatched)); }
@@ -2810,9 +2851,13 @@ async fn run_agent(
                                             continue;
                                         }
                                         // Close must reach the peer before waiting for an insertion it may cancel.
-                                        let result = cx.send_request(v2::CloseSessionRequest::new(downstream_id.clone()))
-                                            .block_task().await.map(|_| ())
+                                        begin_native_interruption(&control.lock().expect("session state is not poisoned"));
+                                        let close = cx.send_request(v2::CloseSessionRequest::new(downstream_id.clone())).block_task();
+                                        // Queue close before a withdrawn dialog can be mistaken for a user dismissal.
+                                        interactions::invalidate(&mut control.lock().expect("session state is not poisoned"));
+                                        let result = close.await.map(|_| ())
                                             .map_err(|_| "agent close failed; check its availability".to_string());
+                                        interrupting.send_replace(None);
                                         if result.is_ok() {
                                             closing = Some(reply);
                                         } else {
@@ -2836,7 +2881,10 @@ async fn run_agent(
                     }
                     Command::Cancel(epoch) => {
                         if epoch == 0 || current(&control, epoch) {
+                            begin_native_interruption(&control.lock().expect("session state is not poisoned"));
                             let _ = cx.send_notification(v2::CancelSessionNotification::new(downstream_id.clone()));
+                            // Preserve downstream cancel-before-dialog-response ordering on the same connection.
+                            interactions::invalidate(&mut control.lock().expect("session state is not poisoned"));
                         }
                     }
                     Command::Close(generation, reply) => {
@@ -2844,15 +2892,18 @@ async fn run_agent(
                             let _ = reply.send(Err("controller was superseded; resume before closing".into()));
                             continue;
                         }
+                        begin_native_interruption(&control.lock().expect("session state is not poisoned"));
                         let close = cx
                             .send_request(v2::CloseSessionRequest::new(downstream_id.clone()))
                             .block_task();
+                        interactions::invalidate(&mut control.lock().expect("session state is not poisoned"));
                         for pending in configuration.drain(..) {
                             pending.cancel().await;
                         }
                         let result = close.await
                             .map(|_| ())
                             .map_err(|_| "agent close failed; check its availability".to_string());
+                        interrupting.send_replace(None);
                         let closed = result.is_ok();
                         let _ = reply.send(result);
                         if closed { break; }
@@ -2860,12 +2911,56 @@ async fn run_agent(
                 }
             }
             Ok(())
-        })
-        .await;
+        });
+    let result = tokio::select! {
+        result = connection => result,
+        _ = native_interruption_expired(interrupted) => {
+            // Drop the connection instead of releasing a dialog response that could invent completion.
+            tracing::warn!(code = "hive::interactions::interruption_timeout", "agent did not confirm cancellation; inspect its state before retrying");
+            Err(Error::internal_error().data("agent cancellation timed out; inspect its state before retrying"))
+        }
+    };
     if let Err(error) = result {
         tracing::warn!(code = ?error.code, "downstream agent connection closed");
     }
     abandon_prompts(&cleanup);
+}
+
+fn begin_native_interruption(state: &Control) {
+    // Pre-insertion questions may need a cancelled reply before the peer can acknowledge
+    // the prompt. Only an explicitly running lifecycle supplies a terminal-idle barrier.
+    if matches!(
+        state.current_state,
+        Some(v2::StateUpdate::Running(_) | v2::StateUpdate::RequiresAction(_))
+    ) && let Some(interrupting) = &state.native_interruption
+    {
+        // Repeated cancels must not extend the lifetime of an unresponsive peer.
+        interrupting.send_if_modified(|deadline| {
+            if deadline.is_some() {
+                return false;
+            }
+            *deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(15));
+            true
+        });
+    }
+}
+
+async fn native_interruption_expired(
+    mut interrupted: watch::Receiver<Option<tokio::time::Instant>>,
+) {
+    loop {
+        let deadline = *interrupted.borrow_and_update();
+        if let Some(deadline) = deadline {
+            tokio::select! {
+                // Prefer an already-observed idle over an expiring watchdog at the same instant.
+                biased;
+                changed = interrupted.changed() => if changed.is_err() { return; },
+                _ = tokio::time::sleep_until(deadline) => return,
+            }
+        } else if interrupted.changed().await.is_err() {
+            return;
+        }
+    }
 }
 
 /// ACPv1 prompt completion is a response, unlike v2's independent idle update.
@@ -3280,7 +3375,10 @@ async fn run_v1_agent(
                                 biased;
                                 result = &mut response => break result.unwrap_or(false),
                                 command = rx.recv() => match command {
-                                     Some(Command::Cancel(epoch)) if epoch == 0 || current(&control, epoch) => { let _ = cx.send_notification(v1::CancelNotification::new(downstream_id.clone())); }
+                                     Some(Command::Cancel(epoch)) if epoch == 0 || current(&control, epoch) => {
+                                         let _ = cx.send_notification(v1::CancelNotification::new(downstream_id.clone()));
+                                         interactions::invalidate(&mut control.lock().expect("session state is not poisoned"));
+                                     }
                                      Some(Command::Cancel(_)) => {}
                                      Some(Command::Configure(change)) => change.finish(&hive_id, Err(session_config::failed())),
                                      Some(Command::Prompt(_, _, key)) => { complete(&control, &key, Err(PromptFailure::NotDispatched)); }
@@ -3288,7 +3386,8 @@ async fn run_v1_agent(
                                          if generation != 0 && !current(&control, generation) {
                                              let _ = reply.send(Err("controller was superseded; resume before closing".into()));
                                          } else {
-                                             let _ = cx.send_notification(v1::CancelNotification::new(downstream_id.clone()));
+                                              let _ = cx.send_notification(v1::CancelNotification::new(downstream_id.clone()));
+                                              interactions::invalidate(&mut control.lock().expect("session state is not poisoned"));
                                              closing = Some(reply);
                                          }
                                      }
@@ -3304,6 +3403,7 @@ async fn run_v1_agent(
                     Command::Cancel(epoch) => {
                         if epoch == 0 || current(&control, epoch) {
                             let _ = cx.send_notification(v1::CancelNotification::new(downstream_id.clone()));
+                            interactions::invalidate(&mut control.lock().expect("session state is not poisoned"));
                         }
                     }
                     Command::Close(generation, reply) => {
@@ -3311,6 +3411,7 @@ async fn run_v1_agent(
                             let _ = reply.send(Err("controller was superseded; resume before closing".into()));
                             continue;
                         }
+                        interactions::invalidate(&mut control.lock().expect("session state is not poisoned"));
                         for pending in configuration.drain(..) {
                             pending.cancel().await;
                         }
@@ -3727,21 +3828,15 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
                         let mut state =
                             entry.control.lock().map_err(|_| Error::internal_error())?;
                         state.owner(&client_id, request.meta.as_ref())?;
-                        if state.closing {
-                            return responder.respond_with_error(
-                                Error::invalid_request()
-                                    .data("session close is already in progress"),
-                            );
-                        }
-                        // Prevent takeover while a close has been admitted but not completed.
-                        state.closing = true;
-                        interactions::invalidate(&mut state);
+                        // Prevent takeover and fence late dialog registration in the same admission lock.
+                        state.begin_close()?;
                         if entry
                             .commands
                             .send(Command::Close(state.generation, reply))
                             .is_err()
                         {
                             state.closing = false;
+                            if let Some(interrupting) = &state.native_interruption { interrupting.send_replace(None); }
                             return Err(
                                 Error::internal_error().data("agent disconnected during close")
                             );
@@ -3792,13 +3887,12 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
         .on_receive_notification(
             async move |request: v2::CancelSessionNotification, _cx: V2ConnectionTo<Client>| {
                 let entry = broker.entry(&request.session_id)?;
-                let mut state = entry.control.lock().map_err(|_| Error::internal_error())?;
+                let state = entry.control.lock().map_err(|_| Error::internal_error())?;
                 if state.owner(&client_id, request.meta.as_ref()).is_err() {
                     // JSON-RPC notifications have no response channel; never forward a stale cancel.
                     tracing::debug!("ignored cancel from stale Hive controller");
                     return Ok(());
                 }
-                interactions::invalidate(&mut state);
                 entry
                     .commands
                     .send(Command::Cancel(state.generation))
@@ -4077,6 +4171,50 @@ mod control_tests {
     }
 
     #[tokio::test]
+    async fn closing_fences_a_dialog_that_has_not_registered_before_the_worker_runs() {
+        let (interrupting, mut interrupted) = watch::channel(None);
+        let mut state = detached();
+        state.current_state = Some(v2::StateUpdate::Running(v2::RunningStateUpdate::new()));
+        state.native_interruption = Some(interrupting.clone());
+        let control = Arc::new(Mutex::new(state));
+        // Construct the handler now but defer registration until close admission has won.
+        let dialog = interactions::permission(
+            control.clone(),
+            v2::RequestPermissionRequest::new("session", "Run?", vec![]),
+        );
+        control.lock().unwrap().begin_close().unwrap();
+        assert!(matches!(
+            dialog.await.outcome,
+            v2::RequestPermissionOutcome::Cancelled
+        ));
+        assert!(
+            interrupted.borrow().is_some(),
+            "The response fence must already exist without worker progress"
+        );
+        interrupting.send_replace(None);
+        interrupted
+            .wait_for(|pending| pending.is_none())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeated_cancellation_cannot_extend_an_unresponsive_agents_deadline() {
+        let (interrupting, interrupted) = watch::channel(None);
+        let mut state = detached();
+        state.current_state = Some(v2::StateUpdate::Running(v2::RunningStateUpdate::new()));
+        state.native_interruption = Some(interrupting.clone());
+        let started = tokio::time::Instant::now();
+        begin_native_interruption(&state);
+        let deadline = *interrupting.borrow();
+        tokio::time::advance(std::time::Duration::from_secs(14)).await;
+        begin_native_interruption(&state);
+        assert_eq!(*interrupting.borrow(), deadline);
+        native_interruption_expired(interrupted).await;
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(15));
+    }
+
+    #[tokio::test]
     async fn cancellation_before_a_spawned_waiter_starts_cannot_revive_the_old_interaction() {
         let control = Arc::new(Mutex::new(detached()));
         let pending = interactions::permission(
@@ -4123,6 +4261,7 @@ mod control_tests {
             last_activity_at: None,
             catalog,
             closing: false,
+            native_interruption: None,
             prompts: HashMap::new(),
             activity: Activity::new(),
             plans: plans::Plans::default(),

@@ -538,6 +538,9 @@ impl Worker {
             }
             Command::Cancel(epoch) => {
                 if epoch == 0 || current(&self.control, epoch) {
+                    crate::interactions::invalidate(
+                        &mut self.control.lock().expect("session state is not poisoned"),
+                    );
                     self.withdraw_approvals(true);
                     // Also aborts an external turn: cancelling is a deliberate controller action.
                     if let Err(error) = self.native.abort().await {
@@ -547,6 +550,11 @@ impl Worker {
                 false
             }
             Command::Close(generation, reply) => {
+                if generation == 0 || current(&self.control, generation) {
+                    crate::interactions::invalidate(
+                        &mut self.control.lock().expect("session state is not poisoned"),
+                    );
+                }
                 if generation != 0 && !current(&self.control, generation) {
                     let _ = reply.send(Err(
                         "controller was superseded; resume before closing".into()

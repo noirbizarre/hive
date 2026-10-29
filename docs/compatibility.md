@@ -312,8 +312,8 @@ infer it merely from negotiating protocol v2.
    scope. A gap issue does not promise optional support. Remove unknown assessments
    when sufficient evidence exists, and record unassessed additions explicitly.
 5. Keep real-agent claims version/date/transport-specific. Retain probe summaries as
-   described below; deterministic mocks do not upgrade product evidence. Cross-agent
-    coverage remains [#45](https://github.com/noirbizarre/hive/issues/45). Programmable
+    described below; deterministic mocks do not upgrade product evidence. Cross-agent
+     replay coverage for [#45](https://github.com/noirbizarre/hive/issues/45) is listed below. Programmable
     Bee tests ([#57](https://github.com/noirbizarre/hive/issues/57)) provide independent
     deterministic ACPv2 evidence, as described below.
 6. Check navigation, preserved anchors, Markdown/spelling and the site build:
@@ -326,11 +326,11 @@ infer it merely from negotiating protocol v2.
 through Hive's normal subprocess connection and client-facing WebSocket/HTTP
 transports. It is part of the ordinary suite, including the existing three-OS
 CI matrix. The normal mise setup provisions Bee's pinned 0.2.0 release;
-`mise.lock` records each platform's artifact URL and checksum. This suite was
-exercised locally on Linux with Bee 0.1.1 and the published `development` build
-(which also reports version 0.1.1). A development-channel run
-must be identified by its lockfile build evidence, not represented as a stable
-release certification. See [development setup](development.md#deterministic-bee-integration-tests).
+`mise.lock` records each platform's artifact URL and checksum. All nine tests,
+including completed-conversation and tool-history reload, passed locally on Linux
+with Bee **0.2.0** on **2026-10-29**. Earlier runs used 0.1.1 and a published
+`development` build reporting 0.1.1; those are separate evidence. See
+[development setup](development.md#deterministic-bee-integration-tests).
 
 The scenarios establish streamed-output correlation, prompt-key idempotency,
 structured plan replacement and attachment state, replay/live reconnect,
@@ -340,6 +340,34 @@ They require no model or provider network access at execution time. Plan and
 transcript bodies remain volatile Hive state, and Bee scenario history is
 memory-only. These tests do not establish restart retention, UI rendering, or
 support for features outside Bee's documented scenario subset.
+
+### Session replay and reconnect regression contract
+
+Fresh clients explicitly request `replayFrom: start` and receive the original
+conversation once, in order. Reopening preserves both Hive and native session
+identity and the original cwd. Replay must not dispatch a prompt, rerun tools,
+or silently substitute a new session when retained history is unavailable.
+
+| Agent / version | Automated evidence | Boundary and expectations |
+| --- | --- | --- |
+| Hive deterministic fixture, ACPv1 and ACPv2 | `earlier_conversations_restore_once_under_the_original_identity_for_both_acp_versions` in `crates/hive-daemon/tests/gateway.rs` | Persistent broker restart: advertised v1 load is preferred, resume-only cannot supply earlier history, v2 requests `start`. Exact ordered text, repeated reopen, native identity/cwd, unchanged downstream session/prompt state, and failed attachment without replacement. |
+| Hive deterministic fixture, ACPv2 | `tool_replacements_agree_across_live_activity_attachment_and_replay` in the same file | Incremental and start replay restore tool content without incrementing the persisted execution counter. |
+| Bee 0.2.0, ACPv2 stdio | `completed_conversations_and_tools_reopen_once_in_order_without_new_work` in `crates/hive-daemon/tests/bee.rs` | Two completed turns, disconnect, three fresh-client reloads, both WS→HTTP and HTTP→WS. Exact message identity/order/content, completed tools without renewed permission, original native identity/cwd and receipts, then explicit continuation. Passed locally on Linux, 2026-10-29. |
+| OpenCode ACP, installed version reported at runtime | Opt-in `opencode_creates_prompts_and_reattaches_to_a_live_hive_session` in `crates/hive-daemon/tests/real_agents.rs` | Two completed turns, three fresh-client snapshots before another prompt, exact transcript comparison and stable native identity/cwd. OpenCode **1.19.5**, ACPv1 stdio, was attempted on Linux on 2026-10-29 but returned no assistant text in the first turn; live replay remains **unverified** for this version. |
+| Hive deterministic fixture, ACPv1 and ACPv2 | `the_opencode_replay_probe_checks_complete_history_with_a_deterministic_agent` in the same file | Ordinary CI executes the OpenCode probe's complete lifecycle and replay assertions against fixtures. This validates the harness, not OpenCode compatibility. |
+
+Live-worker replay is Hive's volatile transcript projection; it does not invoke
+downstream load/resume again. Bee scenario sessions are memory-only. Durable
+downstream restoration is covered separately by the restart matrix and opt-in
+native probes according to advertised capabilities. Successful empty or partial
+history remains usable with honest coverage warnings; unsupported, missing, or
+rejected restoration produces a controlled failure rather than a new session.
+OpenCode ACP evidence is separate from the OpenCode server adapter.
+
+Existing Web fresh-page tests and TUI projection tests cover snapshot replacement
+and client deduplication. The agent tests above use typed protocol clients rather
+than launching the browser or terminal UI. See the
+[replay probe instructions](development.md#session-replay-and-reconnect-coverage).
 
 ## Protocol boundary
 

@@ -139,7 +139,10 @@ Coverage includes streamed output and idempotency, plan replacements and
 attachment snapshots, start/incremental replay, live cross-transport reconnect,
 cancellation and active close, permissions, forms/capability fallback, pending
 interaction withdrawal, accepted errors, and Hive's minimal durable prompt
-receipts/terminal evidence. Event and response boundaries synchronize assertions
+receipts/terminal evidence. Completed text and permission/tool conversations also
+exercise repeated fresh-client reloads in both transport directions, checking
+exact message identity/order/content and unchanged native identity, cwd and
+receipts before an explicit continuation prompt. Event and response boundaries synchronize assertions
 without sleeps. An isolated test flow ensures broker/process cleanup also runs
 after assertion failures and timeouts.
 
@@ -172,7 +175,7 @@ summary. Keep source-inspected support separate from completed runtime probes.
 The mock gateway test (`cargo test -p hive-daemon --test gateway`) is the
 deterministic CI baseline. CLI lifecycle and status checks live in
 `cargo test -p hive-cli --test daemon`. `crates/hive-daemon/tests/real_agents.rs` contains
-five **ignored** tests, independently selectable for Pi or OpenCode. They run
+**ignored** probes, independently selectable for Pi or OpenCode. They run
 only with an explicit `HIVE_REAL_PI=1` or `HIVE_REAL_OPENCODE=1` opt-in. Missing
 binary/version or native session ID prints `SKIP` with the missing
 prerequisite. Once a configured binary is available, a failing protocol/model
@@ -212,8 +215,45 @@ For a configured OpenCode model, run:
 
 ```sh
 HIVE_REAL_OPENCODE=1 HIVE_REAL_OPENCODE_WIRE=v1 HIVE_REAL_OPENCODE_CWD=/absolute/empty/workspace \
-  cargo test -p hive-daemon --test real_agents opencode_creates_prompts_and_reattaches_to_a_live_hive_session -- --ignored --exact --nocapture
+  mise exec -- cargo test --locked -p hive-daemon --test real_agents opencode_creates_prompts_and_reattaches_to_a_live_hive_session -- --ignored --exact --nocapture
 ```
+
+#### Session replay and reconnect coverage
+
+The OpenCode lifecycle probe completes two model turns before disconnecting,
+then compares three fresh-client `start` snapshots across HTTP/SSE and WebSocket
+with the original transcript before explicitly prompting again. It verifies
+native session identity, cwd, ordering, duplicate identities, and absence of a
+new running turn or permission request during replay. It prints a `REPLAY` marker
+only after those checks pass. Startup/resume idle barriers without a terminal
+stop reason are not mistaken for completion of a new prompt.
+
+The probe uses up to three model turns. It remains opt-in because it requires
+an installed/authenticated agent and can incur model costs. A `SKIP` marker is
+not a compatibility pass; neither is initialization alone. On 2026-10-29 the
+installed OpenCode 1.19.5 ACPv1 probe failed in its first turn without observable
+assistant text, before reaching replay. No completed replay claim is made for
+that local configuration.
+
+Run the same probe logic without OpenCode or credentials in ordinary CI:
+
+```sh
+mise exec -- cargo test --locked -p hive-daemon --test real_agents \
+  the_opencode_replay_probe_checks_complete_history_with_a_deterministic_agent
+```
+
+This checks harness behavior against both ACP versions, not real-agent support.
+The Bee suite covers live-worker reload with the independent 0.2.0 scenario
+agent. The gateway restart matrix covers advertised ACPv1 load/resume and ACPv2
+retained-history restoration, including controlled unavailable-history failures
+and no fresh-session fallback. Persisted mock execution counts independently
+verify that tool replay does not rerun work; unchanged Hive receipts alone would
+not establish the absence of downstream dispatch. See the
+[compatibility evidence table](compatibility.md#session-replay-and-reconnect-regression-contract).
+
+If PATH selects an older Bee despite mise provisioning, set `HIVE_BEE_COMMAND`
+to the `bee` executable inside the directory reported by `mise where bee`.
+Keep the printed `BEE` version evidence with the test result.
 
 Pi defaults to an installed `pi-acp` (otherwise `npx -y pi-acp`) on wire v1.
 `hive doctor pi` runs the same probe from the CLI. The initialize-only probe

@@ -2577,6 +2577,29 @@ async fn restore_conversation(version: AgentVersion, mode: &str) -> std::path::P
     );
     let before: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&agent_state).unwrap()).unwrap();
+    let identity = || {
+        let db = rusqlite::Connection::open_with_flags(
+            &database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let record: String = db
+            .query_row(
+                "SELECT record FROM sessions WHERE id=?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let record: serde_json::Value = serde_json::from_str(&record).unwrap();
+        serde_json::json!({"id":record["id"], "nativeId":record["downstream_id"], "cwd":record["cwd"]})
+    };
+    let original_identity = identity();
+    assert_eq!(original_identity["id"], id.to_string());
+    assert!(!original_identity["nativeId"].as_str().unwrap().is_empty());
+    assert_eq!(
+        original_identity["cwd"],
+        std::env::current_dir().unwrap().to_str().unwrap()
+    );
     broker.shutdown().await;
     server.abort();
     let _ = server.await;
@@ -2706,6 +2729,12 @@ async fn restore_conversation(version: AgentVersion, mode: &str) -> std::path::P
                 }),
                 "{catalog}"
             );
+            // A failed startup restoration must also fail an actual fresh-client reopen;
+            // catalog diagnostics alone would miss an attachment fallback to a new session.
+            assert!(transcript_snapshot(address, id.clone()).await.is_err());
+            let after_failure = summaries(address).await;
+            assert_eq!(after_failure["sessions"].as_array().unwrap().len(), 1);
+            assert_eq!(after_failure["sessions"][0]["sessionId"], id.to_string());
         }
         "resume-only" => {
             let error = transcript_snapshot(address, id.clone()).await.unwrap_err();
@@ -2752,7 +2781,10 @@ async fn restore_conversation(version: AgentVersion, mode: &str) -> std::path::P
             let (texts, seq) = transcript_snapshot(address, id.clone()).await.unwrap();
             assert_eq!(texts, expected, "{version:?} {mode}");
             assert!(seq > old_seq, "restart must not reuse old live cursors");
-            assert_eq!(transcript_snapshot(address, id).await.unwrap().0, expected);
+            assert_eq!(
+                transcript_snapshot(address, id.clone()).await.unwrap().0,
+                expected
+            );
             let status = &catalog["sessions"][0]["transcript"];
             assert_eq!(status["source"], "agent_history");
             assert_eq!(status["restoration"], "supported");
@@ -2767,6 +2799,11 @@ async fn restore_conversation(version: AgentVersion, mode: &str) -> std::path::P
     }
     let after: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&agent_state).unwrap()).unwrap();
+    assert_eq!(
+        identity(),
+        original_identity,
+        "reopening must preserve native identity and cwd even when history is unavailable"
+    );
     assert_eq!(
         before["next"], after["next"],
         "restoration cannot create a replacement"
@@ -3272,11 +3309,19 @@ async fn live_tools_and_late_tasks_reach_every_observer_and_survive_live_only_re
 
 #[tokio::test]
 async fn tool_replacements_agree_across_live_activity_attachment_and_replay() {
-    let config = config_with_agent(
+    let directory = tempfile::tempdir().unwrap();
+    let agent_state = directory.path().join("agent.json");
+    let mut config = config_with_agent(
         "mock",
         env!("CARGO_BIN_EXE_hive-test-agent"),
         AgentVersion::V2,
     );
+    config
+        .agents
+        .get_mut("mock")
+        .unwrap()
+        .env
+        .insert("HIVE_MOCK_STATE".into(), agent_state.display().to_string());
     let (address, server) = start_gateway(config).await;
     let (tx, mut rx) = mpsc::unbounded_channel();
     timeout(
@@ -3334,6 +3379,13 @@ async fn tool_replacements_agree_across_live_activity_attachment_and_replay() {
                         tools
                     };
                     let tools = reduce(&live);
+                    let executions = || {
+                        let state: serde_json::Value =
+                            serde_json::from_slice(&std::fs::read(&agent_state).unwrap()).unwrap();
+                        state["executions"].clone()
+                    };
+                    let before = executions();
+                    assert_eq!(before["tool-content-sequence"], 1);
                     assert_eq!(tools.as_object().unwrap().len(), 3);
                     for id in ["replacement", "empty", "null"] {
                         let events: Vec<_> = live
@@ -3382,6 +3434,11 @@ async fn tool_replacements_agree_across_live_activity_attachment_and_replay() {
                     .await;
                     assert_eq!(incremental["activitySnapshot"]["tools"], tools);
                     assert_eq!(reduce(&events), tools);
+                    assert_eq!(
+                        executions(),
+                        before,
+                        "incremental replay must not execute tools again"
+                    );
                     let (full, events) = tool_attachment(
                         address,
                         opened.session_id,
@@ -3407,6 +3464,11 @@ async fn tool_replacements_agree_across_live_activity_attachment_and_replay() {
                             assert_eq!(content[0]["content"]["text"], "replacement");
                         }
                     }
+                    assert_eq!(
+                        executions(),
+                        before,
+                        "start replay must not execute tools again"
+                    );
                     Ok(())
                 },
             ),

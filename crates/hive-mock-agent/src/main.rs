@@ -610,6 +610,9 @@ async fn main() -> agent_client_protocol::Result<()> {
                         return Ok(());
                     }
                     if text.contains("tool-content-sequence") {
+                        // Persisted at the turn's idle barrier, this counts execution independently
+                        // of replayed tool updates so tests can detect hidden tool reruns.
+                        *state.lock().map_err(|_| Error::internal_error())?.executions.entry("tool-content-sequence".into()).or_default() += 1;
                         for (id, content) in [
                             ("replacement", serde_json::json!([{"type":"content","content":{"type":"text","text":"replacement"}}])),
                             ("empty", serde_json::json!([])),

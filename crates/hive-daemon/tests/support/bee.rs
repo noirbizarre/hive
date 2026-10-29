@@ -121,6 +121,39 @@ pub struct Peer {
 }
 
 impl Gateway {
+    pub fn identity_and_receipts(&self, id: &v2::SessionId) -> Value {
+        let db = rusqlite::Connection::open_with_flags(
+            &self.database,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let saved: String = db
+            .query_row(
+                "SELECT record FROM sessions WHERE id=?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let saved: Value = serde_json::from_str(&saved).unwrap();
+        let mut statement = db
+            .prepare("SELECT key,result,terminal FROM prompts WHERE session_id=?1 ORDER BY key")
+            .unwrap();
+        let receipts: Vec<Value> = statement
+            .query_map([id.to_string()], |row| {
+                Ok(json!([
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?
+                ]))
+            })
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        // Ownership generations and replay sequence reservations may change on attachment;
+        // native identity, workspace, and completed prompt evidence must not.
+        json!({"id": saved["id"], "nativeId": saved["downstream_id"], "cwd": saved["cwd"], "receipts": receipts})
+    }
+
     pub async fn client<F, Fut>(&self, scheme: &str, forms: bool, flow: F) -> Result
     where
         F: FnOnce(Peer) -> Fut + Send + 'static,

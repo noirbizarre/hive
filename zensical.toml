@@ -56,6 +56,7 @@ nav = [
     { "007: Human interactions" = "adr/007-capability-aware-human-interaction-routing.md" },
     { "008: Embedded Vue UI" = "adr/008-embedded-vue-interface.md" },
     { "009: Agent-owned history" = "adr/009-agent-owned-history-and-session-registry.md" },
+    { "011: Project and workspace domain" = "adr/011-project-and-workspace-domain.md" },
   ] },
   { "Development" = [
     { "Development guide" = "development.md" },

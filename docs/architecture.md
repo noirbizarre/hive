@@ -54,7 +54,7 @@ remains the session authority.
 | --- | --- |
 | `crates/hive-cli` | Executable, command dispatch, browser opening, doctor output |
 | `crates/hive-daemon` | HTTP boundary, shared broker, workers, control, persistence, activity and usage |
-| `crates/hive-core` | Transport-free Hive ID generation and declared lifecycle vocabulary |
+| `crates/hive-core` | Transport-free identities, project/workspace domain and backend contracts, declared session vocabulary |
 | `crates/hive-protocol` | SDK integration, protocol version type, native interaction validation |
 | `crates/hive-tui` | Terminal ACP client and UI |
 | `crates/hive-mock-agent` | Deterministic development/test agent |
@@ -62,7 +62,14 @@ remains the session authority.
 
 The CLI depends on daemon and TUI libraries. Those libraries do not depend on
 the CLI or each other. The operative broker lifecycle is implemented in the
-daemon, not derived from the unused lifecycle vocabulary in `hive-core`.
+daemon, not derived from the unused session lifecycle vocabulary in `hive-core`.
+
+Project and workspace contracts are defined in
+[ADR-011](adr/011-project-and-workspace-domain.md). They distinguish logical
+projects, per-node repository checkouts/caches, and concrete workspaces. Core
+enforces workspace state transitions and declares provisioning, inspection, cleanup,
+and optional global integration contracts. Runtime repository operations and session
+integration are subsequent work; the current broker still launches from a cwd.
 
 ## Session and process ownership
 

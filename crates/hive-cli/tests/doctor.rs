@@ -38,6 +38,53 @@ fn run(command: &mut std::process::Command) -> Output {
 }
 
 #[test]
+fn included_profiles_and_fragment_errors_reach_both_doctor_formats() {
+    let sandbox = Sandbox::new();
+    let config = sandbox.config("include = ['fragment.toml']");
+    let fragment = sandbox.0.join("fragment.toml");
+    for (text, code) in [
+        (
+            "[agents.gone]\ncommand = 'hive-definitely-not-installed'",
+            "hive::compat::binary_missing",
+        ),
+        (
+            "[agents.a]\ncommand = 42\nsecret = 'secret-value'",
+            "hive::config::syntax",
+        ),
+        ("include = ['secret-value']", "hive::config::syntax"),
+    ] {
+        std::fs::write(&fragment, text).unwrap();
+        for json in [false, true] {
+            let mut args = vec![
+                "doctor",
+                "--listen",
+                "127.0.0.1:0",
+                "--config",
+                config.to_str().unwrap(),
+            ];
+            if json {
+                args.push("--json");
+            }
+            let output = run(&mut sandbox.hive(&args));
+            assert_eq!(output.status.code(), Some(1));
+            let all = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(all.contains(code), "{all}");
+            assert!(!all.contains("secret-value"), "{all}");
+            if code == "hive::config::syntax" {
+                assert!(all.contains("fragment.toml"), "{all}");
+            }
+            if json {
+                let _: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
 fn a_broken_config_exits_non_zero_and_still_prints_valid_json() {
     let sandbox = Sandbox::new();
     let config = sandbox.config("default_agent = 'missing'\n");

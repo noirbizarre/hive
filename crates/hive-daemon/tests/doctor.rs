@@ -39,6 +39,28 @@ fn profile<'a>(report: &'a Report, id: &str) -> &'a hive_daemon::doctor::Profile
 }
 
 #[tokio::test]
+async fn included_agents_are_probed_and_composed_semantic_errors_are_collected() {
+    let sandbox = Sandbox::new();
+    let fragment = sandbox.0.join("agents.toml");
+    std::fs::write(&fragment, format!("[agents.good]\ncommand = '{MOCK}'\n")).unwrap();
+    let report = run(sandbox.options("include = ['agents.toml']\ndefault_agent = 'good'")).await;
+    assert!(!report.failed(), "{report:#?}");
+    assert_eq!(profile(&report, "good").status, Status::Pass);
+    std::fs::write(
+        &fragment,
+        format!("[agents.good]\ncommand = '{MOCK}'\n[agents.empty]\n"),
+    )
+    .unwrap();
+    let report = run(sandbox.options("include = ['agents.toml']\ndefault_agent = 'missing'")).await;
+    assert_eq!(
+        codes(&report.config.findings),
+        ["hive::config::default_agent", "hive::config::profile"]
+    );
+    assert_eq!(profile(&report, "good").status, Status::Pass);
+    assert_eq!(profile(&report, "empty").status, Status::Skip);
+}
+
+#[tokio::test]
 async fn healthy_v1_and_v2_agents_are_reported_with_their_capabilities() {
     let report = run(Sandbox::new().options(&format!(
         "[agents.modern]\ncommand = '{MOCK}'\n[agents.legacy]\ncommand = '{MOCK}'\nargs = ['v1']\nversions = ['v1']\n"

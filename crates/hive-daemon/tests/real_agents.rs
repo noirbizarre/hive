@@ -12,6 +12,8 @@ use hive_protocol::AgentVersion;
 use tokio::{sync::mpsc, time::timeout};
 
 const TURN_TIMEOUT: Duration = Duration::from_secs(120);
+const PROBE_PROMPT: &str =
+    "Reply with one short sentence about the weather on Mars. Do not use tools or read files.";
 
 struct Installation {
     id: &'static str,
@@ -152,6 +154,8 @@ fn stage(error: Error) -> String {
                     | "native v2 initialize failed"
                     | "native agent did not negotiate ACPv1"
                     | "native agent did not negotiate ACPv2"
+                    | "native agent does not advertise history restoration via session/load"
+                    | "native agent does not advertise session support for history restoration"
                     | "session/load rejected native ID; check cwd and native ACP load capability"
                     | "session/resume rejected native ID; check cwd and native ACP resume capability"
                     | "session/prompt acknowledgement timed out"
@@ -183,6 +187,7 @@ fn workspace(id: &str) -> Result<PathBuf, String> {
 #[derive(Default)]
 struct Observed {
     text: bool,
+    answer: String,
     running: bool,
     chunks: bool,
     snapshots: bool,
@@ -196,10 +201,8 @@ async fn turn(
     owner: &Option<v2::Meta>,
     key: &str,
 ) -> Result<Observed, String> {
-    let request = v2::PromptRequest::new(
-        id.clone(),
-        vec!["Reply with one short sentence about the weather on Mars. Do not use tools or read files.".into()],
-    ).meta(owned(owner, key));
+    let request =
+        v2::PromptRequest::new(id.clone(), vec![PROBE_PROMPT.into()]).meta(owned(owner, key));
     timeout(TURN_TIMEOUT, cx.send_request(request).block_task())
         .await
         .map_err(|_| "session/prompt acknowledgement timed out".to_string())?
@@ -215,6 +218,7 @@ async fn turn(
                     observed.chunks = true;
                     if let v2::ContentBlock::Text(text) = chunk.content {
                         observed.text |= !text.text.trim().is_empty();
+                        observed.answer.push_str(&text.text);
                     }
                 }
                 v2::SessionUpdate::AgentMessage(message) => {
@@ -223,11 +227,17 @@ async fn turn(
                         observed.text |= content.iter().any(|content| {
                             matches!(content, v2::ContentBlock::Text(text) if !text.text.trim().is_empty())
                         });
+                        observed.answer = content.iter().filter_map(|block| match block {
+                            v2::ContentBlock::Text(text) => Some(text.text.as_str()),
+                            _ => None,
+                        }).collect();
                     }
                 }
                 v2::SessionUpdate::ToolCallUpdate(_) => observed.tools = true,
                 v2::SessionUpdate::StateUpdate(v2::StateUpdate::Running(_)) => observed.running = true,
-                v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(_)) => return Ok(observed),
+                // Startup and resume barriers report current idle without ending the prompt
+                // just sent; only a terminal stop reason is evidence this turn completed.
+                v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(idle)) if idle.stop_reason.is_some() => return Ok(observed),
                 _ => {}
             }
         }
@@ -255,10 +265,16 @@ async fn run_probe(installation: Installation, configuration: bool) -> Result<()
     };
     let mut agents = BTreeMap::new();
     agents.insert(installation.id.into(), profile);
-    let broker = hive_daemon::Broker::new(Config {
-        default_agent: Some(installation.id.into()),
-        agents,
-    });
+    let directory = tempfile::tempdir().map_err(|_| "cannot create probe state directory")?;
+    let database = directory.path().join("hive/sessions.sqlite3");
+    let broker = hive_daemon::Broker::persistent(
+        Config {
+            default_agent: Some(installation.id.into()),
+            agents,
+        },
+        database.clone(),
+    )
+    .map_err(|_| "cannot open probe session database")?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(|_| "cannot bind loopback listener")?;
@@ -278,7 +294,7 @@ async fn run_probe(installation: Installation, configuration: bool) -> Result<()
         if configuration {
             configuration_lifecycle(address, installation.id).await
         } else {
-            lifecycle(address, installation.id).await
+            lifecycle(address, installation.id, database).await
         }
     });
     let result = timeout(Duration::from_secs(300), &mut flow).await;
@@ -346,7 +362,153 @@ async fn real_agent_settings_can_change_and_restore_without_inference() {
     }
 }
 
-async fn lifecycle(address: SocketAddr, id: &str) -> Result<(), String> {
+fn saved_identity(database: &std::path::Path, session: &v2::SessionId) -> serde_json::Value {
+    let db =
+        rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let record: String = db
+        .query_row(
+            "SELECT record FROM sessions WHERE id=?1",
+            [session.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let record: serde_json::Value = serde_json::from_str(&record).unwrap();
+    serde_json::json!({"id":record["id"], "nativeId":record["downstream_id"], "cwd":record["cwd"]})
+}
+
+async fn replay_snapshot(
+    address: SocketAddr,
+    scheme: &str,
+    session: v2::SessionId,
+    cwd: PathBuf,
+) -> Result<Vec<serde_json::Value>, String> {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let boundary = tx.clone();
+    let permissions = tx.clone();
+    timeout(
+        Duration::from_secs(30),
+        Client
+            .v2()
+            .on_receive_notification(
+                async move |update: v2::UpdateSessionNotification, _: V2ConnectionTo<Agent>| {
+                    tx.send(Some(
+                        serde_json::to_value(update).map_err(Error::into_internal_error)?,
+                    ))
+                    .map_err(Error::into_internal_error)
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .on_receive_request(
+                async move |_: v2::RequestPermissionRequest,
+                            responder: agent_client_protocol::Responder<
+                    v2::RequestPermissionResponse,
+                >,
+                            _: V2ConnectionTo<Agent>| {
+                    permissions
+                        .send(Some(serde_json::json!({"unexpectedPermission":true})))
+                        .map_err(Error::into_internal_error)?;
+                    responder.respond_with_error(Error::invalid_request())
+                },
+                agent_client_protocol::on_receive_request!(),
+            )
+            .connect_with(
+                HttpClient::new(format!("{scheme}://{address}"))
+                    .map_err(|_| "invalid replay URL")?,
+                async move |cx| {
+                    cx.send_request(v2::InitializeRequest::new(
+                        ProtocolVersion::V2,
+                        v2::Implementation::new("replay-probe", "1"),
+                    ))
+                    .block_task()
+                    .await?;
+                    let listed = cx
+                        .send_request(v2::ListSessionsRequest::new())
+                        .block_task()
+                        .await?;
+                    assert_eq!(
+                        listed.sessions.len(),
+                        1,
+                        "reopening must not replace or fork the conversation"
+                    );
+                    assert!(
+                        listed.sessions[0].session_id == session,
+                        "reopening changed the session identity"
+                    );
+                    assert!(
+                        serde_json::to_value(&listed.sessions[0]).unwrap()["cwd"]
+                            == cwd.to_str().unwrap(),
+                        "reopening changed the workspace"
+                    );
+                    let (done, response) = tokio::sync::oneshot::channel();
+                    cx.prepare_request(
+                        v2::ResumeSessionRequest::new(session.clone(), cwd)
+                            .replay_from(v2::ReplayFrom::Start(v2::ReplayFromStart::new()))
+                            .meta(v2::Meta::from_iter([(
+                                "hive".into(),
+                                serde_json::json!({"mode":"observe"}),
+                            )])),
+                    )
+                    .on_receiving_result(async move |result| {
+                        // Close the batch after every replay notification, not after a guessed message count.
+                        boundary.send(None).map_err(Error::into_internal_error)?;
+                        let _ = done.send(result);
+                        Ok(())
+                    })?;
+                    let attached = response.await.map_err(Error::into_internal_error)??;
+                    assert_eq!(attached.meta.as_ref().unwrap()["hive"]["running"], false);
+                    let mut messages = Vec::new();
+                    while let Some(event) = rx
+                        .recv()
+                        .await
+                        .expect("Replay connection ended before response boundary")
+                    {
+                        assert_ne!(
+                            event["unexpectedPermission"], true,
+                            "replay must not request permission again"
+                        );
+                        assert!(
+                            event["sessionId"] == session.to_string(),
+                            "replay crossed session identities"
+                        );
+                        let update = &event["update"];
+                        match update["sessionUpdate"].as_str() {
+                            Some("user_message" | "agent_message") => messages.push(update.clone()),
+                            Some("state_update") => assert_eq!(update["state"], "idle"),
+                            Some("user_message_chunk" | "agent_message_chunk") => panic!(
+                                "replay must restore snapshots without starting another turn"
+                            ),
+                            _ => {}
+                        }
+                        assert!(
+                            messages.len() <= 32,
+                            "Replay exceeded the short probe transcript budget"
+                        );
+                    }
+                    let ids: std::collections::BTreeSet<_> = messages
+                        .iter()
+                        .map(|message| {
+                            (
+                                message["sessionUpdate"].to_string(),
+                                message["messageId"].to_string(),
+                            )
+                        })
+                        .collect();
+                    assert_eq!(
+                        ids.len(),
+                        messages.len(),
+                        "replay duplicated message identities"
+                    );
+                    Ok(messages)
+                },
+            ),
+    )
+    .await
+    .map_err(|_| "transcript replay timed out".to_string())?
+    .map_err(|_| "transcript replay failed; inspect session history and agent capabilities".into())
+}
+
+async fn lifecycle(address: SocketAddr, id: &str, database: PathBuf) -> Result<(), String> {
     let cwd = workspace(id)?;
     let providers: serde_json::Value = reqwest::get(format!("http://{address}/v1/providers"))
         .await
@@ -358,6 +520,7 @@ async fn lifecycle(address: SocketAddr, id: &str) -> Result<(), String> {
         return Err("Hive did not register the requested stdio profile".into());
     }
     let (tx, mut rx) = mpsc::unbounded_channel();
+    let original_database = database.clone();
     let first = Client.v2().on_receive_notification(
         async move |update: v2::UpdateSessionNotification, _: V2ConnectionTo<Agent>| {
             tx.send(update).map_err(Error::into_internal_error)
@@ -378,8 +541,45 @@ async fn lifecycle(address: SocketAddr, id: &str) -> Result<(), String> {
         let observed = turn(&cx, &mut rx, &session, &opened.meta, "real-agent-first").await.map_err(|stage| diagnostic(&stage))?;
         if !observed.text { return Err(diagnostic("first turn completed without observable assistant text")); }
         eprintln!("FIRST running={} chunks={} snapshots={} tools={} idle=true text=true", observed.running, observed.chunks, observed.snapshots, observed.tools);
-        Ok((session, cwd))
+        let replay = if id == "opencode" {
+            let second = turn(&cx, &mut rx, &session, &opened.meta, "real-agent-before-reload").await.map_err(|stage| diagnostic(&stage))?;
+            assert!(second.text, "second turn must complete before reload");
+            let snapshot = replay_snapshot(address, "ws", session.clone(), cwd.clone()).await.map_err(|_| diagnostic("Hive live-worker session/resume failed"))?;
+            assert_eq!(snapshot.len(), 4, "both completed turns must be retained");
+            for (pair, answer) in snapshot.as_chunks::<2>().0.iter().zip([observed.answer, second.answer]) {
+                assert_eq!(pair[0]["sessionUpdate"], "user_message");
+                assert!(pair[0]["content"][0]["text"] == PROBE_PROMPT, "restored user content must match the submitted prompt");
+                assert_eq!(pair[1]["sessionUpdate"], "agent_message");
+                let text: String = pair[1]["content"].as_array().unwrap().iter().filter_map(|block| block["text"].as_str()).collect();
+                assert!(text == answer, "restored output must match the actual completed turn");
+            }
+            Some(snapshot)
+        } else { None };
+        let identity = saved_identity(&original_database, &session);
+        Ok((session, cwd, replay, identity))
     }).await.map_err(stage)?;
+    if let Some(expected) = &first.2 {
+        let identity = &first.3;
+        assert!(!identity["nativeId"].as_str().unwrap().is_empty());
+        assert!(
+            identity["cwd"] == first.1.to_str().unwrap(),
+            "saved workspace changed"
+        );
+        for scheme in ["http", "ws", "http"] {
+            let replay = replay_snapshot(address, scheme, first.0.clone(), first.1.clone()).await?;
+            assert!(
+                &replay == expected,
+                "fresh-client replay changed or duplicated retained history"
+            );
+            assert!(
+                &saved_identity(&database, &first.0) == identity,
+                "reopening changed native identity or workspace"
+            );
+        }
+        eprintln!(
+            "REPLAY agent={id} turns=2 reloads=3 ordered=true duplicates=false identity_preserved=true boundary=live-worker"
+        );
+    }
     let status: serde_json::Value = reqwest::get(format!("http://{address}/v1/status"))
         .await
         .map_err(|_| "Hive status request failed")?
@@ -408,7 +608,7 @@ async fn lifecycle(address: SocketAddr, id: &str) -> Result<(), String> {
                 .block_task()
                 .await
                 .map_err(|_| diagnostic("second Hive initialize failed"))?;
-                let (session, cwd) = first;
+                let (session, cwd, _, _) = first;
                 let listed = cx
                     .send_request(v2::ListSessionsRequest::new())
                     .block_task()
@@ -500,6 +700,7 @@ async fn native_session(installation: Installation) -> Result<(), String> {
             if !initialized.agent_capabilities.load_session {
                 return Err(diagnostic("native agent does not advertise history restoration via session/load"));
             }
+            eprintln!("NATIVE_CAPABILITIES wire=v1 load_session=true");
             cx.send_request(v1::LoadSessionRequest::new(native_id, cwd))
                 .block_task().await.map_err(|_| diagnostic("session/load rejected native ID; check cwd and native ACP load capability"))?;
             Ok(())
@@ -520,6 +721,10 @@ async fn native_session(installation: Installation) -> Result<(), String> {
             if initialized.protocol_version != ProtocolVersion::V2 {
                 return Err(diagnostic("native agent did not negotiate ACPv2"));
             }
+            if initialized.capabilities.session.is_none() {
+                return Err(diagnostic("native agent does not advertise session support for history restoration"));
+            }
+            eprintln!("NATIVE_CAPABILITIES wire=v2 session=true replay_from=start");
             cx.send_request(v2::ResumeSessionRequest::new(v2::SessionId::new(native_id), cwd).replay_from(v2::ReplayFrom::Start(v2::ReplayFromStart::new())))
                 .block_task().await.map_err(|_| diagnostic("session/resume rejected native ID; check cwd and native ACP resume capability"))?;
             Ok(())
@@ -584,6 +789,27 @@ async fn pi_creates_prompts_and_reattaches_to_a_live_hive_session() {
     let wire = installation.wire;
     if let Err(stage) = run(installation).await {
         panic!("Pi {version} stdio {wire:?}: {stage}");
+    }
+}
+
+#[tokio::test]
+async fn the_opencode_replay_probe_checks_complete_history_with_a_deterministic_agent() {
+    // Exercise the opt-in probe's assertions in ordinary CI without relying on
+    // credentials or model output; this is harness evidence, not OpenCode certification.
+    for wire in [AgentVersion::V1, AgentVersion::V2] {
+        run(Installation {
+            id: "opencode",
+            command: env!("CARGO_BIN_EXE_hive-test-agent").into(),
+            args: if wire == AgentVersion::V1 {
+                vec!["v1".into()]
+            } else {
+                Vec::new()
+            },
+            version: "deterministic-fixture".into(),
+            wire,
+        })
+        .await
+        .unwrap();
     }
 }
 

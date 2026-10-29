@@ -23,6 +23,203 @@ fn assert_sequences(events: &[Value]) {
     );
 }
 
+fn transcript(events: &[Value]) -> Vec<Value> {
+    events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event["update"]["sessionUpdate"].as_str(),
+                Some("user_message" | "agent_message" | "tool_call_update")
+            )
+        })
+        .map(|event| event["update"].clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn completed_conversations_and_tools_reopen_once_in_order_without_new_work() {
+    for scenario in ["success", "permission"] {
+        run(scenario, move |gateway| async move {
+            for (from, to) in [("ws", "http"), ("http", "ws")] {
+                let storage = gateway.clone();
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                gateway
+                    .client(from, false, async move |mut peer| {
+                        let opened = peer.open(storage.cwd.clone()).await?;
+                        let mut live = Vec::new();
+                        for key in ["first", "second"] {
+                            let receipt = peer.prompt(&opened, key).await?;
+                            if scenario == "permission" {
+                                loop {
+                                    match peer.event().await {
+                                        Event::Update(update) => {
+                                            live.push(serde_json::to_value(update).unwrap())
+                                        }
+                                        Event::Permission(_, responder) => {
+                                            responder.respond(
+                                                v2::RequestPermissionResponse::new(
+                                                    v2::RequestPermissionOutcome::Selected(
+                                                        v2::SelectedPermissionOutcome::new(
+                                                            "allow_once",
+                                                        ),
+                                                    ),
+                                                ),
+                                            )?;
+                                            break;
+                                        }
+                                        _ => panic!("Expected the live fixture permission request"),
+                                    }
+                                }
+                            }
+                            live.extend(peer.idle("end_turn").await);
+                            storage.journal(&opened.session_id, key, &receipt, "completed");
+                        }
+                        let (_, snapshot) = peer
+                            .attach(
+                                opened.session_id.clone(),
+                                storage.cwd.clone(),
+                                Some(v2::ReplayFrom::Start(v2::ReplayFromStart::new())),
+                                true,
+                            )
+                            .await?;
+                        let expected = transcript(&snapshot);
+                        let messages: Vec<_> = expected
+                            .iter()
+                            .filter(|update| update["sessionUpdate"] != "tool_call_update")
+                            .collect();
+                        assert_eq!(messages.len(), 4);
+                        let users = native(&live, "user_message");
+                        let chunks = native(&live, "agent_message_chunk");
+                        for (index, pair) in messages.as_chunks::<2>().0.iter().enumerate() {
+                            assert_eq!(pair[0]["sessionUpdate"], "user_message");
+                            assert_eq!(pair[0]["messageId"], users[index]["messageId"]);
+                            assert_eq!(pair[0]["content"], users[index]["content"]);
+                            assert_eq!(pair[1]["sessionUpdate"], "agent_message");
+                            let id = &pair[1]["messageId"];
+                            let content: String = chunks
+                                .iter()
+                                .filter(|chunk| &chunk["messageId"] == id)
+                                .map(|chunk| chunk["content"]["text"].as_str().unwrap())
+                                .collect();
+                            assert_eq!(pair[1]["content"][0]["text"], content);
+                        }
+                        let identities: std::collections::BTreeSet<_> = messages
+                            .iter()
+                            .map(|message| {
+                                (
+                                    message["sessionUpdate"].to_string(),
+                                    message["messageId"].to_string(),
+                                )
+                            })
+                            .collect();
+                        assert_eq!(identities.len(), 4);
+                        if scenario == "permission" {
+                            let tools = native(&snapshot, "tool_call_update");
+                            assert_eq!(tools.len(), 2);
+                            assert!(tools.iter().all(|tool| tool["status"] == "completed"));
+                        }
+                        let evidence = storage.identity_and_receipts(&opened.session_id);
+                        assert_eq!(evidence["id"], opened.session_id.to_string());
+                        assert!(!evidence["nativeId"].as_str().unwrap().is_empty());
+                        assert_eq!(evidence["cwd"], storage.cwd.to_str().unwrap());
+                        assert_eq!(evidence["receipts"].as_array().unwrap().len(), 2);
+                        tx.send((opened.session_id, expected, evidence)).unwrap();
+                        Ok(())
+                    })
+                    .await?;
+                let (id, expected, evidence) = rx.await.map_err(Error::into_internal_error)?;
+                // Each connection starts with an empty view, as a page reload does; snapshots
+                // must be complete and identical rather than append another copy of history.
+                for scheme in [to, from, to] {
+                    let id = id.clone();
+                    let expected = expected.clone();
+                    let evidence = evidence.clone();
+                    let storage = gateway.clone();
+                    gateway
+                        .client(scheme, false, async move |mut peer| {
+                            let listed = peer
+                                .cx
+                                .send_request(v2::ListSessionsRequest::new())
+                                .block_task()
+                                .await?;
+                            assert_eq!(
+                                listed.sessions.len(),
+                                1,
+                                "reopening must not create another conversation"
+                            );
+                            let entry = listed
+                                .sessions
+                                .iter()
+                                .find(|entry| entry.session_id == id)
+                                .unwrap();
+                            assert_eq!(
+                                serde_json::to_value(entry).unwrap()["cwd"],
+                                storage.cwd.to_str().unwrap()
+                            );
+                            let (attached, replay) = peer
+                                .attach(
+                                    id.clone(),
+                                    storage.cwd.clone(),
+                                    Some(v2::ReplayFrom::Start(v2::ReplayFromStart::new())),
+                                    false,
+                                )
+                                .await?;
+                            assert_eq!(transcript(&replay), expected);
+                            assert!(
+                                replay
+                                    .iter()
+                                    .all(|event| event["sessionId"] == id.to_string())
+                            );
+                            assert!(native(&replay, "agent_message_chunk").is_empty());
+                            assert!(native(&replay, "user_message_chunk").is_empty());
+                            assert!(
+                                native(&replay, "state_update")
+                                    .iter()
+                                    .all(|state| state["state"] == "idle")
+                            );
+                            assert_eq!(attached.meta.as_ref().unwrap()["hive"]["running"], false);
+                            assert_eq!(storage.identity_and_receipts(&id), evidence);
+                            Ok(())
+                        })
+                        .await?;
+                }
+                let storage = gateway.clone();
+                gateway
+                    .client(to, false, async move |mut peer| {
+                        let (attached, _) =
+                            peer.attach(id.clone(), storage.cwd, None, false).await?;
+                        let opened = v2::NewSessionResponse::new(id).meta(attached.meta);
+                        peer.prompt(&opened, "third").await?;
+                        if scenario == "permission" {
+                            loop {
+                                match peer.event().await {
+                                    Event::Update(_) => {}
+                                    Event::Permission(_, responder) => {
+                                        responder.respond(v2::RequestPermissionResponse::new(
+                                            v2::RequestPermissionOutcome::Selected(
+                                                v2::SelectedPermissionOutcome::new("allow_once"),
+                                            ),
+                                        ))?;
+                                        break;
+                                    }
+                                    _ => panic!(
+                                        "Expected a permission only after the explicit new prompt"
+                                    ),
+                                }
+                            }
+                        }
+                        peer.idle("end_turn").await;
+                        peer.close(&opened).await?;
+                        Ok(())
+                    })
+                    .await?;
+            }
+            Ok(())
+        })
+        .await;
+    }
+}
+
 #[tokio::test]
 async fn streamed_turns_are_correlated_and_idempotent_on_both_transports() {
     run("success", |gateway| async move {

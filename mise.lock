@@ -51,19 +51,19 @@ backend = "github:noirbizarre/bee"
 specifiers = ["development"]
 
 [tools.bee."platforms.linux-x64"]
-checksum = "sha256:508684705cb9734b975b1162ea174eb8584391f6caa41555e64705cdc0eb5ca2"
+checksum = "sha256:1d3503e6f99f02db45c0fb18104fdf6ac7ea83c7fa3fcf46bed6c3bfed42ee18"
 url = "https://github.com/noirbizarre/bee/releases/download/development/bee_development_linux-amd64"
-url_api = "https://api.github.com/repos/noirbizarre/bee/releases/assets/685850656"
+url_api = "https://api.github.com/repos/noirbizarre/bee/releases/assets/686881640"
 
 [tools.bee."platforms.macos-arm64"]
-checksum = "sha256:b846e679aed0878d85fb178540524aadd973c2dd7bb65784a01feb2fdbc77755"
+checksum = "sha256:70a7fc999030e5af9d33a9a681608e54dfda789268967b1b1ad030e67a89ef56"
 url = "https://github.com/noirbizarre/bee/releases/download/development/bee_development_darwin-arm64"
-url_api = "https://api.github.com/repos/noirbizarre/bee/releases/assets/685850653"
+url_api = "https://api.github.com/repos/noirbizarre/bee/releases/assets/686881643"
 
 [tools.bee."platforms.windows-x64"]
-checksum = "sha256:c541cbf997814ca1310062da7aaa8c8d52eedc20aab9a8164f89abaec5a52d67"
+checksum = "sha256:01ea3adc432f03bcf414e1360e50b63856a0981e7a4e5fa8761f0a7548b21291"
 url = "https://github.com/noirbizarre/bee/releases/download/development/bee_development_windows-amd64.exe"
-url_api = "https://api.github.com/repos/noirbizarre/bee/releases/assets/685850741"
+url_api = "https://api.github.com/repos/noirbizarre/bee/releases/assets/686881713"
 
 [[tools.cargo-binstall]]
 version = "1.22.0"

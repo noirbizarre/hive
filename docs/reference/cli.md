@@ -11,6 +11,7 @@ Use `hive <command> --help` for the installed executable's exact help.
 | `hive daemon` | Foreground daemon | `--listen`, `--config` |
 | `hive daemon status` | Print daemon status response | `--url` |
 | `hive daemon reload` | Reload the original config for new sessions | `--url` |
+| `hive project <command>` | Manage project definitions and node-local overrides | `--url` |
 | `hive web` | Open embedded browser client | `--url` |
 | `hive doctor [AGENT]...` | Diagnose all or selected profiles and daemon setup | `--config`, `--listen`, `--json` |
 | `hive completions <shell>` | Write shell completion script to stdout | Shell argument |
@@ -44,7 +45,7 @@ prompting and does not create daemon lock/state files.
 
 ## Web, status, and reload URLs
 
-Their daemon base URL is selected in this order:
+Their daemon base URL, also used by project commands, is selected in this order:
 
 1. Explicit `--url`.
 2. `HIVE_URL`.
@@ -72,8 +73,8 @@ status on failure. Unix SIGHUP invokes the same operation. See
 | --- | --- | --- |
 | `HIVE_CONFIG` | Daemon, doctor, serve | Configuration file |
 | `HIVE_DEFAULT_AGENT` | Configuration loading | Override default profile ID |
-| `HIVE_LISTEN` | Daemon, doctor, serve | Listen address; URL fallback for status/web/reload |
-| `HIVE_URL` | Status, web, reload | Daemon base URL |
+| `HIVE_LISTEN` | Daemon, doctor, serve | Listen address; URL fallback for status/web/reload/project |
+| `HIVE_URL` | Status, web, reload, project | Daemon base URL |
 | `RUST_LOG` | Daemon tracing | Log filter |
 | `VISUAL` | TUI | Preferred external prompt editor, executable and arguments |
 | `EDITOR` | TUI | Prompt editor when `VISUAL` is empty or unset |
@@ -87,6 +88,43 @@ credentials and profile `password_env` variables belong to the daemon environmen
 
 The TUI's `Ctrl-X`, `Ctrl-E` editor shortcut uses `vi` if both editor variables
 are empty or unset. See [external editing](../guides/tui.md#use-an-external-editor).
+
+## Projects
+
+Project commands print JSON and use the same daemon URL precedence as status.
+`--url` works anywhere after `hive project`. Definitions registered through the
+CLI persist in the daemon's database, independently of TOML-owned definitions.
+
+```sh
+hive project register --name Hive --remote https://github.com/noirbizarre/hive.git \
+  --default-ref main --preparation '[["mise","install"]]'
+hive project list
+hive project show project-11111111-1111-4111-8111-111111111111
+hive project update project-11111111-1111-4111-8111-111111111111 --name "Hive renamed"
+hive project remove project-11111111-1111-4111-8111-111111111111
+```
+
+Registration allocates an ID unless `--id` is supplied. Only `--name` is required;
+omit `--remote` for local-only projects. Update replaces all metadata: omitted
+remote/ref fields are cleared and preparation defaults to `[]`. Registration and
+update do not clone or execute preparation. Config-owned update/removal is rejected;
+edit TOML and run `hive daemon reload` instead.
+
+Directory overrides require an explicit stable node ID; Hive does not allocate a
+new node identity for each request:
+
+```sh
+hive project override set project-11111111-1111-4111-8111-111111111111 \
+  node-22222222-2222-4222-8222-222222222222 /home/user/work/hive
+hive project override show project-11111111-1111-4111-8111-111111111111 \
+  node-22222222-2222-4222-8222-222222222222
+hive project override remove project-11111111-1111-4111-8111-111111111111 \
+  node-22222222-2222-4222-8222-222222222222
+```
+
+Use `--syntax windows` for Windows absolute paths; the default is `posix`.
+Removing a project only removes its definition, preserving all local directories,
+overrides, repository instances, and workspaces.
 
 ## Shell completions
 

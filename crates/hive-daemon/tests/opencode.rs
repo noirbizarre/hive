@@ -32,6 +32,7 @@ fn cwd() -> String {
 
 fn opencode_profile(url: &str, password_env: Option<&str>) -> Profile {
     Profile {
+        project: None,
         name: None,
         kind: ProfileKind::OpencodeServer,
         command: None,
@@ -52,6 +53,7 @@ fn config(url: &str) -> Config {
 
 fn config_with(profile: Profile) -> Config {
     Config {
+        projects: Default::default(),
         default_agent: Some("oc".into()),
         agents: BTreeMap::from([("oc".into(), profile)]),
     }

@@ -5,12 +5,15 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use hive_core::{identity::ProjectId, project::ProjectDefinition};
 use hive_protocol::AgentVersion;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(default)]
+    pub projects: BTreeMap<ProjectId, ProjectDefinition>,
     pub default_agent: Option<String>,
     #[serde(default)]
     pub agents: BTreeMap<String, Profile>,
@@ -20,6 +23,8 @@ pub struct Config {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RootDocument {
+    #[serde(default)]
+    projects: BTreeMap<ProjectId, ProjectDefinition>,
     default_agent: Option<String>,
     #[serde(default)]
     include: Vec<String>,
@@ -30,6 +35,8 @@ struct RootDocument {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FragmentDocument {
+    #[serde(default)]
+    projects: BTreeMap<ProjectId, ProjectDefinition>,
     #[serde(default)]
     agents: BTreeMap<String, Profile>,
 }
@@ -96,6 +103,7 @@ impl ProfileKind {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
+    pub project: Option<ProjectId>,
     pub name: Option<String>,
     #[serde(default)]
     pub kind: ProfileKind,
@@ -163,6 +171,14 @@ fn is_loopback_host(host: &str) -> bool {
 /// pasted into bug reports and these messages are printed by `hive doctor`.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error, miette::Diagnostic)]
 pub enum ConfigError {
+    #[error("{0}")]
+    #[diagnostic(
+        code(hive::config::project),
+        help(
+            "declare valid, unique project IDs under [projects] before referencing them from agents; declarations may be in any included file"
+        )
+    )]
+    Project(String),
     #[error("{0}")]
     #[diagnostic(
         code(hive::config::unreadable),
@@ -453,11 +469,26 @@ impl Config {
         }
         for (id, profile) in &self.agents {
             let mut found = Vec::new();
+            if let Some(project) = &profile.project
+                && !self.projects.contains_key(project)
+            {
+                found.push(ConfigError::Project(format!(
+                    "agent '{id}' references an unconfigured project"
+                )));
+            }
             validate_profile(id, profile, &mut found);
             problems.extend(found.into_iter().map(|error| Problem {
                 agent: Some(id.clone()),
                 error,
             }));
+        }
+        for (id, definition) in &self.projects {
+            if let Err(error) = definition.validate() {
+                problems.push(Problem {
+                    agent: None,
+                    error: ConfigError::Project(format!("project '{id}': {error}")),
+                });
+            }
         }
         problems
     }
@@ -564,6 +595,7 @@ fn include_paths(root: &Path, entry: &str, index: usize) -> Result<Vec<PathBuf>,
 
 fn compose(root: &Path, document: RootDocument) -> Result<Config, ConfigError> {
     let mut config = Config {
+        projects: document.projects,
         default_agent: document.default_agent,
         agents: document.agents,
     };
@@ -571,6 +603,11 @@ fn compose(root: &Path, document: RootDocument) -> Result<Config, ConfigError> {
     let mut files = BTreeMap::from([(identity, root.to_path_buf())]);
     let mut origins: BTreeMap<_, _> = config
         .agents
+        .keys()
+        .map(|id| (id.clone(), root.to_path_buf()))
+        .collect();
+    let mut project_origins: BTreeMap<_, _> = config
+        .projects
         .keys()
         .map(|id| (id.clone(), root.to_path_buf()))
         .collect();
@@ -588,6 +625,16 @@ fn compose(root: &Path, document: RootDocument) -> Result<Config, ConfigError> {
             }
             let text = std::fs::read_to_string(&path).map_err(|error| unreadable(&path, error))?;
             let fragment: FragmentDocument = parse_document(&path, &text)?;
+            for (id, definition) in fragment.projects {
+                if let Some(previous) = project_origins.insert(id.clone(), path.clone()) {
+                    return Err(ConfigError::Project(format!(
+                        "project '{id}' is defined in both {} and {}",
+                        previous.display(),
+                        path.display()
+                    )));
+                }
+                config.projects.insert(id, definition);
+            }
             for (id, profile) in fragment.agents {
                 if let Some(previous) = origins.insert(id.clone(), path.clone()) {
                     return Err(ConfigError::DuplicateAgent(format!(
@@ -639,6 +686,58 @@ pub fn default_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn project_references_resolve_after_all_fragments_in_either_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("hive.toml");
+        let id = hive_core::identity::ProjectId::new();
+        let declaration = format!(
+            "[projects.{id}]\nname = 'Portable'\nrepository_source = 'git@example.test:repo'\n"
+        );
+        std::fs::write(directory.path().join("project.toml"), &declaration).unwrap();
+        std::fs::write(
+            directory.path().join("agent.toml"),
+            format!("[agents.coder]\ncommand = 'unused'\nproject = '{id}'\n"),
+        )
+        .unwrap();
+        for includes in [
+            "['agent.toml','project.toml']",
+            "['project.toml','agent.toml']",
+        ] {
+            std::fs::write(&root, format!("include = {includes}\n")).unwrap();
+            let config = super::ConfigSource::new(Some(root.clone()))
+                .unwrap()
+                .load()
+                .unwrap();
+            assert_eq!(config.agents["coder"].project.as_ref(), Some(&id));
+            assert_eq!(config.projects[&id].name, "Portable");
+        }
+        // Changing the containing filename cannot allocate a new logical identity.
+        std::fs::rename(
+            directory.path().join("project.toml"),
+            directory.path().join("moved.toml"),
+        )
+        .unwrap();
+        std::fs::write(&root, "include = ['agent.toml','moved.toml']").unwrap();
+        assert!(
+            super::ConfigSource::new(Some(root.clone()))
+                .unwrap()
+                .load()
+                .unwrap()
+                .projects
+                .contains_key(&id)
+        );
+        std::fs::write(&root, "include = ['agent.toml']").unwrap();
+        assert!(matches!(
+            super::ConfigSource::new(Some(root.clone())).unwrap().load(),
+            Err(super::ConfigError::Project(_))
+        ));
+        std::fs::write(&root, format!("include = ['moved.toml']\n{declaration}")).unwrap();
+        assert!(matches!(
+            super::ConfigSource::new(Some(root)).unwrap().load(),
+            Err(super::ConfigError::Project(_))
+        ));
+    }
     use super::{Config, ConfigError, ConfigSource};
 
     fn read_fragments(root: &str, files: &[(&str, &str)]) -> Result<Config, ConfigError> {

@@ -42,7 +42,7 @@ flowchart TB
 The diagram separates three boundaries:
 
 - **ACP** carries conversation, control, and agent interactions.
-- **Operational HTTP** carries discovery, summaries, readiness, and assets.
+- **Operational HTTP** carries discovery, summaries, readiness, project administration, and assets.
 - **Workers** translate the chosen downstream adapter into the shared broker contract.
 
 Clients do not own Hive sessions. SQLite provides durable bookkeeping; the daemon
@@ -70,6 +70,13 @@ projects, per-node repository checkouts/caches, and concrete workspaces. Core
 enforces workspace state transitions and declares provisioning, inspection, cleanup,
 and optional global integration contracts. Runtime repository operations and session
 integration are subsequent work; the current broker still launches from a cwd.
+
+The daemon combines config-owned project declarations with separately persisted
+managed definitions. Explicit IDs cannot overlap across those authorities.
+Configuration references resolve after all fragments compose. CRUD and reload
+share a publication gate; database commits precede catalog invalidation. Node-local
+path overrides are independent metadata, not repository instances or workspaces.
+See [registry authority](adr/011-project-and-workspace-domain.md#project-registry-authority).
 
 ## Session and process ownership
 

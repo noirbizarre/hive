@@ -19,6 +19,11 @@ use crate::{
 
 #[derive(Debug, thiserror::Error, Diagnostic)]
 pub enum ReloadError {
+    #[error(
+        "configured project '{0}' already belongs to the durable registry; remove or rename one definition and reload"
+    )]
+    #[diagnostic(code(hive::project::collision))]
+    ProjectCollision(hive_core::identity::ProjectId),
     #[error("this broker has no configuration file; start Hive with a configuration source")]
     #[diagnostic(code(hive::reload::no_source))]
     NoSource,
@@ -42,7 +47,7 @@ impl ReloadError {
     pub(crate) fn response(self) -> (StatusCode, Json<serde_json::Value>) {
         let status = match &self {
             Self::Config(_) => StatusCode::UNPROCESSABLE_ENTITY,
-            Self::Identity(_) | Self::NoSource => StatusCode::CONFLICT,
+            Self::Identity(_) | Self::NoSource | Self::ProjectCollision(_) => StatusCode::CONFLICT,
             Self::Stopping => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -92,6 +97,10 @@ pub(crate) struct Binding {
 }
 
 pub(crate) struct Registry {
+    pub managed_projects: std::collections::BTreeMap<
+        hive_core::identity::ProjectId,
+        hive_core::project::ProjectDefinition,
+    >,
     pub current: Arc<Config>,
     pub source: Option<ConfigSource>,
     pub bindings: HashMap<String, Binding>,
@@ -173,6 +182,13 @@ impl Broker {
         }
         for (id, profile) in &candidate.agents {
             registry.check(id, profile)?;
+        }
+        if let Some(id) = candidate
+            .projects
+            .keys()
+            .find(|id| registry.managed_projects.contains_key(*id))
+        {
+            return Err(ReloadError::ProjectCollision(id.clone()));
         }
         registry.current = Arc::new(candidate);
         self.catalog.send_modify(|revision| *revision += 1);

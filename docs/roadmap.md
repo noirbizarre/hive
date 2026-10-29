@@ -1,6 +1,6 @@
 # Status and roadmap
 
-This page describes the implementation in this checkout as of 2026-10-24.
+This page describes the implementation in this checkout as of 2026-10-29.
 It does not assert the current state of linked issues or a published release.
 The [compatibility matrices](compatibility.md) distinguish deterministic
 coverage from retained real-agent evidence.
@@ -17,6 +17,7 @@ coverage from retained real-agent evidence.
 | Token usage and cost estimates | Reported turn totals and exact optional pricing mappings | [#18](https://github.com/noirbizarre/hive/issues/18) |
 | Pi ACP adapter setup | External `pi-acp`; retained evidence is initialization only | [#19](https://github.com/noirbizarre/hive/issues/19) |
 | OpenCode native adoption | Explicit server adapter; API workflow, not a client adoption picker | [#5](https://github.com/noirbizarre/hive/issues/5) |
+| Logical project registry | Composed TOML definitions, durable CRUD, stable IDs, node-local overrides; no provisioning | [#84](https://github.com/noirbizarre/hive/issues/84) |
 
 These are implemented capabilities, not blanket guarantees for every installed
 agent. In particular, a passing initialize probe does not establish model turns,

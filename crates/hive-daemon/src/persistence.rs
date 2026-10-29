@@ -7,8 +7,14 @@ use std::{path::PathBuf, sync::Mutex};
 
 use crate::prompt_journal::{Fingerprint, JournalError, Outcome as PromptOutcome};
 use crate::usage::Ledger;
+use hive_core::{
+    identity::{NodeId, ProjectId},
+    project::ProjectDefinition,
+    workspace::NodePath,
+};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -85,6 +91,10 @@ fn default_origin() -> String {
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
+    #[error(
+        "cannot read or write project registry metadata; check database permissions, disk space and stored definitions, then retry"
+    )]
+    Project,
     #[error(
         "session database {path} contains an invalid request journal entry ({source}); restore a backup or inspect the journal without deleting pending reservations"
     )]
@@ -228,7 +238,7 @@ impl Store {
         let version: u32 = db
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(wrap)?;
-        if version > 3 {
+        if version > 4 {
             return Err(StoreError::Future { path, version });
         }
         if version == 0 {
@@ -289,6 +299,12 @@ impl Store {
             migration.execute_batch("ALTER TABLE prompts ADD COLUMN terminal TEXT; ALTER TABLE prompts ADD COLUMN recovery_ack INTEGER NOT NULL DEFAULT 0; PRAGMA user_version=3;").map_err(wrap)?;
             migration.commit().map_err(wrap)?;
         }
+        if version < 4 {
+            let migration = db.transaction().map_err(wrap)?;
+            // No cascading ownership: removing a definition must never remove local resources.
+            migration.execute_batch("CREATE TABLE projects (id TEXT PRIMARY KEY, definition TEXT NOT NULL); CREATE TABLE project_node_overrides (project_id TEXT NOT NULL, node_id TEXT NOT NULL, directory TEXT NOT NULL, PRIMARY KEY(project_id,node_id)); PRAGMA user_version=4;").map_err(wrap)?;
+            migration.commit().map_err(wrap)?;
+        }
         // A future schema or failed migration must not change the existing journal mode.
         db.pragma_update(None, "journal_mode", "WAL")
             .map_err(wrap)?;
@@ -304,6 +320,89 @@ impl Store {
             path: self.path.clone(),
             source,
         }
+    }
+
+    pub(crate) fn projects(&self) -> Result<BTreeMap<ProjectId, ProjectDefinition>, StoreError> {
+        let db = self.connection.lock().map_err(|_| StoreError::Project)?;
+        let mut query = db
+            .prepare("SELECT id,definition FROM projects ORDER BY id")
+            .map_err(|_| StoreError::Project)?;
+        let rows = query
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|_| StoreError::Project)?;
+        rows.map(|row| {
+            let (id, definition) = row.map_err(|_| StoreError::Project)?;
+            Ok((
+                ProjectId::try_from(id).map_err(|_| StoreError::Project)?,
+                serde_json::from_str(&definition).map_err(|_| StoreError::Project)?,
+            ))
+        })
+        .collect()
+    }
+
+    pub(crate) fn write_project(
+        &self,
+        id: &ProjectId,
+        definition: Option<&ProjectDefinition>,
+    ) -> Result<(), StoreError> {
+        let db = self.connection.lock().map_err(|_| StoreError::Project)?;
+        if let Some(definition) = definition {
+            let json = serde_json::to_string(definition).map_err(|_| StoreError::Project)?;
+            db.execute("INSERT INTO projects(id,definition) VALUES (?1,?2) ON CONFLICT(id) DO UPDATE SET definition=excluded.definition", params![id.as_str(), json])
+                .map_err(|_| StoreError::Project)?;
+        } else {
+            db.execute("DELETE FROM projects WHERE id=?1", [id.as_str()])
+                .map_err(|_| StoreError::Project)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn project_override(
+        &self,
+        project: &ProjectId,
+        node: &NodeId,
+    ) -> Result<Option<NodePath>, StoreError> {
+        let db = self.connection.lock().map_err(|_| StoreError::Project)?;
+        let json: Option<String> = db
+            .query_row(
+                "SELECT directory FROM project_node_overrides WHERE project_id=?1 AND node_id=?2",
+                params![project.as_str(), node.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| StoreError::Project)?;
+        let directory: Option<NodePath> = json
+            .map(|value| serde_json::from_str(&value).map_err(|_| StoreError::Project))
+            .transpose()?;
+        if directory
+            .as_ref()
+            .is_some_and(|directory| directory.node() != node)
+        {
+            return Err(StoreError::Project);
+        }
+        Ok(directory)
+    }
+
+    pub(crate) fn write_project_override(
+        &self,
+        project: &ProjectId,
+        node: &NodeId,
+        directory: Option<&NodePath>,
+    ) -> Result<(), StoreError> {
+        let db = self.connection.lock().map_err(|_| StoreError::Project)?;
+        if let Some(directory) = directory {
+            let json = serde_json::to_string(directory).map_err(|_| StoreError::Project)?;
+            db.execute("INSERT INTO project_node_overrides(project_id,node_id,directory) VALUES (?1,?2,?3) ON CONFLICT(project_id,node_id) DO UPDATE SET directory=excluded.directory", params![project.as_str(), node.as_str(), json]).map_err(|_| StoreError::Project)?;
+        } else {
+            db.execute(
+                "DELETE FROM project_node_overrides WHERE project_id=?1 AND node_id=?2",
+                params![project.as_str(), node.as_str()],
+            )
+            .map_err(|_| StoreError::Project)?;
+        }
+        Ok(())
     }
 
     fn journal(&self, source: JournalError) -> StoreError {
@@ -640,10 +739,101 @@ mod tests {
         let db = Connection::open(&path).unwrap();
         // Recreate the exact schema-1 journal; registry JSON is deliberately untouched.
         db.execute_batch(
-            "ALTER TABLE prompts DROP COLUMN content_fingerprint; ALTER TABLE prompts DROP COLUMN terminal; ALTER TABLE prompts DROP COLUMN recovery_ack; PRAGMA user_version=1;",
+            "ALTER TABLE prompts DROP COLUMN content_fingerprint; ALTER TABLE prompts DROP COLUMN terminal; ALTER TABLE prompts DROP COLUMN recovery_ack; DROP TABLE projects; DROP TABLE project_node_overrides; PRAGMA user_version=1;",
         )
         .unwrap();
         (path, db)
+    }
+
+    #[test]
+    fn schema_three_upgrades_preserve_sessions_and_project_removal_does_not_cascade() {
+        let path = temporary();
+        let store = Store::open(path.clone()).unwrap();
+        store.save(&record("keep-session")).unwrap();
+        drop(store);
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(
+            "DROP TABLE projects; DROP TABLE project_node_overrides; PRAGMA user_version=3;",
+        )
+        .unwrap();
+        drop(db);
+        let store = Store::open(path.clone()).unwrap();
+        let id = ProjectId::new();
+        let definition: ProjectDefinition =
+            serde_json::from_value(serde_json::json!({"name":"Local"})).unwrap();
+        store.write_project(&id, Some(&definition)).unwrap();
+        store.write_project(&id, None).unwrap();
+        assert_eq!(store.records().unwrap()[0].id, "keep-session");
+        assert!(store.projects().unwrap().is_empty());
+        drop(store);
+        std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_failed_project_migration_rolls_back_without_touching_sessions_or_prompt_reservations() {
+        let path = temporary();
+        let store = Store::open(path.clone()).unwrap();
+        store
+            .reserve_prompt(
+                &record("keep"),
+                "pending",
+                &Fingerprint::content(&[]).unwrap(),
+            )
+            .unwrap();
+        drop(store);
+        let db = Connection::open(&path).unwrap();
+        // Leaving the second table in place forces failure after the first CREATE succeeds.
+        db.execute_batch("DROP TABLE projects; PRAGMA user_version=3;")
+            .unwrap();
+        let sessions: String = db
+            .query_row("SELECT record FROM sessions WHERE id='keep'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(Store::open(path.clone()).is_err());
+        assert_eq!(
+            db.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .unwrap(),
+            3
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name='projects'",
+                [],
+                |row| row.get::<_, u32>(0)
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.query_row("SELECT record FROM sessions WHERE id='keep'", [], |row| row
+                .get::<_, String>(0))
+                .unwrap(),
+            sessions
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT COUNT(*) FROM prompts WHERE session_id='keep' AND key='pending'",
+                [],
+                |row| row.get::<_, u32>(0)
+            )
+            .unwrap(),
+            1
+        );
+        drop(db);
+        std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn corrupted_project_metadata_is_rejected_without_exposing_its_contents() {
+        let path = temporary();
+        let store = Store::open(path.clone()).unwrap();
+        let id = ProjectId::new();
+        store.connection.lock().unwrap().execute("INSERT INTO projects VALUES (?1,?2)", params![id.as_str(), r#"{"name":"Bad","repository_source":"https://private-token@example.test/repo"}"#]).unwrap();
+        let error = store.projects().unwrap_err();
+        assert!(!error.to_string().contains("private-token"));
+        drop(store);
+        std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
     }
 
     #[test]
@@ -693,7 +883,7 @@ mod tests {
             assert_eq!(
                 db.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
                     .unwrap(),
-                3
+                4
             );
             assert_eq!(
                 db.query_row("SELECT record FROM sessions", [], |row| row
@@ -1008,7 +1198,7 @@ mod tests {
         assert_eq!(
             db.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
                 .unwrap(),
-            3
+            4
         );
         drop(db);
         std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();

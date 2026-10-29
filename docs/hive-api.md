@@ -13,6 +13,12 @@ user. Session conversation/control methods live exclusively on `/acp`.
 | `GET /v1/status` | Name, build version, live/persisted session counts, default agent, active sessions by agent |
 | `GET /v1/providers` | Profile IDs, names, declared transports/versions, default indication |
 | `POST /v1/config/reload` | Validate and publish the original configuration for new sessions |
+| `GET /v1/projects` | Sorted effective project definitions with ownership origin |
+| `POST /v1/projects` | Register durable metadata without cloning |
+| `GET /v1/projects/{id}` | Inspect one definition |
+| `PUT /v1/projects/{id}` | Replace a managed definition, preserving its ID |
+| `DELETE /v1/projects/{id}` | Remove a managed definition only |
+| `GET/PUT/DELETE /v1/projects/{id}/nodes/{node}/override` | Inspect, set, or remove a node-local directory preference |
 | `GET /v1/providers/{agent}/native-sessions` | Native sessions an OpenCode server profile can adopt |
 | `GET /v1/sessions` | Live/persisted session summaries and catalog revision |
 | `GET /v1/sessions/events` | SSE catalog revision invalidations |
@@ -50,6 +56,56 @@ trusted-local-user boundary, without introducing a separate login.
 Unix SIGHUP and `hive daemon reload` call the same reload implementation.
 See [configuration](configuration.md#reloading-changes) for identity and environment
 rules and [operations](operations.md#reloading-configuration) for examples.
+
+## Project registry
+
+`POST /v1/projects` accepts an optional `id` and project metadata:
+
+```json
+{
+  "name": "Hive",
+  "repository_source": "https://github.com/noirbizarre/hive.git",
+  "default_ref": "main",
+  "preparation": [["mise", "install"]]
+}
+```
+
+Only `name` is required. A successful registration returns the allocated `id`,
+`origin: "managed"`, and the metadata (absent optional source/ref fields serialize
+as null). `GET /v1/projects` returns `{ "projects": [...] }` sorted by ID.
+Configured entries have `origin: "config"`. `PUT` accepts the same metadata
+without `id` and replaces all mutable fields. Unknown fields are rejected.
+
+Overrides never appear in portable project responses. A `PUT` to the node override
+route accepts an explicit owning node and absolute path syntax:
+
+```json
+{
+  "directory": {
+    "node": "node-22222222-2222-4222-8222-222222222222",
+    "syntax": "posix",
+    "path": "/home/user/work/hive"
+  }
+}
+```
+
+The body node must match the route node. `windows` syntax also works. `GET`
+returns `{ "project": "…", "node": "…", "directory": { ... } }`. Override writes
+return `{ "updated": true }`; definition/override deletion returns
+`{ "removed": true }`. Orphaned overrides remain inspectable and explicitly
+removable after a definition is removed.
+
+All project mutations use the same origin policy as reload and invalidate the
+catalog after successful durable publication. Errors carry `code`, `message`,
+and `help`, with `hive::project::*` codes: 422 for invalid input, 404 for unknown
+resources, 409 for duplicate IDs or configured ownership, 403 for rejected origins,
+503 for shutdown or unavailable persistence, and 500 for storage failures.
+Configured/managed collisions also reject configuration reload with 409.
+
+Registration stores intent without Git or filesystem operations. Definitions
+contain no local paths or credential fields. Deletion never deletes resources or
+overrides. See [configuration](configuration.md#logical-projects) for validation
+and authority rules.
 
 ## ACP boundary
 

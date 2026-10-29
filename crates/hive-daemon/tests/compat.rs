@@ -11,6 +11,7 @@ use miette::Diagnostic;
 
 fn profile(command: &str, args: &[&str], version: AgentVersion) -> Profile {
     Profile {
+        project: None,
         name: None,
         command: Some(command.into()),
         args: args.iter().map(ToString::to_string).collect(),

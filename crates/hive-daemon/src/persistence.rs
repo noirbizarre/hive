@@ -773,6 +773,8 @@ mod tests {
     fn a_failed_project_migration_rolls_back_without_touching_sessions_or_prompt_reservations() {
         let path = temporary();
         let store = Store::open(path.clone()).unwrap();
+        // Prompt reservations belong to an already persisted session, enforced by the foreign key.
+        store.save(&record("keep")).unwrap();
         store
             .reserve_prompt(
                 &record("keep"),

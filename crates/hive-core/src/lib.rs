@@ -1,4 +1,8 @@
-//! Transport-independent identity and lifecycle vocabulary for Hive sessions.
+//! Transport-independent identities and domain contracts for Hive orchestration.
+
+pub mod identity;
+pub mod project;
+pub mod workspace;
 
 use serde::{Deserialize, Serialize};
 

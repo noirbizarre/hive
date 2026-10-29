@@ -17,7 +17,7 @@ pub struct Options {
 enum Command {
     /// Persist metadata without cloning or preparing the project.
     Register {
-        /// Allocate an ID automatically when omitted.
+        /// Use a name-derived slug with an available numeric suffix when omitted.
         #[arg(long)]
         id: Option<String>,
         #[command(flatten)]

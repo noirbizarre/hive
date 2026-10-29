@@ -690,7 +690,7 @@ mod tests {
     fn project_references_resolve_after_all_fragments_in_either_order() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("hive.toml");
-        let id = hive_core::identity::ProjectId::new();
+        let id = hive_core::identity::ProjectId::from_name("Portable");
         let declaration = format!(
             "[projects.{id}]\nname = 'Portable'\nrepository_source = 'git@example.test:repo'\n"
         );

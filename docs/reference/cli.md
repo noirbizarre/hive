@@ -99,12 +99,14 @@ CLI persist in the daemon's database, independently of TOML-owned definitions.
 hive project register --name Hive --remote https://github.com/noirbizarre/hive.git \
   --default-ref main --preparation '[["mise","install"]]'
 hive project list
-hive project show project-11111111-1111-4111-8111-111111111111
-hive project update project-11111111-1111-4111-8111-111111111111 --name "Hive renamed"
-hive project remove project-11111111-1111-4111-8111-111111111111
+hive project show hive
+hive project update hive --name "Hive renamed"
+hive project remove hive
 ```
 
-Registration allocates an ID unless `--id` is supplied. Only `--name` is required;
+Registration derives a lowercase slug from `--name` unless `--id` is supplied.
+If the slug is taken, it tries `-2`, `-3`, and so on; the chosen ID survives renames.
+Only `--name` is required;
 omit `--remote` for local-only projects. Update replaces all metadata: omitted
 remote/ref fields are cleared and preparation defaults to `[]`. Registration and
 update do not clone or execute preparation. Config-owned update/removal is rejected;
@@ -114,11 +116,11 @@ Directory overrides require an explicit stable node ID; Hive does not allocate a
 new node identity for each request:
 
 ```sh
-hive project override set project-11111111-1111-4111-8111-111111111111 \
+hive project override set hive \
   node-22222222-2222-4222-8222-222222222222 /home/user/work/hive
-hive project override show project-11111111-1111-4111-8111-111111111111 \
+hive project override show hive \
   node-22222222-2222-4222-8222-222222222222
-hive project override remove project-11111111-1111-4111-8111-111111111111 \
+hive project override remove hive \
   node-22222222-2222-4222-8222-222222222222
 ```
 

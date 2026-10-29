@@ -76,6 +76,7 @@ async fn project_commands_preserve_ids_across_daemon_restart_and_never_delete_lo
     )
     .await;
     let id = created["id"].as_str().unwrap();
+    assert_eq!(id, "cli-project");
     let node = format!("node-{}", uuid::Uuid::new_v4());
     let sentinel = runtime.join("keep-local-work");
     std::fs::write(&sentinel, "uncommitted").unwrap();

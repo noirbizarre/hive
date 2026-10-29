@@ -110,12 +110,17 @@ label and is not a selector.
 
 ## Logical projects
 
-Project IDs are portable `project-<canonical UUID>` identifiers. Allocate one once
-(for example through `hive project register`) and preserve it across renames,
-configuration-file moves, and checkout relocations. Files and paths are not identity.
+Project IDs are portable lowercase slugs such as `hive` or `my-project`.
+Registration generates a slug from the display name and appends `-2`, `-3`, and so
+on if it is already taken by a configured or managed definition. Non-ASCII and
+non-alphanumeric characters become separators; names without ASCII letters or
+digits fall back to `project`. Explicit IDs use lowercase ASCII letters, digits,
+and single hyphens, without leading or trailing hyphens. Existing UUID-based
+project IDs remain valid. Preserve the chosen ID across renames, configuration-file
+moves, and checkout relocations; changing a display name never changes the ID.
 
 ```toml
-[projects.project-11111111-1111-4111-8111-111111111111]
+[projects.hive]
 name = "Hive"
 repository_source = "https://github.com/noirbizarre/hive.git"
 default_ref = "main"
@@ -123,7 +128,7 @@ preparation = [["mise", "install"]]
 
 [agents.coder]
 command = "some-acp-agent"
-project = "project-11111111-1111-4111-8111-111111111111"
+project = "hive"
 ```
 
 `name` is required and nonblank. Other project fields are optional. Remotes accept

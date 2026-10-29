@@ -70,7 +70,10 @@ rules and [operations](operations.md#reloading-configuration) for examples.
 }
 ```
 
-Only `name` is required. A successful registration returns the allocated `id`,
+Only `name` is required. Without an explicit `id`, registration generates a name
+slug (`Hive` becomes `hive`), trying `hive-2`, `hive-3`, and so on for collisions
+with either configured or managed projects. Allocation is serialized, so concurrent
+registrations cannot choose the same ID. A successful registration returns the allocated `id`,
 `origin: "managed"`, and the metadata (absent optional source/ref fields serialize
 as null). `GET /v1/projects` returns `{ "projects": [...] }` sorted by ID.
 Configured entries have `origin: "config"`. `PUT` accepts the same metadata

@@ -247,11 +247,26 @@ impl Broker {
         request: Registration,
     ) -> Result<RegisteredProject, RegistryError> {
         request.definition.validate()?;
-        let id = request.id.unwrap_or_default();
         self.project_write(move |_, registry, store| {
-            if registry.current.projects.contains_key(&id)
-                || registry.managed_projects.contains_key(&id)
-            {
+            // Allocate under the writer gate so concurrent registrations cannot choose the same suffix.
+            let taken = |id: &ProjectId| {
+                registry.current.projects.contains_key(id)
+                    || registry.managed_projects.contains_key(id)
+            };
+            let id = if let Some(id) = request.id {
+                id
+            } else {
+                let base = ProjectId::from_name(&request.definition.name);
+                let mut candidate = base.clone();
+                let mut suffix = 2_u64;
+                while taken(&candidate) {
+                    candidate = ProjectId::try_from(format!("{base}-{suffix}"))
+                        .expect("a numeric suffix preserves project slug syntax");
+                    suffix += 1;
+                }
+                candidate
+            };
+            if taken(&id) {
                 return Err(RegistryError::Conflict);
             }
             store
@@ -529,6 +544,75 @@ mod tests {
             json!({"name":name,"repository_source":"git@example.test:team/repo"}),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn automatic_slugs_skip_configured_and_managed_ids_even_during_concurrent_registration() {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("state/catalog.sqlite3");
+        let mut config = Config::default();
+        let configured = ProjectId::from_name("Hive");
+        config
+            .projects
+            .insert(configured.clone(), definition("Configured"));
+        let broker = Broker::persistent(config.clone(), path.clone()).unwrap();
+        let explicit = ProjectId::try_from("hive-2".to_owned()).unwrap();
+        broker
+            .register_project(Registration {
+                id: Some(explicit),
+                definition: definition("Explicit"),
+            })
+            .await
+            .unwrap();
+        let (first, second) = tokio::join!(
+            broker.register_project(Registration {
+                id: None,
+                definition: definition("Hive")
+            }),
+            broker.register_project(Registration {
+                id: None,
+                definition: definition("Hive")
+            }),
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        let allocated =
+            std::collections::BTreeSet::from([first.id.to_string(), second.id.to_string()]);
+        assert_eq!(
+            allocated,
+            std::collections::BTreeSet::from(["hive-3".to_owned(), "hive-4".to_owned()])
+        );
+        let renamed = broker
+            .replace_project(first.id.clone(), definition("Renamed"))
+            .await
+            .unwrap();
+        assert_eq!(renamed.id, first.id);
+        assert!(matches!(
+            broker
+                .register_project(Registration {
+                    id: Some(configured),
+                    definition: definition("Hive")
+                })
+                .await,
+            Err(RegistryError::Conflict)
+        ));
+        drop(broker);
+        let broker = Broker::persistent(config, path).unwrap();
+        let next = broker
+            .register_project(Registration {
+                id: None,
+                definition: definition("Hive"),
+            })
+            .await
+            .unwrap();
+        assert_eq!(next.id.as_str(), "hive-5");
+        assert!(
+            broker
+                .projects()
+                .unwrap()
+                .iter()
+                .any(|project| project.id == first.id && project.definition.name == "Renamed")
+        );
     }
 
     #[tokio::test]
@@ -982,6 +1066,7 @@ mod tests {
             response.text().await.unwrap()
         );
         let created: Value = response.json().await.unwrap();
+        assert_eq!(created["id"], "created");
         let item = format!("{endpoint}/{}", created["id"].as_str().unwrap());
         for (value, code) in [
             (json!({"name":" "}), "hive::project::name"),

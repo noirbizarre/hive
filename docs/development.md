@@ -108,23 +108,23 @@ mise exec -- cargo test --locked -p hive-daemon --test bee
 
 Bee is declared in the project-specific section of `mise.toml` using mise's
 GitHub backend. The normal `mise install` and existing CI mise action install
-the host's raw executable from Bee's **`development` prerelease** and expose
+the host's raw executable from Bee's **0.2.0 release** and expose
 `bee` (`bee.exe` on Windows) on PATH alongside the other tools. `mise.lock`
 records platform-specific artifact URLs and checksums for the Linux x64,
 macOS ARM64, and Windows x64 CI runners. Installation needs network access;
 tests do not.
 
-The development tag is mutable, so its lockfile digests identify the tested
-artifacts even when `bee --version` still reports the same version. To adopt
-a newer development build, refresh Bee's lock entries and reinstall it:
+Bee is pinned to a numbered release so development builds cannot invalidate
+the locked checksums. To adopt a newer release, update `tools.bee.version` in
+`mise.toml`, refresh Bee's lock entries, and install it:
 
 ```sh
 mise lock bee --platform linux-x64,macos-arm64,windows-x64
-mise install --locked --force bee
+mise install --locked bee
 ```
 
-Review and commit the updated lockfile alongside any compatibility changes.
-Switch `tools.bee.version` to the next numbered release when adopting it.
+Review and commit the updated configuration and lockfile alongside any
+compatibility changes.
 
 Tests themselves never download anything. They use `HIVE_BEE_COMMAND` when set,
 otherwise `bee` on PATH. Activate mise in your shell or use `mise exec --` when

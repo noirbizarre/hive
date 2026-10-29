@@ -241,8 +241,7 @@ bee = "github:noirbizarre/bee"
 
 [tools.bee]
 # Keep the external test agent on the shared install/PATH and checksum-locking path.
-version = "development"
-prerelease = true
+version = "0.2.0"
 format = "raw"
 bin = "bee"
 platforms.windows-x64 = { bin = "bee.exe" }

@@ -128,6 +128,26 @@ checksum = "sha256:f2b8c692d9488c3313d7786e2099976151c10fd8f76580b12d045bb9683a8
 url = "https://github.com/orhun/git-cliff/releases/download/v2.12.0/git-cliff-2.12.0-x86_64-pc-windows-msvc.zip"
 url_api = "https://api.github.com/repos/orhun/git-cliff/releases/assets/343380021"
 
+[[tools.mr-boxington]]
+version = "1.28.0"
+backend = "packslip:github.com/jdx/mr-boxington"
+specifiers = ["1.28.0"]
+
+[tools.mr-boxington."platforms.linux-x64"]
+checksum = "sha256:50ce9360221d9274a73d70c9d2d5285dc2d8353a101de0845e3da5bb0083bcfb"
+url = "https://github.com/jdx/mr-boxington/releases/download/v1.28.0/mbx-x86_64-unknown-linux-gnu.tar.gz"
+signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
+
+[tools.mr-boxington."platforms.macos-arm64"]
+checksum = "sha256:ac73ba0637a443ba9c43354008f6bcd5d9e8a84b703e46f23202025c1f849472"
+url = "https://github.com/jdx/mr-boxington/releases/download/v1.28.0/mbx-aarch64-apple-darwin.tar.gz"
+signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
+
+[tools.mr-boxington."platforms.windows-x64"]
+checksum = "sha256:3fdecc44d68f37215079f6b6fa8c1e2ad95ee9dd30668759ed9dfd98e02bc95d"
+url = "https://github.com/jdx/mr-boxington/releases/download/v1.28.0/mbx-x86_64-pc-windows-msvc.zip"
+signer = "sigstore-oidc:https://github.com/jdx/mr-boxington/.github/workflows/release.yml"
+
 [[tools.prek]]
 version = "0.5.0"
 backend = "aqua:j178/prek"
@@ -150,6 +170,14 @@ checksum = "sha256:3b1704f9c44d2a5f29af84c18dc5529c2cefab75697bdfdf69074cced1c05
 url = "https://github.com/j178/prek/releases/download/v0.5.0/prek-x86_64-pc-windows-msvc.zip"
 url_api = "https://api.github.com/repos/j178/prek/releases/assets/531708991"
 provenance = "github-attestations"
+
+[[tools.rust]]
+version = "stable"
+backend = "core:rust"
+specifiers = ["stable"]
+
+[tools.rust.options]
+components = "clippy,rustfmt"
 
 [[tools.typos]]
 version = "1.50.0"

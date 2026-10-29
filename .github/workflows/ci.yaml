@@ -34,12 +34,17 @@ concurrency:
 jobs:
   lint:
     name: 🕵️ Lint
+    needs: webui
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 
       # Project assets must exist before hooks invoke Clippy.
-      - uses: ./.github/actions/build-web
+      - name: Download Web UI assets
+        uses: actions/download-artifact@v8
+        with:
+          name: webui-dist
+          path: clients/hive-web/dist/
 
       # The channel comes from the action ref, not rust-toolchain.toml,
       # and each job installs the components it needs.
@@ -75,6 +80,7 @@ jobs:
 
   test:
     name: 🧪 Tests (${{ matrix.os.name }})
+    needs: webui
     runs-on: ${{ matrix.os.runner }}
     strategy:
       fail-fast: false
@@ -91,7 +97,11 @@ jobs:
             flag: macos
     steps:
       - uses: actions/checkout@v7
-      - uses: ./.github/actions/build-web
+      - name: Download Web UI assets
+        uses: actions/download-artifact@v8
+        with:
+          name: webui-dist
+          path: clients/hive-web/dist/
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
@@ -144,6 +154,29 @@ jobs:
           directory: target/nextest/ci
           report_type: test_results
 
+  webui:
+    name: 🌐 Web UI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: clients/hive-web/package-lock.json
+      - run: npm ci --prefix clients/hive-web
+      - run: npm run build --prefix clients/hive-web
+      - run: npm run test --prefix clients/hive-web
+
+      # The bundle is platform-independent, so every Rust job embeds identical assets.
+      - name: Upload Web UI assets
+        uses: actions/upload-artifact@v7
+        with:
+          name: webui-dist
+          path: clients/hive-web/dist/
+          if-no-files-found: error
+          retention-days: 1
+
   # gh-ship runs the release. Its configuration and the workflows it names must
   # satisfy the contract it enforces, and finding out otherwise mid-release is
   # the worst possible moment — so it is checked on every pull request instead.
@@ -166,10 +199,15 @@ jobs:
   # breakage surfaces in a user's build, not here.
   msrv:
     name: 🧓 MSRV
+    needs: webui
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: ./.github/actions/build-web
+      - name: Download Web UI assets
+        uses: actions/download-artifact@v8
+        with:
+          name: webui-dist
+          path: clients/hive-web/dist/
 
       - name: Read the MSRV from Cargo.toml
         id: msrv

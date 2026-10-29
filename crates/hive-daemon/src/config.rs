@@ -661,9 +661,10 @@ mod tests {
         let paths =
             super::include_paths(std::path::Path::new("config.toml"), "Cargo.[t]oml", 0).unwrap();
         assert_eq!(paths.len(), 1);
+        // Windows canonical paths carry a verbatim prefix, so normalize both sides.
         assert_eq!(
             std::fs::canonicalize(&paths[0]).unwrap(),
-            std::env::current_dir().unwrap().join("Cargo.toml")
+            std::fs::canonicalize(std::env::current_dir().unwrap().join("Cargo.toml")).unwrap()
         );
     }
 

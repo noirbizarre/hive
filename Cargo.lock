@@ -1426,6 +1426,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "clap_complete",
+ "hive-core",
  "hive-daemon",
  "hive-tui",
  "miette",
@@ -1445,6 +1446,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "toml",
+ "url",
  "uuid",
 ]
 

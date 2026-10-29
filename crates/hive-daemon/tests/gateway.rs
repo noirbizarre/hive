@@ -2130,6 +2130,7 @@ fn config_with_agent(id: &str, command: &str, version: AgentVersion) -> Config {
     agents.insert(
         id.to_string(),
         Profile {
+            project: None,
             name: None,
             command: Some(words.next().unwrap().to_string()),
             args: words.map(str::to_string).collect(),
@@ -2144,6 +2145,7 @@ fn config_with_agent(id: &str, command: &str, version: AgentVersion) -> Config {
         },
     );
     Config {
+        projects: Default::default(),
         default_agent: Some(id.to_string()),
         agents,
     }
@@ -3981,6 +3983,7 @@ async fn declared_http_and_websocket_agents_are_reached_through_the_sdk() {
         config.agents.insert(
             id.into(),
             Profile {
+                project: None,
                 name: None,
                 command: None,
                 args: vec![],
@@ -4399,6 +4402,7 @@ async fn a_disconnect_and_handoff_during_generation_do_not_restart_the_prompt() 
         Profile {
             name: None,
             command: None,
+            project: None,
             args: vec![],
             env: BTreeMap::new(),
             endpoint: Some(format!("http://{downstream}")),
@@ -4884,6 +4888,7 @@ async fn permission_and_form_and_url_elicitation_reach_the_current_pilot() {
         Profile {
             name: None,
             command: None,
+            project: None,
             args: vec![],
             env: BTreeMap::new(),
             endpoint: Some(format!("http://{downstream}")),

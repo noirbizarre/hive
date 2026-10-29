@@ -40,8 +40,8 @@ default_agent = "claude"
 command = "claude-agent-acp"
 ```
 
-Each fragment contains `[agents.<id>]` tables with the same profile fields as the
-root. `include` and `default_agent` are root-only settings. A default can select a
+Each fragment can contain `[agents.<id>]` and `[projects.<id>]` tables with the
+same fields as the root. `include` and `default_agent` are root-only settings. A default can select a
 profile declared in a fragment. The root can also declare profiles directly.
 
 Include entries are file paths or shell-style globs (`*`, `?`, character classes,
@@ -96,9 +96,10 @@ Listen address, state/runtime locations, and tracing settings require restart.
 
 | Setting | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `include` | Array of strings | `[]` | Root-only paths or globs for profile fragments |
+| `include` | Array of strings | `[]` | Root-only paths or globs for configuration fragments |
 | `default_agent` | String | Unset | Profile ID for session creation without a selector |
 | `agents` | Table of profiles | Empty | Available downstream agents |
+| `projects` | Table keyed by project IDs | Empty | Portable configured definitions |
 
 `HIVE_DEFAULT_AGENT` overrides `default_agent`. The selected ID must exist.
 A daemon can start without a default, but clients must then select a profile.
@@ -107,11 +108,66 @@ Profile IDs contain only ASCII letters, digits, `-`, or `_`, and cannot be empty
 The ID in `[agents.opencode]` is `opencode`. Its optional `name` is only a display
 label and is not a selector.
 
+## Logical projects
+
+Project IDs are portable lowercase slugs such as `hive` or `my-project`.
+Registration generates a slug from the display name and appends `-2`, `-3`, and so
+on if it is already taken by a configured or managed definition. Non-ASCII and
+non-alphanumeric characters become separators; names without ASCII letters or
+digits fall back to `project`. Explicit IDs use lowercase ASCII letters, digits,
+and single hyphens, without leading or trailing hyphens. Existing UUID-based
+project IDs remain valid. Preserve the chosen ID across renames, configuration-file
+moves, and checkout relocations; changing a display name never changes the ID.
+
+```toml
+[projects.hive]
+name = "Hive"
+repository_source = "https://github.com/noirbizarre/hive.git"
+default_ref = "main"
+preparation = [["mise", "install"]]
+
+[agents.coder]
+command = "some-acp-agent"
+project = "hive"
+```
+
+`name` is required and nonblank. Other project fields are optional. Remotes accept
+HTTPS, SSH URLs, and SCP-style SSH (`git@host:team/repo.git`); filesystem sources,
+other schemes, passwords, HTTP userinfo, query strings, and fragments are rejected.
+Configure Git/SSH credentials on each execution node. Preparation stores argv
+arrays with nonblank executables and no NUL characters; arguments are ordinary
+metadata, not a place for secrets. Registration does not contact Git, clone a
+repository, resolve refs, or execute preparation. Omitted `default_ref` leaves
+default-ref selection to future repository provisioning.
+
+A local-only project can omit `repository_source`. Existing cwd-based sessions
+and the core `existing` directory policy remain available. An agent's optional
+`project` currently declares and validates intent; it does not provision a session
+or change its cwd.
+
+Project IDs must be unique across all selected files. References resolve after
+complete composition, including declarations in later fragments. Profile references
+must target **configured** projects, so doctor and configuration validation do not
+depend on mutable SQLite state.
+
+Configured definitions are read-only through the operational API and CLI: edit
+TOML and reload. Separately, `hive project register` creates a durable, managed
+definition in SQLite. The effective registry lists both origins; collisions fail
+startup or reload rather than silently overriding either definition. To transfer
+a managed ID into TOML, remove its managed definition before loading the declaration.
+
+Node-local directory overrides are stored separately for each project/node ID.
+Different nodes can use different paths for the same project. Overrides are
+preferences, not clone/cache records or runtime workspaces; paths need not exist
+at registration time. Removing a definition never deletes directories, clones,
+workspaces, or overrides. See [project commands](reference/cli.md#projects).
+
 ## Profile fields
 
 | Field | Type | Default | Applies to |
 | --- | --- | --- | --- |
 | `name` | String | Profile ID for display | All profiles |
+| `project` | Project ID | Unset | Optional configured project reference, validated after composition |
 | `kind` | `"acp"` or `"opencode-server"` | `"acp"` | All profiles |
 | `command` | String | Unset | ACP stdio executable |
 | `args` | Array of strings | `[]` | ACP stdio arguments |

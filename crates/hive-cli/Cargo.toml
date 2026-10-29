@@ -14,6 +14,7 @@ path = "src/main.rs"
 clap = { workspace = true }
 clap_complete = { workspace = true }
 hive-daemon = { path = "../hive-daemon" }
+hive-core = { path = "../hive-core" }
 hive-tui = { path = "../hive-tui" }
 miette = { workspace = true }
 reqwest = { workspace = true }

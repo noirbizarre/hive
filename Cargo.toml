@@ -82,6 +82,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
+url = "2"
 rusqlite = { version = "0.40", features = ["bundled"] }
 webbrowser = "1"
 ratatui = "0.30.2"

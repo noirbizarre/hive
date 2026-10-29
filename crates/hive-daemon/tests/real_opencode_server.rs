@@ -203,10 +203,12 @@ fn encode(text: &str) -> String {
 
 fn config(server: &Server) -> Config {
     Config {
+        projects: Default::default(),
         default_agent: Some("oc".into()),
         agents: BTreeMap::from([(
             "oc".into(),
             Profile {
+                project: None,
                 name: None,
                 kind: ProfileKind::OpencodeServer,
                 command: None,

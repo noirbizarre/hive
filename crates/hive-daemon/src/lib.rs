@@ -44,6 +44,7 @@ mod opencode;
 mod persistence;
 mod plans;
 mod pricing;
+pub mod projects;
 mod prompt_journal;
 pub mod reload;
 mod session_config;
@@ -1043,6 +1044,7 @@ impl Broker {
         let (catalog, _) = watch::channel(0);
         Self {
             registry: Arc::new(Mutex::new(reload::Registry {
+                managed_projects: Default::default(),
                 current: Arc::new(registry),
                 source: None,
                 bindings: HashMap::new(),
@@ -1058,12 +1060,28 @@ impl Broker {
         }
     }
 
-    pub fn persistent(registry: Config, path: PathBuf) -> Result<Self, persistence::StoreError> {
+    pub fn persistent(registry: Config, path: PathBuf) -> Result<Self, projects::InitError> {
+        if let Some(problem) = registry.problems().into_iter().next() {
+            return Err(projects::InitError::Config(problem.error));
+        }
         let store = Arc::new(Store::open(path)?);
+        let managed = store.projects()?;
+        if let Some(id) = registry
+            .projects
+            .keys()
+            .find(|id| managed.contains_key(*id))
+        {
+            return Err(projects::InitError::Collision(id.clone()));
+        }
         store.recover_prompts()?;
         // Retain interrupted keys indefinitely; only definitely non-resumable old records age out.
         store.prune(now_millis().saturating_sub(90 * 24 * 60 * 60 * 1000))?;
         let mut broker = Self::new(registry);
+        broker
+            .registry
+            .lock()
+            .expect("configuration lock poisoned")
+            .managed_projects = managed;
         broker.offline = Arc::new(Mutex::new(
             store
                 .records()?
@@ -1651,8 +1669,12 @@ impl Broker {
 
     /// Close every downstream worker when an embedded gateway stops serving requests.
     pub async fn shutdown(&self) {
-        if let Ok(mut registry) = self.registry.lock() {
-            registry.stopping = true;
+        {
+            // Let committed project writes finish publishing before shutdown closes admission.
+            let _writer = self.reloading.lock().await;
+            if let Ok(mut registry) = self.registry.lock() {
+                registry.stopping = true;
+            }
         }
         let entries = self
             .sessions
@@ -3456,6 +3478,7 @@ pub fn router_with_origin(broker: Broker, origin: Option<&str>) -> Router {
     }
     server
         .into_router()
+        .merge(projects::router(broker.clone(), origin.map(str::to_owned)))
         .route(
             "/v1/config/reload",
             post({

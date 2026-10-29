@@ -7,6 +7,7 @@ use hive_daemon::config::ConfigSource;
 use hive_tui::Options as TuiOptions;
 
 mod doctor;
+mod project;
 
 const HELP_STYLES: Styles = Styles::styled()
     .header(AnsiColor::Cyan.on_default().bold())
@@ -33,6 +34,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Manage logical projects and node-local directory overrides.
+    Project(project::Options),
     /// Open the terminal client.
     Tui(TuiOptions),
     /// Run the local gateway in the foreground or query its status.
@@ -228,6 +231,7 @@ async fn main() -> miette::Result<()> {
         | Some(Command::Serve(options)) => serve(options).await,
         Some(Command::Web { url }) => web(url),
         Some(Command::Doctor(options)) => doctor(options).await,
+        Some(Command::Project(options)) => project::run(options).await,
         Some(Command::Completions { shell }) => {
             generate(shell, &mut Cli::command(), "hive", &mut std::io::stdout());
             Ok(())

@@ -70,6 +70,7 @@ where
     .unwrap();
     let broker = hive_daemon::Broker::persistent(
         Config {
+            projects: Default::default(),
             default_agent: Some("bee".into()),
             agents: BTreeMap::from([("bee".into(), profile)]),
         },

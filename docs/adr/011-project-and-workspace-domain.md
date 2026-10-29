@@ -30,14 +30,16 @@ Its existing session vocabulary remains separate from workspace state.
 | `Workspace` | Concrete environment with project, owning node, policy, retention, current operation identity, and observed location |
 | `OperationId` | Durable key for one logical provision or cleanup operation, including retries |
 
-Project, node, repository, workspace, and operation IDs have distinct prefixes and
-canonical UUID spellings. Allocate once and persist them. In particular, node
+Project IDs use lowercase slugs, with numeric suffixes allocated at registration
+when a slug is taken. Existing `project-<UUID>` IDs remain valid. Node, repository,
+workspace, and operation IDs have distinct prefixes and canonical UUID spellings.
+Allocate once and persist them. In particular, node
 identity comes from node registration, not from a new allocation per request.
 Renaming a project or moving a directory does not change its identity.
 
 | Field | Portability and authority |
 | --- | --- |
-| Resource IDs | Portable opaque identifiers; never derived from cwd or configuration filenames |
+| Resource IDs | Portable identifiers; project slugs originate from names at registration, never regenerated from cwd or configuration filenames |
 | Repository source | Logical locator resolved by the owning backend; not a credential store |
 | `NodePath` | Absolute node-local path with explicit owning node and POSIX/Windows syntax |
 | Requested base ref and branch | Portable intent; backend resolves and validates against the actual repository |
@@ -190,6 +192,25 @@ named profiles are composed independently (#117); no profile, context, or UI sta
 is attached to individual files in this domain.
 
 ## Consequences
+
+### Project registry authority
+
+Issue #84 implements config-owned definitions and a separate SQLite-managed
+registry. TOML keys are explicit `ProjectId`s and never derived from fragment
+filenames. Duplicate IDs across fragments or ownership sources are errors.
+Existing agent profiles can reference configured projects after composition;
+SQLite-only entries do not satisfy declarative references, keeping doctor and
+configuration validation independent of node-local mutable state.
+
+HTTP/CLI writes mutate managed definitions only. Configured entries require an
+edit and reload. Both mutations and reload share a serialized publication gate;
+durable writes commit before publishing the managed snapshot and catalog revision.
+Registration validates portable metadata without Git or filesystem operations.
+Node-local directory overrides are keyed separately by project and node identity,
+and remain inert when their definition disappears. Removing definitions does not
+authorize deletion of repositories, workspaces, or local directories.
+
+### Domain tradeoffs
 
 Three resource identities require explicit association and separate persistence,
 but avoid confusing a shared cache, task checkout, and logical project. A simple

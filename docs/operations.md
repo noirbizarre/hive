@@ -59,6 +59,20 @@ Use [troubleshooting](troubleshooting.md) for diagnostic actions and
 
 ## Storage and backups
 
+### Project definitions
+
+`hive project list` shows both configured and managed definitions. Managed
+registrations and node-local directory overrides persist in the same private
+database as the session catalog; include them in backups. Configured definitions
+remain in their TOML files and must be backed up separately.
+
+Use TOML/reload for configured entries and `hive project update` for managed ones.
+ID collisions reject startup or reload. Removing a definition only detaches
+metadata: it never removes a checkout, workspace, local directory, or override.
+See [project commands](reference/cli.md#projects).
+
+### Database contents
+
 Hive stores its catalog in `$XDG_STATE_HOME/hive/sessions.sqlite3`, falling back
 to `$HOME/.local/state/hive/sessions.sqlite3`. It uses SQLite WAL.
 
@@ -80,7 +94,8 @@ retention/fallback policy; see [ADR-009](adr/009-agent-owned-history-and-session
 Schema version 2 upgrades earlier journals transactionally: it fingerprints each
 legacy prompt, blanks its body, and reduces results to message IDs or failure
 markers without releasing pending reservations. Invalid legacy rows abort the
-upgrade rather than dropping requests. Schema 3 adds write-ahead dispatch,
+upgrade rather than dropping requests. Schema 4 adds managed project definitions
+and node-local overrides without cascading resource deletion. Schema 3 adds write-ahead dispatch,
 controlled terminal evidence and per-request recovery acknowledgements. Older
 Hive binaries refuse unsupported schemas. Legacy null/failed outcomes cannot
 prove non-dispatch: upgrading may require a one-time explicit acknowledgement,

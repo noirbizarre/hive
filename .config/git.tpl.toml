@@ -17,6 +17,7 @@ docs = true
 docs_accent = "indigo"
 keywords = ""
 kind = "workspace"
+mbx = true
 msrv = true
 msrv_version = "1.88"
 owner = "noirbizarre"

@@ -1,6 +1,9 @@
 //! Profile declarations are inert until a client starts a session.
 
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 use hive_protocol::AgentVersion;
 use serde::{Deserialize, Serialize};
@@ -11,6 +14,24 @@ pub struct Config {
     pub default_agent: Option<String>,
     #[serde(default)]
     pub agents: BTreeMap<String, Profile>,
+}
+
+// File composition stays out of the runtime config so inline configs cannot silently ignore includes.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RootDocument {
+    default_agent: Option<String>,
+    #[serde(default)]
+    include: Vec<String>,
+    #[serde(default)]
+    agents: BTreeMap<String, Profile>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FragmentDocument {
+    #[serde(default)]
+    agents: BTreeMap<String, Profile>,
 }
 
 /// The selected path is anchored once, so reload cannot switch sources with the caller's cwd.
@@ -155,6 +176,31 @@ pub enum ConfigError {
         help("fix the TOML near the reported line; unknown profile fields are rejected")
     )]
     Syntax(String),
+
+    #[error("{0}")]
+    #[diagnostic(
+        code(hive::config::include),
+        help(
+            "set include in the root config to an array of file paths or valid shell-style globs"
+        )
+    )]
+    Include(String),
+
+    #[error("{0}")]
+    #[diagnostic(
+        code(hive::config::duplicate_file),
+        help("remove repeated or overlapping includes; the root cannot include itself")
+    )]
+    DuplicateFile(String),
+
+    #[error("{0}")]
+    #[diagnostic(
+        code(hive::config::duplicate_agent),
+        help(
+            "rename or remove one agent definition; profiles cannot override or extend each other"
+        )
+    )]
+    DuplicateAgent(String),
 
     #[error("{0}")]
     #[diagnostic(
@@ -373,31 +419,12 @@ impl Config {
     }
 
     fn read_path(path: PathBuf, missing_ok: bool) -> Result<Self, ConfigError> {
-        let mut config: Self = match std::fs::read_to_string(&path) {
-            Ok(text) => toml::from_str(&text).map_err(|error: toml::de::Error| {
-                let line = error.span().map(|span| {
-                    text[..span.start]
-                        .bytes()
-                        .filter(|byte| *byte == b'\n')
-                        .count()
-                        + 1
-                });
-                // The toml message can quote values, so only the position is reported.
-                ConfigError::Syntax(format!(
-                    "invalid Hive config {}{}; check TOML syntax and profile fields",
-                    path.display(),
-                    line.map_or(String::new(), |line| format!(" near line {line}"))
-                ))
-            })?,
+        let mut config = match std::fs::read_to_string(&path) {
+            Ok(text) => compose(&path, parse_document(&path, &text)?)?,
             Err(error) if missing_ok && error.kind() == std::io::ErrorKind::NotFound => {
                 Self::default()
             }
-            Err(error) => {
-                return Err(ConfigError::Unreadable(format!(
-                    "cannot read Hive config {}: {error}",
-                    path.display()
-                )));
-            }
+            Err(error) => return Err(unreadable(&path, error)),
         };
         if let Ok(default) = std::env::var("HIVE_DEFAULT_AGENT") {
             config.default_agent = Some(default);
@@ -457,6 +484,125 @@ impl Config {
     }
 }
 
+fn unreadable(path: &Path, error: std::io::Error) -> ConfigError {
+    ConfigError::Unreadable(format!(
+        "cannot read Hive config {}: {error}",
+        path.display()
+    ))
+}
+
+fn parse_document<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    text: &str,
+) -> Result<T, ConfigError> {
+    toml::from_str(text).map_err(|error: toml::de::Error| {
+        let line = error.span().map(|span| {
+            text[..span.start].bytes().filter(|byte| *byte == b'\n').count() + 1
+        });
+        // Parser messages can quote credentials, so report only the source and position.
+        ConfigError::Syntax(format!(
+            "invalid Hive config {}{}; check TOML syntax and allowed fields (include/default_agent are root-only)",
+            path.display(),
+            line.map_or(String::new(), |line| format!(" near line {line}"))
+        ))
+    })
+}
+
+fn include_paths(root: &Path, entry: &str, index: usize) -> Result<Vec<PathBuf>, ConfigError> {
+    let invalid = || {
+        ConfigError::Include(format!(
+            "invalid include entry {} in {}; use a nonempty path or valid glob",
+            index + 1,
+            root.display()
+        ))
+    };
+    if entry.is_empty() {
+        return Err(invalid());
+    }
+    // A bare --config filename has an empty parent; prefixing that with '/' would escape cwd.
+    let base = root
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    // Literal paths must fail when missing, unlike intentionally optional glob matches.
+    if !entry.contains(['*', '?', '[', ']']) {
+        return Ok(vec![base.join(entry)]);
+    }
+    let pattern = if Path::new(entry).is_absolute() {
+        entry.to_owned()
+    } else {
+        // Brackets in the selected root directory are filenames, not pattern syntax.
+        let base = base.to_str().ok_or_else(invalid)?;
+        format!(
+            "{}{separator}{entry}",
+            glob::Pattern::escape(base),
+            separator = std::path::MAIN_SEPARATOR
+        )
+    };
+    let matches = glob::glob_with(
+        &pattern,
+        glob::MatchOptions {
+            require_literal_leading_dot: true,
+            ..Default::default()
+        },
+    )
+    .map_err(|_| invalid())?;
+    let mut paths = matches
+        .map(|result| {
+            result.map_err(|error| {
+                ConfigError::Unreadable(format!(
+                    "cannot expand includes in {}: {error}",
+                    root.display()
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    // Deterministic first-error reporting must not depend on directory enumeration order.
+    paths.sort();
+    Ok(paths)
+}
+
+fn compose(root: &Path, document: RootDocument) -> Result<Config, ConfigError> {
+    let mut config = Config {
+        default_agent: document.default_agent,
+        agents: document.agents,
+    };
+    let identity = std::fs::canonicalize(root).map_err(|error| unreadable(root, error))?;
+    let mut files = BTreeMap::from([(identity, root.to_path_buf())]);
+    let mut origins: BTreeMap<_, _> = config
+        .agents
+        .keys()
+        .map(|id| (id.clone(), root.to_path_buf()))
+        .collect();
+    for (index, entry) in document.include.iter().enumerate() {
+        for path in include_paths(root, entry, index)? {
+            // Resolve identity without changing the path base or editor-replacement behavior.
+            let identity =
+                std::fs::canonicalize(&path).map_err(|error| unreadable(&path, error))?;
+            if let Some(previous) = files.insert(identity, path.clone()) {
+                return Err(ConfigError::DuplicateFile(format!(
+                    "Hive config {} is selected more than once (also {})",
+                    path.display(),
+                    previous.display()
+                )));
+            }
+            let text = std::fs::read_to_string(&path).map_err(|error| unreadable(&path, error))?;
+            let fragment: FragmentDocument = parse_document(&path, &text)?;
+            for (id, profile) in fragment.agents {
+                if let Some(previous) = origins.insert(id.clone(), path.clone()) {
+                    return Err(ConfigError::DuplicateAgent(format!(
+                        "agent '{id}' is defined in both {} and {}",
+                        previous.display(),
+                        path.display()
+                    )));
+                }
+                config.agents.insert(id, profile);
+            }
+        }
+    }
+    Ok(config)
+}
+
 impl Profile {
     pub fn transport(&self) -> &'static str {
         if self.kind == ProfileKind::OpencodeServer {
@@ -494,6 +640,184 @@ pub fn default_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{Config, ConfigError, ConfigSource};
+
+    fn read_fragments(root: &str, files: &[(&str, &str)]) -> Result<Config, ConfigError> {
+        let dir = tempfile::tempdir().unwrap();
+        // Metacharacters in the parent must never become part of the include pattern.
+        let base = dir.path().join("config[local]");
+        std::fs::create_dir(&base).unwrap();
+        for (name, text) in files {
+            let path = base.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let path = base.join("config.toml");
+        std::fs::write(&path, root).unwrap();
+        Config::read(Some(path))
+    }
+
+    #[test]
+    fn a_bare_root_filename_resolves_globs_in_the_current_directory() {
+        let paths =
+            super::include_paths(std::path::Path::new("config.toml"), "Cargo.[t]oml", 0).unwrap();
+        assert_eq!(paths.len(), 1);
+        // Windows canonical paths carry a verbatim prefix, so normalize both sides.
+        assert_eq!(
+            std::fs::canonicalize(&paths[0]).unwrap(),
+            std::fs::canonicalize(std::env::current_dir().unwrap().join("Cargo.toml")).unwrap()
+        );
+    }
+
+    #[test]
+    fn absolute_includes_do_not_use_the_root_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let fragment = dir.path().join("agent.toml");
+        std::fs::write(&fragment, "[agents.a]\ncommand = 'a'").unwrap();
+        for entry in [fragment, dir.path().join("*.toml")] {
+            let config =
+                read_fragments(&format!("include = ['{}']", entry.display()), &[]).unwrap();
+            assert!(config.agents.contains_key("a"));
+        }
+    }
+
+    #[test]
+    fn includes_compose_profiles_relative_to_the_selected_root_before_validation() {
+        let config = read_fragments(
+            "include = ['conf.d/*.toml']\ndefault_agent = 'b'\n[agents.root]\ncommand = 'root'",
+            &[
+                ("conf.d/b.toml", "[agents.b]\ncommand = 'b'"),
+                ("conf.d/a.toml", "[agents.a]\ncommand = 'a'"),
+                ("conf.d/.hidden.toml", "not valid TOML"),
+            ],
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(
+            config.agents.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["a", "b", "root"]
+        );
+        assert_eq!(config.default_agent.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn absent_glob_matches_are_optional_but_literal_files_are_required() {
+        assert!(read_fragments("include = ['conf.d/*.toml']", &[]).is_ok());
+        assert!(matches!(
+            read_fragments("include = ['missing.toml']", &[]),
+            Err(ConfigError::Unreadable(_))
+        ));
+        for entry in ["", "conf.d/["] {
+            assert!(matches!(
+                read_fragments(&format!("include = ['{entry}']"), &[]),
+                Err(ConfigError::Include(_))
+            ));
+        }
+        // Merely creating conf.d must not opt an existing root into composition.
+        assert!(
+            read_fragments("", &[("conf.d/a.toml", "broken TOML")])
+                .unwrap()
+                .agents
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn include_order_and_sorted_matches_determine_the_first_failure() {
+        let files = [
+            ("a.toml", "[agents.a]\ncommand = 42"),
+            ("b.toml", "[agents.b]\ncommand = 42"),
+        ];
+        let error = read_fragments("include = ['b.toml', 'a.toml']", &files).unwrap_err();
+        assert!(error.to_string().contains("b.toml"));
+        let error = read_fragments("include = ['[ab].toml']", &files).unwrap_err();
+        assert!(error.to_string().contains("a.toml"));
+    }
+
+    #[test]
+    fn agent_definitions_cannot_override_or_extend_another_source() {
+        for root in [
+            "include = ['a.toml']\n[agents.a]\ncommand = 'root'",
+            "include = ['a.toml', 'b.toml']",
+        ] {
+            let error = read_fragments(
+                root,
+                &[
+                    ("a.toml", "[agents.a]\ncommand = 'a'"),
+                    ("b.toml", "[agents.a]\nargs = ['secret-value']"),
+                ],
+            )
+            .unwrap_err();
+            assert!(matches!(error, ConfigError::DuplicateAgent(_)));
+            let text = error.to_string();
+            assert!(text.contains("a.toml"));
+            assert!(text.contains(if root.contains("root") {
+                "config.toml"
+            } else {
+                "b.toml"
+            }));
+            assert!(!text.contains("secret-value"));
+        }
+    }
+
+    #[test]
+    fn repeated_files_and_self_inclusion_are_rejected_even_without_agents() {
+        for includes in [
+            "['a.toml', './a.toml']",
+            "['a.toml', '[ab].toml']",
+            "['config.toml']",
+        ] {
+            assert!(matches!(
+                read_fragments(&format!("include = {includes}"), &[("a.toml", "")]),
+                Err(ConfigError::DuplicateFile(_))
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_aliases_cannot_include_the_same_file_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.toml"), "").unwrap();
+        std::os::unix::fs::symlink("a.toml", dir.path().join("b.toml")).unwrap();
+        let root = dir.path().join("config.toml");
+        std::fs::write(&root, "include = ['a.toml', 'b.toml']").unwrap();
+        assert!(matches!(
+            Config::read(Some(root)),
+            Err(ConfigError::DuplicateFile(_))
+        ));
+    }
+
+    #[test]
+    fn fragments_reject_root_settings_and_redact_invalid_values() {
+        for text in [
+            "include = []",
+            "default_agent = 'secret-value'",
+            "[agents.a]\ncommand = 42\npassword = 'secret-value'",
+            "[agents.a]\ncommand = 'secret-value'\n[",
+        ] {
+            let error = read_fragments("include = ['fragment.toml']", &[("fragment.toml", text)])
+                .unwrap_err();
+            assert!(matches!(error, ConfigError::Syntax(_)));
+            let message = error.to_string();
+            assert!(message.contains("fragment.toml"));
+            assert!(message.contains("line"));
+            assert!(!message.contains("secret-value"));
+        }
+        assert!(matches!(
+            read_fragments("include = ['conf.d']", &[("conf.d/a.toml", "")]),
+            Err(ConfigError::Unreadable(_))
+        ));
+    }
+
+    #[test]
+    fn composed_configs_still_collect_all_semantic_problems() {
+        let config = read_fragments(
+            "include = ['a.toml']\ndefault_agent = 'missing'",
+            &[("a.toml", "[agents.a]\nversions = []")],
+        )
+        .unwrap();
+        assert_eq!(config.problems().len(), 3);
+    }
 
     #[test]
     fn a_missing_implicit_source_is_allowed_only_at_startup() {
@@ -714,6 +1038,9 @@ mod tests {
             super::ConfigError::Endpoint(String::new()),
             super::ConfigError::Header(String::new()),
             super::ConfigError::Credentials(String::new()),
+            super::ConfigError::Include(String::new()),
+            super::ConfigError::DuplicateFile(String::new()),
+            super::ConfigError::DuplicateAgent(String::new()),
         ];
         let codes: Vec<_> = errors
             .iter()
@@ -732,6 +1059,9 @@ mod tests {
                 "hive::config::endpoint",
                 "hive::config::header",
                 "hive::config::credentials",
+                "hive::config::include",
+                "hive::config::duplicate_file",
+                "hive::config::duplicate_agent",
             ]
         );
         assert!(errors.iter().all(|e| e.help().is_some()));

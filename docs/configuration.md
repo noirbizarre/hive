@@ -1,7 +1,8 @@
 # Configuration
 
-Hive loads one TOML file when the daemon starts. Profiles describe how to reach
-agents. They do not start agents until a session needs them.
+Hive loads a root TOML file and any fragments it explicitly includes when the
+daemon starts. Profiles describe how to reach agents. They do not start agents
+until a session needs them.
 
 ## File location and precedence
 
@@ -14,8 +15,7 @@ The file is selected in this order:
 5. `./hive/config.toml` when both variables are unset.
 
 An absent default file produces an empty configuration. An absent explicitly
-selected file is an error. Files are not merged. Unknown fields are rejected
-rather than silently ignored.
+selected file is an error. Unknown fields are rejected rather than silently ignored.
 
 Use the same file when checking and serving:
 
@@ -24,10 +24,48 @@ hive doctor --config /absolute/path/config.toml
 hive daemon --config /absolute/path/config.toml
 ```
 
+## Configuration fragments
+
+Use the root `include` setting to group profiles into separate files:
+
+```toml
+# ~/.config/hive/config.toml
+include = ["conf.d/*.toml"]
+default_agent = "claude"
+```
+
+```toml
+# ~/.config/hive/conf.d/claude.toml
+[agents.claude]
+command = "claude-agent-acp"
+```
+
+Each fragment contains `[agents.<id>]` tables with the same profile fields as the
+root. `include` and `default_agent` are root-only settings. A default can select a
+profile declared in a fragment. The root can also declare profiles directly.
+
+Include entries are file paths or shell-style globs (`*`, `?`, character classes,
+and `**` for recursive matching). Relative paths resolve beside the selected root
+file, including when using `--config` or `HIVE_CONFIG`; absolute paths also work.
+Environment variables and `~` are not expanded. A glob does not match hidden files
+unless its pattern explicitly starts that component with a dot.
+
+Hive reads root profiles first, then include entries in list order, sorting each
+glob's matches by path. A glob matching nothing is allowed, including an absent
+or empty `conf.d`. An explicitly named missing file, invalid pattern, unreadable
+file, or directory selected as a fragment is an error. Glob traversal errors
+reported by the filesystem matcher also fail loading.
+
+Agent IDs must be unique across all files: profiles cannot override or extend
+one another. Repeated files, overlapping includes, symlink aliases, and including
+the root itself are rejected. There is no automatic `conf.d` discovery; without
+`include`, only the root is loaded.
+
 ## Reloading changes
 
 After editing, run `hive daemon reload`, or send SIGHUP to the daemon on Unix.
-Hive rereads the original path, including files replaced atomically by an editor.
+Hive rereads the original path, including files replaced atomically by an editor,
+and re-expands its includes so fragment additions, removals, and edits are picked up.
 It validates the entire candidate before publishing it. Invalid or unreadable
 files leave the previous configuration active; deleting even an implicit default
 file causes reload to fail rather than clear the registry.
@@ -58,6 +96,7 @@ Listen address, state/runtime locations, and tracing settings require restart.
 
 | Setting | Type | Default | Meaning |
 | --- | --- | --- | --- |
+| `include` | Array of strings | `[]` | Root-only paths or globs for profile fragments |
 | `default_agent` | String | Unset | Profile ID for session creation without a selector |
 | `agents` | Table of profiles | Empty | Available downstream agents |
 

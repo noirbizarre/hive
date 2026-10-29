@@ -248,6 +248,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fragment_changes_are_rediscovered_and_failed_composition_preserves_the_catalog() {
+        let fixture = Fixture::new();
+        let fragments = fixture.0.join("conf.d");
+        std::fs::create_dir(&fragments).unwrap();
+        let a = fragments.join("a.toml");
+        let b = fragments.join("b.toml");
+        std::fs::write(&a, "[agents.a]\ncommand = 'old-agent'").unwrap();
+        let source = fixture.config("include = ['conf.d/*.toml']");
+        let broker = Broker::new(source.load().unwrap()).with_config_source(source);
+        std::fs::write(&a, "[agents.a]\ncommand = 'edited-agent'").unwrap();
+        std::fs::write(&b, "[agents.b]\ncommand = 'added-agent'").unwrap();
+        assert_eq!(broker.reload_config().await.unwrap(), 1);
+        assert_eq!(
+            broker.config().agents["a"].command.as_deref(),
+            Some("edited-agent")
+        );
+        assert!(broker.config().agents.contains_key("b"));
+        let before = broker.config();
+        for invalid in ["[", "[agents.a]\ncommand = 'duplicate'"] {
+            std::fs::write(&b, invalid).unwrap();
+            assert!(broker.reload_config().await.is_err());
+            assert!(Arc::ptr_eq(&before, &broker.config()));
+            assert_eq!(*broker.catalog.borrow(), 1);
+        }
+        fixture.config("include = ['conf.d/*.toml', 'missing.toml']");
+        std::fs::remove_file(&b).unwrap();
+        assert!(broker.reload_config().await.is_err());
+        assert!(Arc::ptr_eq(&before, &broker.config()));
+        assert_eq!(*broker.catalog.borrow(), 1);
+        fixture.config("include = ['conf.d/*.toml']");
+        assert_eq!(broker.reload_config().await.unwrap(), 2);
+        assert!(!broker.config().agents.contains_key("b"));
+    }
+
+    #[tokio::test]
     async fn only_valid_complete_candidates_replace_the_current_registry_and_revision() {
         let fixture = Fixture::new();
         let source = fixture.config(ACP);

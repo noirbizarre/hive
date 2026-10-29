@@ -325,7 +325,7 @@ infer it merely from negotiating protocol v2.
 `crates/hive-daemon/tests/bee.rs` exercises Bee's documented `--scenario` contract
 through Hive's normal subprocess connection and client-facing WebSocket/HTTP
 transports. It is part of the ordinary suite, including the existing three-OS
-CI matrix. The normal mise setup provisions Bee's `development` prerelease;
+CI matrix. The normal mise setup provisions Bee's pinned 0.2.0 release;
 `mise.lock` records each platform's artifact URL and checksum. This suite was
 exercised locally on Linux with Bee 0.1.1 and the published `development` build
 (which also reports version 0.1.1). A development-channel run

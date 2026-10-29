@@ -46,24 +46,27 @@ url = "https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellche
 url_api = "https://api.github.com/repos/koalaman/shellcheck/releases/assets/279056944"
 
 [[tools.bee]]
-version = "development"
+version = "0.2.0"
 backend = "github:noirbizarre/bee"
-specifiers = ["development"]
+specifiers = ["0.2.0"]
 
 [tools.bee."platforms.linux-x64"]
-checksum = "sha256:1d3503e6f99f02db45c0fb18104fdf6ac7ea83c7fa3fcf46bed6c3bfed42ee18"
-url = "https://github.com/noirbizarre/bee/releases/download/development/bee_development_linux-amd64"
-url_api = "https://api.github.com/repos/noirbizarre/bee/releases/assets/686881640"
+checksum = "sha256:2d6ce9d2fba8a1ffa69864ef1436b128859cee6ba462277b078ef2f4f004ccec"
+checksum_source = "mise-versions"
+url = "https://github.com/noirbizarre/bee/releases/download/0.2.0/bee_0.2.0_linux-amd64"
+url_api = "https://api.github.com/repos/noirbizarre/bee/releases/assets/688236520"
 
 [tools.bee."platforms.macos-arm64"]
-checksum = "sha256:70a7fc999030e5af9d33a9a681608e54dfda789268967b1b1ad030e67a89ef56"
-url = "https://github.com/noirbizarre/bee/releases/download/development/bee_development_darwin-arm64"
-url_api = "https://api.github.com/repos/noirbizarre/bee/releases/assets/686881643"
+checksum = "sha256:1654d6eda53d1cb5b99dd8b9107aacf24e6c0b9b1a157b11c3cb6abb4580b722"
+checksum_source = "mise-versions"
+url = "https://github.com/noirbizarre/bee/releases/download/0.2.0/bee_0.2.0_darwin-arm64"
+url_api = "https://api.github.com/repos/noirbizarre/bee/releases/assets/688236524"
 
 [tools.bee."platforms.windows-x64"]
-checksum = "sha256:01ea3adc432f03bcf414e1360e50b63856a0981e7a4e5fa8761f0a7548b21291"
-url = "https://github.com/noirbizarre/bee/releases/download/development/bee_development_windows-amd64.exe"
-url_api = "https://api.github.com/repos/noirbizarre/bee/releases/assets/686881713"
+checksum = "sha256:d39f745ba35582d6ff82499bae006e3a1b0f09549c74890d2c6888b8e77c1002"
+checksum_source = "mise-versions"
+url = "https://github.com/noirbizarre/bee/releases/download/0.2.0/bee_0.2.0_windows-amd64.exe"
+url_api = "https://api.github.com/repos/noirbizarre/bee/releases/assets/688236612"
 
 [[tools.cargo-binstall]]
 version = "1.22.0"

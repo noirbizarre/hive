@@ -40,7 +40,8 @@ default_agent = "claude"
 command = "claude-agent-acp"
 ```
 
-Each fragment can contain `[agents.<id>]` and `[projects.<id>]` tables with the
+Each fragment can contain `[agents.<id>]`, `[projects.<id>]`, `[workspaces.<id>]`
+and global `[worktrunk]` tables with the
 same fields as the root. `include` and `default_agent` are root-only settings. A default can select a
 profile declared in a fragment. The root can also declare profiles directly.
 
@@ -100,6 +101,8 @@ Listen address, state/runtime locations, and tracing settings require restart.
 | `default_agent` | String | Unset | Profile ID for session creation without a selector |
 | `agents` | Table of profiles | Empty | Available downstream agents |
 | `projects` | Table keyed by project IDs | Empty | Portable configured definitions |
+| `workspaces` | Table keyed by policy names | Empty | Workspace policy templates |
+| `worktrunk` | Global integration table | Auto-detect | Optional WorkTrunk lifecycle selection |
 
 `HIVE_DEFAULT_AGENT` overrides `default_agent`. The selected ID must exist.
 A daemon can start without a default, but clients must then select a profile.
@@ -138,12 +141,12 @@ Configure Git/SSH credentials on each execution node. Preparation stores argv
 arrays with nonblank executables and no NUL characters; arguments are ordinary
 metadata, not a place for secrets. Registration does not contact Git, clone a
 repository, resolve refs, or execute preparation. Omitted `default_ref` leaves
-default-ref selection to future repository provisioning.
+default-ref selection to the fetched remote default branch.
 
 A local-only project can omit `repository_source`. Existing cwd-based sessions
 and the core `existing` directory policy remain available. An agent's optional
-`project` currently declares and validates intent; it does not provision a session
-or change its cwd.
+`project` alone declares and validates intent without changing cwd. Adding an
+explicit `workspace` policy activates provisioning before downstream agent startup.
 
 Project IDs must be unique across all selected files. References resolve after
 complete composition, including declarations in later fragments. Profile references
@@ -162,12 +165,116 @@ preferences, not clone/cache records or runtime workspaces; paths need not exist
 at registration time. Removing a definition never deletes directories, clones,
 workspaces, or overrides. See [project commands](reference/cli.md#projects).
 
+## Workspace policies
+
+Policies are independent named declarations, not runtime workspace IDs:
+
+```toml
+[workspaces.task]
+policy = "worktree"
+base_ref = "main" # optional: request, policy, project default, then remote HEAD
+
+[workspaces.independent]
+policy = "clone"
+
+[workspaces.local]
+policy = "existing"
+directory = "/home/user/work/project"
+
+[agents.coder]
+command = "some-acp-agent"
+project = "hive"
+workspace = "task"
+
+[worktrunk]
+enabled = false
+```
+
+Project, workspace and agent declarations may live in separate included files.
+All references resolve after composition; duplicates are errors, including multiple
+global `[worktrunk]` declarations. Files never become profiles or contexts.
+An `existing` policy may omit its directory to use the project's override for the
+local node (whose stable identity is returned by `hive repository list`).
+
+Worktree and clone policies create a distinct `hive/<workspace-id>` branch unless
+the caller supplies a fresh branch. Each new Git-backed provision fetches first;
+fetch failure prevents startup rather than silently using stale refs. Existing
+workspaces are never reset by fetch. Identical operation retries retain their
+original resolved base and backend. Changing a project source creates a new cache
+generation rather than repointing existing workspaces.
+
+`ephemeral` policies specify `backing = "worktree"` or `"clone"` and a finite
+`retention` (for example `retention = { kind = "until", expires_at = 1800000000 }`).
+This records lifetime intent; automatic expiration execution is separate work.
+Session shutdown never implies removal.
+
+An explicit `--cwd` / Hive `existing` launch selector bypasses a profile's policy.
+Without a policy or selector, ordinary ACP cwd behavior is preserved, including
+downstream-only paths when using a remote agent. Explicit existing-directory
+selections are node-local. A workspace-ID selector attaches to that ready resource
+instead of provisioning.
+Native adoption and session resume cannot request a replacement workspace.
+
+### Global WorkTrunk integration
+
+`enabled = true` requires compatible `wt`; `false` bypasses it without probing.
+An absent or empty section auto-detects a usable installation, otherwise selecting
+native Git. This choice is global, never per-profile. Selected WorkTrunk owns
+worktree creation/removal and directory templates: Hive supplies no target path
+and persists the actual returned directory. Failures never fall back mid-operation.
+
+Hooks remain enabled and require prior WorkTrunk approval. For a new bare cache,
+Hive reads project configuration from the pinned base commit and supplies that
+snapshot to WorkTrunk so branch-specific hooks are not silently skipped. Inspect
+the operation for its `worktrunkConfig` snapshot path, review it, then use
+`WORKTRUNK_PROJECT_CONFIG_PATH=<snapshot> wt -C <bare-repository> config approvals add`
+before retrying the original operation. Hive never passes `--yes`. Blocking hook
+failures prevent readiness; background hooks retain WorkTrunk's asynchronous
+semantics. Interrupted hooks require inspection/manual reconciliation, not blind
+replay. Activity markers are tracked separately in issue #118.
+
+### Flat bare layout and independent hook settings
+
+New worktree repositories prefer this layout:
+
+```text
+<project-root>/
+  .git/                    # bare shared repository
+  main/                    # example default-branch checkout
+  workspace-.../           # independent native task checkout
+```
+
+Native task directories are immediate children even when branch names contain
+slashes. Existing layouts are retained; WorkTrunk's selected paths take precedence.
+Independent clone policies use separate managed directories.
+
+New flat bare repositories enable `extensions.worktreeConfig`. Following
+[Git's configuration rules](https://git-scm.com/docs/git-worktree#_configuration_file),
+`core.bare=true` resides in the bare repository's `config.worktree`, not shared
+config. Linked checkouts can therefore have independent settings. The extension
+does not by itself isolate Git's default shared hooks directory. Inside each
+checkout, give hook tools an independent directory:
+
+```sh
+git config --worktree core.hooksPath "$(git rev-parse --absolute-git-dir)/hooks"
+prek install
+```
+
+Current prek honors worktree-local `core.hooksPath`. If installing hooks from
+WorkTrunk lifecycle hooks, configure that path before `prek install` there too.
+Use `git config --worktree`, rather than `--local`, for branch-specific hook and
+sparse-checkout settings. Hive does not install hook shims automatically.
+
+Worktrees isolate checkouts, **not processes or filesystem access**. They are not
+security sandboxes.
+
 ## Profile fields
 
 | Field | Type | Default | Applies to |
 | --- | --- | --- | --- |
 | `name` | String | Profile ID for display | All profiles |
 | `project` | Project ID | Unset | Optional configured project reference, validated after composition |
+| `workspace` | Policy name | Unset | Provision this policy before startup; requires `project` |
 | `kind` | `"acp"` or `"opencode-server"` | `"acp"` | All profiles |
 | `command` | String | Unset | ACP stdio executable |
 | `args` | Array of strings | `[]` | ACP stdio arguments |

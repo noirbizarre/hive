@@ -41,6 +41,19 @@ use ui::{App, Page, SessionSnapshot};
 
 #[derive(Args, Clone, Debug)]
 pub struct Options {
+    /// Explicitly use a directory instead of a profile's managed workspace policy.
+    #[arg(long, conflicts_with_all = ["workspace", "workspace_id", "project", "base_ref", "branch", "session"])]
+    pub cwd: Option<std::path::PathBuf>,
+    #[arg(long, conflicts_with_all = ["workspace_id", "session"])]
+    pub project: Option<String>,
+    #[arg(long, conflicts_with_all = ["workspace_id", "session"])]
+    pub workspace: Option<String>,
+    #[arg(long, conflicts_with_all = ["session", "base_ref", "branch"])]
+    pub workspace_id: Option<String>,
+    #[arg(long, conflicts_with = "session")]
+    pub base_ref: Option<String>,
+    #[arg(long, conflicts_with = "session")]
+    pub branch: Option<String>,
     #[arg(long, default_value = "127.0.0.1:8765")]
     pub address: String,
     #[arg(long, default_value = "ws", value_parser = ["ws", "http"])]
@@ -556,6 +569,10 @@ fn start_creation(cx: &V2ConnectionTo<Agent>, app: &mut App, profile: String) {
     let previous = previous_pilot(app, None);
     let mut meta = v2::Meta::new();
     meta.insert("hive".into(), serde_json::json!({"agent":profile}));
+    if let Some(launch) = &app.workspace_launch {
+        meta.get_mut("hive").expect("Hive metadata exists")["workspace"] =
+            serde_json::to_value(launch).expect("launch serializes");
+    }
     let request = v2::NewSessionRequest::new(app.cwd.clone()).meta(meta);
     let (sent, result) = oneshot::channel();
     app.session_operation = Some(SessionOperation {
@@ -681,6 +698,33 @@ fn apply_created(app: &mut App, result: Result<v2::NewSessionResponse, String>) 
                 );
             }
             app.owner = created.meta;
+            let cwd = app
+                .owner
+                .as_ref()
+                .and_then(|meta| meta.get("hive"))
+                .and_then(|hive| hive["workspace"]["effectiveCwd"].as_str())
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| app.cwd.clone());
+            // Catalog refresh may already have discovered this durable pending creation.
+            app.sessions.retain(|session| session.session_id != id);
+            app.sessions.push(ui::SessionSummary {
+                session_id: id.clone(),
+                cwd,
+                agent: app
+                    .profiles
+                    .get(app.profile_selected)
+                    .cloned()
+                    .unwrap_or_default(),
+                title: None,
+                lifecycle: "active".into(),
+                recovery: None,
+                recovery_reason: None,
+                activity: "idle".into(),
+                last_activity_at: None,
+                control_owner: None,
+                generation: 1,
+            });
+            app.refresh_requested = true;
             app.select_session(id);
             app.status = "Session created".into();
         }
@@ -772,7 +816,12 @@ fn apply_catalog(app: &mut App, catalog: Catalog) {
         .snapshot
         .sessions
         .into_iter()
-        .filter(|s| app.all || s.cwd == app.cwd)
+        .filter(|s| {
+            app.all
+                || s.cwd == app.cwd
+                || app.active.as_deref() == Some(s.session_id.as_str())
+                || app.recent.contains(&s.session_id)
+        })
         .collect();
     app.update_sessions(sessions);
     update_profiles(app, &catalog.providers);
@@ -1815,9 +1864,34 @@ async fn run_with_clipboard(
     mut clipboard: clipboard::Clipboard,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut app = App {
-        cwd: std::env::current_dir()?,
+        cwd: options
+            .cwd
+            .clone()
+            .map(std::path::absolute)
+            .transpose()?
+            .unwrap_or(std::env::current_dir()?),
         all: true,
         ..App::default()
+    };
+    app.workspace_launch = if let Some(directory) = &options.cwd {
+        Some(hive_protocol::workspace::Launch::Existing {
+            directory: std::path::absolute(directory)?.display().to_string(),
+        })
+    } else if let Some(id) = &options.workspace_id {
+        Some(hive_protocol::workspace::Launch::Attach { id: id.clone() })
+    } else if options.project.is_some()
+        || options.workspace.is_some()
+        || options.branch.is_some()
+        || options.base_ref.is_some()
+    {
+        Some(hive_protocol::workspace::Launch::New {
+            project: options.project.clone(),
+            policy: options.workspace.clone(),
+            base_ref: options.base_ref.clone(),
+            branch: options.branch.clone(),
+        })
+    } else {
+        None
     };
     let providers: serde_json::Value =
         reqwest::get(format!("http://{}/v1/providers", options.address))
@@ -2103,6 +2177,26 @@ async fn run_with_clipboard(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn creation_replaces_its_pending_catalog_entry_with_the_effective_workspace_scope() {
+        let mut app = super::ui::App::default();
+        app.sessions.push(serde_json::from_value(serde_json::json!({"sessionId":"hive-pending","cwd":"/launch","agent":"coder","lifecycle":"recovering","activity":"unknown","generation":1})).unwrap());
+        let mut response =
+            super::v2::NewSessionResponse::new(super::v2::SessionId::new("hive-pending"));
+        let mut meta = super::v2::Meta::new();
+        meta.insert(
+            "hive".into(),
+            serde_json::json!({"workspace":{"effectiveCwd":"/managed/task"}}),
+        );
+        response.meta = Some(meta);
+        super::apply_created(&mut app, Ok(response));
+        assert_eq!(app.sessions.len(), 1);
+        assert_eq!(
+            app.sessions[0].cwd,
+            std::path::PathBuf::from("/managed/task")
+        );
+        assert_eq!(app.sessions[0].lifecycle, "active");
+    }
     use super::*;
 
     #[cfg(unix)]

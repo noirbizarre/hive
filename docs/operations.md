@@ -71,6 +71,64 @@ ID collisions reject startup or reload. Removing a definition only detaches
 metadata: it never removes a checkout, workspace, local directory, or override.
 See [project commands](reference/cli.md#projects).
 
+### Repositories and task workspaces
+
+`hive repository list` reports the stable local node ID and reusable cache status;
+`hive repository fetch <id>` refreshes one cache explicitly. Configure private
+repository access through node-local Git credential helpers or SSH credentials.
+Hive disables interactive credential prompts and retains controlled errors rather
+than raw command stderr. Repository URLs must remain credential-free.
+
+`hive workspace list`, `show <id>` and `inspect <id>` expose durable lifecycle,
+backend, actual paths and fresh cleanup evidence. `hive workspace create --project
+hive --policy task` provisions independently of sessions. Commands print operation
+IDs before network I/O; preserve the key with `--operation <id>` on identical
+retries. `hive workspace operation <id>` shows original intent, pinned commit,
+partial path, hook snapshot and session holds. Branch/ref/path conflicts never
+force checkout or adopt an unrelated directory.
+
+Resources reside beside the session database under `repositories/`, `clones/`,
+and (for preserved independent-clone history) `archives/`. Newly acquired worktree
+caches use `<project-root>/.git` with sibling checkouts. WorkTrunk can place its
+checkouts elsewhere; include those actual paths in backups. Back up resource files
+and the database together while Hive is stopped. Moving a bare repository without
+repairing Git's linked-worktree metadata breaks its checkouts.
+
+Removal is explicit: `hive workspace remove <id>`. It refuses active/unknown use,
+unverifiable identity and dirty tracked, untracked or ignored content. Explicit
+`--discard-changes` permits data loss only for an otherwise verified idle managed
+resource. Worktree branches are retained; clean independent-clone removal first
+archives all refs/objects, including unpushed commits, stashes and notes. Externally owned
+directories cannot be deleted through workspace cleanup.
+
+Disconnect, shutdown and transport failure retain session-use holds. Use
+protection covers adopted native sessions and managed checkouts reached
+through existing-directory aliases. Pending durable startups remain visible in
+the session catalog even if their requesting RPC is cancelled. Confirmed
+close releases a hold atomically with removal of the session catalog record,
+without deleting its workspace. Restart validates the original workspace before
+reattaching; missing/conflicting resources remain unavailable, never replaced.
+Abandoned reservations can be released only when admission, durable records and
+the dispatch journal together prove that no downstream worker could have started.
+Inspect uncertain startup/cleanup and hook effects before retrying. Broader
+automatic recovery and retention execution remain separate work (#89).
+
+For interrupted checkout creation, `hive workspace reconcile <id>` validates
+the recorded Git identity without recreating it. If WorkTrunk's path response
+was lost, supply its actual directory with `--directory`. For uncertain hooks,
+review and reconcile their external effects first, then use `--hooks-reconciled`.
+This never replays provisioning hooks. Cleanup reconciliation either verifies
+completed absence or permits replay of the original removal operation; safety
+checks still apply. A native cleanup whose response was lost can also reconcile
+absence when retried with its original operation ID.
+
+Archive plans are recorded before copying an independent clone. Partial copies
+and completed archives are reconciled against the original refs before removal,
+including interruption between copying, renaming and recording the final path.
+Timed-out Git/WorkTrunk commands terminate their process group (Windows Job) and
+cancel output collection; successfully detached WorkTrunk hooks retain their
+normal background lifetime.
+
 ### Database contents
 
 Hive stores its catalog in `$XDG_STATE_HOME/hive/sessions.sqlite3`, falling back
@@ -95,7 +153,9 @@ Schema version 2 upgrades earlier journals transactionally: it fingerprints each
 legacy prompt, blanks its body, and reduces results to message IDs or failure
 markers without releasing pending reservations. Invalid legacy rows abort the
 upgrade rather than dropping requests. Schema 4 adds managed project definitions
-and node-local overrides without cascading resource deletion. Schema 3 adds write-ahead dispatch,
+and node-local overrides without cascading resource deletion. Schema 5 adds the
+durable local node, repositories, workspaces, operation history and session-use
+holds. Schema 3 adds write-ahead dispatch,
 controlled terminal evidence and per-request recovery acknowledgements. Older
 Hive binaries refuse unsupported schemas. Legacy null/failed outcomes cannot
 prove non-dispatch: upgrading may require a one-time explicit acknowledgement,

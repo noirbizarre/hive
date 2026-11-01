@@ -50,6 +50,7 @@ pub mod reload;
 mod session_config;
 mod transcript;
 mod usage;
+pub mod workspaces;
 use activity::Activity;
 use config::{Config, Pricing, Profile, ProfileKind};
 use persistence::{Outcome, Record, Store};
@@ -74,6 +75,26 @@ impl ConnectTo<Client> for Downstream {
 }
 
 struct AbortOnDrop(Option<tokio::task::AbortHandle>);
+
+/// A durable pending creation must stay discoverable even when its requesting RPC is cancelled.
+struct PendingStartup {
+    broker: Broker,
+    record: Option<Arc<Mutex<Record>>>,
+    armed: bool,
+}
+
+impl Drop for PendingStartup {
+    fn drop(&mut self) {
+        if self.armed
+            && let Some(record) = &self.record
+            && let Ok(mut record) = record.lock()
+        {
+            record.outcome = Outcome::Unavailable;
+            record.reason = Some("agent startup did not complete; inspect the original downstream session and workspace before retrying".into());
+            self.broker.update_offline(record.clone());
+        }
+    }
+}
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
@@ -150,6 +171,7 @@ struct Entry {
 type NativeInterruption = watch::Sender<Option<tokio::time::Instant>>;
 
 struct Control {
+    workspace_context: Option<hive_protocol::workspace::Context>,
     // Only live hop mappings can identify a request-scoped question's original requester.
     parents: HashMap<v1::RequestId, interactions::Parent>,
     startup_parent: Option<interactions::Parent>,
@@ -304,6 +326,7 @@ impl Control {
         }
         Self {
             generation: record.generation,
+            workspace_context: record.workspace_context.clone(),
             parents: HashMap::new(),
             startup_parent: None,
             prompt_parents: HashMap::new(),
@@ -369,6 +392,7 @@ impl Control {
         }
         Self {
             generation: 1,
+            workspace_context: None,
             parents: HashMap::new(),
             startup_parent: None,
             prompt_parents: HashMap::new(),
@@ -428,6 +452,7 @@ impl Control {
         // Live-only clients skip pre-response events; the response must cover the same state.
         activity["seq"] = self.next_seq.saturating_sub(1).into();
         let mut hive = serde_json::json!({
+            "workspace": self.workspace_context,
             "generation": self.generation, "nextSeq": self.next_seq,
             "running": self.busy(), "pilot": self.pilot.is_some(),
             "activitySnapshot": activity,
@@ -617,6 +642,7 @@ fn prompt_title(blocks: &[v2::ContentBlock]) -> Option<String> {
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionSummary {
+    workspace: Option<hive_protocol::workspace::Context>,
     session_id: String,
     cwd: v2::AbsolutePath,
     agent: String,
@@ -643,6 +669,7 @@ impl SessionSummary {
     fn from_entry(id: &str, entry: &Entry, state: &Control) -> Self {
         Self {
             session_id: id.to_owned(),
+            workspace: state.workspace_context.clone(),
             cwd: entry.cwd.clone(),
             agent: entry.profile.clone(),
             title: state.title.clone(),
@@ -692,6 +719,7 @@ impl SessionSummary {
         }
         Self {
             session_id: record.id.clone(),
+            workspace: record.workspace_context.clone(),
             cwd: v2::AbsolutePath::from(PathBuf::from(&record.cwd)),
             agent: record.profile.clone(),
             title: record.title.clone(),
@@ -826,6 +854,31 @@ impl Broker {
         let Some(store) = self.store.clone() else {
             return;
         };
+        if record.downstream_id.is_empty() {
+            record.outcome = Outcome::Unavailable;
+            record.reason = Some("session startup was interrupted before a downstream identity was recorded; inspect the workspace and downstream agent before reconciliation".into());
+            self.update_offline(record);
+            return;
+        }
+        if record.workspace_context.is_some() {
+            match workspaces::Service::new(store.clone())
+                .attached(record.id.clone())
+                .await
+            {
+                Ok(Some(entry))
+                    if entry.workspace.location().is_some_and(|location| {
+                        PathBuf::from(&record.cwd).canonicalize().is_ok_and(|cwd| {
+                            cwd.starts_with(location.root.as_str()) && cwd.is_dir()
+                        })
+                    }) => {}
+                _ => {
+                    record.outcome = Outcome::Unavailable;
+                    record.reason = Some("workspace identity is unavailable or changed; inspect the original workspace before recovering this session".into());
+                    self.update_offline(record);
+                    return;
+                }
+            }
+        }
         let Some(provider) = self.config().agents.get(&record.profile).cloned() else {
             record.outcome = Outcome::Unavailable;
             record.reason =
@@ -1702,8 +1755,14 @@ impl Broker {
     ) -> agent_client_protocol::Result<v2::NewSessionResponse> {
         let requested = request.meta.as_mut().and_then(|meta| meta.get_mut("hive"));
         let mut adopt: Option<String> = None;
+        let mut workspace_launch: Option<hive_protocol::workspace::Launch> = None;
         let chosen = match requested {
             Some(serde_json::Value::Object(hive)) => {
+                if let Some(value) = hive.remove("workspace") {
+                    workspace_launch = Some(serde_json::from_value(value).map_err(|_| {
+                        Error::invalid_params().data("invalid _meta.hive.workspace launch selector")
+                    })?);
+                }
                 if let Some(value) = hive.remove("adopt") {
                     adopt = Some(
                         value
@@ -1718,7 +1777,8 @@ impl Broker {
                 }
                 let id =
                     match hive.remove("agent") {
-                        Some(serde_json::Value::String(id)) if !id.is_empty() => id,
+                        Some(serde_json::Value::String(id)) if !id.is_empty() => Some(id),
+                        None if workspace_launch.is_some() => None,
                         _ => return Err(Error::invalid_params().data(
                             "_meta.hive.agent must be a nonempty profile ID; see GET /v1/providers",
                         )),
@@ -1730,7 +1790,7 @@ impl Broker {
                         .expect("metadata exists")
                         .remove("hive");
                 }
-                Some(id)
+                id
             }
             Some(_) => {
                 return Err(
@@ -1740,7 +1800,7 @@ impl Broker {
             None => None,
         };
         let hive_id = v2::SessionId::new(SessionId::new().as_str());
-        let (chosen, provider, mut reservation) = {
+        let (chosen, provider, launch_config, launch_projects, mut reservation) = {
             // Selection and binding publication are one admission boundary with reload.
             let mut registry = self.registry.lock().map_err(|_| Error::internal_error())?;
             if registry.stopping {
@@ -1772,6 +1832,8 @@ impl Broker {
             (
                 chosen,
                 provider,
+                registry.current.clone(),
+                registry.managed_projects.clone(),
                 reload::Reservation {
                     registry: self.registry.clone(),
                     id: hive_id.to_string(),
@@ -1780,6 +1842,10 @@ impl Broker {
             )
         };
         let kind = provider.kind;
+        if adopt.is_some() && workspace_launch.is_some() {
+            return Err(Error::invalid_params()
+                .data("native adoption cannot provision or select a different workspace"));
+        }
         if adopt.is_some() && kind != ProfileKind::OpencodeServer {
             return Err(Error::invalid_params().data(format!(
                 "agent '{chosen}' cannot adopt native sessions; _meta.hive.adopt needs a profile with kind = 'opencode-server'"
@@ -1792,6 +1858,29 @@ impl Broker {
                     .map_err(|error| error.to_acp())?,
             ),
             None => None,
+        };
+        let workspace_context = if adopt.is_none() {
+            self.launch_workspace(
+                &mut request,
+                workspace_launch,
+                &provider,
+                launch_config,
+                launch_projects,
+                hive_id.to_string(),
+            )
+            .await
+            .map_err(|error| Error::invalid_request().data(error.json()))?
+        } else {
+            // Adoption uses an existing downstream scope; it still needs cleanup protection
+            // when that directory belongs to a managed checkout on this node.
+            if let Some(store) = &self.store {
+                workspaces::Service::new(store.clone())
+                    .track_directory(request.cwd.0.clone(), hive_id.to_string())
+                    .await
+                    .map_err(|error| Error::invalid_request().data(error.json()))?
+            } else {
+                None
+            }
         };
         let (tx, rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = oneshot::channel();
@@ -1810,6 +1899,7 @@ impl Broker {
                 .client_capabilities
                 .insert(client_id.clone(), parent.capabilities.clone());
             state.startup_parent = Some(parent);
+            state.workspace_context = workspace_context.clone();
         }
         let cwd = request.cwd.clone();
         let entry_control = control.clone();
@@ -1821,6 +1911,7 @@ impl Broker {
         let store = self.store.clone();
         let stored_record = self.store.as_ref().map(|_| {
             Arc::new(Mutex::new(Record {
+                workspace_context,
                 id: hive_id.to_string(),
                 downstream_id: String::new(),
                 cwd: cwd.0.display().to_string(),
@@ -1840,7 +1931,7 @@ impl Broker {
                 next_seq: 1,
                 reserved_seq: 0,
                 generation: 1,
-                outcome: Outcome::Active,
+                outcome: Outcome::Recovering,
                 reason: None,
                 uncertain: false,
                 usage: Ledger::default(),
@@ -1851,6 +1942,31 @@ impl Broker {
             }))
         });
         let worker_record = stored_record.clone();
+        let mut pending_startup = PendingStartup {
+            broker: self.clone(),
+            record: stored_record.clone(),
+            armed: false,
+        };
+        if let (Some(store), Some(record)) = (&self.store, &stored_record) {
+            // An uncertain downstream startup must retain both its workspace hold and session identity.
+            store
+                .save(&*record.lock().map_err(|_| Error::internal_error())?)
+                .map_err(storage_error)?;
+            pending_startup.armed = true;
+            self.offline
+                .lock()
+                .map_err(|_| Error::internal_error())?
+                .insert(
+                    hive_id.to_string(),
+                    record.lock().map_err(|_| Error::internal_error())?.clone(),
+                );
+            self.catalog.send_modify(|revision| *revision += 1);
+            reservation.retained = true;
+            workspaces::Service::new(store.clone())
+                .mark_dispatched(hive_id.to_string())
+                .await
+                .map_err(|error| Error::internal_error().data(error.json()))?;
+        }
         let worker_registry = self.registry.clone();
         // Each session owns its subprocess: no guessed transport support or duplicate probing.
         let task = tokio::spawn(async move {
@@ -1955,6 +2071,7 @@ impl Broker {
                 if let (Some(store), Some(record)) = (&self.store, &stored_record) {
                     let mut record = record.lock().map_err(|_| Error::internal_error())?;
                     record.downstream_id = downstream_id;
+                    record.outcome = Outcome::Active;
                     {
                         let state = entry_control.lock().map_err(|_| Error::internal_error())?;
                         // Pin what the worker decided at attach time, so recovery never swaps it.
@@ -1982,13 +2099,20 @@ impl Broker {
                     state.record = stored_record.clone();
                 }
                 {
+                    // Match snapshot's sessions-then-offline order, so no reader can see
+                    // a gap while a durable pending creation becomes a live session.
                     let mut sessions = self.sessions.lock().map_err(|_| Error::internal_error())?;
+                    self.offline
+                        .lock()
+                        .map_err(|_| Error::internal_error())?
+                        .remove(&hive_id.to_string());
                     sessions.insert(hive_id.to_string(), entry);
                     self.catalog.send_modify(|revision| *revision += 1);
                 }
                 reservation.retained = true;
                 let _ = active_tx.send(());
                 startup_guard.0 = None;
+                pending_startup.armed = false;
                 response.session_id = hive_id;
                 response.meta = Some(
                     entry_control
@@ -3479,6 +3603,7 @@ pub fn router_with_origin(broker: Broker, origin: Option<&str>) -> Router {
     server
         .into_router()
         .merge(projects::router(broker.clone(), origin.map(str::to_owned)))
+        .merge(workspaces::router(broker.clone(), origin.map(str::to_owned)))
         .route(
             "/v1/config/reload",
             post({
@@ -3871,10 +3996,9 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
                         match received.await {
                             Ok(Ok(())) => {
                                 interactions::settled(&entry.control).await;
-                                if let Some(store) = &broker.store {
-                                    store
-                                        .remove(&request.session_id.to_string())
-                                        .map_err(storage_error)?;
+                                 if let Some(store) = &broker.store {
+                                    workspaces::Service::new(store.clone()).release(request.session_id.to_string()).await
+                                        .map_err(|error| Error::internal_error().data(error.json()))?;
                                 }
                                 let mut sessions = broker
                                     .sessions
@@ -4257,6 +4381,7 @@ mod control_tests {
         let (changed, _) = watch::channel(1);
         let (catalog, _) = watch::channel(0);
         Control {
+            workspace_context: None,
             generation: 1,
             parents: HashMap::new(),
             startup_parent: None,

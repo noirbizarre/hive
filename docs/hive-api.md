@@ -19,6 +19,15 @@ user. Session conversation/control methods live exclusively on `/acp`.
 | `PUT /v1/projects/{id}` | Replace a managed definition, preserving its ID |
 | `DELETE /v1/projects/{id}` | Remove a managed definition only |
 | `GET/PUT/DELETE /v1/projects/{id}/nodes/{node}/override` | Inspect, set, or remove a node-local directory preference |
+| `GET /v1/repositories` | Local node ID and repository cache status |
+| `GET /v1/repositories/{id}` | Inspect one cache |
+| `POST /v1/repositories/{id}/fetch` | Fetch remote refs without moving task branches |
+| `GET/POST /v1/workspaces` | List or provision durable workspaces |
+| `GET /v1/workspaces/{id}` | Inspect recorded intent, lifecycle and location |
+| `GET /v1/workspaces/{id}/inspect` | Fresh backend identity, presence and cleanup evidence |
+| `POST /v1/workspaces/{id}/remove` | Explicit safe removal |
+| `POST /v1/workspaces/{id}/reconcile` | Reconcile an interrupted resource without replaying provisioning hooks |
+| `GET /v1/operations/{id}` | Original request, pinned commit, partial path and session holds |
 | `GET /v1/providers/{agent}/native-sessions` | Native sessions an OpenCode server profile can adopt |
 | `GET /v1/sessions` | Live/persisted session summaries and catalog revision |
 | `GET /v1/sessions/events` | SSE catalog revision invalidations |
@@ -56,6 +65,76 @@ trusted-local-user boundary, without introducing a separate login.
 Unix SIGHUP and `hive daemon reload` call the same reload implementation.
 See [configuration](configuration.md#reloading-changes) for identity and environment
 rules and [operations](operations.md#reloading-configuration) for examples.
+
+## Repository and workspace lifecycle
+
+Workspace administration requires a persistent daemon. Creation accepts a project
+ID, configured policy name and caller-allocated durable operation ID:
+
+```json
+{
+  "operation": "operation-11111111-1111-4111-8111-111111111111",
+  "project": "hive",
+  "policy": "task",
+  "base_ref": "main",
+  "branch": "task/example"
+}
+```
+
+`base_ref` and `branch` are optional. Identical operation requests reconcile the
+same workspace; changed intent under a key conflicts. Read the returned workspace
+record for its actual path and backend. List responses wrap records in
+`workspaces` / `repositories`; repository inventory also returns `node`.
+Creation failures return the operation ID for inspection. Removal accepts
+`{"operation":"operation-…","discard_changes":false}`. Discard permits dirty
+managed-data removal but never bypasses use/ownership checks. Removal retains task
+branches; independent-clone archival appears in its `archive` field.
+
+Mutations use reload's same-origin policy. Error bodies contain `code`, `message`
+and `help`; failures use stable `hive::repository::*` / `hive::workspace::*` codes.
+Unknown IDs return 404, invalid requests 422, unavailable persistence 503, origin
+rejection 403 and lifecycle/Git/safety conflicts 409. Raw subprocess stderr is
+never forwarded. Poll workspace/operation routes for interrupted commands before
+retrying; inspection is read-only and does not replay hooks.
+
+Explicit reconciliation accepts `directory` (optional actual absolute path) and
+`hooks_reconciled` (default false). It verifies the operation's repository,
+registered path, exact branch and ancestry from the pinned base before claiming a partial
+checkout. WorkTrunk uncertainty requires explicit acknowledgement that external
+hook effects have been reviewed/reconciled. Cleanup reconciliation verifies
+absence or authorizes an identical safe retry; it does not override session-use
+or cleanup-safety checks.
+
+### Session launch selectors
+
+A profile's configured workspace policy activates automatically before downstream
+startup. `project` alone leaves ordinary ACP cwd behavior intact. Optional
+`_meta.hive.workspace` overrides that choice:
+
+```json
+{
+  "cwd": "/",
+  "_meta": {
+    "hive": {
+      "agent": "coder",
+      "workspace": {"kind":"new", "project":"hive", "policy":"task", "baseRef":"main"}
+    }
+  }
+}
+```
+
+`new` may also supply `branch`; omitted project/policy use profile defaults.
+`{"kind":"attach","id":"workspace-…"}` attaches a ready resource.
+`{"kind":"existing","directory":"/absolute/path"}` bypasses managed creation.
+A selector can omit `agent` when a default profile exists. Hive consumes selectors
+instead of forwarding them downstream. Native adoption cannot use them; resume
+reattaches its original resource and never provisions a replacement.
+
+Creation/resume metadata includes `_meta.hive.workspace` with `project`, `workspace`
+and `effectiveCwd`, or null for an unmanaged cwd. Session summaries expose the same
+context. Clients must retain the returned/listed cwd for resume and relinquish,
+rather than reusing their launch placeholder. Confirmed close releases use while
+retaining the workspace.
 
 ## Project registry
 

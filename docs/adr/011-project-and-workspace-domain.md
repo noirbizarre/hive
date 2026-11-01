@@ -3,7 +3,8 @@
 ## Status
 
 Accepted. Defines the contracts for [issue #83](https://github.com/noirbizarre/hive/issues/83).
-Concrete backends and runtime integration are subsequent work.
+Concrete node-local backends, repository caching and session-start integration
+implement these contracts in the daemon workspace service (#85/#86/#87).
 
 ## Context
 
@@ -153,8 +154,8 @@ help can be adapted into binary-edge diagnostics without coupling core to miette
 
 ### Global WorkTrunk integration contract
 
-The following is the **future runtime configuration shape**. This issue defines
-its core contract, not daemon configuration ingestion or executable discovery:
+The daemon composes the following global runtime configuration, independently
+of agent profiles and workspace-policy declarations:
 
 ```toml
 [worktrunk]
@@ -169,8 +170,8 @@ enabled = true
 
 `WorktrunkConfig::select` short-circuits explicit disablement before invoking its
 probe callback. Detection considers capabilities, not merely executable presence.
-Selection covers both lifecycle delegation and Hive activity publication. It is a
-global integration choice, never a per-profile or per-file switch.
+Selection governs lifecycle delegation now; Hive activity publication will consume
+the same global selection in #118. It is never a per-profile or per-file switch.
 
 WorkTrunk-specific commands, hook handling, marker formats, and path templates stay
 behind the integration boundary. Creation/removal must delegate to WorkTrunk when
@@ -180,8 +181,9 @@ own template. Commands and markers execute on the workspace-owning node.
 Activity publication must aggregate sessions sharing a worktree: one session ending
 cannot clear another session's activity. The integration must document mappings for
 running, waiting/needs-input, completed, cancelled, and failed activity and reconcile
-stale markers after restart or lost sessions. Marker mappings, discovery, command
-execution, configuration composition, and reload behavior are #118 work.
+stale markers after restart or lost sessions. Marker mappings and stale-marker
+recovery are #118 work. Lifecycle commands, configuration composition and backend
+pinning across reload are implemented by the workspace service.
 
 ### Implementation boundaries
 
@@ -222,5 +224,20 @@ as retryable would be simpler but could repeat hooks or create duplicate resourc
 
 Core tests cover lifecycle transitions, record validation, cleanup checks, retry
 contracts with a deterministic fake backend, and global integration selection.
-Concrete backend implementations still need filesystem, concurrency, interruption,
-and integration tests; the contract is not itself a Git implementation.
+The daemon tests concrete Git acquisition, concurrency, interrupted acquisition,
+durability, safe cleanup and WorkTrunk path/hook delegation against local remotes.
+
+### Flat bare acquisition and worktree-local configuration
+
+New managed worktree repositories prefer `<project-root>/.git` as their bare
+common repository, with native checkouts as immediate sibling directories.
+Acquisition publishes the bare repository before adding linked checkouts, avoiding
+administrative links to temporary staging paths. Existing layouts are preserved.
+WorkTrunk chooses its own paths without a Hive target-directory override.
+
+Acquisition enables `extensions.worktreeConfig`, scoping `core.bare=true` to the
+bare repository's `config.worktree` rather than shared config. Worktree-specific
+hook paths and sparse-checkout settings belong in `git config --worktree`.
+The default hooks directory is still shared unless `core.hooksPath` is scoped to
+an independent directory. This permits tools such as prek to use distinct hooks
+per checkout without collisions; Hive does not install hook shims itself.

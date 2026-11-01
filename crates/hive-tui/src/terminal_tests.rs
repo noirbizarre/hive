@@ -194,6 +194,12 @@ async fn runtime_fixture() {
     });
     run_with_clipboard(
         Options {
+            cwd: None,
+            project: None,
+            workspace: None,
+            workspace_id: None,
+            base_ref: None,
+            branch: None,
             address: address.to_string(),
             transport: "ws".into(),
             agent: create.then(|| "fixture".into()),

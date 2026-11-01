@@ -251,6 +251,7 @@ async fn run(installation: Installation) -> Result<(), String> {
 
 async fn run_probe(installation: Installation, configuration: bool) -> Result<(), String> {
     let profile = Profile {
+        workspace: None,
         project: None,
         name: None,
         command: Some(installation.command),
@@ -270,6 +271,8 @@ async fn run_probe(installation: Installation, configuration: bool) -> Result<()
     let database = directory.path().join("hive/sessions.sqlite3");
     let broker = hive_daemon::Broker::persistent(
         Config {
+            workspaces: Default::default(),
+            worktrunk: None,
             projects: Default::default(),
             default_agent: Some(installation.id.into()),
             agents,
@@ -751,6 +754,7 @@ async fn pi_initialize_probe_reports_a_capability_report() {
         return;
     };
     let profile = Profile {
+        workspace: None,
         project: None,
         name: None,
         command: Some(installation.command),

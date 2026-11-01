@@ -113,7 +113,7 @@ impl Outcome {
         }
     }
 
-    pub fn recorded(result: &Result<v2::PromptResponse, PromptFailure>) -> Self {
+    pub(crate) fn recorded(result: &Result<v2::PromptResponse, PromptFailure>) -> Self {
         match result {
             Ok(response) => Self::Acknowledged {
                 message_id: response.message_id.clone(),
@@ -140,7 +140,7 @@ impl Outcome {
         serde_json::to_string(self).map_err(|_| JournalError::Outcome)
     }
 
-    pub fn into_response(self) -> Result<v2::PromptResponse, PromptFailure> {
+    pub(crate) fn into_response(self) -> Result<v2::PromptResponse, PromptFailure> {
         match self {
             Self::Acknowledged { message_id } => Ok(v2::PromptResponse::new(message_id)),
             Self::Cancelled {} => Err(PromptFailure::Cancelled),

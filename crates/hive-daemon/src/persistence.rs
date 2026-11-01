@@ -200,6 +200,15 @@ impl Store {
                 });
             }
         }
+        // Allocate managed resources beneath one physical directory spelling. macOS
+        // /var aliases and Windows short/extended paths must not create distinct identities.
+        let parent = parent
+            .canonicalize()
+            .map_err(|source| StoreError::Directory {
+                path: parent.into(),
+                source,
+            })?;
+        let path = parent.join(path.file_name().expect("database has a filename"));
         let existing = std::fs::symlink_metadata(&path).ok();
         if existing.as_ref().is_some_and(|meta| !meta.is_file()) {
             return Err(StoreError::Directory {

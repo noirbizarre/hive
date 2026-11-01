@@ -958,6 +958,8 @@ impl Runtime<'_> {
                 &["config", "extensions.worktreeConfig", "true"],
                 "clone",
             )?;
+            #[cfg(windows)]
+            git(&staging, &["config", "core.longpaths", "true"], "clone")?;
             git(
                 &staging,
                 &["config", "--worktree", "core.bare", "true"],
@@ -1500,6 +1502,8 @@ impl Runtime<'_> {
                 &["remote", "set-url", "origin", &repo.source],
                 "clone",
             )?;
+            #[cfg(windows)]
+            git(&target, &["config", "core.longpaths", "true"], "clone")?;
             git(&target, &["checkout", "-b", &branch, &commit], "checkout")?;
             target
         } else {
@@ -2003,6 +2007,12 @@ impl Runtime<'_> {
                 &["config", "hive.archiveOperation", operation.as_str()],
                 "archive",
             )?;
+            #[cfg(windows)]
+            git(
+                &plan.staging,
+                &["config", "core.longpaths", "true"],
+                "archive",
+            )?;
             std::fs::rename(&plan.staging, &plan.destination).map_err(|_| Error::Storage)?;
         }
         self.path(&plan.destination)
@@ -2045,9 +2055,10 @@ impl Runtime<'_> {
             &["worktree", "list", "--porcelain", "-z"],
             "inspect",
         )?;
-        Ok(!registrations
-            .split('\0')
-            .any(|field| field.strip_prefix("worktree ") == Some(location.root.as_str())))
+        Ok(!registered_worktree(
+            &registrations,
+            Path::new(location.root.as_str()),
+        )?)
     }
 
     fn reconcile(
@@ -2119,8 +2130,16 @@ impl Runtime<'_> {
                 return Err(Error::Request);
             }
             let path = path.canonicalize().map_err(|_| Error::Conflict)?;
-            if backend != "worktrunk" && operation.path.as_ref() != Some(&path) {
-                return Err(Error::Conflict);
+            if backend != "worktrunk" {
+                let intended = operation
+                    .path
+                    .as_ref()
+                    .ok_or(Error::Conflict)?
+                    .canonicalize()
+                    .map_err(|_| Error::Conflict)?;
+                if intended != path {
+                    return Err(Error::Conflict);
+                }
             }
             let repository = self
                 .state
@@ -2148,10 +2167,7 @@ impl Runtime<'_> {
                     &["worktree", "list", "--porcelain", "-z"],
                     "inspect",
                 )?;
-                if !list
-                    .split('\0')
-                    .any(|field| field.strip_prefix("worktree ") == path.to_str())
-                {
+                if !registered_worktree(&list, &path)? {
                     return Err(Error::Conflict);
                 }
             } else if git(&path, &["config", "--get", "remote.origin.url"], "inspect")?.trim()
@@ -2390,8 +2406,18 @@ fn execute_with_config(
             }
         }
     });
+    // Git for Windows requires opt-in long-path handling even for fresh repositories.
+    // Pass portable argv spellings while retaining canonical filesystem identities in state.
+    #[cfg(windows)]
+    {
+        if program == "git" {
+            command.args(["-c", "core.longpaths=true"]);
+        }
+        command.args(args.iter().map(|arg| git_path_argument(arg)));
+    }
+    #[cfg(not(windows))]
+    command.args(args);
     command
-        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2416,6 +2442,56 @@ fn execute_with_config(
         });
     }
     String::from_utf8(output).map_err(|_| Error::Uncertain)
+}
+
+fn registered_worktree(list: &str, expected: &Path) -> Result<bool, Error> {
+    // Missing leaves still need a physical parent identity to detect stale registrations
+    // after an interrupted removal; canonicalizing only existing worktrees is insufficient.
+    fn identity(path: &Path) -> std::io::Result<PathBuf> {
+        let mut current = path;
+        let mut suffix = Vec::new();
+        loop {
+            match current.canonicalize() {
+                Ok(mut root) => {
+                    root.extend(suffix.into_iter().rev());
+                    return Ok(root);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    suffix.push(current.file_name().ok_or(error)?.to_owned());
+                    current = current
+                        .parent()
+                        .ok_or_else(|| std::io::Error::other("no path parent"))?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    let expected = identity(expected).map_err(|_| Error::Conflict)?;
+    for path in list
+        .split('\0')
+        .filter_map(|field| field.strip_prefix("worktree "))
+    {
+        if identity(Path::new(path)).map_err(|_| Error::Conflict)? == expected {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(any(windows, test))]
+fn git_path_argument(argument: &str) -> String {
+    if let Some(path) = argument.strip_prefix(r"\\?\UNC\") {
+        return format!("//{}", path.replace('\\', "/"));
+    }
+    if let Some(path) = argument.strip_prefix(r"\\?\") {
+        return path.replace('\\', "/");
+    }
+    if argument.as_bytes().get(1) == Some(&b':')
+        && matches!(argument.as_bytes().get(2), Some(b'\\' | b'/'))
+    {
+        return argument.replace('\\', "/");
+    }
+    argument.into()
 }
 
 fn capture_command(

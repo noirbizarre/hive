@@ -399,7 +399,14 @@ async fn workspace_provisioning_scopes_opencode_creation_and_failure_never_creat
             effective.to_str()
         );
         let (_, native) = discover(address, "oc", effective.to_str()).await;
-        assert!(native.to_string().contains(effective.to_str().unwrap()));
+        let expected = serde_json::Value::String(effective.display().to_string());
+        assert!(
+            native["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|session| session["directory"] == expected)
+        );
         assert_eq!(fake.exact("POST /session"), 1);
         let mut meta = v2::Meta::new();
         meta.insert(

@@ -1567,3 +1567,66 @@ fn command_timeouts_stop_descendants_even_after_the_leader_exits_and_join_all_re
         );
     }
 }
+
+#[test]
+fn windows_git_arguments_use_portable_paths_without_changing_refs_or_remotes() {
+    assert_eq!(
+        git_path_argument(r"\\?\C:\Users\runner\project"),
+        "C:/Users/runner/project"
+    );
+    assert_eq!(
+        git_path_argument(r"\\?\UNC\server\share\project"),
+        "//server/share/project"
+    );
+    assert_eq!(
+        git_path_argument(r"C:\Users\runner\project"),
+        "C:/Users/runner/project"
+    );
+    for value in [
+        "refs/heads/main",
+        "git@example.test:project",
+        "https://example.test/project",
+        "--verify",
+    ] {
+        assert_eq!(git_path_argument(value), value);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn state_directory_aliases_and_missing_worktree_registrations_resolve_physical_paths() {
+    let fixture = Fixture::new();
+    let alias = fixture.seed.join("state-alias");
+    std::os::unix::fs::symlink(fixture.service.store.state_directory(), &alias).unwrap();
+    let reopened = Service::new(Arc::new(
+        Store::open(alias.join("catalog.sqlite3")).unwrap(),
+    ));
+    assert_eq!(
+        reopened.store.state_directory(),
+        fixture.service.store.state_directory()
+    );
+    let missing = fixture.service.store.state_directory().join("missing");
+    let list = format!(
+        "worktree {}\0branch refs/heads/task\0\0",
+        alias.join("missing").display()
+    );
+    assert!(registered_worktree(&list, &missing).unwrap());
+    assert!(!registered_worktree(&list, &missing.with_file_name("different")).unwrap());
+}
+
+#[tokio::test]
+async fn managed_checkouts_and_metadata_support_paths_longer_than_the_legacy_windows_limit() {
+    let fixture = Fixture::new();
+    let mut request = fixture.request();
+    request.project = ProjectId::try_from("project".repeat(22)).unwrap();
+    let entry = fixture.create(request).await.unwrap();
+    let location = entry.workspace.location().unwrap();
+    assert!(location.root.as_str().len() > 260);
+    assert!(Path::new(location.root.as_str()).join("content").is_file());
+    fixture
+        .service
+        .remove(entry.workspace.id().clone(), OperationId::new(), false)
+        .await
+        .unwrap();
+    assert!(!Path::new(location.root.as_str()).exists());
+}

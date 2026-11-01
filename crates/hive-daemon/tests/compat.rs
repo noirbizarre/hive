@@ -11,6 +11,7 @@ use miette::Diagnostic;
 
 fn profile(command: &str, args: &[&str], version: AgentVersion) -> Profile {
     Profile {
+        workspace: None,
         project: None,
         name: None,
         command: Some(command.into()),

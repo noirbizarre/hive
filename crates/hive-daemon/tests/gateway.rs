@@ -17,6 +17,70 @@ mod interactions;
 #[path = "support/recovery.rs"]
 mod recovery;
 
+#[tokio::test]
+async fn configured_workspace_cwd_reaches_both_adapters_and_close_retains_the_resource() {
+    for version in [AgentVersion::V1, AgentVersion::V2] {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().canonicalize().unwrap();
+        let effective = directory.join("effective");
+        std::fs::create_dir(&effective).unwrap();
+        let command = format!(
+            "{}{}",
+            env!("CARGO_BIN_EXE_hive-test-agent"),
+            if version == AgentVersion::V1 {
+                " v1"
+            } else {
+                ""
+            }
+        );
+        let mut config = config_with_agent("mock", &command, version);
+        let project = hive_core::identity::ProjectId::from_name("demo");
+        config.projects.insert(
+            project.clone(),
+            serde_json::from_value(serde_json::json!({"name":"Demo"})).unwrap(),
+        );
+        config.workspaces.insert(
+            "task".into(),
+            hive_daemon::config::WorkspaceTemplate::Existing {
+                directory: Some(effective.clone()),
+            },
+        );
+        let profile = config.agents.get_mut("mock").unwrap();
+        profile.project = Some(project);
+        profile.workspace = Some("task".into());
+        let broker =
+            hive_daemon::Broker::persistent(config, directory.join("state/catalog.sqlite3"))
+                .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = hive_daemon::router(broker.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        timeout(Duration::from_secs(15), Client.v2().connect_with(HttpClient::new(format!("ws://{address}")).unwrap(), async move |cx| {
+            cx.send_request(v2::InitializeRequest::new(ProtocolVersion::V2, v2::Implementation::new("workspace-test", "1"))).block_task().await?;
+            let opened = cx.send_request(v2::NewSessionRequest::new(directory)).block_task().await?;
+            let metadata = &opened.meta.as_ref().unwrap()["hive"]["workspace"];
+            assert_eq!(metadata["effectiveCwd"].as_str(), effective.to_str());
+            let catalog = summaries(address).await;
+            assert_eq!(catalog["sessions"][0]["cwd"].as_str(), effective.to_str());
+            assert_eq!(catalog["sessions"][0]["workspace"]["workspace"], metadata["workspace"]);
+            let resumed = cx.send_request(v2::ResumeSessionRequest::new(opened.session_id.clone(), effective.clone())).block_task().await?;
+            cx.send_request(v2::CloseSessionRequest::new(opened.session_id).meta(resumed.meta)).block_task().await?;
+            let resources: serde_json::Value = reqwest::get(format!("http://{address}/v1/workspaces")).await.unwrap().json().await.unwrap();
+            assert_eq!(resources["workspaces"][0]["workspace"]["state"], "ready");
+            assert!(effective.exists());
+            let mut meta = v2::Meta::new();
+            meta.insert("hive".into(), serde_json::json!({"workspace":{"kind":"existing","directory":effective.join("missing")}}));
+            let error = cx.send_request(v2::NewSessionRequest::new(effective).meta(meta)).block_task().await.unwrap_err();
+            assert_eq!(serde_json::to_value(error).unwrap()["data"]["code"], "hive::workspace::request");
+            Ok(())
+        })).await.unwrap().unwrap();
+        broker.shutdown().await;
+        server.abort();
+    }
+}
+
 fn controlled(meta: &Option<v2::Meta>, key: &str) -> v2::Meta {
     let mut value = meta.clone().unwrap();
     value.get_mut("hive").unwrap()["key"] = serde_json::json!(key);
@@ -2131,6 +2195,7 @@ fn config_with_agent(id: &str, command: &str, version: AgentVersion) -> Config {
         id.to_string(),
         Profile {
             project: None,
+            workspace: None,
             name: None,
             command: Some(words.next().unwrap().to_string()),
             args: words.map(str::to_string).collect(),
@@ -2146,6 +2211,8 @@ fn config_with_agent(id: &str, command: &str, version: AgentVersion) -> Config {
     );
     Config {
         projects: Default::default(),
+        workspaces: Default::default(),
+        worktrunk: None,
         default_agent: Some(id.to_string()),
         agents,
     }
@@ -3984,6 +4051,7 @@ async fn declared_http_and_websocket_agents_are_reached_through_the_sdk() {
             id.into(),
             Profile {
                 project: None,
+                workspace: None,
                 name: None,
                 command: None,
                 args: vec![],
@@ -4403,6 +4471,7 @@ async fn a_disconnect_and_handoff_during_generation_do_not_restart_the_prompt() 
             name: None,
             command: None,
             project: None,
+            workspace: None,
             args: vec![],
             env: BTreeMap::new(),
             endpoint: Some(format!("http://{downstream}")),
@@ -4889,6 +4958,7 @@ async fn permission_and_form_and_url_elicitation_reach_the_current_pilot() {
             name: None,
             command: None,
             project: None,
+            workspace: None,
             args: vec![],
             env: BTreeMap::new(),
             endpoint: Some(format!("http://{downstream}")),

@@ -17,7 +17,7 @@ pub enum WorktrunkAvailability {
     Incompatible,
 }
 
-/// WorkTrunk selection requires both lifecycle delegation and Hive activity publication.
+/// Global lifecycle selection, also consumed by the future activity publisher (#118).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IntegrationSelection {
     Native,

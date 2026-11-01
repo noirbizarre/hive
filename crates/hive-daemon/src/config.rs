@@ -9,9 +9,50 @@ use hive_core::{identity::ProjectId, project::ProjectDefinition};
 use hive_protocol::AgentVersion;
 use serde::{Deserialize, Serialize};
 
+/// Portable policy templates deliberately contain no runtime repository identity.
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "policy", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkspaceTemplate {
+    Worktree {
+        base_ref: Option<hive_core::workspace::GitRef>,
+    },
+    Clone {
+        base_ref: Option<hive_core::workspace::GitRef>,
+    },
+    Existing {
+        directory: Option<PathBuf>,
+    },
+    Ephemeral {
+        backing: String,
+        base_ref: Option<hive_core::workspace::GitRef>,
+        retention: hive_core::workspace::Retention,
+    },
+}
+
+impl WorkspaceTemplate {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match self {
+            Self::Existing {
+                directory: Some(path),
+            } if !path.is_absolute() => Err("existing workspace directory must be absolute"),
+            Self::Ephemeral {
+                backing, retention, ..
+            } if !matches!(backing.as_str(), "worktree" | "clone")
+                || matches!(retention, hive_core::workspace::Retention::Retain) =>
+            {
+                Err("ephemeral policies need worktree/clone backing and finite retention")
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(default)]
+    pub workspaces: BTreeMap<String, WorkspaceTemplate>,
+    pub worktrunk: Option<hive_core::workspace::integration::WorktrunkConfig>,
     #[serde(default)]
     pub projects: BTreeMap<ProjectId, ProjectDefinition>,
     pub default_agent: Option<String>,
@@ -24,6 +65,9 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 struct RootDocument {
     #[serde(default)]
+    workspaces: BTreeMap<String, WorkspaceTemplate>,
+    worktrunk: Option<hive_core::workspace::integration::WorktrunkConfig>,
+    #[serde(default)]
     projects: BTreeMap<ProjectId, ProjectDefinition>,
     default_agent: Option<String>,
     #[serde(default)]
@@ -35,6 +79,9 @@ struct RootDocument {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FragmentDocument {
+    #[serde(default)]
+    workspaces: BTreeMap<String, WorkspaceTemplate>,
+    worktrunk: Option<hive_core::workspace::integration::WorktrunkConfig>,
     #[serde(default)]
     projects: BTreeMap<ProjectId, ProjectDefinition>,
     #[serde(default)]
@@ -103,6 +150,7 @@ impl ProfileKind {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
+    pub workspace: Option<String>,
     pub project: Option<ProjectId>,
     pub name: Option<String>,
     #[serde(default)]
@@ -171,6 +219,14 @@ fn is_loopback_host(host: &str) -> bool {
 /// pasted into bug reports and these messages are printed by `hive doctor`.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error, miette::Diagnostic)]
 pub enum ConfigError {
+    #[error("{0}")]
+    #[diagnostic(
+        code(hive::config::workspace),
+        help(
+            "declare unique workspace policies under [workspaces] and reference them from agents with a project"
+        )
+    )]
+    Workspace(String),
     #[error("{0}")]
     #[diagnostic(
         code(hive::config::project),
@@ -469,6 +525,13 @@ impl Config {
         }
         for (id, profile) in &self.agents {
             let mut found = Vec::new();
+            if let Some(policy) = &profile.workspace
+                && (!self.workspaces.contains_key(policy) || profile.project.is_none())
+            {
+                found.push(ConfigError::Workspace(format!(
+                    "agent '{id}' requires a declared workspace policy and project"
+                )));
+            }
             if let Some(project) = &profile.project
                 && !self.projects.contains_key(project)
             {
@@ -487,6 +550,14 @@ impl Config {
                 problems.push(Problem {
                     agent: None,
                     error: ConfigError::Project(format!("project '{id}': {error}")),
+                });
+            }
+        }
+        for policy in self.workspaces.values() {
+            if let Err(error) = policy.validate() {
+                problems.push(Problem {
+                    agent: None,
+                    error: ConfigError::Workspace(error.into()),
                 });
             }
         }
@@ -595,6 +666,8 @@ fn include_paths(root: &Path, entry: &str, index: usize) -> Result<Vec<PathBuf>,
 
 fn compose(root: &Path, document: RootDocument) -> Result<Config, ConfigError> {
     let mut config = Config {
+        workspaces: document.workspaces,
+        worktrunk: document.worktrunk,
         projects: document.projects,
         default_agent: document.default_agent,
         agents: document.agents,
@@ -625,6 +698,20 @@ fn compose(root: &Path, document: RootDocument) -> Result<Config, ConfigError> {
             }
             let text = std::fs::read_to_string(&path).map_err(|error| unreadable(&path, error))?;
             let fragment: FragmentDocument = parse_document(&path, &text)?;
+            for (id, policy) in fragment.workspaces {
+                if config.workspaces.insert(id, policy).is_some() {
+                    return Err(ConfigError::Workspace(
+                        "duplicate workspace policy across configuration files".into(),
+                    ));
+                }
+            }
+            if let Some(worktrunk) = fragment.worktrunk
+                && config.worktrunk.replace(worktrunk).is_some()
+            {
+                return Err(ConfigError::Workspace(
+                    "WorkTrunk settings are declared more than once".into(),
+                ));
+            }
             for (id, definition) in fragment.projects {
                 if let Some(previous) = project_origins.insert(id.clone(), path.clone()) {
                     return Err(ConfigError::Project(format!(
@@ -686,6 +773,65 @@ pub fn default_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn workspace_policies_and_global_worktrunk_settings_compose_before_profile_references() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("hive.toml");
+        std::fs::write(
+            directory.path().join("project.toml"),
+            "[projects.demo]\nname = 'Demo'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("policy.toml"),
+            "[workspaces.task]\npolicy = 'worktree'\n[worktrunk]\nenabled = false\n",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("agent.toml"),
+            "[agents.coder]\ncommand = 'agent'\nproject = 'demo'\nworkspace = 'task'\n",
+        )
+        .unwrap();
+        for include in [
+            "['agent.toml','project.toml','policy.toml']",
+            "['policy.toml','project.toml','agent.toml']",
+        ] {
+            std::fs::write(&root, format!("include = {include}\n")).unwrap();
+            let config = super::ConfigSource::new(Some(root.clone()))
+                .unwrap()
+                .load()
+                .unwrap();
+            assert_eq!(config.agents["coder"].workspace.as_deref(), Some("task"));
+            assert_eq!(config.worktrunk.unwrap().enabled, Some(false));
+        }
+        std::fs::write(
+            directory.path().join("agent.toml"),
+            "[agents.coder]\ncommand = 'agent'\nproject = 'demo'\nworkspace = 'absent'\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            super::ConfigSource::new(Some(root)).unwrap().load(),
+            Err(super::ConfigError::Workspace(_))
+        ));
+    }
+
+    #[test]
+    fn duplicate_policies_and_global_integration_settings_are_rejected_across_fragments() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("hive.toml");
+        for declaration in [
+            "[workspaces.task]\npolicy = 'worktree'\n",
+            "[worktrunk]\nenabled = false\n",
+        ] {
+            std::fs::write(&root, format!("include = ['fragment.toml']\n{declaration}")).unwrap();
+            std::fs::write(directory.path().join("fragment.toml"), declaration).unwrap();
+            assert!(matches!(
+                super::ConfigSource::new(Some(root.clone())).unwrap().load(),
+                Err(super::ConfigError::Workspace(_))
+            ));
+        }
+    }
+
     #[test]
     fn project_references_resolve_after_all_fragments_in_either_order() {
         let directory = tempfile::tempdir().unwrap();

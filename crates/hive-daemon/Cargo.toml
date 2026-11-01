@@ -11,6 +11,7 @@ name = "hive-test-agent"
 path = "../hive-mock-agent/src/main.rs"
 
 [dependencies]
+command-group = { workspace = true }
 agent-client-protocol = { workspace = true }
 agent-client-protocol-http = { workspace = true }
 axum = { workspace = true }

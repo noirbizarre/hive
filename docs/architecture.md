@@ -69,7 +69,12 @@ Project and workspace contracts are defined in
 projects, per-node repository checkouts/caches, and concrete workspaces. Core
 enforces workspace state transitions and declares provisioning, inspection, cleanup,
 and optional global integration contracts. Runtime repository operations and session
-integration are subsequent work; the current broker still launches from a cwd.
+integration live in the daemon's node-local workspace service. It provisions before
+downstream startup when a profile selects a workspace policy, retaining legacy cwd
+launches otherwise. Durable resource intent and session-use holds are independent
+of client attachment and session catalog lifetime. A cross-process resource gate
+serializes Git mutations and cleanup admission without holding SQLite locks over
+subprocess execution.
 
 The daemon combines config-owned project declarations with separately persisted
 managed definitions. Explicit IDs cannot overlap across those authorities.

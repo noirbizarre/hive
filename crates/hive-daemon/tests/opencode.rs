@@ -32,6 +32,7 @@ fn cwd() -> String {
 
 fn opencode_profile(url: &str, password_env: Option<&str>) -> Profile {
     Profile {
+        workspace: None,
         project: None,
         name: None,
         kind: ProfileKind::OpencodeServer,
@@ -53,6 +54,8 @@ fn config(url: &str) -> Config {
 
 fn config_with(profile: Profile) -> Config {
     Config {
+        workspaces: Default::default(),
+        worktrunk: None,
         projects: Default::default(),
         default_agent: Some("oc".into()),
         agents: BTreeMap::from([("oc".into(), profile)]),
@@ -360,6 +363,65 @@ fn data_code(error: &Error) -> String {
 }
 
 // ---- discovery and adoption ---------------------------------------------------------------
+
+#[tokio::test]
+async fn workspace_provisioning_scopes_opencode_creation_and_failure_never_creates_a_native_session()
+ {
+    let (fake, url) = fake_opencode::start(Options::default()).await;
+    let temporary = tempfile::tempdir().unwrap();
+    let effective = temporary.path().canonicalize().unwrap().join("effective");
+    std::fs::create_dir(&effective).unwrap();
+    let mut config = config(&url);
+    let project = hive_core::identity::ProjectId::from_name("demo");
+    config.projects.insert(
+        project.clone(),
+        serde_json::from_value(json!({"name":"Demo"})).unwrap(),
+    );
+    config.workspaces.insert(
+        "task".into(),
+        hive_daemon::config::WorkspaceTemplate::Existing {
+            directory: Some(effective.clone()),
+        },
+    );
+    config.agents.get_mut("oc").unwrap().project = Some(project);
+    config.agents.get_mut("oc").unwrap().workspace = Some("task".into());
+    let broker =
+        hive_daemon::Broker::persistent(config, temporary.path().join("state/catalog.sqlite3"))
+            .unwrap();
+    let address = serve(broker.clone()).await;
+    connect(address, Pilot::default(), async |cx, _| {
+        let opened = cx
+            .send_request(v2::NewSessionRequest::new(std::env::current_dir().unwrap()))
+            .block_task()
+            .await?;
+        assert_eq!(
+            opened.meta.as_ref().unwrap()["hive"]["workspace"]["effectiveCwd"].as_str(),
+            effective.to_str()
+        );
+        let (_, native) = discover(address, "oc", effective.to_str()).await;
+        assert!(native.to_string().contains(effective.to_str().unwrap()));
+        assert_eq!(fake.exact("POST /session"), 1);
+        let mut meta = v2::Meta::new();
+        meta.insert(
+            "hive".into(),
+            json!({"workspace":{"kind":"existing","directory":effective.join("missing")}}),
+        );
+        let error = cx
+            .send_request(v2::NewSessionRequest::new(std::env::current_dir().unwrap()).meta(meta))
+            .block_task()
+            .await
+            .unwrap_err();
+        assert_eq!(data_code(&error), "hive::workspace::request");
+        assert_eq!(fake.exact("POST /session"), 1);
+        cx.send_request(v2::CloseSessionRequest::new(opened.session_id).meta(opened.meta))
+            .block_task()
+            .await?;
+        Ok(())
+    })
+    .await;
+    assert!(effective.exists());
+    broker.shutdown().await;
+}
 
 #[test]
 fn reload_keeps_native_sessions_on_their_original_server_until_explicit_close() {

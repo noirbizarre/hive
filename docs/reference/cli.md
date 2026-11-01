@@ -12,6 +12,8 @@ Use `hive <command> --help` for the installed executable's exact help.
 | `hive daemon status` | Print daemon status response | `--url` |
 | `hive daemon reload` | Reload the original config for new sessions | `--url` |
 | `hive project <command>` | Manage project definitions and node-local overrides | `--url` |
+| `hive repository <command>` | List, inspect and fetch node caches | `--url` |
+| `hive workspace <command>` | Provision, inspect and remove task workspaces | `--url` |
 | `hive web` | Open embedded browser client | `--url` |
 | `hive doctor [AGENT]...` | Diagnose all or selected profiles and daemon setup | `--config`, `--listen`, `--json` |
 | `hive completions <shell>` | Write shell completion script to stdout | Shell argument |
@@ -29,9 +31,38 @@ prompt submission, native adoption, or session deletion subcommands.
 | `--transport` | `ws` | `ws` or `http` (HTTP/SSE) |
 | `--agent` | Unset | Preselect a profile in the creation picker |
 | `--session` | Unset | Attach to a known Hive session ID |
+| `--cwd` | Unset | Explicit existing directory, bypassing a profile workspace policy |
+| `--project` | Profile default | Project override for workspace creation |
+| `--workspace` | Profile default | Named workspace policy |
+| `--workspace-id` | Unset | Attach a ready workspace to a new session |
+| `--base-ref` / `--branch` | Policy/task default | Base ref or fresh branch for managed creation |
 
 These work on both `hive` and `hive tui`. The TUI does not derive its address
 from `HIVE_URL` or `HIVE_LISTEN`.
+
+## Workspaces and repositories
+
+Workspace creation flags conflict with `--session`; explicit `--cwd` conflicts
+with managed-workspace selectors. These options apply when creating a session
+from the profile picker, not when resuming one.
+
+```sh
+hive --agent coder --project hive --workspace task
+hive workspace create --project hive --policy task
+hive workspace list
+hive workspace show <workspace-id>
+hive workspace inspect <workspace-id>
+hive workspace operation <operation-id>
+hive workspace reconcile <workspace-id>
+hive workspace remove <workspace-id>
+hive repository list
+hive repository show <repository-id>
+hive repository fetch <repository-id>
+```
+
+Creation/removal accept `--operation` for identical retries. Removal also accepts
+`--discard-changes`; this overrides dirty-data protection only, never ownership
+or active-use checks. See [workspace operations](../operations.md#repositories-and-task-workspaces).
 
 ## Daemon and doctor
 

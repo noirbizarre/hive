@@ -9,6 +9,20 @@ const session = { sessionId: 'hive-tui', cwd: '/workspace', agent: 'pi', title: 
 const modelOptions = currentValue => [{ configId: 'model', name: 'Model', category: 'model', type: 'select', currentValue,
   options: [{ groupId: 'provider', name: 'Provider', options: [{ value: 'fast', name: 'Fast' }, { value: 'careful', name: 'Careful' }] }] }];
 
+test('provisioned workspace cwd is retained when relinquishing a newly created session', async () => {
+  const sockets = transport((socket, message, result) => {
+    if (message.method === 'session/new') return { ...result, _meta: { hive: { ...result._meta.hive,
+      workspace: { project: 'demo', workspace: 'workspace-one', effectiveCwd: '/projects/demo/worktree-one' } } } };
+  });
+  const client = connect('ws://localhost/acp');
+  await client.create('coder');
+  assert.equal(client.state().session.cwd, '/projects/demo/worktree-one');
+  await client.open(session);
+  const relinquish = sockets[0].sent.find(message => message.params?._meta?.hive?.mode === 'relinquish');
+  assert.equal(relinquish.params.cwd, '/projects/demo/worktree-one');
+  client.close();
+});
+
 test('older provider responses cannot overwrite a newer catalog refresh', async () => {
   const pending = [];
   let revision = 1;

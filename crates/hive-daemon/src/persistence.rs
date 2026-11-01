@@ -42,6 +42,8 @@ impl Outcome {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Record {
+    #[serde(default)]
+    pub workspace_context: Option<hive_protocol::workspace::Context>,
     pub id: String,
     pub downstream_id: String,
     pub cwd: String,
@@ -64,7 +66,7 @@ pub struct Record {
     pub reason: Option<String>,
     pub uncertain: bool,
     #[serde(default)]
-    pub usage: Ledger,
+    pub(crate) usage: Ledger,
     // The fields below were added after the first schema shipped. They are optional in the JSON
     // blob so records written by earlier builds still decode (no SQL migration needed).
     /// Adapter that owns the downstream session: `acp` (default) or `opencode-server`.
@@ -91,6 +93,10 @@ fn default_origin() -> String {
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
+    #[error(
+        "cannot access workspace registry; check database permissions and stored resource records"
+    )]
+    Resource,
     #[error(
         "cannot read or write project registry metadata; check database permissions, disk space and stored definitions, then retry"
     )]
@@ -238,7 +244,7 @@ impl Store {
         let version: u32 = db
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(wrap)?;
-        if version > 4 {
+        if version > 5 {
             return Err(StoreError::Future { path, version });
         }
         if version == 0 {
@@ -305,6 +311,12 @@ impl Store {
             migration.execute_batch("CREATE TABLE projects (id TEXT PRIMARY KEY, definition TEXT NOT NULL); CREATE TABLE project_node_overrides (project_id TEXT NOT NULL, node_id TEXT NOT NULL, directory TEXT NOT NULL, PRIMARY KEY(project_id,node_id)); PRAGMA user_version=4;").map_err(wrap)?;
             migration.commit().map_err(wrap)?;
         }
+        if version < 5 {
+            // Resource lifetimes are independent of session and project catalog deletion.
+            let migration = db.transaction().map_err(wrap)?;
+            migration.execute_batch("CREATE TABLE resources (key TEXT PRIMARY KEY, record TEXT NOT NULL); PRAGMA user_version=5;").map_err(wrap)?;
+            migration.commit().map_err(wrap)?;
+        }
         // A future schema or failed migration must not change the existing journal mode.
         db.pragma_update(None, "journal_mode", "WAL")
             .map_err(wrap)?;
@@ -320,6 +332,52 @@ impl Store {
             path: self.path.clone(),
             source,
         }
+    }
+
+    pub(crate) fn state_directory(&self) -> &std::path::Path {
+        self.path.parent().expect("database has a parent")
+    }
+
+    pub(crate) fn resource<T: serde::de::DeserializeOwned>(
+        &self,
+        key: &str,
+    ) -> Result<Option<T>, StoreError> {
+        let db = self.connection.lock().map_err(|_| StoreError::Resource)?;
+        let value: Option<String> = db
+            .query_row("SELECT record FROM resources WHERE key=?1", [key], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(|_| StoreError::Resource)?;
+        value
+            .map(|value| serde_json::from_str(&value).map_err(|_| StoreError::Resource))
+            .transpose()
+    }
+
+    pub(crate) fn save_resource<T: Serialize>(
+        &self,
+        key: &str,
+        value: &T,
+    ) -> Result<(), StoreError> {
+        let json = serde_json::to_string(value).map_err(|_| StoreError::Resource)?;
+        self.connection.lock().map_err(|_| StoreError::Resource)?.execute("INSERT INTO resources(key,record) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET record=excluded.record", params![key,json]).map_err(|_| StoreError::Resource)?;
+        Ok(())
+    }
+
+    pub(crate) fn close_resource_session<T: Serialize>(
+        &self,
+        session: &str,
+        state: &T,
+    ) -> Result<(), StoreError> {
+        let json = serde_json::to_string(state).map_err(|_| StoreError::Resource)?;
+        let mut db = self.connection.lock().map_err(|_| StoreError::Resource)?;
+        let tx = db.transaction().map_err(|_| StoreError::Resource)?;
+        // Never forget a session before releasing its workspace hold durably in the same commit.
+        tx.execute("DELETE FROM sessions WHERE id=?1", [session])
+            .map_err(|_| StoreError::Resource)?;
+        tx.execute("UPDATE resources SET record=?1 WHERE key='node'", [json])
+            .map_err(|_| StoreError::Resource)?;
+        tx.commit().map_err(|_| StoreError::Resource)
     }
 
     pub(crate) fn projects(&self) -> Result<BTreeMap<ProjectId, ProjectDefinition>, StoreError> {
@@ -706,6 +764,7 @@ mod tests {
 
     fn record(id: &str) -> Record {
         Record {
+            workspace_context: None,
             id: id.into(),
             downstream_id: "agent-session".into(),
             cwd: "/tmp".into(),
@@ -739,7 +798,7 @@ mod tests {
         let db = Connection::open(&path).unwrap();
         // Recreate the exact schema-1 journal; registry JSON is deliberately untouched.
         db.execute_batch(
-            "ALTER TABLE prompts DROP COLUMN content_fingerprint; ALTER TABLE prompts DROP COLUMN terminal; ALTER TABLE prompts DROP COLUMN recovery_ack; DROP TABLE projects; DROP TABLE project_node_overrides; PRAGMA user_version=1;",
+            "ALTER TABLE prompts DROP COLUMN content_fingerprint; ALTER TABLE prompts DROP COLUMN terminal; ALTER TABLE prompts DROP COLUMN recovery_ack; DROP TABLE projects; DROP TABLE project_node_overrides; DROP TABLE resources; PRAGMA user_version=1;",
         )
         .unwrap();
         (path, db)
@@ -753,7 +812,7 @@ mod tests {
         drop(store);
         let db = Connection::open(&path).unwrap();
         db.execute_batch(
-            "DROP TABLE projects; DROP TABLE project_node_overrides; PRAGMA user_version=3;",
+            "DROP TABLE projects; DROP TABLE project_node_overrides; DROP TABLE resources; PRAGMA user_version=3;",
         )
         .unwrap();
         drop(db);
@@ -839,6 +898,35 @@ mod tests {
     }
 
     #[test]
+    fn schema_four_upgrades_resources_without_rewriting_existing_sessions() {
+        let path = temporary();
+        let store = Store::open(path.clone()).unwrap();
+        store.save(&record("before-resources")).unwrap();
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TABLE resources; PRAGMA user_version=4;")
+            .unwrap();
+        drop(store);
+        let store = Store::open(path.clone()).unwrap();
+        assert_eq!(store.records().unwrap()[0].id, "before-resources");
+        assert!(store.records().unwrap()[0].workspace_context.is_none());
+        store
+            .save_resource("test", &serde_json::json!({"durable":true}))
+            .unwrap();
+        assert_eq!(
+            store
+                .resource::<serde_json::Value>("test")
+                .unwrap()
+                .unwrap()["durable"],
+            true
+        );
+        drop(store);
+        std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
+    }
+
+    #[test]
     fn migration_scrubs_bodies_and_metadata_without_releasing_reservations_or_losing_acknowledgements()
      {
         let (path, db) = legacy_database();
@@ -885,7 +973,7 @@ mod tests {
             assert_eq!(
                 db.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
                     .unwrap(),
-                4
+                5
             );
             assert_eq!(
                 db.query_row("SELECT record FROM sessions", [], |row| row
@@ -1200,7 +1288,7 @@ mod tests {
         assert_eq!(
             db.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
                 .unwrap(),
-            4
+            5
         );
         drop(db);
         std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();

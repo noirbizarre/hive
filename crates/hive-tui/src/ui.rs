@@ -42,6 +42,7 @@ pub enum Page {
 
 #[derive(Default)]
 pub struct App {
+    pub workspace_launch: Option<hive_protocol::workspace::Launch>,
     pub page: Page,
     pub sessions: Vec<SessionSummary>,
     pub profiles: Vec<String>,

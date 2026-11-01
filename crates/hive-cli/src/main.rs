@@ -8,6 +8,7 @@ use hive_tui::Options as TuiOptions;
 
 mod doctor;
 mod project;
+mod workspace;
 
 const HELP_STYLES: Styles = Styles::styled()
     .header(AnsiColor::Cyan.on_default().bold())
@@ -34,6 +35,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Provision, inspect and explicitly remove task workspaces.
+    Workspace(workspace::Options),
+    /// Inspect and refresh node-local repository caches.
+    Repository(workspace::RepositoryOptions),
     /// Manage logical projects and node-local directory overrides.
     Project(project::Options),
     /// Open the terminal client.
@@ -209,6 +214,8 @@ fn web_url(url: Option<String>) -> String {
 async fn main() -> miette::Result<()> {
     let Cli { tui, command } = Cli::parse();
     match command {
+        Some(Command::Workspace(options)) => workspace::run(options).await,
+        Some(Command::Repository(options)) => workspace::repository(options).await,
         None => hive_tui::run(tui)
             .await
             .map_err(|error| miette::miette!("cannot start Hive TUI: {error}")),

@@ -630,13 +630,14 @@ export function connect(url, onChange = () => {}) {
         if (version !== openVersion) {
           // Selection may change while creation asks a question; don't leave an invisible pilot behind.
           const hive = created._meta?.hive;
-          if (hive?.role === 'pilot') await request('session/resume', { sessionId: created.sessionId, cwd: '/',
+          if (hive?.role === 'pilot') await request('session/resume', { sessionId: created.sessionId, cwd: hive.workspace?.effectiveCwd || '/',
             _meta: { hive: { mode: 'relinquish', generation: hive.generation, token: hive.token } } });
           creationUncertain = false;
           store?.removeItem('hive.creating');
           throw new Error('Session created; select it from the session list');
         }
-        selected = { sessionId: created.sessionId, cwd: '/', agent };
+        selected = { sessionId: created.sessionId, cwd: created._meta?.hive?.workspace?.effectiveCwd || '/', agent,
+          workspace: created._meta?.hive?.workspace };
         desired = { ...selected };
         creationUncertain = false;
         store?.removeItem('hive.creating');

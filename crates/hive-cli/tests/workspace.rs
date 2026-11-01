@@ -58,8 +58,7 @@ async fn command(address: SocketAddr, resource: &str, args: &[&str], success: bo
     if success {
         serde_json::from_slice(&output.stdout).unwrap()
     } else {
-        assert!(String::from_utf8_lossy(&output.stderr).contains("unsafe_cleanup"));
-        Value::Null
+        Value::String(String::from_utf8_lossy(&output.stderr).into_owned())
     }
 }
 
@@ -113,16 +112,60 @@ async fn workspace_commands_provision_flat_checkouts_survive_restart_and_preserv
         true,
     )
     .await;
+    let explicit = format!("operation-{}", uuid::Uuid::new_v4());
     let second = command(
         address,
         "workspace",
-        &["create", "--project", "demo", "--policy", "task"],
+        &[
+            "create",
+            "--project",
+            "demo",
+            "--policy",
+            "task",
+            "--base-ref",
+            "main",
+            "--branch",
+            "cli-task",
+            "--operation",
+            &explicit,
+        ],
         true,
     )
     .await;
     let first_id = first["workspace"]["id"].as_str().unwrap();
     let second_id = second["workspace"]["id"].as_str().unwrap();
     assert_ne!(first_id, second_id);
+    let replay = command(
+        address,
+        "workspace",
+        &[
+            "create",
+            "--project",
+            "demo",
+            "--policy",
+            "task",
+            "--base-ref",
+            "main",
+            "--branch",
+            "cli-task",
+            "--operation",
+            &explicit,
+        ],
+        true,
+    )
+    .await;
+    assert_eq!(replay["workspace"]["id"], second_id);
+    assert_eq!(
+        command(address, "workspace", &["list"], true).await["workspaces"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        command(address, "workspace", &["inspect", first_id], true).await["presence"],
+        "present"
+    );
     let location = |entry: &Value| {
         PathBuf::from(
             entry["workspace"]["location"]["root"]["path"]
@@ -141,13 +184,42 @@ async fn workspace_commands_provision_flat_checkouts_survive_restart_and_preserv
     assert_eq!(bare.file_name().unwrap(), ".git");
     assert_eq!(first_path.parent(), bare.parent());
     assert_eq!(second_path.parent(), bare.parent());
+    let repository = repositories["repositories"][0]["id"].as_str().unwrap();
+    assert_eq!(
+        command(address, "repository", &["show", repository], true).await["project"],
+        "demo"
+    );
+    assert_eq!(
+        command(address, "repository", &["fetch", repository], true).await["status"],
+        "ready"
+    );
+    let rejected = command(
+        address,
+        "workspace",
+        &[
+            "reconcile",
+            second_id,
+            "--directory",
+            second_path.to_str().unwrap(),
+            "--hooks-reconciled",
+        ],
+        false,
+    )
+    .await;
+    assert!(
+        rejected
+            .as_str()
+            .unwrap()
+            .contains("hive::workspace::request")
+    );
     let operation = first["workspace"]["operation"].as_str().unwrap();
     assert_eq!(
         command(address, "workspace", &["operation", operation], true).await["workspace"],
         first_id
     );
     std::fs::write(first_path.join("untracked"), "important").unwrap();
-    command(address, "workspace", &["remove", first_id], false).await;
+    let rejected = command(address, "workspace", &["remove", first_id], false).await;
+    assert!(rejected.as_str().unwrap().contains("unsafe_cleanup"));
     child.kill().await.unwrap();
     child.wait().await.unwrap();
     let mut child = daemon(&root, address).await;
@@ -159,7 +231,24 @@ async fn workspace_commands_provision_flat_checkouts_survive_restart_and_preserv
         command(address, "workspace", &["show", first_id], true).await["workspace"]["id"],
         first_id
     );
-    command(address, "workspace", &["remove", second_id], true).await;
+    let removal = format!("operation-{}", uuid::Uuid::new_v4());
+    command(
+        address,
+        "workspace",
+        &["remove", second_id, "--operation", &removal],
+        true,
+    )
+    .await;
+    assert_eq!(
+        command(
+            address,
+            "workspace",
+            &["remove", second_id, "--operation", &removal],
+            true
+        )
+        .await["workspace"]["state"],
+        "removed"
+    );
     assert!(!second_path.exists());
     assert_eq!(
         std::fs::read_to_string(first_path.join("untracked")).unwrap(),

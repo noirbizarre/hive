@@ -1635,3 +1635,524 @@ async fn long_project_identifiers_do_not_expand_managed_repository_or_worktree_p
         .unwrap();
     assert!(!Path::new(location.root.as_str()).exists());
 }
+
+async fn workspace_api(broker: crate::Broker) -> (String, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let router = crate::router_with_origin(broker, Some(&url));
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    (url, server)
+}
+
+#[tokio::test]
+async fn administration_rejects_unknown_resources_malformed_requests_and_missing_persistence_without_mutation()
+ {
+    let fixture = Fixture::new();
+    let config: crate::config::Config = serde_json::from_value(serde_json::json!({"projects":{"project":fixture.definition},"workspaces":{"task":{"policy":"worktree"}},"worktrunk":{"enabled":false}})).unwrap();
+    let broker = crate::Broker::persistent(
+        config,
+        fixture
+            .service
+            .store
+            .state_directory()
+            .join("catalog.sqlite3"),
+    )
+    .unwrap();
+    let (url, server) = workspace_api(broker.clone()).await;
+    let client = reqwest::Client::new();
+    let workspace = WorkspaceId::new();
+    let repository = RepositoryId::new();
+    for (method, path, expected) in [
+        (
+            reqwest::Method::GET,
+            format!("/v1/workspaces/{workspace}"),
+            404,
+        ),
+        (
+            reqwest::Method::GET,
+            format!("/v1/workspaces/{workspace}/inspect"),
+            404,
+        ),
+        (
+            reqwest::Method::GET,
+            format!("/v1/repositories/{repository}"),
+            404,
+        ),
+        (
+            reqwest::Method::POST,
+            format!("/v1/repositories/{repository}/fetch"),
+            404,
+        ),
+        (reqwest::Method::GET, "/v1/workspaces/invalid".into(), 422),
+        (
+            reqwest::Method::GET,
+            "/v1/workspaces/invalid/inspect".into(),
+            422,
+        ),
+        (reqwest::Method::GET, "/v1/repositories/invalid".into(), 422),
+        (
+            reqwest::Method::POST,
+            "/v1/repositories/invalid/fetch".into(),
+            422,
+        ),
+        (reqwest::Method::GET, "/v1/operations/invalid".into(), 422),
+    ] {
+        let response = client
+            .request(method, format!("{url}{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), expected, "{path}");
+        let diagnostic: serde_json::Value = response.json().await.unwrap();
+        assert!(
+            diagnostic["code"]
+                .as_str()
+                .unwrap()
+                .starts_with("hive::workspace::")
+        );
+    }
+    let request =
+        serde_json::json!({"operation":OperationId::new(),"project":"project","policy":"task"});
+    for (route, body) in [
+        (
+            "/v1/workspaces".to_owned(),
+            serde_json::json!({"operation":"private-sentinel"}),
+        ),
+        (
+            format!("/v1/workspaces/{workspace}/remove"),
+            serde_json::json!({"operation":"private-sentinel"}),
+        ),
+        (
+            format!("/v1/workspaces/{workspace}/reconcile"),
+            serde_json::json!({"unknown":"private-sentinel"}),
+        ),
+    ] {
+        let response = client
+            .post(format!("{url}{route}"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 422);
+        assert!(!response.text().await.unwrap().contains("private-sentinel"));
+    }
+    let mut unknown = request.clone();
+    unknown["project"] = serde_json::json!("missing");
+    assert_eq!(
+        client
+            .post(format!("{url}/v1/workspaces"))
+            .json(&unknown)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        404
+    );
+    unknown["policy"] = serde_json::json!("missing");
+    assert_eq!(
+        client
+            .post(format!("{url}/v1/workspaces"))
+            .json(&unknown)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        422
+    );
+    let mut collision = request.clone();
+    collision["branch"] = serde_json::json!("main");
+    let response = client
+        .post(format!("{url}/v1/workspaces"))
+        .json(&collision)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 409);
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap()["operation"],
+        collision["operation"]
+    );
+    broker.shutdown().await;
+    assert_eq!(
+        client
+            .post(format!("{url}/v1/workspaces"))
+            .json(&request)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        503
+    );
+    server.abort();
+    let (url, server) = workspace_api(crate::Broker::new(crate::config::Config::default())).await;
+    for route in ["/v1/workspaces", "/v1/repositories"] {
+        assert_eq!(
+            client
+                .get(format!("{url}{route}"))
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16(),
+            503
+        );
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn ephemeral_backings_and_node_directory_overrides_preserve_their_ownership_and_retention_contracts()
+ {
+    let fixture = Fixture::new();
+    for backing in ["worktree", "clone"] {
+        let mut request = fixture.request();
+        request.policy = WorkspaceTemplate::Ephemeral {
+            backing: backing.into(),
+            base_ref: Some(GitRef::try_from("main".to_owned()).unwrap()),
+            retention: Retention::Until { expires_at: 1 },
+        };
+        let entry = fixture.create(request).await.unwrap();
+        assert!(entry.workspace.intent().retention.eligible_at(2));
+        assert_eq!(entry.workspace.state(), WorkspaceState::Ready);
+        assert!(matches!(
+            entry.workspace.intent().policy,
+            WorkspacePolicy::Ephemeral { .. }
+        ));
+        assert!(matches!(
+            fixture
+                .service
+                .inspect(entry.workspace.id().clone())
+                .await
+                .unwrap(),
+            Inspection::Present { .. }
+        ));
+        fixture
+            .service
+            .remove(entry.workspace.id().clone(), OperationId::new(), false)
+            .await
+            .unwrap();
+    }
+    let project = ProjectId::from_name("project");
+    let node = fixture.service.node().await.unwrap();
+    let directory = NodePath::new(
+        node.clone(),
+        if cfg!(windows) {
+            PathSyntax::Windows
+        } else {
+            PathSyntax::Posix
+        },
+        fixture.seed.to_str().unwrap().into(),
+    )
+    .unwrap();
+    fixture
+        .service
+        .store
+        .write_project_override(&project, &node, Some(&directory))
+        .unwrap();
+    let mut request = fixture.request();
+    request.policy = WorkspaceTemplate::Existing { directory: None };
+    let entry = fixture.create(request).await.unwrap();
+    assert_eq!(
+        Path::new(entry.workspace.location().unwrap().root.as_str()),
+        fixture.seed.canonicalize().unwrap()
+    );
+    assert!(
+        fixture
+            .service
+            .remove(entry.workspace.id().clone(), OperationId::new(), true)
+            .await
+            .is_err()
+    );
+    for policy in [
+        serde_json::json!({"policy":"existing","directory":"relative"}),
+        serde_json::json!({"policy":"ephemeral","backing":"unsupported","retention":{"kind":"until","expires_at":1}}),
+        serde_json::json!({"policy":"ephemeral","backing":"clone","retention":{"kind":"retain"}}),
+    ] {
+        let config: crate::config::Config =
+            serde_json::from_value(serde_json::json!({"workspaces":{"invalid":policy}})).unwrap();
+        assert!(config.validate().is_err());
+    }
+}
+
+#[tokio::test]
+async fn core_backend_rejects_foreign_routing_changed_intent_and_cleanup_without_a_matching_managed_identity()
+ {
+    use hive_core::workspace::{
+        WorkspaceError,
+        backend::{ProvisionFailure, ProvisionRequest, WorkspaceBackend},
+    };
+    let fixture = Fixture::new();
+    let entry = fixture.create(fixture.request()).await.unwrap();
+    let backend: &dyn WorkspaceBackend = &fixture.service;
+    let request = ProvisionRequest {
+        operation: entry.workspace.operation().unwrap().clone(),
+        workspace: entry.workspace.id().clone(),
+        backend: entry.workspace.backend().unwrap().clone(),
+        intent: entry.workspace.intent().clone(),
+    };
+    let target = ResourceTarget {
+        workspace: entry.workspace.id().clone(),
+        node: entry.workspace.intent().node.clone(),
+        backend: entry.workspace.backend().unwrap().clone(),
+        ownership: Ownership::HiveManaged,
+        location: entry.workspace.location().cloned(),
+    };
+    assert!(matches!(
+        backend.inspect(target.clone()).await.unwrap(),
+        Inspection::Present { .. }
+    ));
+    let mut foreign = target.clone();
+    foreign.node = NodeId::new();
+    assert!(matches!(
+        backend.inspect(foreign).await,
+        Err(WorkspaceError::NodeMismatch { .. })
+    ));
+    let mut conflict = target.clone();
+    conflict.backend = BackendId("foreign".into());
+    assert!(matches!(
+        backend.inspect(conflict.clone()).await,
+        Err(WorkspaceError::UnsafeCleanup { .. })
+    ));
+    conflict.location = None;
+    assert!(matches!(
+        backend.inspect(conflict.clone()).await.unwrap(),
+        Inspection::IdentityConflict
+    ));
+    assert!(matches!(
+        backend
+            .cleanup(CleanupRequest {
+                operation: OperationId::new(),
+                target: conflict,
+                mode: CleanupMode::DiscardChanges
+            })
+            .await,
+        Err(WorkspaceError::Cleanup { .. })
+    ));
+    let mut changed = request.clone();
+    changed.backend = BackendId("foreign".into());
+    assert!(matches!(
+        backend.provision(changed).await,
+        Err(WorkspaceError::RetryConflict { .. })
+    ));
+    let mut unknown = target.clone();
+    unknown.workspace = WorkspaceId::new();
+    assert!(matches!(
+        backend.inspect(unknown).await,
+        Err(WorkspaceError::InvalidRecord)
+    ));
+    assert!(matches!(
+        backend
+            .cleanup(CleanupRequest {
+                operation: request.operation.clone(),
+                target,
+                mode: CleanupMode::DiscardChanges
+            })
+            .await,
+        Err(WorkspaceError::RetryConflict { .. })
+    ));
+    let mut collision = fixture.request();
+    collision.branch = Some(GitRef::try_from("main".to_owned()).unwrap());
+    assert!(fixture.create(collision.clone()).await.is_err());
+    let failed = fixture
+        .service
+        .list()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.workspace.operation() == Some(&collision.operation))
+        .unwrap();
+    assert!(matches!(
+        backend
+            .provision(ProvisionRequest {
+                operation: collision.operation,
+                workspace: failed.workspace.id().clone(),
+                backend: failed.workspace.backend().unwrap().clone(),
+                intent: failed.workspace.intent().clone()
+            })
+            .await,
+        Err(WorkspaceError::Provisioning {
+            reason: ProvisionFailure::BranchConflict,
+            ..
+        })
+    ));
+    let source = entry.workspace.location().unwrap().root.as_str();
+    let moved = fixture.seed.join("moved-managed");
+    std::fs::rename(source, &moved).unwrap();
+    assert!(matches!(
+        backend.provision(request).await,
+        Err(WorkspaceError::UncertainOperation { .. })
+    ));
+    assert!(moved.join("content").exists());
+    assert!(!Path::new(source).exists());
+}
+
+#[tokio::test]
+async fn core_backend_retries_a_transient_acquisition_failure_with_its_original_workspace_and_operation()
+ {
+    use hive_core::workspace::{
+        WorkspaceError,
+        backend::{ProvisionOutcome, ProvisionRequest, WorkspaceBackend},
+    };
+    let fixture = Fixture::new();
+    let hidden = fixture.remote.with_extension("offline");
+    std::fs::rename(&fixture.remote, &hidden).unwrap();
+    let request = fixture.request();
+    assert!(fixture.create(request.clone()).await.is_err());
+    let failed = fixture.service.list().await.unwrap().remove(0);
+    let original = ProvisionRequest {
+        operation: request.operation,
+        workspace: failed.workspace.id().clone(),
+        backend: failed.workspace.backend().unwrap().clone(),
+        intent: failed.workspace.intent().clone(),
+    };
+    let backend: &dyn WorkspaceBackend = &fixture.service;
+    assert!(matches!(
+        backend.provision(original.clone()).await,
+        Err(WorkspaceError::Provisioning {
+            retry: RetryDisposition::InspectFirst,
+            ..
+        })
+    ));
+    std::fs::rename(hidden, &fixture.remote).unwrap();
+    let recovered = backend.provision(original).await.unwrap();
+    assert_eq!(&recovered.workspace, failed.workspace.id());
+    assert_eq!(recovered.outcome, ProvisionOutcome::Created);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn lost_worktrunk_responses_require_hook_reconciliation_without_repeating_creation_or_removal()
+ {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let executable = fixture._directory.path().join("fake-wt");
+    std::fs::write(
+        &executable,
+        r#"#!/bin/sh
+case "$*" in
+  'switch --help') printf '%s' '--format --no-cd --create';;
+  'remove --help') printf '%s' '--foreground --no-delete-branch --format';;
+  'config approvals list --help') printf '%s' '--format';;
+  'config approvals list --format=json') printf '%s' '{"state":"no_commands"}';;
+  switch\ --create*)
+    for last do :; done
+    git worktree add -b "$last" "$PWD/../hook-checkout" "$4" >/dev/null || exit 1
+    printf 'create\n' >> "$HOME/hook-calls"
+    printf '{'
+    ;;
+  remove\ *)
+    for last do :; done
+    git worktree remove "$last" || exit 1
+    printf 'remove\n' >> "$HOME/hook-calls"
+    exit 1
+    ;;
+  *) exit 1;;
+esac
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let request = fixture.request();
+    assert!(matches!(
+        fixture
+            .service
+            .create(
+                request.clone(),
+                fixture.definition.clone(),
+                WorktrunkConfig {
+                    enabled: Some(true)
+                },
+                None
+            )
+            .await,
+        Err(Error::Uncertain)
+    ));
+    let failed = fixture.service.list().await.unwrap().remove(0);
+    let repository = fixture.service.repositories().await.unwrap().remove(0);
+    let actual = Path::new(repository.repository.root.as_str())
+        .parent()
+        .unwrap()
+        .join("hook-checkout");
+    let broker = crate::Broker::persistent(
+        crate::config::Config::default(),
+        fixture
+            .service
+            .store
+            .state_directory()
+            .join("catalog.sqlite3"),
+    )
+    .unwrap();
+    let (url, server) = workspace_api(broker).await;
+    let client = reqwest::Client::new();
+    let route = format!("{url}/v1/workspaces/{}/reconcile", failed.workspace.id());
+    assert_eq!(
+        client
+            .post(&route)
+            .json(&serde_json::json!({"directory":actual}))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16(),
+        409
+    );
+    let ready: Entry = client
+        .post(&route)
+        .json(&serde_json::json!({"directory":actual,"hooks_reconciled":true}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(ready.workspace.state(), WorkspaceState::Ready);
+    assert_eq!(
+        fixture
+            .service
+            .create(
+                request,
+                fixture.definition.clone(),
+                WorktrunkConfig {
+                    enabled: Some(false)
+                },
+                None
+            )
+            .await
+            .unwrap()
+            .workspace
+            .id(),
+        ready.workspace.id()
+    );
+    assert!(matches!(
+        fixture
+            .service
+            .remove(ready.workspace.id().clone(), OperationId::new(), false)
+            .await,
+        Err(Error::Worktrunk)
+    ));
+    assert!(!actual.exists());
+    let removed: Entry = client
+        .post(route)
+        .json(&serde_json::json!({"hooks_reconciled":true}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(removed.workspace.state(), WorkspaceState::Removed);
+    assert_eq!(
+        std::fs::read_to_string(fixture._directory.path().join("hook-calls")).unwrap(),
+        "create\nremove\n"
+    );
+    server.abort();
+}

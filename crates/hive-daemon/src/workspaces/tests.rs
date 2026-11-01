@@ -1615,13 +1615,18 @@ async fn state_directory_aliases_and_missing_worktree_registrations_resolve_phys
 }
 
 #[tokio::test]
-async fn managed_checkouts_and_metadata_support_paths_longer_than_the_legacy_windows_limit() {
+async fn long_project_identifiers_do_not_expand_managed_repository_or_worktree_paths() {
     let fixture = Fixture::new();
     let mut request = fixture.request();
     request.project = ProjectId::try_from("project".repeat(22)).unwrap();
     let entry = fixture.create(request).await.unwrap();
     let location = entry.workspace.location().unwrap();
-    assert!(location.root.as_str().len() > 260);
+    let root = Path::new(location.root.as_str());
+    assert_eq!(root.file_name().unwrap(), entry.workspace.id().as_str());
+    assert_eq!(
+        root.parent().unwrap().file_name().unwrap(),
+        entry.repository.as_ref().unwrap().as_str()
+    );
     assert!(Path::new(location.root.as_str()).join("content").is_file());
     fixture
         .service

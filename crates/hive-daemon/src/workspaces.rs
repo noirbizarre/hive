@@ -920,7 +920,9 @@ impl Runtime<'_> {
             return Ok(repo);
         }
         let id = RepositoryId::new();
-        let project_root = self.root().join(format!("{project}-{id}"));
+        // Project slugs are unbounded portable identifiers, not filesystem components.
+        // Stable resource IDs avoid inflating Windows linked-worktree metadata paths.
+        let project_root = self.root().join(id.as_str());
         let repo = Repository {
             repository: NodeRepository {
                 id,
@@ -1419,7 +1421,7 @@ impl Runtime<'_> {
         } else {
             bare.parent()
                 .ok_or(Error::Conflict)?
-                .join(format!("worktree-{}", entry.workspace.id()))
+                .join(entry.workspace.id().as_str())
         };
         if backend.0 != "worktrunk" && target.try_exists().map_err(|_| Error::Conflict)? {
             return Err(Error::Conflict);

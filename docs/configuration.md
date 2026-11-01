@@ -241,7 +241,7 @@ New worktree repositories prefer this layout:
 <project-root>/
   .git/                    # bare shared repository
   main/                    # example default-branch checkout
-  worktree-workspace-.../   # independent native task checkout
+  workspace-.../           # independent native task checkout
 ```
 
 Native task directories are immediate children even when branch names contain

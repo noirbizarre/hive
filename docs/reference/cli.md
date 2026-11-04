@@ -40,6 +40,37 @@ prompt submission, native adoption, or session deletion subcommands.
 These work on both `hive` and `hive tui`. The TUI does not derive its address
 from `HIVE_URL` or `HIVE_LISTEN`.
 
+### Terminal capability overrides
+
+These local client options accept `auto`, `on`, or `off`, defaulting to `auto`.
+CLI values override environment values, including an explicit `auto` restoring
+automatic detection. They work on both `hive` and `hive tui`.
+
+| Option | Environment variable | Operation |
+| --- | --- | --- |
+| `--terminal-kitty-graphics` | `HIVE_TERMINAL_KITTY_GRAPHICS` | Kitty graphics (not keyboard support) |
+| `--terminal-osc52-write` | `HIVE_TERMINAL_OSC52_WRITE` | Text clipboard writes |
+| `--terminal-osc52-read` | `HIVE_TERMINAL_OSC52_READ` | Text clipboard read attempts |
+| `--terminal-osc5522-write` | `HIVE_TERMINAL_OSC5522_WRITE` | Rich clipboard writes |
+| `--terminal-osc5522-read` | `HIVE_TERMINAL_OSC5522_READ` | Rich clipboard read attempts |
+| `--terminal-osc7501` | `HIVE_TERMINAL_OSC7501` | Program status reporting |
+
+`on` asserts support for that operation; for reads it also explicitly opts into
+attempting clipboard access. Read and write settings are independent. The
+terminal may still deny access. `off` disables that operation, and unknown
+automatic support falls back without using the protocol. A non-TTY stdin or
+stdout, or `TERM=dumb`, makes all six operations unavailable even with `on`.
+
+```sh
+hive tui --terminal-kitty-graphics off --terminal-osc52-write on
+HIVE_TERMINAL_OSC52_WRITE=on hive --terminal-osc52-write auto
+```
+
+These options configure the shared capability foundation; they do not install
+protocol backends. Current native clipboard operations remain independent.
+See [terminal capabilities](../guides/tui.md#terminal-capabilities) for detection
+limitations and the TUI diagnostic legend.
+
 ## Workspaces and repositories
 
 Workspace creation flags conflict with `--session`; explicit `--cwd` conflicts

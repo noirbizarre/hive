@@ -1,6 +1,7 @@
 //! Full-screen ACPv2 client; the daemon remains the sole session authority.
 
 mod activity;
+pub mod capabilities;
 mod clipboard;
 mod editor;
 mod external_editor;
@@ -41,6 +42,8 @@ use ui::{App, Page, SessionSnapshot};
 
 #[derive(Args, Clone, Debug)]
 pub struct Options {
+    #[command(flatten)]
+    pub terminal: capabilities::TerminalOptions,
     /// Explicitly use a directory instead of a profile's managed workspace policy.
     #[arg(long, conflicts_with_all = ["workspace", "workspace_id", "project", "base_ref", "branch", "session"])]
     pub cwd: Option<std::path::PathBuf>,
@@ -1864,6 +1867,7 @@ async fn run_with_clipboard(
     mut clipboard: clipboard::Clipboard,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut app = App {
+        terminal_capabilities: capabilities::TerminalCapabilities::detect(&options.terminal),
         cwd: options
             .cwd
             .clone()

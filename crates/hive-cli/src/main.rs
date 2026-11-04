@@ -252,6 +252,138 @@ mod tests {
     use clap::ColorChoice;
     use clap::error::ErrorKind;
 
+    const TERMINAL_FLAGS: [(&str, &str); 6] = [
+        ("--terminal-kitty-graphics", "HIVE_TERMINAL_KITTY_GRAPHICS"),
+        ("--terminal-osc52-write", "HIVE_TERMINAL_OSC52_WRITE"),
+        ("--terminal-osc52-read", "HIVE_TERMINAL_OSC52_READ"),
+        ("--terminal-osc5522-write", "HIVE_TERMINAL_OSC5522_WRITE"),
+        ("--terminal-osc5522-read", "HIVE_TERMINAL_OSC5522_READ"),
+        ("--terminal-osc7501", "HIVE_TERMINAL_OSC7501"),
+    ];
+
+    fn terminal_values(
+        options: &hive_tui::capabilities::TerminalOptions,
+    ) -> [hive_tui::capabilities::CapabilityOverride; 6] {
+        [
+            options.kitty_graphics,
+            options.osc52_write,
+            options.osc52_read,
+            options.osc5522_write,
+            options.osc5522_read,
+            options.osc7501,
+        ]
+    }
+
+    #[test]
+    fn terminal_overrides_accept_the_same_values_in_both_tui_entry_points() {
+        use hive_tui::capabilities::CapabilityOverride;
+
+        for (index, (flag, _)) in TERMINAL_FLAGS.iter().enumerate() {
+            for (value, expected) in [
+                ("auto", CapabilityOverride::Auto),
+                ("on", CapabilityOverride::On),
+                ("off", CapabilityOverride::Off),
+            ] {
+                let bare = Cli::try_parse_from(["hive", flag, value]).unwrap();
+                let explicit = Cli::try_parse_from(["hive", "tui", flag, value]).unwrap();
+                let Some(Command::Tui(options)) = explicit.command else {
+                    panic!("missing tui command")
+                };
+                assert_eq!(terminal_values(&bare.tui.terminal)[index], expected);
+                assert_eq!(bare.tui.terminal, options.terminal);
+            }
+            let error = Cli::try_parse_from(["hive", flag, "yes"]).err().unwrap();
+            assert_eq!(error.kind(), ErrorKind::InvalidValue);
+            assert!(error.to_string().contains("auto, on, off"));
+        }
+        for arguments in [vec!["hive", "--help"], vec!["hive", "tui", "--help"]] {
+            let help = Cli::try_parse_from(arguments).err().unwrap().to_string();
+            for (flag, variable) in TERMINAL_FLAGS {
+                assert!(help.contains(flag));
+                assert!(help.contains(variable));
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_environment_values_and_cli_precedence_are_checked_in_isolated_processes() {
+        for scenario in ["values", "invalid"] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "tests::terminal_environment_fixture",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("HIVE_TEST_TERMINAL_ENV", scenario);
+            // Child-only environment changes keep parallel parser tests independent and safe.
+            for (_, variable) in TERMINAL_FLAGS {
+                child.env_remove(variable);
+            }
+            if scenario == "values" {
+                for (_, variable) in TERMINAL_FLAGS {
+                    child.env(variable, "on");
+                }
+            } else {
+                child.env("HIVE_TERMINAL_OSC52_READ", "invalid");
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_environment_fixture() {
+        use hive_tui::capabilities::CapabilityOverride;
+
+        let Ok(scenario) = std::env::var("HIVE_TEST_TERMINAL_ENV") else {
+            return;
+        };
+        if scenario == "invalid" {
+            assert_eq!(
+                Cli::try_parse_from(["hive"]).err().unwrap().kind(),
+                ErrorKind::InvalidValue
+            );
+            return;
+        }
+        for prefix in [vec!["hive"], vec!["hive", "tui"]] {
+            let cli = Cli::try_parse_from(prefix.clone()).unwrap();
+            let options = match cli.command {
+                Some(Command::Tui(options)) => options,
+                _ => cli.tui,
+            };
+            assert_eq!(
+                terminal_values(&options.terminal),
+                [CapabilityOverride::On; 6]
+            );
+            for (index, (flag, _)) in TERMINAL_FLAGS.iter().enumerate() {
+                for (value, expected) in [
+                    ("off", CapabilityOverride::Off),
+                    ("auto", CapabilityOverride::Auto),
+                ] {
+                    let mut args = prefix.clone();
+                    args.extend([flag, value]);
+                    let cli = Cli::try_parse_from(args).unwrap();
+                    let options = match cli.command {
+                        Some(Command::Tui(options)) => options,
+                        _ => cli.tui,
+                    };
+                    assert_eq!(terminal_values(&options.terminal)[index], expected);
+                }
+            }
+        }
+        assert!(matches!(
+            Cli::try_parse_from(["hive", "daemon"]).unwrap().command,
+            Some(Command::Daemon(_))
+        ));
+    }
+
     #[test]
     fn a_bare_command_and_explicit_tui_accept_the_same_client_options() {
         let bare =

@@ -1532,6 +1532,7 @@ dependencies = [
  "agent-client-protocol",
  "arboard",
  "axum",
+ "base64 0.22.1",
  "clap",
  "crossterm",
  "hive-protocol",

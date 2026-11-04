@@ -12,6 +12,13 @@ pub struct Options {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Report interrupted operations, orphan observations and cleanup blockers.
+    Recovery,
+    /// Plan and explicitly apply safe expired-ephemeral cleanup.
+    Sweep {
+        #[command(subcommand)]
+        command: SweepCommand,
+    },
     /// Reconcile an interrupted operation against its exact registered Git identity.
     Reconcile {
         id: String,
@@ -57,6 +64,24 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum SweepCommand {
+    /// Freeze candidates and retry identities without deleting anything.
+    Plan {
+        #[arg(long = "workspace")]
+        workspaces: Vec<String>,
+        #[arg(long)]
+        operation: Option<String>,
+    },
+    Show {
+        id: String,
+    },
+    /// Apply or retry the frozen plan with fresh safety checks.
+    Apply {
+        id: String,
+    },
+}
+
 #[derive(Args)]
 pub struct RepositoryOptions {
     #[arg(long, env = "HIVE_URL", global = true)]
@@ -89,6 +114,46 @@ fn path(id: String) -> miette::Result<String> {
 
 pub async fn run(options: Options) -> miette::Result<()> {
     let (method, route, body) = match options.command {
+        Command::Recovery => (reqwest::Method::GET, "/v1/workspaces/recovery".into(), None),
+        Command::Sweep { command } => match command {
+            SweepCommand::Plan {
+                workspaces,
+                operation: key,
+            } => {
+                let workspaces = workspaces
+                    .into_iter()
+                    .map(WorkspaceId::try_from)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| {
+                        miette::miette!("invalid workspace ID; use hive workspace list")
+                    })?;
+                let operation = operation(key)?;
+                eprintln!("operation: {operation}");
+                (
+                    reqwest::Method::POST,
+                    "/v1/workspace-sweeps".into(),
+                    Some(
+                        json!({"operation":operation,"workspaces":if workspaces.is_empty() { None } else { Some(workspaces) }}),
+                    ),
+                )
+            }
+            SweepCommand::Show { id } => {
+                let id = operation(Some(id))?;
+                (
+                    reqwest::Method::GET,
+                    format!("/v1/workspace-sweeps/{id}"),
+                    None,
+                )
+            }
+            SweepCommand::Apply { id } => {
+                let id = operation(Some(id))?;
+                (
+                    reqwest::Method::POST,
+                    format!("/v1/workspace-sweeps/{id}/apply"),
+                    None,
+                )
+            }
+        },
         Command::Reconcile {
             id,
             directory,
@@ -203,5 +268,17 @@ async fn request(
         "{}",
         serde_json::to_string_pretty(&body).expect("JSON serializes")
     );
+    // HTTP success describes a valid batch, not successful cleanup of every item.
+    if route.ends_with("/apply")
+        && body["items"].as_array().is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| !matches!(item["status"].as_str(), Some("removed" | "already_removed")))
+        })
+    {
+        return Err(miette::miette!(
+            "sweep has unresolved items; inspect their failure/help fields, reconcile as directed, and apply the same sweep ID to retry"
+        ));
+    }
     Ok(())
 }

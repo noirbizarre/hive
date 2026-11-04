@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "tests/recovery.rs"]
+mod recovery_tests;
+
 #[path = "../../tests/support/fake_opencode.rs"]
 mod fake_opencode;
 
@@ -939,6 +942,54 @@ async fn resource_routes_expose_durable_operations_and_reject_foreign_or_dirty_r
     });
     let client = reqwest::Client::new();
     let operation = OperationId::new();
+    let sweep = serde_json::json!({"operation":OperationId::new(),"workspaces":[]});
+    assert_eq!(
+        client
+            .post(format!("{url}/v1/workspace-sweeps"))
+            .header("origin", "https://foreign.test")
+            .json(&sweep)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+    client
+        .post(format!("{url}/v1/workspace-sweeps"))
+        .json(&sweep)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    let sweep_id = sweep["operation"].as_str().unwrap();
+    assert_eq!(
+        client
+            .post(format!("{url}/v1/workspace-sweeps/{sweep_id}/apply"))
+            .header("origin", "https://foreign.test")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        client
+            .post(format!("{url}/v1/workspace-sweeps/{sweep_id}/apply"))
+            .json(&serde_json::json!({"discard_changes":true}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    );
+    client
+        .get(format!("{url}/v1/workspaces/recovery"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
     let request = serde_json::json!({"operation":operation,"project":"project","policy":"task"});
     assert_eq!(
         client
@@ -2057,7 +2108,12 @@ esac
     )
     .unwrap();
     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let request = fixture.request();
+    let mut request = fixture.request();
+    request.policy = WorkspaceTemplate::Ephemeral {
+        backing: "worktree".into(),
+        base_ref: None,
+        retention: Retention::Until { expires_at: 1 },
+    };
     assert!(matches!(
         fixture
             .service
@@ -2073,6 +2129,15 @@ esac
         Err(Error::Uncertain)
     ));
     let failed = fixture.service.list().await.unwrap().remove(0);
+    fixture
+        .service
+        .run(|rt| rt.recover_resources())
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture.service.list().await.unwrap()[0].workspace.state(),
+        WorkspaceState::Failed
+    );
     let repository = fixture.service.repositories().await.unwrap().remove(0);
     let actual = Path::new(repository.repository.root.as_str())
         .parent()
@@ -2130,14 +2195,41 @@ esac
             .id(),
         ready.workspace.id()
     );
-    assert!(matches!(
+    let sweep = fixture
+        .service
+        .plan_sweep(SweepRequest {
+            operation: OperationId::new(),
+            workspaces: None,
+        })
+        .await
+        .unwrap();
+    let sweep = serde_json::to_value(sweep).unwrap();
+    let operation =
+        OperationId::try_from(sweep["request"]["operation"].as_str().unwrap().to_owned()).unwrap();
+    let applied = serde_json::to_value(
         fixture
             .service
-            .remove(ready.workspace.id().clone(), OperationId::new(), false)
-            .await,
-        Err(Error::Worktrunk)
-    ));
+            .apply_sweep(operation.clone())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(applied["items"][0]["status"], "retryable_failure");
     assert!(!actual.exists());
+    fixture
+        .service
+        .run(|rt| rt.recover_resources())
+        .await
+        .unwrap();
+    let uncertain = serde_json::to_value(
+        fixture
+            .service
+            .apply_sweep(operation.clone())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(uncertain["items"][0]["status"], "manual_intervention");
     let removed: Entry = client
         .post(route)
         .json(&serde_json::json!({"hooks_reconciled":true}))
@@ -2150,6 +2242,9 @@ esac
         .await
         .unwrap();
     assert_eq!(removed.workspace.state(), WorkspaceState::Removed);
+    let completed =
+        serde_json::to_value(fixture.service.apply_sweep(operation).await.unwrap()).unwrap();
+    assert_eq!(completed["items"][0]["status"], "already_removed");
     assert_eq!(
         std::fs::read_to_string(fixture._directory.path().join("hook-calls")).unwrap(),
         "create\nremove\n"

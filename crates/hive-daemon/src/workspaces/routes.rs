@@ -51,12 +51,79 @@ pub(crate) fn router(broker: crate::Broker, origin: Option<String>) -> Router {
         .route("/v1/repositories/{id}", get(repository))
         .route("/v1/repositories/{id}/fetch", post(fetch))
         .route("/v1/workspaces", get(list).post(create))
+        .route("/v1/workspaces/recovery", get(recovery))
+        .route("/v1/workspace-sweeps", post(plan_sweep))
+        .route("/v1/workspace-sweeps/{id}", get(sweep))
+        .route("/v1/workspace-sweeps/{id}/apply", post(apply_sweep))
         .route("/v1/workspaces/{id}", get(show))
         .route("/v1/workspaces/{id}/inspect", get(inspect))
         .route("/v1/workspaces/{id}/remove", post(remove))
         .route("/v1/workspaces/{id}/reconcile", post(reconcile))
         .route("/v1/operations/{id}", get(operation))
         .with_state(Context { broker, origin })
+}
+
+async fn recovery(State(cx): State<Context>) -> Response {
+    let projects = cx.broker.recovery_projects().map_err(response)?;
+    Ok(Json(json!(
+        cx.broker
+            .workspace_service()
+            .map_err(response)?
+            .recovery(projects)
+            .await
+            .map_err(response)?
+    )))
+}
+
+async fn plan_sweep(
+    State(cx): State<Context>,
+    headers: HeaderMap,
+    body: Result<Json<super::SweepRequest>, JsonRejection>,
+) -> Response {
+    cx.authorize(&headers)?;
+    let Json(request) = body.map_err(|_| response(Error::Request))?;
+    Ok(Json(json!(
+        cx.broker
+            .workspace_service()
+            .map_err(response)?
+            .plan_sweep(request)
+            .await
+            .map_err(response)?
+    )))
+}
+
+async fn sweep(State(cx): State<Context>, Path(id): Path<String>) -> Response {
+    let id = OperationId::try_from(id).map_err(|_| response(Error::Request))?;
+    Ok(Json(json!(
+        cx.broker
+            .workspace_service()
+            .map_err(response)?
+            .sweep(id)
+            .await
+            .map_err(response)?
+    )))
+}
+
+async fn apply_sweep(
+    State(cx): State<Context>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    cx.authorize(&headers)?;
+    // Applying cannot silently accept replacement intent or destructive flags.
+    if !body.is_empty() && serde_json::from_slice::<Value>(&body).ok() != Some(json!({})) {
+        return Err(response(Error::Request));
+    }
+    let id = OperationId::try_from(id).map_err(|_| response(Error::Request))?;
+    Ok(Json(json!(
+        cx.broker
+            .workspace_service()
+            .map_err(response)?
+            .apply_sweep(id)
+            .await
+            .map_err(response)?
+    )))
 }
 
 async fn operation(State(cx): State<Context>, Path(id): Path<String>) -> Response {

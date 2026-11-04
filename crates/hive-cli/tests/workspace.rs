@@ -100,7 +100,7 @@ async fn workspace_commands_provision_flat_checkouts_survive_restart_and_preserv
             remote.to_str().unwrap(),
         ],
     );
-    std::fs::write(root.join("config.toml"), "[projects.demo]\nname = 'Demo'\nrepository_source = 'https://example.test/project'\n[workspaces.task]\npolicy = 'worktree'\n[worktrunk]\nenabled = false\n").unwrap();
+    std::fs::write(root.join("config.toml"), "[projects.demo]\nname = 'Demo'\nrepository_source = 'https://example.test/project'\n[workspaces.task]\npolicy = 'worktree'\n[workspaces.temporary]\npolicy = 'ephemeral'\nbacking = 'clone'\nretention = { kind = 'until', expires_at = 1 }\n[worktrunk]\nenabled = false\n").unwrap();
     let reserve = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = reserve.local_addr().unwrap();
     drop(reserve);
@@ -268,6 +268,41 @@ async fn workspace_commands_provision_flat_checkouts_survive_restart_and_preserv
         &bare,
         &["show-ref", "--verify", &format!("refs/heads/{branch}")],
     );
+    let temporary = command(
+        address,
+        "workspace",
+        &["create", "--project", "demo", "--policy", "temporary"],
+        true,
+    )
+    .await;
+    let path = location(&temporary);
+    let sweep = command(address, "workspace", &["sweep", "plan"], true).await;
+    let sweep_id = sweep["request"]["operation"].as_str().unwrap();
+    assert_eq!(sweep["items"].as_array().unwrap().len(), 1);
+    child.kill().await.unwrap();
+    child.wait().await.unwrap();
+    let mut child = daemon(&root, address).await;
+    assert!(path.exists(), "restart must not apply a persisted sweep");
+    assert_eq!(
+        command(address, "workspace", &["sweep", "show", sweep_id], true).await,
+        sweep
+    );
+    let report = command(address, "workspace", &["recovery"], true).await;
+    assert!(
+        report["workspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["retention_eligible"] == true)
+    );
+    std::fs::write(path.join("important"), "preserve").unwrap();
+    command(address, "workspace", &["sweep", "apply", sweep_id], false).await;
+    assert!(path.join("important").exists());
+    std::fs::remove_file(path.join("important")).unwrap();
+    let applied = command(address, "workspace", &["sweep", "apply", sweep_id], true).await;
+    assert_eq!(applied["items"][0]["status"], "removed");
+    assert_eq!(applied["items"][0]["cleanup"], sweep["items"][0]["cleanup"]);
+    assert!(!path.exists());
     child.kill().await.unwrap();
     child.wait().await.unwrap();
     std::fs::remove_dir_all(root).unwrap();

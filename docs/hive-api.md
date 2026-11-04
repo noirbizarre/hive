@@ -23,6 +23,10 @@ user. Session conversation/control methods live exclusively on `/acp`.
 | `GET /v1/repositories/{id}` | Inspect one cache |
 | `POST /v1/repositories/{id}/fetch` | Fetch remote refs without moving task branches |
 | `GET/POST /v1/workspaces` | List or provision durable workspaces |
+| `GET /v1/workspaces/recovery` | Fresh recovery, orphan and retention inventory |
+| `POST /v1/workspace-sweeps` | Persist a non-destructive cleanup plan |
+| `GET /v1/workspace-sweeps/{operation}` | Inspect frozen selection, cleanup requests and results |
+| `POST /v1/workspace-sweeps/{operation}/apply` | Explicitly apply or retry that exact cleanup plan |
 | `GET /v1/workspaces/{id}` | Inspect recorded intent, lifecycle and location |
 | `GET /v1/workspaces/{id}/inspect` | Fresh backend identity, presence and cleanup evidence |
 | `POST /v1/workspaces/{id}/remove` | Explicit safe removal |
@@ -104,6 +108,31 @@ checkout. WorkTrunk uncertainty requires explicit acknowledgement that external
 hook effects have been reviewed/reconciled. Cleanup reconciliation verifies
 absence or authorizes an identical safe retry; it does not override session-use
 or cleanup-safety checks.
+
+### Recovery and sweep requests
+
+Recovery returns `node`, `observed_at`, `workspaces`, `repositories`,
+`repository_findings`, `orphans` and `scan_errors`. Workspace findings include the
+recorded entry, classifications, actual/partial path, fresh inspection, holder IDs,
+retention eligibility/baseline/expiry, cleanup blocker and lifecycle observations.
+Missing catalog rows do not erase holder IDs. Reads do not adopt or delete resources.
+
+Plan with `{"operation":"operation-…","workspaces":["workspace-…"]}`;
+omit/null `workspaces` to freeze currently expired ephemeral candidates. An empty
+array selects none. Explicit selection never overrides safety or retention policy.
+Reordered/duplicate explicit IDs normalize to the same intent; changing selection
+under a saved operation key returns 409. Plans store their original `request`,
+`created_at`, and `items` containing workspace ID, child operation ID, immutable
+`cleanup` request, `status` and optional `failure`. Planning is non-destructive.
+
+Apply accepts an empty body or `{}`; replacement intent/discard flags are rejected.
+Every item is rechecked under resource admission. Outcomes are `removed`,
+`already_removed`, `blocked`, `retryable_failure` or `manual_intervention`;
+before application, eligible items are `planned`. Failures include stable codes and
+actionable help. A valid batch with mixed outcomes returns 200; request/storage
+errors retain the normal error status contract. Reapply the same plan to retry.
+Restart never automatically applies persisted plans. See the
+[retention policy](operations.md#recovery-inventory-and-ephemeral-sweeps).
 
 ### Session launch selectors
 

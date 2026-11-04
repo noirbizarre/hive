@@ -4091,9 +4091,14 @@ async fn serve_inner(
     } else {
         broker
     };
-    // Register before serving readiness: an immediate HUP must never terminate the process.
+    // Queue reload signals even while resource inspection delays HTTP readiness.
     #[cfg(unix)]
     let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+    // Settle proven resource outcomes before reattachment sees them; recovery never deletes.
+    broker
+        .recover_workspaces()
+        .await
+        .map_err(std::io::Error::other)?;
     #[cfg(unix)]
     let hangups = tokio::spawn({
         let broker = broker.clone();

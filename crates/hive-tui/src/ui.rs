@@ -42,6 +42,7 @@ pub enum Page {
 
 #[derive(Default)]
 pub struct App {
+    pub terminal_capabilities: crate::capabilities::TerminalCapabilities,
     pub workspace_launch: Option<hive_protocol::workspace::Launch>,
     pub page: Page,
     pub sessions: Vec<SessionSummary>,
@@ -453,10 +454,14 @@ impl App {
                 Span::styled(title, theme.text()),
             ]),
             Line::styled(
-                format!(
-                    "  {} · Ctrl-P model · Ctrl-G settings",
-                    self.config_summary()
-                ),
+                if self.page == Page::Sessions {
+                    self.terminal_capability_summary()
+                } else {
+                    format!(
+                        "  {} · Ctrl-P model · Ctrl-G settings",
+                        self.config_summary()
+                    )
+                },
                 theme.muted(),
             ),
         ];
@@ -465,6 +470,42 @@ impl App {
             lines.insert(1, Line::styled(label, theme.warning()));
         }
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    }
+
+    fn terminal_capability_summary(&self) -> String {
+        use crate::capabilities::{Capability, CapabilitySource};
+
+        let caps = self.terminal_capabilities;
+        if caps.kitty_graphics.source == CapabilitySource::UnavailableTransport {
+            return "  Terminal caps: unavailable (non-TTY or TERM=dumb)".into();
+        }
+        let label = |cap: Capability| {
+            let state = if cap.is_usable() {
+                "+"
+            } else if cap.effective == crate::capabilities::Support::Unknown {
+                "?"
+            } else {
+                "-"
+            };
+            // Overrides are assertions rather than negotiated support; make that visible.
+            format!(
+                "{state}{}",
+                if cap.source == CapabilitySource::Override {
+                    "*"
+                } else {
+                    ""
+                }
+            )
+        };
+        format!(
+            "  Terminal caps: graphics={} OSC52=w{}/r{} OSC5522=w{}/r{} OSC7501={}",
+            label(caps.kitty_graphics),
+            label(caps.osc52_write),
+            label(caps.osc52_read),
+            label(caps.osc5522_write),
+            label(caps.osc5522_read),
+            label(caps.osc7501),
+        )
     }
 
     fn history_label(&self) -> Option<String> {
@@ -1045,6 +1086,45 @@ mod tests {
         assert!(!rendered.contains("Select an item"));
         assert!(!rendered.contains("Enter pilot"));
         assert!(!rendered.contains("o observe"));
+    }
+
+    #[test]
+    fn the_session_heading_reports_the_shared_capability_decisions() {
+        use crate::capabilities::{Capability, CapabilitySource, Support, TerminalCapabilities};
+
+        let enabled = Capability {
+            detected: Support::Unknown,
+            effective: Support::Supported,
+            source: CapabilitySource::Override,
+        };
+        let disabled = Capability {
+            effective: Support::Unsupported,
+            ..enabled
+        };
+        let mut app = App {
+            terminal_capabilities: TerminalCapabilities {
+                kitty_graphics: enabled,
+                osc52_write: disabled,
+                osc5522_read: enabled,
+                ..TerminalCapabilities::default()
+            },
+            all: true,
+            ..App::default()
+        };
+        let mut terminal = Terminal::new(TestBackend::new(120, 14)).unwrap();
+        terminal.draw(|frame| app.show(frame)).unwrap();
+        assert!(
+            screen(&terminal)
+                .contains("Terminal caps: graphics=+* OSC52=w-*/r? OSC5522=w?/r+* OSC7501=?")
+        );
+        // Capability diagnostics must not consume the overview or introduce a minimum width.
+        let mut terminal = Terminal::new(TestBackend::new(40, 14)).unwrap();
+        terminal.draw(|frame| app.show(frame)).unwrap();
+        assert!(screen(&terminal).contains("No sessions yet"));
+        app.terminal_capabilities.kitty_graphics.source = CapabilitySource::UnavailableTransport;
+        let mut terminal = Terminal::new(TestBackend::new(100, 14)).unwrap();
+        terminal.draw(|frame| app.show(frame)).unwrap();
+        assert!(screen(&terminal).contains("Terminal caps: unavailable"));
     }
 
     #[test]

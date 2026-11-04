@@ -178,6 +178,54 @@ the TUI. See [CLI reference](../reference/cli.md).
 
 ## Display
 
+### Terminal capabilities
+
+The Sessions heading shows a compact **Terminal caps** diagnostic, resolved once
+when the local TUI starts and shared by TUI components. `graphics` means Kitty
+graphics, `OSC52` is the text clipboard protocol, `OSC5522` is the rich clipboard
+protocol, and `OSC7501` is program status reporting. Clipboard entries distinguish
+`w` (write) and `r` (read).
+
+- `+`: permitted to attempt the operation based on detection or configuration.
+- `?`: unknown; the operation falls back without using the protocol.
+- `-`: disabled or unsupported.
+- `*` following a state: explicitly overridden, rather than detected.
+- **unavailable**: stdin or stdout is not a TTY, or `TERM=dumb`; overrides cannot
+  enable optional terminal operations on that transport.
+
+The line clips in compact layouts. It reports capability decisions, not which
+backends Hive implements: terminal image rendering, OSC clipboard operations,
+and program status reporting are separate follow-up work. Existing text
+rendering, native clipboard operations, and terminal-native paste remain usable
+without any positive capability decision.
+
+Automatic detection is deliberately conservative and sends no terminal queries:
+
+| Evidence | Automatic decision |
+| --- | --- |
+| Direct `TERM=xterm-kitty` | Kitty graphics and OSC 52 writes supported |
+| `TMUX`, `STY`, or `ZELLIJ` present (even empty), or `TERM` starting with `screen`/`tmux` | All optional protocol support unknown |
+| Missing, empty, generic, or unrecognized terminal identity | All optional protocol support unknown |
+| OSC 5522 or OSC 7501 on any terminal | Unknown without an override |
+| Clipboard reads on any terminal | Unknown without explicit read opt-in |
+
+Environment variables are hints, not negotiation: SSH may omit them or forward
+stale values, multiplexers may block protocols, and terminal versions and user
+settings vary. Kitty-specific incidental variables do not establish support for
+newer protocols. Overrides assert support but neither implement multiplexer
+passthrough nor guarantee that the terminal will accept an operation.
+
+Clipboard write support never grants read permission. Explicit read `on` opts
+into attempts for only that operation; a terminal can still refuse them. See
+[capability overrides](../reference/cli.md#terminal-capability-overrides) for all
+CLI options and environment variables. For example:
+
+```sh
+hive tui --terminal-osc52-write on --terminal-osc52-read off
+```
+
+### Transcript and activity
+
 The transcript follows your terminal's foreground/background and ANSI colors.
 Session details collapse in narrow terminals. Unknown activity remains unknown,
 and an attention marker reflects only questions visible to this client.

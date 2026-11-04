@@ -51,6 +51,10 @@ def main():
         pid, master = pty.fork()
         if pid == 0:
             env = dict(os.environ, VISUAL=f'"{sys.executable}" "{editor}"')
+            # Exercise startup detection without inheriting the developer's outer terminal hints.
+            env["TERM"] = "dumb" if create else "xterm-kitty"
+            for marker in ("TMUX", "STY", "ZELLIJ"):
+                env.pop(marker, None)
             # The child injects a failing clipboard backend rather than touching the native clipboard.
             env["XDG_RUNTIME_DIR"] = str(directory)
             if create:
@@ -165,6 +169,8 @@ def main():
             action("stall")
             send(b"\t")
             wait(lambda: screen.contains("Sessions"))
+            capability_summary = "Terminal caps: unavailable" if create else "Terminal caps: graphics=+"
+            wait(lambda: screen.contains(capability_summary))
             send(b"\t")
             wait(lambda: screen.contains("Message"))
             wait(lambda: state()["stalled"])
@@ -224,6 +230,9 @@ def main():
             else:
                 raise AssertionError("TUI failed to shut down")
             assert settings(master) == original, "terminal modes were not restored"
+            # Detection must not inject capability queries into the terminal's input conversation.
+            for protocol in (b"\x1b_G", b"\x1b]52;", b"\x1b]5522;", b"\x1b]7501;"):
+                assert protocol not in output, "capability detection emitted a protocol sequence"
         except BaseException:
             sys.stderr.write(output.decode(errors="replace"))
             raise

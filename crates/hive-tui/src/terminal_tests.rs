@@ -194,6 +194,7 @@ async fn runtime_fixture() {
     });
     run_with_clipboard(
         Options {
+            terminal: capabilities::TerminalOptions::default(),
             cwd: None,
             project: None,
             workspace: None,

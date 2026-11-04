@@ -156,6 +156,12 @@ impl GitIntent {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ManagedBacking {
+    /// Backend codecs own SCM-specific intent; lifecycle code only pins provenance.
+    Backend {
+        selection: Box<backend::BackendSelection>,
+        intent: backend::BackendData,
+    },
+    /// Legacy Git record shape, retained for deterministic persisted-record migration.
     Worktree {
         repository: RepositoryId,
         git: GitIntent,
@@ -168,6 +174,10 @@ pub enum ManagedBacking {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "policy", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkspacePolicy {
+    Managed {
+        selection: Box<backend::BackendSelection>,
+        intent: backend::BackendData,
+    },
     Existing {
         directory: NodePath,
     },
@@ -227,6 +237,14 @@ pub struct WorkspaceIntent {
 
 impl WorkspaceIntent {
     pub fn validate(&self) -> Result<(), WorkspaceError> {
+        if let Some(selection) = self.selection()
+            && let Some(repository) = &selection.repository
+        {
+            self.check_node(&repository.node)?;
+            if repository.project != self.project {
+                return Err(WorkspaceError::InvalidIntent);
+            }
+        }
         if let WorkspacePolicy::Existing { directory } = &self.policy {
             self.check_node(directory.node())?;
         }
@@ -257,11 +275,39 @@ impl WorkspaceIntent {
             Ownership::HiveManaged
         }
     }
+
+    /// Legacy Git policies have no split provenance; their admission adapter supplies it.
+    #[must_use]
+    pub fn selection(&self) -> Option<&backend::BackendSelection> {
+        match &self.policy {
+            WorkspacePolicy::Managed { selection, .. }
+            | WorkspacePolicy::Ephemeral {
+                backing: ManagedBacking::Backend { selection, .. },
+            } => Some(selection),
+            _ => None,
+        }
+    }
 }
 
-/// Opaque integration identity, interpreted only by the backend registry.
+/// Legacy service-facing provisioner label; repository identity uses `RepositoryBackendId`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BackendId(pub String);
+
+impl BackendId {
+    /// Normalize legacy service labels at the compatibility boundary, not during dispatch.
+    #[must_use]
+    pub fn provisioner(&self) -> backend::ProvisionerId {
+        backend::ProvisionerId(
+            match self.0.as_str() {
+                "native" => "git.worktree",
+                "clone" => "git.clone",
+                "existing" => "external.directory",
+                _ => &self.0,
+            }
+            .to_owned(),
+        )
+    }
+}
 
 /// Backend-authoritative observations, persisted verbatim after provisioning.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -270,6 +316,9 @@ pub struct WorkspaceLocation {
     pub root: NodePath,
     pub working_directory: NodePath,
     pub backend: BackendId,
+    /// Versioned evidence is interpreted by the pinned provisioner, not generic lifecycle code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observations: Option<backend::BackendData>,
     pub resolved_base: Option<GitRef>,
     pub branch: Option<GitRef>,
     /// Opaque object ID: object format validation belongs to the selected Git backend.
@@ -483,6 +532,12 @@ impl TryFrom<WorkspaceRecord> for Workspace {
 
     fn try_from(record: WorkspaceRecord) -> Result<Self, Self::Error> {
         record.intent.validate()?;
+        if let Some(selection) = record.intent.selection()
+            && let Some(backend) = &record.backend
+            && backend.provisioner() != selection.provisioner
+        {
+            return Err(WorkspaceError::InvalidRecord);
+        }
         if let Some(location) = &record.location {
             record.intent.check_node(location.root.node())?;
             record

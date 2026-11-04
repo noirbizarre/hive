@@ -94,6 +94,16 @@ checkouts elsewhere; include those actual paths in backups. Back up resource fil
 and the database together while Hive is stopped. Moving a bare repository without
 repairing Git's linked-worktree metadata breaks its checkouts.
 
+Resource snapshots pin separate repository-backend and workspace-provisioner
+identities. On first access after upgrading, versionless records migrate atomically
+without moving directories or rewriting original operation/sweep requests. Native
+Git, clone and WorkTrunk records retain their implementation regardless of current
+configuration. Missing implementations or unsupported backend-data versions require
+restoring a compatible installation; they do not trigger native Git fallback.
+Back up the database and resource files before upgrading. To downgrade, restore a
+matching pre-upgrade backup rather than opening an upgraded snapshot with an older
+binary. See [provenance migration](adr/011-project-and-workspace-domain.md#persisted-provenance-migration).
+
 Removal is explicit: `hive workspace remove <id>`. It refuses active/unknown use,
 unverifiable identity and dirty tracked, untracked or ignored content. Explicit
 `--discard-changes` permits data loss only for an otherwise verified idle managed

@@ -76,6 +76,17 @@ of client attachment and session catalog lifetime. A cross-process resource gate
 serializes Git mutations and cleanup admission without holding SQLite locks over
 subprocess execution.
 
+Repository storage and workspace provisioning have independent identities and
+contracts in `hive_core::workspace::backend`. A compatibility registry/manager
+dispatches a pinned repository handle to a compatible provisioner. Native Git
+worktrees, independent clones and WorkTrunk reuse one Git acquisition/cache backend;
+WorkTrunk is Git-only. Managed intent and observations are versioned backend data,
+so another SCM can supply its own model without changing lifecycle orchestration.
+Concrete implementations and Git response adapters live under
+`crates/hive-daemon/src/workspaces/backends.rs` and its submodules; shared admission,
+durable checkpoints,
+leases, state transitions and cleanup safety stay in the workspace service.
+
 Resource startup reconciliation precedes session reattachment and settles only
 verified native outcomes. Recovery inventory exposes incomplete and orphaned
 resources without granting deletion authority. Explicit ephemeral sweep plans

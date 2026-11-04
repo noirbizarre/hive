@@ -42,6 +42,28 @@ pub enum CleanupFailure {
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum WorkspaceError {
+    #[error(
+        "backend identity is registered more than once; assign distinct identities instead of replacing an implementation"
+    )]
+    DuplicateBackend,
+    #[error(
+        "repository backend {backend:?} with storage {storage:?} is unavailable; restore the recorded backend on the owning node"
+    )]
+    UnknownRepositoryBackend { backend: String, storage: String },
+    #[error("workspace provisioner {provisioner:?} is unavailable; restore it on the owning node")]
+    UnknownProvisioner { provisioner: String },
+    #[error(
+        "workspace provisioner {provisioner:?} cannot use repository backend {backend:?} with storage {storage:?}; select a compatible provisioner before creating the resource"
+    )]
+    IncompatibleBackends {
+        provisioner: String,
+        backend: Option<String>,
+        storage: Option<String>,
+    },
+    #[error(
+        "backend data schema {schema:?} version {version} is unsupported or invalid; use a compatible Hive/backend version"
+    )]
+    UnsupportedBackendData { schema: String, version: u32 },
     #[error("unknown project {project}; register the project or select a registered identifier")]
     UnknownProject { project: ProjectId },
     #[error("execution node {node} is unavailable; reconnect it or select an available node")]
@@ -113,6 +135,11 @@ impl WorkspaceError {
     #[must_use]
     pub fn code(&self) -> &'static str {
         match self {
+            Self::DuplicateBackend => "hive::workspace::duplicate_backend",
+            Self::UnknownRepositoryBackend { .. } => "hive::workspace::unknown_repository_backend",
+            Self::UnknownProvisioner { .. } => "hive::workspace::unknown_provisioner",
+            Self::IncompatibleBackends { .. } => "hive::workspace::incompatible_backends",
+            Self::UnsupportedBackendData { .. } => "hive::workspace::unsupported_backend_data",
             Self::UnknownProject { .. } => "hive::workspace::unknown_project",
             Self::UnavailableNode { .. } => "hive::workspace::unavailable_node",
             Self::InvalidRef => "hive::workspace::invalid_ref",
@@ -166,6 +193,35 @@ mod tests {
         let workspace = WorkspaceId::new();
         let operation = OperationId::new();
         let cases = [
+            (WorkspaceError::DuplicateBackend, "duplicate_backend"),
+            (
+                WorkspaceError::UnknownRepositoryBackend {
+                    backend: "missing".into(),
+                    storage: "missing.store".into(),
+                },
+                "unknown_repository_backend",
+            ),
+            (
+                WorkspaceError::UnknownProvisioner {
+                    provisioner: "missing".into(),
+                },
+                "unknown_provisioner",
+            ),
+            (
+                WorkspaceError::IncompatibleBackends {
+                    provisioner: "worktrunk".into(),
+                    backend: Some("other".into()),
+                    storage: Some("other.store".into()),
+                },
+                "incompatible_backends",
+            ),
+            (
+                WorkspaceError::UnsupportedBackendData {
+                    schema: "example.intent".into(),
+                    version: 2,
+                },
+                "unsupported_backend_data",
+            ),
             (
                 WorkspaceError::UnknownProject {
                     project: ProjectId::new(),

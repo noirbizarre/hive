@@ -22,6 +22,7 @@ fn intent() -> WorkspaceIntent {
 
 fn location(node: &NodeId) -> WorkspaceLocation {
     WorkspaceLocation {
+        observations: None,
         root: path(node, "/actual/integration/location"),
         working_directory: path(node, "/actual/integration/location/package"),
         backend: BackendId("fake-integration-v1".to_owned()),

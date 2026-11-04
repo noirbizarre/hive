@@ -223,6 +223,13 @@ native Git. This choice is global, never per-profile. Selected WorkTrunk owns
 worktree creation/removal and directory templates: Hive supplies no target path
 and persists the actual returned directory. Failures never fall back mid-operation.
 
+This setting selects the Git worktree provisioner, not the repository/SCM backend.
+Native Git and WorkTrunk share the same acquired Git cache; independent clone and
+existing-directory policies keep their own provisioning behavior. Each workspace
+and operation pins the repository backend, storage handle and provisioner before
+effects. Reloading this setting affects new selection only: retry, inspection,
+reconciliation and cleanup keep their recorded implementations.
+
 Hooks remain enabled and require prior WorkTrunk approval. For a new bare cache,
 Hive reads project configuration from the pinned base commit and supplies that
 snapshot to WorkTrunk so branch-specific hooks are not silently skipped. Inspect

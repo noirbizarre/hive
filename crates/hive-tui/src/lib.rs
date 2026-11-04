@@ -5,6 +5,7 @@ pub mod capabilities;
 mod clipboard;
 mod editor;
 mod external_editor;
+pub mod images;
 mod picker;
 mod state;
 mod theme;
@@ -211,6 +212,7 @@ impl FormDraft {
 
 struct TerminalGuard {
     active: bool,
+    images: images::KittyRenderer,
 }
 impl Interaction {
     fn url_id(&self) -> Option<String> {
@@ -269,7 +271,10 @@ fn reconcile_interactions(
 }
 impl TerminalGuard {
     fn enter() -> std::io::Result<Self> {
-        let mut guard = Self { active: false };
+        let mut guard = Self {
+            active: false,
+            images: images::KittyRenderer::default(),
+        };
         guard.resume()?;
         Ok(guard)
     }
@@ -295,13 +300,44 @@ impl TerminalGuard {
             return Err(error);
         }
         self.active = true;
+        self.images.invalidate();
         Ok(())
     }
+
+    fn draw<W: std::io::Write>(
+        &mut self,
+        terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<W>>,
+        capabilities: &capabilities::TerminalCapabilities,
+        render: impl FnOnce(&mut ratatui::Frame, &mut images::ImageFrame),
+    ) -> std::io::Result<()> {
+        self.images.resize(terminal.size()?);
+        self.images.begin(terminal.backend_mut())?;
+        let mut desired = images::ImageFrame::new(capabilities);
+        let area = terminal.draw(|frame| render(frame, &mut desired))?.area;
+        // draw() also autoresizes: a resize racing the initial size query can clear
+        // resident image data, so trust the geometry actually used by the frame.
+        self.images
+            .resize(ratatui::layout::Size::new(area.width, area.height));
+        self.images.finish(terminal.backend_mut(), desired)
+    }
+
+    fn clear<W: std::io::Write>(
+        &mut self,
+        terminal: &mut ratatui::Terminal<ratatui::backend::CrosstermBackend<W>>,
+    ) -> std::io::Result<()> {
+        self.images.invalidate();
+        self.images.begin(terminal.backend_mut())?;
+        terminal.clear()
+    }
+
     fn suspend(&mut self) -> std::io::Result<()> {
         if !self.active {
             return Ok(());
         }
-        // Attempt both restorations even if terminal output fails.
+        // Images belong to this alternate screen, never to the shell or editor.
+        let images = self.images.cleanup(&mut std::io::stdout());
+        self.images.invalidate();
+        // Attempt all restorations even if terminal output fails.
         let screen = execute!(
             std::io::stdout(),
             DisableMouseCapture,
@@ -311,12 +347,13 @@ impl TerminalGuard {
         );
         let raw = disable_raw_mode();
         self.active = false;
-        screen.and(raw)
+        images.and(screen).and(raw)
     }
 }
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         // Retry all cleanup even after a partially failed suspend or resume.
+        let _ = self.images.cleanup(&mut std::io::stdout());
         let _ = execute!(
             std::io::stdout(),
             DisableMouseCapture,
@@ -2010,7 +2047,8 @@ async fn run_with_clipboard(
                           _ = frames.tick() => {
                               if dirty && editing.is_none() {
                                   restore_draft(&mut app);
-                                  terminal.draw(|frame| app.show(frame)).map_err(Error::into_internal_error)?;
+                                   let capabilities = app.terminal_capabilities;
+                                   guard.draw(&mut terminal, &capabilities, |frame, images| app.show_with_images(frame, images)).map_err(Error::into_internal_error)?;
                                   dirty = false;
                               }
                               continue;
@@ -2018,7 +2056,7 @@ async fn run_with_clipboard(
                           result = editor_completion(&mut editing) => {
                               editing = None;
                               guard.resume().map_err(Error::into_internal_error)?;
-                              terminal.clear().map_err(Error::into_internal_error)?;
+                               guard.clear(&mut terminal).map_err(Error::into_internal_error)?;
                               while keys.try_recv().is_ok() {}
                               let _ = reader_control.send(ReaderControl::Resume);
                               match result { Ok(edited) => external_editor::apply(&mut app, edited), Err(error) => app.status = error }
@@ -2105,7 +2143,10 @@ async fn run_with_clipboard(
                                       dirty = true;
                                       continue;
                                   }
-                                 // The next draw recalculates wrapping and click targets after a resize.
+                                   Event::Resize(_, _) => {
+                                       // Pixel geometry can change even when cell dimensions do not.
+                                       guard.images.invalidate(); dirty = true; continue;
+                                   }
                                   _ => { dirty = true; continue; },
                               };
                               dirty = true;
@@ -2170,7 +2211,10 @@ async fn run_with_clipboard(
         app.status = format!("Disconnected ({result:?}); reconnecting to the same Hive session…");
         if editing.is_none() {
             restore_draft(&mut app);
-            terminal.draw(|frame| app.show(frame))?;
+            let capabilities = app.terminal_capabilities;
+            guard.draw(&mut terminal, &capabilities, |frame, images| {
+                app.show_with_images(frame, images)
+            })?;
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
@@ -2212,9 +2256,31 @@ mod tests {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))
                 .unwrap();
-        terminal
-            .draw(|frame| {
-                frame.set_cursor_position((2, 2));
+        // The PTY parent records graphics bytes; no terminal response is needed.
+        let mut capabilities = capabilities::TerminalCapabilities::default();
+        capabilities.kitty_graphics.effective = capabilities::Support::Supported;
+        let source = images::fixture_source();
+        guard
+            .draw(&mut terminal, &capabilities, |frame, images| {
+                images::fixture_scene(frame, images, &source);
+            })
+            .unwrap();
+        guard
+            .draw(&mut terminal, &capabilities, |frame, images| {
+                images::fixture_scene(frame, images, &source);
+            })
+            .unwrap();
+        eprintln!("HIVE_PTY_IMAGE_RESIZE_READY");
+        // The parent changes the actual PTY size before acknowledging with `r`.
+        // Ignore a queued resize notification; draw must also notice geometry itself.
+        loop {
+            if matches!(event::read().unwrap(), Event::Key(key) if key.code == KeyCode::Char('r')) {
+                break;
+            }
+        }
+        guard
+            .draw(&mut terminal, &capabilities, |frame, images| {
+                images::fixture_scene(frame, images, &source);
             })
             .unwrap();
         let (sender, mut keys) = mpsc::unbounded_channel();
@@ -2249,19 +2315,78 @@ mod tests {
                 .success()
         );
         guard.resume().unwrap();
-        terminal.clear().unwrap();
+        guard.clear(&mut terminal).unwrap();
+        guard
+            .draw(&mut terminal, &capabilities, |frame, images| {
+                images::fixture_scene(frame, images, &source);
+            })
+            .unwrap();
         control.send(ReaderControl::Resume).unwrap();
         assert!(crossterm::terminal::is_raw_mode_enabled().unwrap());
         eprintln!("HIVE_PTY_PASTE_READY");
-        let pasted = tokio::time::timeout(Duration::from_secs(5), keys.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(pasted, Event::Paste(ref value) if value == "one\ntwo"));
+        let pasted = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let event = keys.recv().await.unwrap();
+                // SIGWINCH can arrive after the resize acknowledgement, especially
+                // when a Cargo frontend shares this controlling terminal.
+                if !matches!(event, Event::Resize(_, _)) {
+                    break event;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(pasted, Event::Paste(ref value) if value == "one\ntwo"),
+            "unexpected event: {pasted:?}"
+        );
         keys.close();
         reader.await.unwrap();
         guard.suspend().unwrap();
         assert!(!crossterm::terminal::is_raw_mode_enabled().unwrap());
+    }
+
+    #[test]
+    #[ignore = "visual image fixture; requires an interactive terminal"]
+    fn inline_images_and_thumbnails_can_be_inspected_in_a_terminal() {
+        let mut guard = TerminalGuard::enter().unwrap();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))
+                .unwrap();
+        let capabilities =
+            capabilities::TerminalCapabilities::detect(&capabilities::TerminalOptions::default());
+        let source = images::fixture_source();
+        let mut hidden = false;
+        let mut overlay = false;
+        loop {
+            guard
+                .draw(&mut terminal, &capabilities, |frame, images| {
+                    if !hidden {
+                        images::fixture_scene(frame, images, &source);
+                    }
+                    if overlay {
+                        images.suppress();
+                        let area = frame.area();
+                        frame.render_widget(ratatui::widgets::Clear, area);
+                        frame.render_widget(
+                            ratatui::widgets::Paragraph::new("Overlay: images must be hidden"),
+                            area,
+                        );
+                    }
+                })
+                .unwrap();
+            match event::read().unwrap() {
+                Event::Key(key) => match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Char('h') => hidden = !hidden,
+                    KeyCode::Char('o') => overlay = !overlay,
+                    KeyCode::Char('c') => guard.clear(&mut terminal).unwrap(),
+                    _ => {}
+                },
+                Event::Resize(_, _) => guard.images.invalidate(),
+                _ => {}
+            }
+        }
     }
 
     #[tokio::test]

@@ -193,9 +193,10 @@ protocol, and `OSC7501` is program status reporting. Clipboard entries distingui
 - **unavailable**: stdin or stdout is not a TTY, or `TERM=dumb`; overrides cannot
   enable optional terminal operations on that transport.
 
-The line clips in compact layouts. It reports capability decisions, not which
-backends Hive implements: terminal image rendering, OSC clipboard operations,
-and program status reporting are separate follow-up work. Existing text
+The line clips in compact layouts. It reports permission to attempt an operation,
+not guaranteed terminal acceptance. The PNG Kitty backend is implemented; routing
+ACP message images to it is tracked separately in [#127][acp-images]. OSC clipboard
+operations and program status reporting remain follow-up work. Existing text
 rendering, native clipboard operations, and terminal-native paste remain usable
 without any positive capability decision.
 
@@ -223,6 +224,46 @@ CLI options and environment variables. For example:
 ```sh
 hive tui --terminal-osc52-write on --terminal-osc52-read off
 ```
+
+### Kitty image backend
+
+The TUI image service accepts PNG data and supports inline images and bounded
+thumbnails. Kitty preserves the image aspect ratio inside the allocated cell
+rectangle. Inline bounds default to 80 columns by 20 rows; thumbnails default to
+20 columns by 6 rows. Both are constrained by the caller's available viewport.
+The same upload can be displayed at multiple sizes.
+
+Captions include the image type, dimensions, and a caller-provided label. Unknown
+or disabled graphics capability uses text only, with no Kitty image escapes.
+Unsupported formats or rejected sources can also use a metadata-only fallback.
+The service checks PNG headers and resource bounds (16 MiB input, dimensions up
+to 16,384 pixels, and 40 million pixels total); the terminal performs PNG decoding.
+Quiet transfers do not query whether the terminal accepted an image, so captions
+remain visible even when graphics are attempted.
+
+The renderer replaces placements during redraws, reuses uploads during ordinary
+redraws, and frees images when they leave the view. Resizing or clearing the
+screen invalidates uploads. Images are suppressed behind pickers and cleaned up
+before editor handoff and terminal restoration. Only Hive-owned image IDs are
+deleted.
+
+ACP message image display is pending [#127][acp-images]. Developers can inspect a
+synthetic inline/thumbnail scene in a Kitty-capable terminal:
+
+```sh
+mise exec -- cargo test -p hive-tui \
+  tests::inline_images_and_thumbnails_can_be_inspected_in_a_terminal \
+  -- --ignored --exact --nocapture
+```
+
+Resize the terminal to check reflow. Press `h` to remove/restore content, `o` to
+toggle an overlay, `c` to clear/rebuild the screen, and `q` to exit. Capability
+overrides also apply to this fixture, for example
+`HIVE_TERMINAL_KITTY_GRAPHICS=off` to inspect fallback. The automated
+`python3 crates/hive-tui/tests/terminal.py` fixture checks image cleanup across
+editor handoff using a controlling PTY.
+
+[acp-images]: https://github.com/noirbizarre/hive/issues/127
 
 ### Transcript and activity
 

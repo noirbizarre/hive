@@ -270,6 +270,15 @@ impl App {
             })
     }
 
+    pub fn show_with_images(&mut self, frame: &mut Frame, images: &mut crate::images::ImageFrame) {
+        self.show(frame);
+        // Kitty placements are emitted after text, so a picker Clear widget alone
+        // cannot prevent them from obscuring the modal. Captions remain readable.
+        if self.picker.is_some() {
+            images.suppress();
+        }
+    }
+
     pub fn show(&mut self, frame: &mut Frame) {
         let theme = Theme;
         let area = frame.area();

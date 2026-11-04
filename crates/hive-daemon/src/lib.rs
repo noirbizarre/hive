@@ -1760,7 +1760,8 @@ impl Broker {
             Some(serde_json::Value::Object(hive)) => {
                 if let Some(value) = hive.remove("workspace") {
                     workspace_launch = Some(serde_json::from_value(value).map_err(|_| {
-                        Error::invalid_params().data("invalid _meta.hive.workspace launch selector")
+                        // Parser errors can echo private selector values; expose only the public contract.
+                        Error::invalid_params().data(workspaces::Error::Selector.json())
                     })?);
                 }
                 if let Some(value) = hive.remove("adopt") {

@@ -339,6 +339,71 @@ async fn workspace_legacy_cwd_and_explicit_existing_launches_preserve_the_downst
 }
 
 #[tokio::test]
+async fn workspace_selector_diagnostics_reject_private_and_mistyped_values_before_startup() {
+    let fixture = Fixture::new(AgentVersion::V2, false);
+    let broker = hive_daemon::Broker::persistent(
+        fixture.source.load().unwrap(),
+        fixture.path("state/catalog.sqlite3"),
+    )
+    .unwrap();
+    // Selector validation needs no Git rewrite, so keep this boundary visible to coverage.
+    let (address, server) = serve(&broker).await;
+    timeout(
+        Duration::from_secs(15),
+        Client.v2().connect_with(
+            HttpClient::new(format!("ws://{address}")).unwrap(),
+            async |cx| {
+                cx.send_request(v2::InitializeRequest::new(
+                    ProtocolVersion::V2,
+                    v2::Implementation::new("workspace-selector-test", "1"),
+                ))
+                .block_task()
+                .await?;
+                for launch in [
+                    json!({"kind":"must-not-leak"}),
+                    json!({"kind":"existing","directory":42}),
+                    json!({"kind":"new","unexpected":"must-not-leak"}),
+                ] {
+                    let error = cx
+                        .send_request(
+                            v2::NewSessionRequest::new(fixture.seed.clone()).meta(selector(launch)),
+                        )
+                        .block_task()
+                        .await
+                        .unwrap_err();
+                    let error = serde_json::to_value(error).unwrap();
+                    assert_eq!(error["code"], -32602);
+                    assert_eq!(error["data"]["code"], "hive::workspace::selector");
+                    assert!(!error["data"]["message"].as_str().unwrap().is_empty());
+                    assert!(!error["data"]["help"].as_str().unwrap().is_empty());
+                    assert!(!error.to_string().contains("must-not-leak"));
+                }
+                assert!(
+                    summaries(address).await["sessions"]
+                        .as_array()
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(
+                    inventory(address).await["workspaces"]
+                        .as_array()
+                        .unwrap()
+                        .is_empty()
+                );
+                assert!(!fixture.path("started").exists());
+                assert!(!fixture.path("agent.json").exists());
+                Ok(())
+            },
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    broker.shutdown().await;
+    server.abort();
+}
+
+#[tokio::test]
 async fn workspace_failures_are_structured_and_leave_no_agent_session_or_profile_binding() {
     let fixture = Fixture::new(AgentVersion::V2, false);
     let (address, mut host) = fixture.start().await;
@@ -354,21 +419,6 @@ async fn workspace_failures_are_structured_and_leave_no_agent_session_or_profile
                 .block_task()
                 .await?;
                 for (launch, code, rpc_code) in [
-                    (
-                        json!({"kind":"must-not-leak"}),
-                        "hive::workspace::selector",
-                        -32602,
-                    ),
-                    (
-                        json!({"kind":"existing","directory":42}),
-                        "hive::workspace::selector",
-                        -32602,
-                    ),
-                    (
-                        json!({"kind":"new","unexpected":"must-not-leak"}),
-                        "hive::workspace::selector",
-                        -32602,
-                    ),
                     (
                         json!({"kind":"new","project":"unknown"}),
                         "hive::workspace::unknown",

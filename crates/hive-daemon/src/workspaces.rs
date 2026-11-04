@@ -25,7 +25,9 @@ use hive_core::{
     },
 };
 use serde::{Deserialize, Serialize};
+mod recovery;
 mod routes;
+pub use recovery::{RecoveryReport, Sweep, SweepRequest};
 pub(crate) use routes::router;
 
 impl crate::Broker {
@@ -213,6 +215,10 @@ pub enum Error {
         "WorkTrunk command failed; check wt compatibility, hook approvals and project hooks, then inspect before retrying"
     )]
     Worktrunk,
+    #[error(
+        "workspace cleanup filesystem operation failed; check checkout/archive permissions, disk space and open files, inspect the cleanup operation, then retry with the same operation key"
+    )]
+    Removal,
     #[error(transparent)]
     Domain(#[from] hive_core::workspace::WorkspaceError),
 }
@@ -232,6 +238,7 @@ impl Error {
             Self::RetryConflict => "hive::workspace::retry_conflict",
             Self::Request => "hive::workspace::request",
             Self::Worktrunk => "hive::workspace::worktrunk",
+            Self::Removal => "hive::workspace::removal",
             Self::Domain(error) => error.code(),
         }
     }
@@ -311,6 +318,12 @@ struct State {
     // A missing catalog row is not proof of idleness once downstream dispatch was possible.
     #[serde(default)]
     dispatched: BTreeSet<String>,
+    #[serde(default)]
+    lifecycle: BTreeMap<String, Vec<recovery::Transition>>,
+    #[serde(default)]
+    last_used: BTreeMap<String, u64>,
+    #[serde(default)]
+    sweeps: BTreeMap<String, Sweep>,
 }
 
 impl Default for State {
@@ -324,6 +337,9 @@ impl Default for State {
             protected: BTreeMap::new(),
             archives: BTreeMap::new(),
             dispatched: BTreeSet::new(),
+            lifecycle: BTreeMap::new(),
+            last_used: BTreeMap::new(),
+            sweeps: BTreeMap::new(),
         }
     }
 }
@@ -467,9 +483,21 @@ impl Service {
     }
     pub async fn release(&self, session: String) -> Result<(), Error> {
         self.run(move |rt| {
+            let affected: Vec<_> = rt
+                .state
+                .workspaces
+                .values()
+                .filter(|entry| rt.holds(&session, entry.workspace.id()))
+                .map(|entry| entry.workspace.id().clone())
+                .collect();
             rt.state.uses.remove(&session);
             rt.state.protected.remove(&session);
             rt.state.dispatched.remove(&session);
+            for id in affected {
+                if !rt.has_use(&id) {
+                    rt.touch(&id);
+                }
+            }
             rt.store
                 .close_resource_session(&session, &rt.state)
                 .map_err(Into::into)
@@ -815,6 +843,9 @@ impl Runtime<'_> {
             }
         }
         self.state.uses.insert(session.clone(), primary);
+        for id in &protected {
+            self.touch(id);
+        }
         self.state.protected.insert(session, protected);
         self.save()
     }
@@ -833,7 +864,8 @@ impl Runtime<'_> {
             .retain(|session, _| self.state.uses.contains_key(session));
         self.save()
     }
-    fn save(&self) -> Result<(), Error> {
+    fn save(&mut self) -> Result<(), Error> {
+        self.record_transitions();
         self.store
             .save_resource("node", &self.state)
             .map_err(Into::into)
@@ -1103,6 +1135,10 @@ impl Runtime<'_> {
     ) -> Result<Entry, Error> {
         request.policy.validate().map_err(|_| Error::Request)?;
         let key = request.operation.to_string();
+        if !self.state.operations.contains_key(&key) && self.operation_reserved(&request.operation)
+        {
+            return Err(Error::RetryConflict);
+        }
         let json = serde_json::to_value(&request).map_err(|_| Error::Request)?;
         if let Some(original) = self.state.operations.get(&key).cloned() {
             if original.request != json {
@@ -1333,9 +1369,13 @@ impl Runtime<'_> {
         self.save()?;
         let result = self.provision(&entry, git_intent.as_ref(), &key);
         match result {
-            Ok(location) => entry
-                .workspace
-                .transition(WorkspaceEvent::Provisioned { location })?,
+            Ok(location) => {
+                #[cfg(test)]
+                recovery::crash_boundary("provisioned");
+                entry
+                    .workspace
+                    .transition(WorkspaceEvent::Provisioned { location })?;
+            }
             Err(error) => {
                 entry.failure = Some(error.code().into());
                 entry
@@ -1694,7 +1734,13 @@ impl Runtime<'_> {
                 },
             });
         };
-        if !path.try_exists().map_err(|_| Error::Conflict)? {
+        // A dangling symlink is a conflicting directory entry, not proven absence.
+        let metadata = match path.symlink_metadata() {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return Err(Error::Conflict),
+        };
+        if metadata.is_none() {
             return if entry.workspace.state() == WorkspaceState::Removed {
                 Ok(Inspection::Absent)
             } else {
@@ -1708,12 +1754,7 @@ impl Runtime<'_> {
                 })
             };
         }
-        if path
-            .symlink_metadata()
-            .map_err(|_| Error::Conflict)?
-            .file_type()
-            .is_symlink()
-        {
+        if metadata.is_some_and(|metadata| metadata.file_type().is_symlink()) {
             return Ok(Inspection::IdentityConflict);
         }
         let location = match self.location(entry, &path, None) {
@@ -1800,6 +1841,12 @@ impl Runtime<'_> {
             },
         });
         let request = serde_json::to_value(&cleanup).map_err(|_| Error::Request)?;
+        if !self.state.operations.contains_key(operation.as_str())
+            && self.operation_reserved(&operation)
+            && !self.planned_cleanup(&cleanup)
+        {
+            return Err(Error::RetryConflict);
+        }
         if let Some(original) = self.state.operations.get(operation.as_str()) {
             if original.request != request {
                 return Err(Error::RetryConflict);
@@ -1866,7 +1913,7 @@ impl Runtime<'_> {
                     self.state.workspaces.insert(id.to_string(), entry.clone());
                     self.save()?;
                 }
-                std::fs::remove_dir_all(path).map_err(|_| Error::Storage)
+                std::fs::remove_dir_all(path).map_err(|_| Error::Removal)
             })()
         } else {
             let repo = self
@@ -1913,6 +1960,10 @@ impl Runtime<'_> {
                 Ok(())
             }
         });
+        #[cfg(test)]
+        if result.is_ok() {
+            recovery::crash_boundary("deleted");
+        }
         match &result {
             Ok(()) => {
                 entry.failure = None;
@@ -1995,11 +2046,11 @@ impl Runtime<'_> {
                 return Err(Error::Conflict);
             }
         } else {
-            std::fs::create_dir_all(&directory).map_err(|_| Error::Storage)?;
+            std::fs::create_dir_all(&directory).map_err(|_| Error::Removal)?;
             if plan.staging.exists() && !complete(&plan.staging) {
                 // Only an operation-owned temporary copy is retried, and only while the
                 // original checkout still matches the durable source snapshot above.
-                std::fs::remove_dir_all(&plan.staging).map_err(|_| Error::Storage)?;
+                std::fs::remove_dir_all(&plan.staging).map_err(|_| Error::Removal)?;
             }
             if !plan.staging.exists() {
                 git(
@@ -2028,18 +2079,17 @@ impl Runtime<'_> {
                 &["config", "core.longpaths", "true"],
                 "archive",
             )?;
-            std::fs::rename(&plan.staging, &plan.destination).map_err(|_| Error::Storage)?;
+            std::fs::rename(&plan.staging, &plan.destination).map_err(|_| Error::Removal)?;
         }
         self.path(&plan.destination)
     }
 
     fn verified_removal_absence(&self, entry: &Entry) -> Result<bool, Error> {
         let location = entry.workspace.location().ok_or(Error::Conflict)?;
-        if Path::new(location.root.as_str())
-            .try_exists()
-            .map_err(|_| Error::Conflict)?
-        {
-            return Ok(false);
+        match Path::new(location.root.as_str()).symlink_metadata() {
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(Error::Conflict),
         }
         if self.has_use(entry.workspace.id()) {
             return Err(Error::Conflict);
@@ -2054,10 +2104,7 @@ impl Runtime<'_> {
             let request: CleanupRequest =
                 serde_json::from_value(operation.request.clone()).map_err(|_| Error::Conflict)?;
             return Ok(request.mode == CleanupMode::DiscardChanges
-                || entry
-                    .archive
-                    .as_ref()
-                    .is_some_and(|archive| Path::new(archive.as_str()).is_dir()));
+                || self.verified_archive(entry, &request.operation));
         }
         let repository = self
             .state

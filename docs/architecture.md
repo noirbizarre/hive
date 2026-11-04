@@ -76,6 +76,13 @@ of client attachment and session catalog lifetime. A cross-process resource gate
 serializes Git mutations and cleanup admission without holding SQLite locks over
 subprocess execution.
 
+Resource startup reconciliation precedes session reattachment and settles only
+verified native outcomes. Recovery inventory exposes incomplete and orphaned
+resources without granting deletion authority. Explicit ephemeral sweep plans
+freeze selection and complete cleanup requests in the resource snapshot; each
+item rechecks safety under the same gate and retains its identity across retries.
+Session close updates retention evidence but does not execute workspace deletion.
+
 The daemon combines config-owned project declarations with separately persisted
 managed definitions. Explicit IDs cannot overlap across those authorities.
 Configuration references resolve after all fragments compose. CRUD and reload

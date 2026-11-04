@@ -110,8 +110,56 @@ without deleting its workspace. Restart validates the original workspace before
 reattaching; missing/conflicting resources remain unavailable, never replaced.
 Abandoned reservations can be released only when admission, durable records and
 the dispatch journal together prove that no downstream worker could have started.
-Inspect uncertain startup/cleanup and hook effects before retrying. Broader
-automatic recovery and retention execution remain separate work (#89).
+Inspect uncertain startup/cleanup and hook effects before retrying.
+
+#### Recovery inventory and ephemeral sweeps
+
+Before serving requests or recovering agent sessions, startup settles only proven
+completed native creation/removal and initializes missing idle-retention metadata.
+It never fetches, recreates checkouts, resumes deletion or applies saved sweeps.
+WorkTrunk's uncertain hook effects still require explicit reconciliation.
+
+`hive workspace recovery` reports incomplete operations, missing/conflicting paths,
+repository staging, session holders, retention expiry and cleanup blockers. Recorded
+lifecycle observations carry operation IDs and Unix-second timestamps; old records
+start their history when first observed, without inventing earlier transitions.
+Orphan discovery scans fixed Hive directory levels (up to 4096 entries) and known
+repositories' worktree registrations, including WorkTrunk paths. Scan failures and
+truncation are reported. Unrecorded resources, missing project associations and
+unreferenced workspaces are inspection candidates, never deletion authority.
+
+Ephemeral expiry makes a resource eligible for an **explicit** sweep:
+
+```sh
+hive workspace recovery
+hive workspace sweep plan
+hive workspace sweep show <operation-id>
+hive workspace sweep apply <operation-id>
+```
+
+Planning prints a durable operation ID before contacting the daemon and freezes
+the current selection, per-workspace cleanup IDs and complete preserve-changes
+requests. `--workspace <id>` may be repeated to select specific candidates;
+`--operation <id>` retries identical planning intent. Newly eligible resources
+require a new plan. Apply retries the same plan and reports every item's result;
+unresolved items make the CLI exit nonzero. Dirty, active, uncertain, unverifiable,
+persistent and external resources remain protected. Interrupted provisioning must
+be explicitly reconciled to a verified ready resource before a sweep can remove it.
+An uncertain WorkTrunk removal requires hook reconciliation before retrying.
+
+`until` retention uses its configured Unix-second expiry. `idle` uses the later of
+configured `last_used_at` and runtime use, refreshed at readiness, successful
+admission and confirmed final session release, including existing-directory aliases.
+Unknown session holds still block deletion even after their catalog rows disappear.
+Legacy records get one conservative full idle window on first observation; overflow
+retains resources, and recorded timestamps never regress on clock rollback.
+
+Every removal rechecks eligibility and fresh ownership, cleanliness and use under
+the resource gate; the gate coordinates Hive operations, not arbitrary external
+filesystem writers. Sweeps never discard dirty work, delete repository caches or
+archives, or delete a workspace just because a prompt/session ended. Worktree
+branches and independent-clone archives retain the normal removal guarantees.
+Activity-marker aggregation and stale-marker recovery belong to #118.
 
 For interrupted checkout creation, `hive workspace reconcile <id>` validates
 the recorded Git identity without recreating it. If WorkTrunk's path response

@@ -83,6 +83,10 @@ hive workspace create --project hive --policy task
 hive workspace list
 hive workspace show <workspace-id>
 hive workspace inspect <workspace-id>
+hive workspace recovery
+hive workspace sweep plan
+hive workspace sweep show <operation-id>
+hive workspace sweep apply <operation-id>
 hive workspace operation <operation-id>
 hive workspace reconcile <workspace-id>
 hive workspace remove <workspace-id>
@@ -94,6 +98,14 @@ hive repository fetch <repository-id>
 Creation/removal accept `--operation` for identical retries. Removal also accepts
 `--discard-changes`; this overrides dirty-data protection only, never ownership
 or active-use checks. See [workspace operations](../operations.md#repositories-and-task-workspaces).
+
+`recovery` reports incomplete/orphan resources, session holds and retention
+blockers without deleting anything. `sweep plan` freezes expired ephemeral
+candidates and accepts repeated `--workspace <id>` selectors and `--operation`
+for identical retries. Planning does not execute cleanup. `sweep apply` explicitly
+applies/retries that plan with fresh safety checks and never discards changes.
+Mixed results print as JSON and unresolved items exit nonzero. Persistent
+workspaces require explicit `remove`; restart never resumes a saved sweep.
 
 ## Daemon and doctor
 

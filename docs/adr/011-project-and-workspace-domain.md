@@ -146,6 +146,16 @@ intent permits dirty managed-resource removal but does not override other checks
 External resources cannot be deleted through this interface; detaching their Hive
 records is a separate registry concern.
 
+Recovery/retention (#89) uses a non-destructive startup pass and inspectable orphan
+inventory. Expiry selects ephemeral cleanup candidates; only explicit sweep
+application executes deletion. Plans persist complete immutable cleanup requests
+and per-resource operation IDs before effects, then recheck safety under resource
+admission on every attempt. Persistent resources remain explicit-remove only.
+Runtime idle-use timestamps are separate from immutable provisioning intent and
+refresh on readiness, admission and confirmed final release, including aliases.
+Unknown dispatched holds survive restart/catalog pruning. WorkTrunk activity
+publication, aggregation and stale-marker recovery remain wholly #118 work.
+
 Typed errors distinguish unknown projects, unavailable nodes, invalid paths/refs,
 provisioning and ordinary cleanup failures, unsafe cleanup, invalid transitions/records, conflicts,
 uncertainty, and non-idempotent operations. Controlled reasons avoid exposing raw

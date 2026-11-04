@@ -174,6 +174,10 @@ impl crate::Broker {
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(
+        "invalid _meta.hive.workspace selector; use kind 'new' with optional project/policy/baseRef/branch, 'attach' with id, or 'existing' with directory"
+    )]
+    Selector,
+    #[error(
         "workspace registry unavailable; use a persistent daemon and check state permissions/disk space"
     )]
     Storage,
@@ -216,6 +220,7 @@ pub enum Error {
 impl Error {
     pub fn code(&self) -> &'static str {
         match self {
+            Self::Selector => "hive::workspace::selector",
             Self::Storage => "hive::workspace::storage",
             Self::Unknown => "hive::workspace::unknown",
             Self::Git("fetch") => "hive::repository::fetch",
@@ -232,7 +237,15 @@ impl Error {
     }
 
     pub fn json(&self) -> serde_json::Value {
-        serde_json::json!({"code":self.code(),"message":self.to_string(),"help":"inspect the resource and original operation before retrying; configure credentials and hook approvals on the execution node"})
+        let help = match self {
+            Self::Selector => {
+                "send a supported _meta.hive.workspace object with correctly typed fields; see the session launch selectors in Hive's API documentation"
+            }
+            _ => {
+                "inspect the resource and original operation before retrying; configure credentials and hook approvals on the execution node"
+            }
+        };
+        serde_json::json!({"code":self.code(),"message":self.to_string(),"help":help})
     }
 }
 

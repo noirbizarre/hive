@@ -16,6 +16,8 @@ use tokio::{
 mod interactions;
 #[path = "support/recovery.rs"]
 mod recovery;
+#[path = "support/workspaces.rs"]
+mod workspaces;
 
 #[tokio::test]
 async fn configured_workspace_cwd_reaches_both_adapters_and_close_retains_the_resource() {

@@ -130,6 +130,19 @@ A selector can omit `agent` when a default profile exists. Hive consumes selecto
 instead of forwarding them downstream. Native adoption cannot use them; resume
 reattaches its original resource and never provisions a replacement.
 
+Hive resolves the selected profile, project, and policy from the fully composed
+configuration before provisioning. Included file order does not affect resolution.
+Without a profile workspace policy or an explicit selector, cwd-only launches keep
+their original ACP directory behavior; use `existing` to bypass a profile policy.
+
+Provisioning completes before an agent process starts or ACP `session/new` is sent
+downstream. Failed provisioning returns an ACP error with structured `data`
+containing `code`, `message`, and `help`, and creates no agent session. Failed
+workspace/operation records remain available for inspection. Malformed selectors
+return invalid params with code `hive::workspace::selector`; resolution and
+provisioning failures use stable `hive::workspace::*` / `hive::repository::*` codes.
+Diagnostics do not echo rejected selector values or Git subprocess output.
+
 Creation/resume metadata includes `_meta.hive.workspace` with `project`, `workspace`
 and `effectiveCwd`, or null for an unmanaged cwd. Session summaries expose the same
 context. Clients must retain the returned/listed cwd for resume and relinquish,

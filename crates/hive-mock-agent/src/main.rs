@@ -155,6 +155,10 @@ fn plan_sequence() -> Vec<v2::SessionUpdate> {
 
 #[tokio::main]
 async fn main() -> agent_client_protocol::Result<()> {
+    // A session-state file alone cannot distinguish "never spawned" from "spawned but never received session/new".
+    if let Some(path) = std::env::var_os("HIVE_MOCK_STARTED") {
+        std::fs::write(path, b"started").map_err(Error::into_internal_error)?;
+    }
     if std::env::args().nth(1).as_deref() == Some("v1") {
         return serve_v1().await;
     }

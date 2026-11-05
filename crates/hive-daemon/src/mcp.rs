@@ -1,4 +1,4 @@
-//! Managed MCP contracts, not an active daemon configuration registry.
+//! Managed MCP contracts and shared stdio runtime, not a daemon configuration registry.
 //!
 //! Resolution is deliberately pure: the owning node must supply observed paths,
 //! effective environment, registered resource identities and credential snapshots.
@@ -12,6 +12,13 @@ use hive_core::{
 };
 use miette::Diagnostic;
 use serde::{Deserialize, Serialize};
+
+mod process;
+pub mod runtime;
+mod sessions;
+pub use sessions::SessionMcpLease;
+pub(crate) use sessions::Sessions;
+pub(crate) use sessions::settled;
 
 #[cfg(test)]
 mod tests;

@@ -37,7 +37,7 @@ fn definition() -> ServerDefinition {
     .unwrap()
 }
 
-fn identity() -> InstanceIdentity {
+pub(super) fn identity() -> InstanceIdentity {
     InstanceIdentity::shared(
         "tools/search".into(),
         definition(),

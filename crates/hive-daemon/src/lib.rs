@@ -135,6 +135,9 @@ fn transport(profile: &Profile) -> Result<Downstream, String> {
 
 #[derive(Clone)]
 pub struct Broker {
+    mcp_runtime: Arc<tokio::sync::OnceCell<mcp::runtime::Runtime>>,
+    mcp_sessions: Arc<mcp::Sessions>,
+    mcp_ephemeral_node: hive_core::identity::NodeId,
     worktrunk: Arc<worktrunk::Publisher>,
     registry: Arc<Mutex<reload::Registry>>,
     reloading: Arc<tokio::sync::Mutex<()>>,
@@ -1021,22 +1024,27 @@ impl Broker {
                 )
                 .await;
             }
-            let closing = worker_control.lock().is_ok_and(|state| state.closing);
+            let closing = worker_control.lock().is_ok_and(|mut state| {
+                // Fence new MCP calls before sweeping cancellation, including retained leases.
+                state.activity.session = "ended".into();
+                state.closing
+            });
+            if !closing {
+                broker.mcp_sessions.cancel(&worker_id);
+            }
             if let Ok(mut state) = worker_control.lock() {
                 interactions::invalidate(&mut state);
             }
-            if !closing && let Ok(mut state) = worker_control.lock() {
-                if let Some(record) = &state.record
-                    && let Ok(mut record) = record.lock()
-                {
-                    record.outcome = Outcome::Unavailable;
-                    record.reason =
-                        Some("agent worker exited; restart Hive to retry recovery".into());
-                    if let Some(store) = &state.store {
-                        let _ = store.save(&record);
-                    }
+            if !closing
+                && let Ok(state) = worker_control.lock()
+                && let Some(record) = &state.record
+                && let Ok(mut record) = record.lock()
+            {
+                record.outcome = Outcome::Unavailable;
+                record.reason = Some("agent worker exited; restart Hive to retry recovery".into());
+                if let Some(store) = &state.store {
+                    let _ = store.save(&record);
                 }
-                state.activity.session = "ended".into();
             }
             if !closing
                 && let Ok(mut sessions) = broker.sessions.lock()
@@ -1133,6 +1141,9 @@ impl Broker {
     pub fn new(registry: Config) -> Self {
         let (catalog, _) = watch::channel(0);
         Self {
+            mcp_runtime: Arc::new(tokio::sync::OnceCell::new()),
+            mcp_sessions: Arc::new(mcp::Sessions::default()),
+            mcp_ephemeral_node: hive_core::identity::NodeId::new(),
             registry: Arc::new(Mutex::new(reload::Registry {
                 managed_projects: Default::default(),
                 current: Arc::new(registry),
@@ -1149,6 +1160,72 @@ impl Broker {
             adopting: Arc::new(Mutex::new(std::collections::HashSet::new())),
             client_capabilities: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Execution locality for trusted callers resolving managed MCP identities.
+    pub async fn mcp_execution_node(
+        &self,
+    ) -> Result<hive_core::identity::NodeId, mcp::runtime::RuntimeError> {
+        Ok(self.managed_mcp().await?.node().clone())
+    }
+
+    async fn managed_mcp(&self) -> Result<&mcp::runtime::Runtime, mcp::runtime::RuntimeError> {
+        self.mcp_runtime
+            .get_or_try_init(|| async {
+                // Reuse the resource domain's persistent node, never a second MCP identity.
+                let node = match &self.store {
+                    Some(store) => workspaces::Service::new(store.clone())
+                        .node()
+                        .await
+                        .map_err(|_| mcp::runtime::RuntimeError::Inputs)?,
+                    None => self.mcp_ephemeral_node.clone(),
+                };
+                mcp::runtime::Runtime::new(node, Default::default())
+            })
+            .await
+    }
+
+    /// Bind a complete trusted resolution snapshot; this does not expose an ACP route.
+    pub async fn bind_mcp(
+        &self,
+        session: &v2::SessionId,
+        identity: mcp::InstanceIdentity,
+    ) -> Result<mcp::SessionMcpLease, mcp::runtime::RuntimeError> {
+        let runtime = self.managed_mcp().await?;
+        let registry = self
+            .registry
+            .lock()
+            .map_err(|_| mcp::runtime::RuntimeError::Binding)?;
+        if registry.stopping {
+            return Err(mcp::runtime::RuntimeError::Stopping);
+        }
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| mcp::runtime::RuntimeError::Binding)?;
+        let entry = sessions
+            .get(&session.to_string())
+            .ok_or(mcp::runtime::RuntimeError::Binding)?;
+        let control = entry
+            .control
+            .lock()
+            .map_err(|_| mcp::runtime::RuntimeError::Binding)?;
+        if control.closing || control.activity.session == "ended" {
+            return Err(mcp::runtime::RuntimeError::Binding);
+        }
+        self.mcp_sessions.bind(
+            session.to_string(),
+            &self.sessions,
+            &self.registry,
+            runtime,
+            identity,
+        )
+    }
+
+    /// Explicit release also works for offline sessions; surviving handles are revoked.
+    pub fn release_mcp(&self, session: &v2::SessionId, binding: uuid::Uuid) {
+        self.mcp_sessions
+            .release(&session.to_string(), Some(binding));
     }
 
     pub fn persistent(registry: Config, path: PathBuf) -> Result<Self, projects::InitError> {
@@ -1177,6 +1254,9 @@ impl Broker {
             store
                 .records()?
                 .into_iter()
+                // Completion evidence is process-local: a closed session must never be resumed
+                // to settle MCP work. Its durable row keeps resource recovery conservative.
+                .filter(|r| !matches!(r.outcome, Outcome::ClosedPendingCleanup))
                 .map(|mut r| {
                     r.generation = r.generation.saturating_add(1);
                     r.next_seq = r.reserved_seq.saturating_add(1).max(r.next_seq);
@@ -1769,6 +1849,10 @@ impl Broker {
                 registry.stopping = true;
             }
         }
+        self.mcp_sessions.clear();
+        if let Some(runtime) = self.mcp_runtime.get() {
+            runtime.shutdown().await;
+        }
         let entries = self
             .sessions
             .lock()
@@ -2027,6 +2111,7 @@ impl Broker {
                 .map_err(|error| Error::internal_error().data(error.json()))?;
         }
         let worker_registry = self.registry.clone();
+        let worker_mcp = self.mcp_sessions.clone();
         // Each session owns its subprocess: no guessed transport support or duplicate probing.
         let task = tokio::spawn(async move {
             if kind == ProfileKind::OpencodeServer {
@@ -2078,6 +2163,12 @@ impl Broker {
                 );
             }
             let closing = worker_control.lock().is_ok_and(|state| state.closing);
+            if !closing {
+                worker_mcp.cancel(&id.to_string());
+                if store.is_none() {
+                    worker_mcp.finish(&id.to_string());
+                }
+            }
             if !closing
                 && let (Some(store), Some(record)) = (&store, &worker_record)
                 && let Ok(mut record) = record.lock()
@@ -4055,9 +4146,29 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
                         match received.await {
                             Ok(Ok(())) => {
                                 interactions::settled(&entry.control).await;
-                                 if let Some(store) = &broker.store {
-                                    workspaces::Service::new(store.clone()).release(request.session_id.to_string()).await
-                                        .map_err(|error| Error::internal_error().data(error.json()))?;
+                                let pending_mcp = broker.mcp_sessions.finish(&request.session_id.to_string());
+                                if let Some(store) = &broker.store {
+                                    if pending_mcp.iter().all(|done| *done.borrow()) {
+                                        workspaces::Service::new(store.clone()).release(request.session_id.to_string()).await
+                                            .map_err(|error| Error::internal_error().data(error.json()))?;
+                                    } else {
+                                        {
+                                            let state = entry.control.lock().map_err(|_| Error::internal_error())?;
+                                            let saved = state.record.as_ref().ok_or_else(|| Error::internal_error().data("cannot persist closed session; inspect the session database before restarting Hive"))?;
+                                            let mut record = saved.lock().map_err(|_| Error::internal_error())?;
+                                            // Share the transition with late worker bookkeeping so it cannot save an active copy.
+                                            store.close_pending_cleanup(&mut record).map_err(storage_error)?;
+                                        }
+                                        // Cancellation is not completion: protect files until the server settles.
+                                        let store = store.clone();
+                                        let session = request.session_id.to_string();
+                                        tokio::spawn(async move {
+                                            mcp::settled(pending_mcp).await;
+                                            if let Err(error) = workspaces::Service::new(store).release(session).await {
+                                                tracing::error!(code = error.code(), "cannot release workspace after MCP operations settled");
+                                            }
+                                        });
+                                    }
                                 }
                                 let mut sessions = broker
                                     .sessions

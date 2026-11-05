@@ -25,6 +25,8 @@ pub enum Outcome {
     Orphaned,
     RecoveryRequired,
     Lost,
+    // Close was acknowledged, but MCP completion has not yet justified releasing workspace holds.
+    ClosedPendingCleanup,
 }
 
 impl Outcome {
@@ -36,6 +38,7 @@ impl Outcome {
             Self::Orphaned => "orphaned",
             Self::RecoveryRequired => "recovery_required",
             Self::Lost => "lost",
+            Self::ClosedPendingCleanup => "closed_pending_cleanup",
         }
     }
 }
@@ -519,6 +522,17 @@ impl Store {
         self.connection.lock().expect("store lock poisoned")
             .execute("INSERT INTO sessions (id, record) VALUES (?1, ?2) ON CONFLICT(id) DO UPDATE SET record=excluded.record", params![record.id, json])
             .map_err(|e| self.sql(e))?;
+        Ok(())
+    }
+
+    pub(crate) fn close_pending_cleanup(&self, record: &mut Record) -> Result<(), StoreError> {
+        let mut closed = record.clone();
+        closed.outcome = Outcome::ClosedPendingCleanup;
+        closed.reason = Some("session is closed; MCP completion is unconfirmed, so workspace holds remain protected; inspect the original MCP server and reconcile its operations before releasing the hold".into());
+        // Persist before publishing close, without deleting prompt evidence or workspace protection.
+        // After restart cancellation alone cannot prove that an external server stopped writing.
+        self.save(&closed)?;
+        *record = closed;
         Ok(())
     }
 
@@ -1154,6 +1168,70 @@ mod tests {
             session.additional_directories
         );
         assert_eq!(recovered.mcp_servers, session.mcp_servers);
+        drop(store);
+        std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn pending_close_survives_restart_and_pruning_without_discarding_prompt_or_resource_evidence() {
+        let path = temporary();
+        let store = Store::open(path.clone()).unwrap();
+        let mut session = record("closed");
+        store.save(&session).unwrap();
+        let fingerprint = Fingerprint::content(&[]).unwrap();
+        store
+            .reserve_prompt(&session, "pending", &fingerprint)
+            .unwrap();
+        store
+            .transition(
+                &mut session,
+                "pending",
+                Some(&PromptOutcome::DispatchPossible {}),
+                None,
+            )
+            .unwrap();
+        let resource = serde_json::json!({"uses":{"closed":"workspace"},"dispatched":["closed"]});
+        store.save_resource("node", &resource).unwrap();
+        store.close_pending_cleanup(&mut session).unwrap();
+        drop(store);
+
+        let store = Store::open(path.clone()).unwrap();
+        store.recover_prompts().unwrap();
+        store.prune(u64::MAX).unwrap();
+        let saved = store.records().unwrap().pop().unwrap();
+        assert!(matches!(saved.outcome, Outcome::ClosedPendingCleanup));
+        assert!(saved.uncertain);
+        assert!(
+            saved
+                .reason
+                .unwrap()
+                .contains("MCP completion is unconfirmed")
+        );
+        assert_eq!(
+            store.resource::<serde_json::Value>("node").unwrap(),
+            Some(resource)
+        );
+        assert_eq!(
+            store.prompt("closed", "pending").unwrap(),
+            Some((fingerprint, Some(PromptOutcome::DispatchPossible {})))
+        );
+        drop(store);
+        std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn failed_pending_close_does_not_publish_an_uncommitted_closed_state() {
+        let path = temporary();
+        let store = Store::open(path.clone()).unwrap();
+        let mut session = record("closed");
+        store.save(&session).unwrap();
+        store.connection.lock().unwrap().execute_batch("CREATE TRIGGER reject_close BEFORE UPDATE ON sessions BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;").unwrap();
+        assert!(store.close_pending_cleanup(&mut session).is_err());
+        assert!(matches!(session.outcome, Outcome::Active));
+        assert!(matches!(
+            store.records().unwrap()[0].outcome,
+            Outcome::Active
+        ));
         drop(store);
         std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
     }

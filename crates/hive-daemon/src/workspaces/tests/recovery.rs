@@ -221,6 +221,116 @@ async fn apply(service: &Service, sweep: &serde_json::Value) -> serde_json::Valu
 }
 
 #[tokio::test]
+async fn closed_sessions_are_not_recovered_and_expired_workspaces_stay_protected_until_mcp_settles()
+{
+    let fixture = Fixture::new();
+    let entry = expired(&fixture, "worktree").await;
+    let id = entry.workspace.id().clone();
+    let path = PathBuf::from(entry.workspace.location().unwrap().root.as_str());
+    fixture
+        .service
+        .attach(id.clone(), "closed".into())
+        .await
+        .unwrap();
+    fixture
+        .service
+        .mark_dispatched("closed".into())
+        .await
+        .unwrap();
+    let mut record: crate::persistence::Record = serde_json::from_value(serde_json::json!({
+        "id":"closed", "downstream_id":"must-not-resume", "cwd":path,
+        "profile":"unused", "version":"v2", "created_at":1, "next_seq":1,
+        "reserved_seq":0, "generation":1, "outcome":"active", "uncertain":false
+    }))
+    .unwrap();
+    fixture.service.store.save(&record).unwrap();
+    let protection = fixture
+        .service
+        .store
+        .resource::<serde_json::Value>("node")
+        .unwrap()
+        .unwrap();
+    fixture
+        .service
+        .store
+        .close_pending_cleanup(&mut record)
+        .unwrap();
+    assert_eq!(
+        fixture
+            .service
+            .store
+            .resource::<serde_json::Value>("node")
+            .unwrap()
+            .unwrap(),
+        protection
+    );
+
+    // Reopen the actual database: neither the broker nor resource recovery retains live MCP evidence.
+    let database = fixture
+        .service
+        .store
+        .state_directory()
+        .join("catalog.sqlite3");
+    for _ in 0..2 {
+        let broker =
+            crate::Broker::persistent(crate::config::Config::default(), database.clone()).unwrap();
+        assert!(broker.offline.lock().unwrap().is_empty());
+        assert!(broker.registry.lock().unwrap().bindings.is_empty());
+        assert!(broker.snapshot(None).unwrap().sessions.is_empty());
+        broker.recover_workspaces().await.unwrap();
+        let service = broker.workspace_service().unwrap();
+        assert!(matches!(
+            service.inspect(id.clone()).await.unwrap(),
+            Inspection::Present {
+                safety: SafetyEvidence {
+                    usage: ResourceUse::Unknown,
+                    ..
+                },
+                ..
+            }
+        ));
+        let sweep = plan(&service, Some(vec![id.clone()])).await;
+        assert_eq!(
+            apply(&service, &sweep).await["items"][0]["status"],
+            "blocked"
+        );
+        assert!(
+            broker
+                .remove_workspace(id.clone(), OperationId::new(), true)
+                .await
+                .is_err()
+        );
+        assert!(path.is_dir());
+        assert!(matches!(
+            service.store.records().unwrap()[0].outcome,
+            crate::persistence::Outcome::ClosedPendingCleanup
+        ));
+    }
+
+    // Only positive completion evidence (or an operator's explicit reconciliation) permits release.
+    let service = Service::new(Arc::new(Store::open(database.clone()).unwrap()));
+    service.release("closed".into()).await.unwrap();
+    let reopened = Service::new(Arc::new(Store::open(database).unwrap()));
+    assert!(reopened.store.records().unwrap().is_empty());
+    assert!(matches!(
+        reopened.inspect(id.clone()).await.unwrap(),
+        Inspection::Present {
+            safety: SafetyEvidence {
+                usage: ResourceUse::Idle,
+                ..
+            },
+            ..
+        }
+    ));
+    let sweep = plan(&reopened, Some(vec![id])).await;
+    assert_eq!(
+        apply(&reopened, &sweep).await["items"][0]["status"],
+        "removed"
+    );
+    assert!(!path.exists());
+}
+
+#[tokio::test]
 async fn sweep_freezes_candidates_and_preserves_dirty_active_unknown_and_persistent_resources() {
     let fixture = Fixture::new();
     let persistent = fixture.create(fixture.request()).await.unwrap();

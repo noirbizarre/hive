@@ -40,6 +40,7 @@ pub mod compat;
 pub mod config;
 pub mod doctor;
 mod interactions;
+pub mod mcp;
 mod opencode;
 mod persistence;
 mod plans;

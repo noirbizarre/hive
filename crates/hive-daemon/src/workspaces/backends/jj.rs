@@ -89,7 +89,7 @@ pub(in crate::workspaces) fn handle(repository: &Repository) -> Result<Repositor
                     repository.repository.node().clone(),
                     repository.repository.root.syntax(),
                     Path::new(repository.repository.root.as_str())
-                        .with_extension("t")
+                        .with_file_name("t")
                         .to_str()
                         .ok_or(Error::Request)?
                         .into(),

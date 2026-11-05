@@ -19,15 +19,17 @@ fn jj_storage_keys_preserve_uuid_suffixes_and_leave_room_for_native_windows_inde
             .bytes()
             .all(|b| b.is_ascii_digit() || (b'a'..=b'v').contains(&b))
     );
-    // Match the runner's ordinary state root and JJ's actual index filename length.
-    let path = format!(
-        r"C:\Users\runneradmin\AppData\Local\Temp\.tmp123456\state\repositories\{first}\jj.t\r\.jj\repo\index\segments\{}",
-        "f".repeat(128)
-    );
-    assert!(
-        path.len() < 260,
-        "native JJ's index path exceeds MAX_PATH: {path}"
-    );
+    // Both index and operation stores use long hashes; budget for the longest metadata parent.
+    for store in [r"index\segments", r"op_store\operations", r"op_store\views"] {
+        let path = format!(
+            r"C:\Users\runneradmin\AppData\Local\Temp\.tmp123456\state\repositories\{first}\t\r\.jj\repo\{store}\{}",
+            "f".repeat(128)
+        );
+        assert!(
+            path.len() < 260,
+            "native JJ's metadata path exceeds MAX_PATH: {path}"
+        );
+    }
 }
 
 fn command(root: &Path, args: &[&str]) -> String {

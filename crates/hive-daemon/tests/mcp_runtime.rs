@@ -213,7 +213,8 @@ async fn scoped_admission_shares_canonical_worktrees_and_isolates_other_worktree
     };
     use agent_client_protocol_http::HttpClient;
     let mut fixture = Fixture::new();
-    let base = fixture.directory.path().canonicalize().unwrap();
+    // Git for Windows rejects canonicalization's verbatim prefix in worktree destination arguments.
+    let base = fixture.directory.path().to_path_buf();
     let first = base.join("first");
     let second = base.join("second");
     let other = base.join("other");

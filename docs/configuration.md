@@ -292,7 +292,36 @@ the operation for its `worktrunkConfig` snapshot path, review it, then use
 before retrying the original operation. Hive never passes `--yes`. Blocking hook
 failures prevent readiness; background hooks retain WorkTrunk's asynchronous
 semantics. Interrupted hooks require inspection/manual reconciliation, not blind
-replay. Activity markers are tracked separately in issue #118.
+replay.
+
+Hive also publishes its own ACP activity through `wt config state marker` for
+verified local Git worktrees, including attached/adopted sessions and worktrees
+created outside Hive. Marker support requires `get` with JSON output and explicit
+branch selection for `get`, `set`, and `clear`. Explicit enablement reports missing
+capabilities rather than silently selecting a fallback. Non-Git repositories,
+detached checkouts, foreign-node workspaces, and unverified remote-provider paths
+do not publish markers on the gateway. Remote execution needs a node-local Hive
+owner; this integration does not infer ownership from a matching cwd string.
+
+| Activity evidence | Marker prefix |
+| --- | --- |
+| Running foreground work | `🤖 Hive` |
+| Needs input, including a pending permission/question | `💬 Hive` |
+| Explicit successful end of turn | `✅ Hive` |
+| Confirmed cancellation | `⏹ Hive` |
+| Failure or refusal | `❌ Hive` |
+
+Markers include a unique ownership suffix. Needs-input takes precedence over
+running across sessions sharing a branch; otherwise the latest known terminal
+outcome remains visible while its session is open. Unknown execution is not
+success and suppresses terminal-only results. Closing or losing the last session
+withdraws Hive's marker. Client disconnection does not close a session.
+
+The activity ledger survives restart and preserves foreign marker values observed
+before an update or clear. See [activity recovery](operations.md#worktrunk-activity-recovery)
+for reconciliation and shared-marker limitations. Disabling the integration stops
+marker probes and writes, deferring any pending marker cleanup until it is enabled
+again. Previously pinned workspace lifecycle operations retain their provisioner.
 
 ### Flat bare layout and independent hook settings
 

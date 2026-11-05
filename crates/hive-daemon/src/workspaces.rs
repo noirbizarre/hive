@@ -28,6 +28,7 @@ use hive_core::{
     },
 };
 use serde::{Deserialize, Serialize};
+pub(crate) mod activity;
 mod backends;
 mod persistence;
 mod recovery;
@@ -2001,6 +2002,7 @@ fn probe_worktrunk() -> WorktrunkAvailability {
         && removal.contains("--no-delete-branch")
         && removal.contains("--format")
         && approvals.contains("--format")
+        && activity::probe_activity() == WorktrunkAvailability::Usable
     {
         WorktrunkAvailability::Usable
     } else {
@@ -2080,6 +2082,46 @@ fn execute_output_mode(
     project_config: Option<&Path>,
     digest: bool,
 ) -> Result<Vec<u8>, Error> {
+    execute_output_with_timeout(
+        program,
+        path,
+        args,
+        worktrunk,
+        project_config,
+        digest,
+        Duration::from_secs(120),
+    )
+}
+
+fn execute_with_timeout(
+    program: &str,
+    path: Option<&Path>,
+    args: &[&str],
+    worktrunk: bool,
+    project_config: Option<&Path>,
+    timeout: Duration,
+) -> Result<String, Error> {
+    String::from_utf8(execute_output_with_timeout(
+        program,
+        path,
+        args,
+        worktrunk,
+        project_config,
+        false,
+        timeout,
+    )?)
+    .map_err(|_| Error::Uncertain)
+}
+
+fn execute_output_with_timeout(
+    program: &str,
+    path: Option<&Path>,
+    args: &[&str],
+    worktrunk: bool,
+    project_config: Option<&Path>,
+    digest: bool,
+    timeout: Duration,
+) -> Result<Vec<u8>, Error> {
     #[cfg(test)]
     let replacement = TEST_GIT_CONFIG.with(|config| {
         config
@@ -2136,8 +2178,8 @@ fn execute_output_mode(
     if let Some(path) = path {
         command.current_dir(path);
     }
-    let (status, output, diagnostic) =
-        capture_output(command, Duration::from_secs(120), worktrunk, digest).map_err(|error| {
+    let (status, output, diagnostic) = capture_output(command, timeout, worktrunk, digest)
+        .map_err(|error| {
             if program == "jj" && matches!(error, Error::Git(_)) {
                 Error::JjUnavailable
             } else {

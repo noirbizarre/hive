@@ -17,7 +17,7 @@ pub enum WorktrunkAvailability {
     Incompatible,
 }
 
-/// Global lifecycle selection, also consumed by the future activity publisher (#118).
+/// Global lifecycle selection, also consumed by the node-local activity publisher.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IntegrationSelection {
     Native,

@@ -51,6 +51,7 @@ mod session_config;
 mod transcript;
 mod usage;
 pub mod workspaces;
+mod worktrunk;
 use activity::Activity;
 use config::{Config, Pricing, Profile, ProfileKind};
 use persistence::{Outcome, Record, Store};
@@ -133,6 +134,7 @@ fn transport(profile: &Profile) -> Result<Downstream, String> {
 
 #[derive(Clone)]
 pub struct Broker {
+    worktrunk: Arc<worktrunk::Publisher>,
     registry: Arc<Mutex<reload::Registry>>,
     reloading: Arc<tokio::sync::Mutex<()>>,
     sessions: Arc<Mutex<HashMap<String, Entry>>>,
@@ -171,6 +173,11 @@ struct Entry {
 type NativeInterruption = watch::Sender<Option<tokio::time::Instant>>;
 
 struct Control {
+    worktrunk_terminal: Option<(u64, worktrunk::Status)>,
+    // Only the initial recovered idle can reuse durable terminal evidence from the previous daemon.
+    worktrunk_restore: bool,
+    // Connection locality is pinned with the worker, not reselected from reloaded profile definitions.
+    worktrunk_local: bool,
     workspace_context: Option<hive_protocol::workspace::Context>,
     // Only live hop mappings can identify a request-scoped question's original requester.
     parents: HashMap<v1::RequestId, interactions::Parent>,
@@ -326,6 +333,9 @@ impl Control {
         }
         Self {
             generation: record.generation,
+            worktrunk_terminal: None,
+            worktrunk_restore: true,
+            worktrunk_local: false,
             workspace_context: record.workspace_context.clone(),
             parents: HashMap::new(),
             startup_parent: None,
@@ -392,6 +402,9 @@ impl Control {
         }
         Self {
             generation: 1,
+            worktrunk_terminal: None,
+            worktrunk_restore: false,
+            worktrunk_local: false,
             workspace_context: None,
             parents: HashMap::new(),
             startup_parent: None,
@@ -562,6 +575,24 @@ impl Control {
     }
 
     fn observe_state(&mut self, status: &v2::StateUpdate) {
+        if !self.hydrating {
+            // Recovered terminal evidence lives in the ledger; idle synchronization cannot revoke it.
+            if !matches!(status, v2::StateUpdate::Idle(idle) if idle.stop_reason.is_none()) {
+                self.worktrunk_restore = false;
+            }
+            match status {
+                v2::StateUpdate::Idle(idle) => {
+                    // A reasonless synchronization update must not erase an observed terminal outcome.
+                    if idle.stop_reason.is_some() {
+                        self.worktrunk_terminal = worktrunk::terminal(idle.stop_reason.as_ref());
+                    }
+                }
+                v2::StateUpdate::Running(_) | v2::StateUpdate::RequiresAction(_) => {
+                    self.worktrunk_terminal = None
+                }
+                _ => {}
+            }
+        }
         self.foreground_reservation = None;
         self.current_state = matches!(
             status,
@@ -808,6 +839,7 @@ pub struct Status {
 
 impl Broker {
     pub async fn reconcile(&self) {
+        worktrunk::Publisher::start(self);
         let ids = self
             .offline
             .lock()
@@ -926,6 +958,10 @@ impl Broker {
             saved.clone(),
             provider.pricing.clone(),
         )));
+        control
+            .lock()
+            .expect("session state is not poisoned")
+            .worktrunk_local = worktrunk::local_profile(&provider);
         let (tx, rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = oneshot::channel();
         let (active_tx, active_rx) = oneshot::channel();
@@ -1104,6 +1140,7 @@ impl Broker {
                 stopping: false,
             })),
             reloading: Arc::new(tokio::sync::Mutex::new(())),
+            worktrunk: Arc::new(worktrunk::Publisher::default()),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             catalog,
             store: None,
@@ -1413,6 +1450,8 @@ impl Broker {
         // Reserving under the ownership lock prevents two simultaneous prompts from both starting.
         let previous_time = state.last_activity_at;
         state.foreground_reservation = Some(key.clone());
+        state.worktrunk_terminal = None;
+        state.worktrunk_restore = false;
         record_activity(&mut state);
         let title = state
             .title
@@ -1744,6 +1783,7 @@ impl Broker {
             // Shutdown is not an explicit user close: preserve downstream state for reattachment.
             entry.abort.abort();
         }
+        self.worktrunk.shutdown().await;
     }
 
     async fn create(
@@ -1754,6 +1794,7 @@ impl Broker {
         parent: interactions::Parent,
     ) -> agent_client_protocol::Result<v2::NewSessionResponse> {
         let requested = request.meta.as_mut().and_then(|meta| meta.get_mut("hive"));
+        worktrunk::Publisher::start(self);
         let mut adopt: Option<String> = None;
         let mut workspace_launch: Option<hive_protocol::workspace::Launch> = None;
         let chosen = match requested {
@@ -1860,6 +1901,7 @@ impl Broker {
             ),
             None => None,
         };
+        let worktrunk_config = launch_config.worktrunk.unwrap_or_default();
         let workspace_context = if adopt.is_none() {
             self.launch_workspace(
                 &mut request,
@@ -1883,6 +1925,20 @@ impl Broker {
                 None
             }
         };
+        if let Some(store) = &self.store
+            && worktrunk::local_profile(&provider)
+        {
+            workspaces::Service::new(store.clone())
+                .check_activity(
+                    request.cwd.0.clone(),
+                    workspace_context
+                        .as_ref()
+                        .map(|context| context.workspace.clone()),
+                    worktrunk_config,
+                )
+                .await
+                .map_err(|error| Error::invalid_request().data(error.json()))?;
+        }
         let (tx, rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = oneshot::channel();
         let (active_tx, active_rx) = oneshot::channel();
@@ -1901,6 +1957,7 @@ impl Broker {
                 .insert(client_id.clone(), parent.capabilities.clone());
             state.startup_parent = Some(parent);
             state.workspace_context = workspace_context.clone();
+            state.worktrunk_local = worktrunk::local_profile(&provider);
         }
         let cwd = request.cwd.clone();
         let entry_control = control.clone();
@@ -4383,10 +4440,13 @@ mod control_tests {
         assert_eq!(control.lock().unwrap().pending_interactions, 0);
     }
 
-    fn detached() -> Control {
+    pub(crate) fn detached() -> Control {
         let (changed, _) = watch::channel(1);
         let (catalog, _) = watch::channel(0);
         Control {
+            worktrunk_terminal: None,
+            worktrunk_restore: false,
+            worktrunk_local: false,
             workspace_context: None,
             generation: 1,
             parents: HashMap::new(),

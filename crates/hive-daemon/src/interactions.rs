@@ -219,6 +219,7 @@ impl Pending {
             return None;
         }
         state.pending_interactions += 1;
+        state.notify();
         Some((
             Self(control.clone()),
             state.interaction_epoch,
@@ -230,6 +231,7 @@ impl Drop for Pending {
     fn drop(&mut self) {
         if let Ok(mut state) = self.0.lock() {
             state.pending_interactions -= 1;
+            state.notify();
             // Ordinary completion must not wake and reoffer unrelated decisions.
             if state.closing {
                 state.changed.send_modify(|_| {});

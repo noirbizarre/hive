@@ -626,6 +626,34 @@ async fn shared_non_git_lifecycle_protects_partial_and_ready_aliases_across_rest
         .await
         .unwrap();
     assert!(entry.workspace.location().unwrap().branch.is_none());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // An executable that always fails makes accidental activity probing observable even on hosts with wt.
+        let executable = root_directory.join("fake-wt");
+        std::fs::write(&executable, "#!/bin/sh\nexit 99\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = root_directory.join("gitconfig");
+        std::fs::write(&config, "").unwrap();
+        let mut activity_service = service.clone();
+        activity_service.git_config = Some(config);
+        activity_service
+            .publish_activity(
+                vec![crate::workspaces::activity::Snapshot {
+                    session: "non-git".into(),
+                    cwd: root_directory.join("checkout"),
+                    workspace: Some(workspace.to_string()),
+                    status: crate::worktrunk::Status::Running,
+                    order: 0,
+                    restored_idle: false,
+                }],
+                WorktrunkConfig {
+                    enabled: Some(true),
+                },
+            )
+            .await
+            .unwrap();
+    }
     let partial = workspace.clone();
     service
         .run(move |rt| {

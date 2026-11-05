@@ -1,6 +1,6 @@
 //! Render only the visible transcript entries, retaining scroll and expansion per session.
 
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
 use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
@@ -13,7 +13,8 @@ use ratatui::{
 use serde_json::Value;
 
 use crate::{
-    state::{Conversation, ConversationLine, LineKind},
+    images::{EncodedImage, ImageBounds, ImageFrame},
+    state::{Conversation, ConversationLine, LineKind, MessagePart},
     theme::Theme,
 };
 
@@ -38,6 +39,7 @@ pub struct Transcript {
     total_rows: usize,
     seen_revision: u64,
     layout_dirty: bool,
+    image_layout: (bool, u16),
     pub selection_invalidated: bool,
 }
 
@@ -48,6 +50,114 @@ struct RenderedEntry {
     plain: String,
     layout: Vec<crate::editor::Row>,
     rows: usize,
+    image_layout: Option<(bool, u16)>,
+    dirty: bool,
+    images: Vec<InlineImage>,
+}
+
+struct InlineImage {
+    caption_row: usize,
+    row: usize,
+    height: u16,
+    image: Arc<EncodedImage>,
+    ordinal: usize,
+}
+
+fn append_layout(
+    plain: &mut String,
+    rows: &mut Vec<crate::editor::Row>,
+    text: Text<'_>,
+    width: u16,
+) {
+    if !rows.is_empty() {
+        plain.push('\n');
+    }
+    let base = plain.len();
+    let (fragment, mut layout) = crate::editor::layout(&text, width);
+    // Every fragment uses the entry's logical offsets, so selection crosses images naturally.
+    for row in &mut layout {
+        row.start += base;
+        row.end += base;
+        for cell in &mut row.cells {
+            cell.offset += base;
+            cell.end += base;
+        }
+    }
+    plain.push_str(&fragment);
+    rows.extend(layout);
+}
+
+fn entry_layout(
+    entry: &ConversationLine,
+    expanded: bool,
+    width: u16,
+    mode: (bool, u16),
+) -> (String, Vec<crate::editor::Row>, Vec<InlineImage>) {
+    if !entry
+        .content
+        .iter()
+        .any(|part| matches!(part, MessagePart::Image(_)))
+    {
+        let (plain, rows) = crate::editor::layout(&entry_text(entry, expanded, width), width);
+        return (plain, rows, Vec::new());
+    }
+    let mut plain = String::new();
+    let mut rows = Vec::new();
+    let mut images = Vec::new();
+    let header = match entry.kind {
+        LineKind::User => Line::styled("▏ You", Theme.accent()),
+        LineKind::Thought => Line::styled(" Thinking:", Theme.muted()),
+        _ => Line::styled("Agent", Theme.muted()),
+    };
+    append_layout(&mut plain, &mut rows, Text::from(header), width);
+    let mut ordinal = 0;
+    for part in &entry.content {
+        match part {
+            MessagePart::Text(text) => {
+                let lines = if entry.kind == LineKind::Thought {
+                    text.lines()
+                        .map(|line| Line::styled(line.to_owned(), Theme.muted()))
+                        .collect()
+                } else {
+                    markdown(text, width)
+                };
+                if !lines.is_empty() {
+                    append_layout(&mut plain, &mut rows, Text::from(lines), width);
+                }
+            }
+            MessagePart::Image(image) => {
+                ordinal += 1;
+                let caption_row = rows.len();
+                append_layout(
+                    &mut plain,
+                    &mut rows,
+                    Text::from(Line::styled(image.caption(ordinal), Theme.muted())),
+                    width,
+                );
+                let caption_height = rows.len() - caption_row;
+                // A reservation must fit with its wrapped caption so scrolling can reveal it fully.
+                let height = usize::from(mode.1)
+                    .saturating_sub(caption_height)
+                    .min(usize::from(ImageBounds::INLINE.rows)) as u16;
+                if mode.0 && height > 0 && image.dimensions().is_ok() && !image.failed() {
+                    images.push(InlineImage {
+                        caption_row,
+                        row: rows.len(),
+                        height,
+                        image: image.clone(),
+                        ordinal,
+                    });
+                    // Pixel reservations have no logical characters and add nothing to copied text.
+                    rows.extend((0..height).map(|_| crate::editor::Row {
+                        start: plain.len(),
+                        end: plain.len(),
+                        ..Default::default()
+                    }));
+                }
+            }
+        }
+    }
+    (plain, rows, images)
 }
 
 impl Transcript {
@@ -259,6 +369,7 @@ impl Transcript {
         }
     }
 
+    #[cfg(test)]
     pub fn render(
         &mut self,
         conversation: &Conversation,
@@ -266,6 +377,26 @@ impl Transcript {
         area: Rect,
         live: bool,
         waiting_for_input: bool,
+    ) {
+        let mut images = ImageFrame::new(&crate::capabilities::TerminalCapabilities::default());
+        self.render_with_images(
+            conversation,
+            frame,
+            area,
+            live,
+            waiting_for_input,
+            &mut images,
+        );
+    }
+
+    pub fn render_with_images(
+        &mut self,
+        conversation: &Conversation,
+        frame: &mut Frame,
+        area: Rect,
+        live: bool,
+        waiting_for_input: bool,
+        images: &mut ImageFrame,
     ) {
         self.area = area;
         if self.epoch != conversation.transcript_epoch {
@@ -276,6 +407,11 @@ impl Transcript {
             };
         }
         let width_changed = self.width != area.width;
+        let image_layout = (images.enabled(), area.height);
+        if self.image_layout != image_layout {
+            self.image_layout = image_layout;
+            self.layout_dirty = true;
+        }
         if width_changed {
             // Width changes affect Markdown tables and wrapped hit targets, not just line counts.
             self.width = area.width;
@@ -296,13 +432,21 @@ impl Transcript {
             let mut first_changed = self.cache.len().min(conversation.lines.len());
             for (index, entry) in conversation.lines.iter().enumerate() {
                 let expanded = self.expanded.contains(&index);
+                // Composer growth changes height without changing text wrapping in retained history.
+                let entry_image_layout = entry
+                    .content
+                    .iter()
+                    .any(|part| matches!(part, MessagePart::Image(_)))
+                    .then_some(image_layout);
                 if self.cache.get(index).is_none_or(|cached| {
                     cached.width != area.width
+                        || cached.image_layout != entry_image_layout
+                        || cached.dirty
                         || cached.revision != entry.revision
                         || cached.expanded != expanded
                 }) {
-                    let text = entry_text(entry, expanded, area.width);
-                    let (plain, layout) = crate::editor::layout(&text, area.width);
+                    let (plain, layout, entry_images) =
+                        entry_layout(entry, expanded, area.width, image_layout);
                     let count = layout.len();
                     if self
                         .selection
@@ -322,6 +466,9 @@ impl Transcript {
                         plain,
                         layout,
                         rows: count,
+                        image_layout: entry_image_layout,
+                        dirty: false,
+                        images: entry_images,
                     };
                     first_changed = first_changed.min(index);
                     if index == self.cache.len() {
@@ -371,6 +518,7 @@ impl Transcript {
             .starts
             .partition_point(|&start| start <= top)
             .saturating_sub(1);
+        let mut failed_entries = Vec::new();
         for (index, &start) in self.starts.iter().enumerate().skip(first) {
             let cached = &self.cache[index];
             let end = start + cached.rows;
@@ -435,6 +583,48 @@ impl Transcript {
                 }
             }
             frame.render_widget(Paragraph::new(text).style(Theme.text()), target);
+            for image in &cached.images {
+                let image_start = start + image.row;
+                let image_end = image_start + usize::from(image.height);
+                if start + image.caption_row >= top && image_end <= bottom {
+                    let pixels = Rect::new(
+                        area.x,
+                        area.y + (image_start - top) as u16,
+                        area.width.min(ImageBounds::INLINE.columns),
+                        image.height,
+                    );
+                    frame.render_widget(ratatui::widgets::Clear, pixels);
+                    match image.image.source() {
+                        Ok(source) => images.place(source, pixels),
+                        Err(_) => {
+                            // Show decode failures immediately; the next layout drops their pixel rows.
+                            frame.render_widget(
+                                Paragraph::new(image.image.caption(image.ordinal))
+                                    .wrap(ratatui::widgets::Wrap { trim: false })
+                                    .style(Theme.muted()),
+                                pixels,
+                            );
+                            failed_entries.push(index);
+                        }
+                    }
+                } else if image_start < bottom && image_end > top {
+                    // Do not scale a partial reservation: that would make images jump while scrolling.
+                    frame.render_widget(
+                        Paragraph::new("[image partially visible; scroll to view]")
+                            .style(Theme.muted()),
+                        Rect::new(
+                            area.x,
+                            area.y + (image_start.max(top) - top) as u16,
+                            area.width,
+                            1,
+                        ),
+                    );
+                }
+            }
+        }
+        for index in failed_entries {
+            self.cache[index].dirty = true;
+            self.layout_dirty = true;
         }
     }
 }
@@ -755,6 +945,301 @@ mod tests {
                         .collect::<v2::Meta>(),
                 );
         assert!(conversation.apply(notification));
+    }
+
+    fn image_conversation() -> Conversation {
+        let mut conversation = Conversation::default();
+        update(
+            &mut conversation,
+            json!({"sessionUpdate":"agent_message","messageId":"images","content":[
+                {"type":"text","text":"before"}, crate::images::fixture_block(),
+                {"type":"text","text":"between"}, crate::images::second_fixture_block(),
+                {"type":"text","text":"after"}
+            ]}),
+        );
+        conversation
+    }
+
+    fn draw_images(
+        view: &mut Transcript,
+        conversation: &Conversation,
+        terminal: &mut Terminal<TestBackend>,
+        support: crate::capabilities::Support,
+    ) -> ImageFrame {
+        let mut capabilities = crate::capabilities::TerminalCapabilities::default();
+        capabilities.kitty_graphics.effective = support;
+        let mut images = ImageFrame::new(&capabilities);
+        terminal
+            .draw(|frame| {
+                view.render_with_images(conversation, frame, frame.area(), true, false, &mut images)
+            })
+            .unwrap();
+        images
+    }
+
+    #[test]
+    fn acp_images_reserve_ordered_rows_and_copy_captions_without_pixel_padding() {
+        use crate::capabilities::Support;
+        let conversation = image_conversation();
+        let mut view = Transcript::default();
+        let mut terminal = Terminal::new(TestBackend::new(100, 60)).unwrap();
+        let images = draw_images(&mut view, &conversation, &mut terminal, Support::Supported);
+        assert_eq!(
+            images.areas(),
+            vec![Rect::new(0, 3, 80, 20), Rect::new(0, 25, 80, 20)]
+        );
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 1)].symbol(), "b");
+        assert_eq!(buffer[(0, 23)].symbol(), "b");
+        assert_eq!(buffer[(0, 45)].symbol(), "a");
+        assert_eq!(
+            view.cache[0].images[0].image.source().unwrap().dimensions(),
+            (8, 8)
+        );
+        assert_eq!(
+            view.cache[0].images[1].image.source().unwrap().dimensions(),
+            (3, 2)
+        );
+        let event = |kind, row, column| MouseEvent {
+            kind,
+            row,
+            column,
+            modifiers: KeyModifiers::NONE,
+        };
+        view.mouse(event(MouseEventKind::Down(MouseButton::Left), 0, 0));
+        view.mouse(event(MouseEventKind::Drag(MouseButton::Left), 45, 5));
+        view.mouse(event(MouseEventKind::Up(MouseButton::Left), 45, 5));
+        assert!(!view.autoscroll());
+        assert_eq!(
+            view.selected_text().unwrap(),
+            "Agent\nbefore\n[image 1: image/png] 8×8\nbetween\n[image 2: image/png] 3×2\nafter"
+        );
+        assert_eq!(
+            view.hit(10, 50),
+            Some((0, "Agent\nbefore\n[image 1: image/png] 8×8".len()))
+        );
+    }
+
+    #[test]
+    fn fallback_and_offscreen_images_do_not_prepare_pixels() {
+        use crate::capabilities::Support;
+        use base64::Engine as _;
+        let pixels = image::RgbImage::from_pixel(3, 2, image::Rgb([20, 80, 150]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        pixels
+            .write_to(&mut bytes, image::ImageFormat::Jpeg)
+            .unwrap();
+        let block = json!({"type":"image","mimeType":"image/jpeg","data":base64::engine::general_purpose::STANDARD.encode(bytes.into_inner())});
+        let mut conversation = Conversation::default();
+        update(
+            &mut conversation,
+            json!({"sessionUpdate":"agent_message","messageId":"images","content":[
+                {"type":"text","text":"before"}, block, {"type":"text","text":"between"}, block
+            ]}),
+        );
+        let prepared = || {
+            conversation.lines[0]
+                .content
+                .iter()
+                .filter_map(|part| match part {
+                    MessagePart::Image(image) => Some(image.is_prepared()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut view = Transcript::default();
+        let mut terminal = Terminal::new(TestBackend::new(100, 25)).unwrap();
+        for support in [Support::Unknown, Support::Unsupported] {
+            draw_images(&mut view, &conversation, &mut terminal, support);
+            assert_eq!(prepared(), [false, false]);
+            assert!(screen(&terminal).contains("[image 1: image/jpeg] 3×2"));
+        }
+        view.top = Some(0);
+        let images = draw_images(&mut view, &conversation, &mut terminal, Support::Supported);
+        assert_eq!(images.areas().len(), 1);
+        assert_eq!(prepared(), [true, false]);
+        view.boundary(true);
+        let images = draw_images(&mut view, &conversation, &mut terminal, Support::Supported);
+        assert_eq!(images.areas().len(), 1);
+        assert_eq!(prepared(), [true, true]);
+    }
+
+    #[test]
+    fn height_and_graphics_changes_reuse_text_only_entry_layouts() {
+        use crate::capabilities::Support;
+        let mut conversation = Conversation::default();
+        update(
+            &mut conversation,
+            json!({"sessionUpdate":"agent_message","messageId":"text","content":[
+                {"type":"text","text":"# Heading\n\nA **formatted** paragraph."}
+            ]}),
+        );
+        let mut view = Transcript::default();
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        draw_images(&mut view, &conversation, &mut terminal, Support::Unknown);
+        let layout = view.cache[0].layout.as_ptr();
+        let plain = view.cache[0].plain.as_ptr();
+        for (height, support) in [(15, Support::Supported), (30, Support::Unknown)] {
+            terminal.backend_mut().resize(100, height);
+            terminal.resize(Rect::new(0, 0, 100, height)).unwrap();
+            draw_images(&mut view, &conversation, &mut terminal, support);
+            assert_eq!(view.cache[0].layout.as_ptr(), layout);
+            assert_eq!(view.cache[0].plain.as_ptr(), plain);
+        }
+    }
+
+    #[test]
+    fn a_visible_conversion_failure_becomes_a_cached_caption_without_pixel_rows() {
+        use crate::capabilities::Support;
+        use base64::Engine as _;
+        let pixels = image::RgbImage::from_pixel(3, 2, image::Rgb([20, 80, 150]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        pixels
+            .write_to(&mut bytes, image::ImageFormat::WebP)
+            .unwrap();
+        let mut bytes = bytes.into_inner();
+        let header = bytes
+            .windows(4)
+            .position(|marker| marker == b"VP8L")
+            .unwrap();
+        // Keep the lossless header and chunk length intact, but corrupt the pixel bitstream.
+        bytes[header + 8 + 5..].fill(0xff);
+        let mut conversation = Conversation::default();
+        update(
+            &mut conversation,
+            json!({"sessionUpdate":"agent_message","messageId":"bad","content":[
+            {"type":"image","mimeType":"image/webp","data":base64::engine::general_purpose::STANDARD.encode(bytes)}
+            ]}),
+        );
+        let mut view = Transcript::default();
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        let images = draw_images(&mut view, &conversation, &mut terminal, Support::Supported);
+        assert!(images.areas().is_empty());
+        assert!(screen(&terminal).contains("could not decode or convert image"));
+        assert!(view.cache[0].dirty);
+        let images = draw_images(&mut view, &conversation, &mut terminal, Support::Supported);
+        assert!(images.areas().is_empty());
+        assert!(view.cache[0].images.is_empty());
+        assert!(!view.cache[0].dirty);
+        assert!(
+            view.cache[0]
+                .plain
+                .contains("could not decode or convert image")
+        );
+    }
+
+    #[test]
+    fn disabled_unknown_and_invalid_images_use_labels_without_graphics() {
+        use crate::capabilities::Support;
+        let mut conversation = image_conversation();
+        update(
+            &mut conversation,
+            json!({"sessionUpdate":"agent_message","messageId":"bad","content":[
+                {"type":"image","mimeType":"image/gif","data":"private-data"},
+                {"type":"image","mimeType":"image/png","data":"invalid-base64"}
+            ]}),
+        );
+        let mut view = Transcript::default();
+        let mut terminal = Terminal::new(TestBackend::new(100, 60)).unwrap();
+        for support in [
+            Support::Unsupported,
+            Support::Unknown,
+            Support::Supported,
+            Support::Unknown,
+        ] {
+            let images = draw_images(&mut view, &conversation, &mut terminal, support);
+            assert_eq!(
+                images.areas().len(),
+                if support == Support::Supported { 2 } else { 0 }
+            );
+            let text = screen(&terminal);
+            assert!(text.contains("[image 1: image/png] 8×8"));
+            assert!(text.contains("unsupported image format image/gif"));
+            assert!(text.contains("invalid base64 image data"));
+            assert!(!text.contains("private-data"));
+        }
+    }
+
+    #[test]
+    fn scrolling_clips_images_without_overlapping_text_and_resize_reflows_reservations() {
+        use crate::capabilities::Support;
+        let conversation = image_conversation();
+        let mut view = Transcript::default();
+        let mut terminal = Terminal::new(TestBackend::new(100, 25)).unwrap();
+        view.top = Some(0);
+        let images = draw_images(&mut view, &conversation, &mut terminal, Support::Supported);
+        assert_eq!(images.areas(), vec![Rect::new(0, 3, 80, 20)]);
+        view.top = Some(4);
+        let images = draw_images(&mut view, &conversation, &mut terminal, Support::Supported);
+        assert!(images.areas().is_empty());
+        assert!(screen(&terminal).contains("partially visible"));
+        view.boundary(true);
+        let images = draw_images(&mut view, &conversation, &mut terminal, Support::Supported);
+        assert_eq!(images.areas().len(), 1);
+        assert_eq!(terminal.backend().buffer()[(0, 24)].symbol(), "a");
+        for (width, height) in [(12, 8), (1, 1), (0, 0), (100, 60)] {
+            terminal.backend_mut().resize(width, height);
+            terminal.resize(Rect::new(0, 0, width, height)).unwrap();
+            let images = draw_images(&mut view, &conversation, &mut terminal, Support::Supported);
+            assert!(
+                images
+                    .areas()
+                    .iter()
+                    .all(|area| area.right() <= width && area.bottom() <= height)
+            );
+        }
+        assert_eq!(view.cache[0].images.len(), 2);
+    }
+
+    #[test]
+    fn acp_redraws_and_appended_text_reuse_uploads_and_replacement_frees_them() {
+        use crate::{capabilities::Support, images::KittyRenderer};
+        let mut conversation = image_conversation();
+        let mut view = Transcript::default();
+        let mut terminal = Terminal::new(TestBackend::new(100, 60)).unwrap();
+        let mut renderer = KittyRenderer::default();
+        let mut bytes = Vec::new();
+        renderer
+            .finish(
+                &mut bytes,
+                draw_images(&mut view, &conversation, &mut terminal, Support::Supported),
+            )
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&bytes).matches("a=t,").count(), 2);
+        bytes.clear();
+        update(
+            &mut conversation,
+            json!({"sessionUpdate":"agent_message_chunk","messageId":"images","content":{"type":"text","text":"!"}}),
+        );
+        renderer.begin(&mut bytes).unwrap();
+        renderer
+            .finish(
+                &mut bytes,
+                draw_images(&mut view, &conversation, &mut terminal, Support::Supported),
+            )
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&bytes).contains("a=t,"));
+        assert!(screen(&terminal).contains("after!"));
+        bytes.clear();
+        update(
+            &mut conversation,
+            json!({"sessionUpdate":"agent_message","messageId":"images","content":null}),
+        );
+        renderer
+            .finish(
+                &mut bytes,
+                draw_images(&mut view, &conversation, &mut terminal, Support::Supported),
+            )
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&bytes).matches("a=d,d=I").count(),
+            2
+        );
+        assert!(view.cache[0].images.is_empty());
+        conversation.begin_transcript(conversation.seq);
+        let images = draw_images(&mut view, &conversation, &mut terminal, Support::Supported);
+        assert!(images.areas().is_empty());
+        assert!(view.cache.is_empty());
     }
 
     fn mouse(kind: MouseEventKind, row: u16, column: u16) -> MouseEvent {

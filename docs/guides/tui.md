@@ -194,9 +194,8 @@ protocol, and `OSC7501` is program status reporting. Clipboard entries distingui
   enable optional terminal operations on that transport.
 
 The line clips in compact layouts. It reports permission to attempt an operation,
-not guaranteed terminal acceptance. The PNG Kitty backend is implemented; routing
-ACP message images to it is tracked separately in [#127][acp-images]. OSC clipboard
-operations and program status reporting remain follow-up work. Existing text
+not guaranteed terminal acceptance. ACP message images use the PNG Kitty backend.
+OSC clipboard operations and program status reporting remain follow-up work. Existing text
 rendering, native clipboard operations, and terminal-native paste remain usable
 without any positive capability decision.
 
@@ -227,6 +226,18 @@ hive tui --terminal-osc52-write on --terminal-osc52-read off
 
 ### Kitty image backend
 
+ACP conversation messages preserve images in their original position among text
+blocks, including multiple images in one message. PNG, JPEG, and WebP are supported;
+JPEG and WebP are converted locally to PNG for terminal transport. Animated WebP
+uses its first frame as a static image. Pixel preparation happens only when an
+image is fully visible with graphics enabled, and is cached across redraws and
+text streaming. Image URIs are displayed as metadata and are never fetched.
+
+Message captions include an image number, original MIME type, and dimensions when
+available. Unsupported formats, locally detected malformed data, or exceeded limits produce an
+explanatory caption. Copying transcript text includes captions, without image data
+or blank pixel rows. Disabled or unknown graphics capability keeps captions only.
+
 The TUI image service accepts PNG data and supports inline images and bounded
 thumbnails. Kitty preserves the image aspect ratio inside the allocated cell
 rectangle. Inline bounds default to 80 columns by 20 rows; thumbnails default to
@@ -241,14 +252,20 @@ to 16,384 pixels, and 40 million pixels total); the terminal performs PNG decodi
 Quiet transfers do not query whether the terminal accepted an image, so captions
 remain visible even when graphics are attempted.
 
+ACP base64 decoding is bounded before allocation. JPEG/WebP decoding also limits
+dimensions and allocation; the 16 MiB transfer limit applies to both input bytes
+and converted PNG output. Transcript reservations shrink to fit the viewport.
+Partially visible image reservations show a scrolling hint instead of rescaling
+the image over neighboring text; scroll until the caption and image fit fully
+inside the conversation viewport to display the pixels.
+
 The renderer replaces placements during redraws, reuses uploads during ordinary
 redraws, and frees images when they leave the view. Resizing or clearing the
 screen invalidates uploads. Images are suppressed behind pickers and cleaned up
 before editor handoff and terminal restoration. Only Hive-owned image IDs are
 deleted.
 
-ACP message image display is pending [#127][acp-images]. Developers can inspect a
-synthetic inline/thumbnail scene in a Kitty-capable terminal:
+Developers can inspect an ACP conversation scene in a Kitty-capable terminal:
 
 ```sh
 mise exec -- cargo test -p hive-tui \
@@ -256,14 +273,14 @@ mise exec -- cargo test -p hive-tui \
   -- --ignored --exact --nocapture
 ```
 
-Resize the terminal to check reflow. Press `h` to remove/restore content, `o` to
-toggle an overlay, `c` to clear/rebuild the screen, and `q` to exit. Capability
+Resize the terminal to check reflow. Use Up/Down and Home/End to scroll the ACP
+scene; press `a` to switch to the synthetic inline/thumbnail scene.
+Press `h` to remove/restore content, `o` to toggle an overlay, `c` to clear/rebuild
+the screen, and `q` to exit. Capability
 overrides also apply to this fixture, for example
 `HIVE_TERMINAL_KITTY_GRAPHICS=off` to inspect fallback. The automated
 `python3 crates/hive-tui/tests/terminal.py` fixture checks image cleanup across
 editor handoff using a controlling PTY.
-
-[acp-images]: https://github.com/noirbizarre/hive/issues/127
 
 ### Transcript and activity
 

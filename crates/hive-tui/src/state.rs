@@ -1,6 +1,25 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use agent_client_protocol::schema::{MaybeUndefined, v2};
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum MessagePart {
+    Text(String),
+    Image(Arc<crate::images::EncodedImage>),
+}
+
+fn message_part(block: &v2::ContentBlock) -> MessagePart {
+    match block {
+        v2::ContentBlock::Image(image) => {
+            MessagePart::Image(Arc::new(crate::images::EncodedImage::new(
+                image.data.clone(),
+                image.mime_type.to_string(),
+                image.uri.clone(),
+            )))
+        }
+        other => MessagePart::Text(content_text(other)),
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LineKind {
@@ -15,6 +34,8 @@ pub enum LineKind {
 pub struct ConversationLine {
     pub kind: LineKind,
     pub text: String,
+    // Ordered content is authoritative for rich messages; text is the compatibility projection.
+    pub content: Vec<MessagePart>,
     pub tool: Option<serde_json::Value>,
     pub revision: u64,
 }
@@ -143,6 +164,7 @@ impl Conversation {
         self.lines.push(ConversationLine {
             kind: LineKind::User,
             text: format!("You: {text}"),
+            content: vec![MessagePart::Text(text)],
             tool: None,
             revision: 0,
         });
@@ -153,6 +175,7 @@ impl Conversation {
         self.lines.push(ConversationLine {
             kind: LineKind::Notice,
             text,
+            content: Vec::new(),
             tool: None,
             revision: 0,
         });
@@ -184,6 +207,7 @@ impl Conversation {
             self.lines.push(ConversationLine {
                 kind,
                 text: format!("{label}: "),
+                content: Vec::new(),
                 tool: None,
                 revision: 0,
             });
@@ -206,6 +230,7 @@ impl Conversation {
             self.lines.push(ConversationLine {
                 kind: LineKind::Tool,
                 text: String::new(),
+                content: Vec::new(),
                 tool: Some(serde_json::json!({"toolCallId": id})),
                 revision: 0,
             });
@@ -252,7 +277,43 @@ impl Conversation {
     ) {
         let text = message_content(content);
         // Even metadata-only first appearances reserve their position in daemon snapshots.
-        self.upsert(key, kind, text.as_deref().unwrap_or(""), text.is_some());
+        self.upsert(
+            key.clone(),
+            kind,
+            text.as_deref().unwrap_or(""),
+            text.is_some(),
+        );
+        if !matches!(content, MaybeUndefined::Undefined) {
+            let line = &mut self.lines[self.messages[&key]];
+            line.content.clear();
+            if let MaybeUndefined::Value(blocks) = content {
+                for block in blocks {
+                    let part = message_part(block);
+                    if let (Some(MessagePart::Text(previous)), MessagePart::Text(next)) =
+                        (line.content.last_mut(), &part)
+                    {
+                        // Full text blocks have always used a newline, unlike streamed chunks.
+                        previous.push('\n');
+                        previous.push_str(next);
+                    } else {
+                        line.content.push(part);
+                    }
+                }
+            }
+        }
+    }
+
+    fn chunk(&mut self, key: String, kind: LineKind, block: &v2::ContentBlock) {
+        self.upsert(key.clone(), kind, &content_text(block), false);
+        let content = &mut self.lines[self.messages[&key]].content;
+        let part = message_part(block);
+        if let (Some(MessagePart::Text(previous)), MessagePart::Text(next)) =
+            (content.last_mut(), &part)
+        {
+            previous.push_str(next);
+        } else {
+            content.push(part);
+        }
     }
 
     pub fn apply(&mut self, notification: v2::UpdateSessionNotification) -> bool {
@@ -302,20 +363,18 @@ impl Conversation {
             }
             v2::SessionUpdate::AgentMessageChunk(chunk) => {
                 self.active_thought = None;
-                self.upsert(
+                self.chunk(
                     format!("agent:{}", chunk.message_id),
                     LineKind::Agent,
-                    &content_text(&chunk.content),
-                    false,
+                    &chunk.content,
                 )
             }
             v2::SessionUpdate::AgentThoughtChunk(chunk) => {
                 let key = format!("thought:{}", chunk.message_id);
-                self.upsert(
+                self.chunk(
                     format!("thought:{}", chunk.message_id),
                     LineKind::Thought,
-                    &content_text(&chunk.content),
-                    false,
+                    &chunk.content,
                 );
                 // Restored snapshots lack per-block execution metadata; only live chunks establish it.
                 if !snapshot {
@@ -337,11 +396,10 @@ impl Conversation {
                     &message.content,
                 );
             }
-            v2::SessionUpdate::UserMessageChunk(chunk) => self.upsert(
+            v2::SessionUpdate::UserMessageChunk(chunk) => self.chunk(
                 format!("user:{}", chunk.message_id),
                 LineKind::User,
-                &content_text(&chunk.content),
-                false,
+                &chunk.content,
             ),
             v2::SessionUpdate::AgentMessage(message) => {
                 self.active_thought = None;
@@ -460,6 +518,8 @@ impl Conversation {
 fn content_text(block: &v2::ContentBlock) -> String {
     match block {
         v2::ContentBlock::Text(text) => text.text.clone(),
+        // The compatibility projection must not serialize/copy a large base64 payload just for its tag.
+        v2::ContentBlock::Image(_) => "[\"image\"]".into(),
         other => format!(
             "[{}]",
             serde_json::to_value(other).unwrap_or_default()["type"]
@@ -491,6 +551,76 @@ mod tests {
         let mut meta = v2::Meta::new();
         meta.insert("hive".into(), serde_json::json!({"seq": seq}));
         v2::UpdateSessionNotification::new(v2::SessionId::new("hive-test"), update).meta(meta)
+    }
+
+    #[test]
+    fn images_keep_their_order_identity_and_patch_semantics_for_every_speaker() {
+        use serde_json::json;
+        for kind in ["agent_message", "user_message", "agent_thought"] {
+            let mut conversation = Conversation::default();
+            let blocks = json!([
+                {"type":"text","text":"before"}, crate::images::fixture_block(),
+                {"type":"text","text":"between"}, crate::images::second_fixture_block(),
+                {"type":"text","text":"after"}
+            ]);
+            let full = json!({"sessionUpdate":kind,"messageId":"same","content":blocks});
+            assert!(conversation.apply(event(1, serde_json::from_value(full.clone()).unwrap())));
+            assert!(matches!(&conversation.lines[0].content[..], [
+                MessagePart::Text(before), MessagePart::Image(_), MessagePart::Text(between),
+                MessagePart::Image(_), MessagePart::Text(after)
+            ] if before == "before" && between == "between" && after == "after"));
+            let MessagePart::Image(original) = &conversation.lines[0].content[1] else {
+                panic!()
+            };
+            let original = original.clone();
+            let mut restored = Conversation::default();
+            restored.begin_transcript(1);
+            let mut snapshot = event(1, serde_json::from_value(full).unwrap());
+            snapshot.meta.as_mut().unwrap().get_mut("hive").unwrap()["snapshot"] = true.into();
+            assert!(restored.apply(snapshot));
+            for client in [&mut conversation, &mut restored] {
+                for (seq, value) in [
+                    (2, json!({"sessionUpdate":kind,"messageId":"same"})),
+                    (
+                        3,
+                        json!({"sessionUpdate":format!("{kind}_chunk"),"messageId":"same","content":{"type":"text","text":"!"}}),
+                    ),
+                    (
+                        4,
+                        json!({"sessionUpdate":format!("{kind}_chunk"),"messageId":"same","content":crate::images::fixture_block()}),
+                    ),
+                    (
+                        5,
+                        json!({"sessionUpdate":"user_message","messageId":"next","content":[{"type":"text","text":"next"}]}),
+                    ),
+                ] {
+                    let update = event(seq, serde_json::from_value(value).unwrap());
+                    assert!(client.apply(update.clone()));
+                    assert!(!client.apply(update));
+                }
+            }
+            assert_eq!(conversation.lines[0].content, restored.lines[0].content);
+            assert_eq!(conversation.lines.len(), 2);
+            let MessagePart::Image(retained) = &conversation.lines[0].content[1] else {
+                panic!()
+            };
+            assert!(Arc::ptr_eq(&original, retained));
+            for (seq, clear) in [(6, json!(null)), (8, json!([]))] {
+                conversation.apply(event(
+                    seq,
+                    serde_json::from_value(
+                        json!({"sessionUpdate":kind,"messageId":"same","content":clear}),
+                    )
+                    .unwrap(),
+                ));
+                assert!(conversation.lines[0].content.is_empty());
+                conversation.apply(event(seq + 1, serde_json::from_value(json!({"sessionUpdate":kind,"messageId":"same","content":[crate::images::fixture_block()]})).unwrap()));
+                assert!(matches!(
+                    &conversation.lines[0].content[..],
+                    [MessagePart::Image(_)]
+                ));
+            }
+        }
     }
 
     #[test]

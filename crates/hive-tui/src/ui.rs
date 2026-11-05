@@ -271,7 +271,7 @@ impl App {
     }
 
     pub fn show_with_images(&mut self, frame: &mut Frame, images: &mut crate::images::ImageFrame) {
-        self.show(frame);
+        self.show_inner(frame, images);
         // Kitty placements are emitted after text, so a picker Clear widget alone
         // cannot prevent them from obscuring the modal. Captions remain readable.
         if self.picker.is_some() {
@@ -279,7 +279,14 @@ impl App {
         }
     }
 
+    #[cfg(test)]
     pub fn show(&mut self, frame: &mut Frame) {
+        let mut images =
+            crate::images::ImageFrame::new(&crate::capabilities::TerminalCapabilities::default());
+        self.show_with_images(frame, &mut images);
+    }
+
+    fn show_inner(&mut self, frame: &mut Frame, images: &mut crate::images::ImageFrame) {
         let theme = Theme;
         let area = frame.area();
         frame.render_widget(Block::default().style(theme.text()), area);
@@ -328,7 +335,7 @@ impl App {
         match self.page {
             Page::Sessions => self.render_sessions(frame, sections[1], theme),
             Page::Profiles => self.render_profiles(frame, sections[1], theme),
-            Page::Chat => self.render_conversation(frame, sections[1], theme),
+            Page::Chat => self.render_conversation(frame, sections[1], theme, images),
         }
         self.render_composer(frame, sections[2], theme);
         self.render_footer(frame, sections[3], theme, columns[1].width == 0);
@@ -654,7 +661,13 @@ impl App {
         frame.render_stateful_widget(list, area, &mut self.profile_list);
     }
 
-    fn render_conversation(&mut self, frame: &mut Frame, area: Rect, theme: Theme) {
+    fn render_conversation(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        theme: Theme,
+        images: &mut crate::images::ImageFrame,
+    ) {
         if self.active.is_none() {
             frame.render_widget(
                 Paragraph::new(Text::from(vec![
@@ -671,13 +684,17 @@ impl App {
         if let Some(id) = self.active.as_ref()
             && let Some(conversation) = self.conversations.get(id)
         {
-            self.transcripts.entry(id.clone()).or_default().render(
-                conversation,
-                frame,
-                body.inner(area),
-                live,
-                self.dialog.is_some(),
-            );
+            self.transcripts
+                .entry(id.clone())
+                .or_default()
+                .render_with_images(
+                    conversation,
+                    frame,
+                    body.inner(area),
+                    live,
+                    self.dialog.is_some(),
+                    images,
+                );
             if let Some(view) = self.transcripts.get_mut(id)
                 && view.selection_invalidated
             {
@@ -1706,5 +1723,43 @@ mod tests {
         terminal.draw(|frame| app.show(frame)).unwrap();
         assert!(screen(&terminal).contains("Latest answer"));
         assert!(!screen(&terminal).contains("Earlier 0"));
+    }
+    #[test]
+    fn acp_images_flow_through_chat_layout_and_are_suppressed_by_pickers() {
+        use crate::capabilities::Support;
+        use serde_json::json;
+        let mut app = App {
+            page: Page::Chat,
+            active: Some("session".into()),
+            ..App::default()
+        };
+        app.terminal_capabilities.kitty_graphics.effective = Support::Supported;
+        let notification = v2::UpdateSessionNotification::new("session", serde_json::from_value(json!({
+            "sessionUpdate":"agent_message", "messageId":"image", "content":[crate::images::fixture_block()]
+        })).unwrap()).meta([("hive".into(), json!({"seq":1}))].into_iter().collect::<v2::Meta>());
+        assert!(
+            app.conversations
+                .entry("session".into())
+                .or_default()
+                .apply(notification)
+        );
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        for picker_open in [false, true, false] {
+            app.picker = picker_open.then(|| crate::picker::Picker::new("session".into(), vec![]));
+            let mut images = crate::images::ImageFrame::new(&app.terminal_capabilities);
+            terminal
+                .draw(|frame| app.show_with_images(frame, &mut images))
+                .unwrap();
+            assert_eq!(images.areas().len(), usize::from(!picker_open));
+            if !picker_open {
+                assert!(screen(&terminal).contains("[image 1: image/png] 8×8"));
+            }
+        }
+        app.active = Some("other-session".into());
+        let mut images = crate::images::ImageFrame::new(&app.terminal_capabilities);
+        terminal
+            .draw(|frame| app.show_with_images(frame, &mut images))
+            .unwrap();
+        assert!(images.areas().is_empty());
     }
 }

@@ -2363,11 +2363,32 @@ mod tests {
         let source = images::fixture_source();
         let mut hidden = false;
         let mut overlay = false;
+        let mut acp_scene = true;
+        let mut conversation = state::Conversation::default();
+        conversation.apply(v2::UpdateSessionNotification::new("fixture", serde_json::from_value(serde_json::json!({
+            "sessionUpdate":"agent_message", "messageId":"images", "content":[
+                {"type":"text","text":"ACP scene: before first image"}, images::fixture_block(),
+                {"type":"text","text":"Between ACP images"}, images::fixture_block(),
+                {"type":"text","text":"After ACP images"}
+            ]
+        })).unwrap()).meta([("hive".into(), serde_json::json!({"seq":1}))].into_iter().collect::<v2::Meta>()));
+        let mut transcript = transcript::Transcript::default();
         loop {
             guard
                 .draw(&mut terminal, &capabilities, |frame, images| {
                     if !hidden {
-                        images::fixture_scene(frame, images, &source);
+                        if acp_scene {
+                            transcript.render_with_images(
+                                &conversation,
+                                frame,
+                                frame.area(),
+                                false,
+                                false,
+                                images,
+                            );
+                        } else {
+                            images::fixture_scene(frame, images, &source);
+                        }
                     }
                     if overlay {
                         images.suppress();
@@ -2386,6 +2407,11 @@ mod tests {
                     KeyCode::Char('h') => hidden = !hidden,
                     KeyCode::Char('o') => overlay = !overlay,
                     KeyCode::Char('c') => guard.clear(&mut terminal).unwrap(),
+                    KeyCode::Char('a') => acp_scene = !acp_scene,
+                    KeyCode::Up => transcript.scroll(-1),
+                    KeyCode::Down => transcript.scroll(1),
+                    KeyCode::Home => transcript.boundary(false),
+                    KeyCode::End => transcript.boundary(true),
                     _ => {}
                 },
                 Event::Resize(_, _) => guard.images.invalidate(),

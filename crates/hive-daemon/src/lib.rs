@@ -1863,10 +1863,13 @@ impl Broker {
                 registry.stopping = true;
             }
         }
+        // Finish any resource admission before retiring bindings and stopping their runtime.
+        let _mcp_admission = self.mcp_sessions.admission.lock().await;
         self.mcp_sessions.clear();
         if let Some(runtime) = self.mcp_runtime.get() {
             runtime.shutdown().await;
         }
+        self.mcp_sessions.drain_cleanup().await;
         let entries = self
             .sessions
             .lock()

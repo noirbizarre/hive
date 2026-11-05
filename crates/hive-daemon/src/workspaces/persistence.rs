@@ -58,7 +58,7 @@ impl Runtime<'_> {
             .uncertain_external_effects)
     }
     pub(super) fn migrate_backends(&mut self) -> Result<bool, Error> {
-        if self.state.version > 1 {
+        if self.state.version > 2 {
             return Err(
                 hive_core::workspace::WorkspaceError::UnsupportedBackendData {
                     schema: "hive.workspace.state".into(),
@@ -67,8 +67,26 @@ impl Runtime<'_> {
                 .into(),
             );
         }
-        if self.state.version == 1 {
+        // A malformed reservation must never disappear from deletion eligibility checks.
+        for (id, reservation) in &self.state.mcp_reservations {
+            if uuid::Uuid::parse_str(id).is_err()
+                || reservation.session.is_empty()
+                || reservation.workspaces.is_empty()
+                || reservation
+                    .workspaces
+                    .iter()
+                    .any(|workspace| !self.state.workspaces.contains_key(workspace.as_str()))
+            {
+                return Err(Error::Conflict);
+            }
+        }
+        if self.state.version == 2 {
             return Ok(false);
+        }
+        if self.state.version == 1 {
+            // Older daemons must refuse snapshots whose independent MCP holds they cannot enforce.
+            self.state.version = 2;
+            return Ok(true);
         }
         for repository in self.state.repositories.values_mut() {
             repository.handle = Some(backends::handle(repository)?);
@@ -118,7 +136,7 @@ impl Runtime<'_> {
             )?;
         }
         // The admission caller publishes this entire snapshot before permitting any side effects.
-        self.state.version = 1;
+        self.state.version = 2;
         Ok(true)
     }
 

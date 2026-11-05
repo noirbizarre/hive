@@ -19,6 +19,63 @@ struct Fixture {
 }
 
 impl Fixture {
+    fn admission(
+        &self,
+        scope: Scope,
+        cwd: Option<&std::path::Path>,
+        idle: u64,
+    ) -> hive_daemon::mcp::StdioAdmission {
+        let path = |path: &std::path::Path| {
+            NodePath::new(
+                self.node.clone(),
+                if cfg!(windows) {
+                    PathSyntax::Windows
+                } else {
+                    PathSyntax::Posix
+                },
+                path.to_str().unwrap().into(),
+            )
+            .unwrap()
+        };
+        hive_daemon::mcp::StdioAdmission {
+            definition_id: "fixture".into(),
+            definition: ServerDefinition::new(
+                Transport::Stdio {
+                    command: env!("CARGO_BIN_EXE_hive-test-mcp").into(),
+                    args: vec![self.log().to_str().unwrap().into(), "normal".into()],
+                    env: BTreeMap::new(),
+                },
+                scope,
+                Ownership::Managed,
+                Lifecycle::OnDemand {
+                    idle_timeout_seconds: idle,
+                },
+            )
+            .unwrap(),
+            launch: hive_daemon::mcp::StdioLaunch {
+                executable: path(std::path::Path::new(env!("CARGO_BIN_EXE_hive-test-mcp"))),
+                env: std::env::vars_os().collect(),
+                cwd: cwd.map(path),
+            },
+            initialization: Initialization {
+                protocol_version: "2025-11-25".into(),
+                client_info: json!({"name":"hive-test", "version":"1"}),
+                capabilities: json!({}),
+                options: json!({}),
+                roots: vec![],
+            },
+            security: SecurityContext {
+                principal: "test".into(),
+                partition: "test".into(),
+                policy_generation: "1".into(),
+                credentials: Credentials::Complete {
+                    external_generations: BTreeMap::new(),
+                },
+            },
+            sharing: hive_daemon::mcp::Sharing::Shared,
+        }
+    }
+
     fn new() -> Self {
         Self::with_policy(RuntimePolicy {
             // Successful native startup needs the production budget on loaded CI hosts.
@@ -145,6 +202,299 @@ impl Fixture {
         .await
         .expect("fixture did not reach protocol barrier");
     }
+}
+
+#[tokio::test]
+async fn scoped_admission_shares_canonical_worktrees_and_isolates_other_worktrees_projects_and_credentials()
+ {
+    use agent_client_protocol::{
+        Client,
+        schema::{ProtocolVersion, v2},
+    };
+    use agent_client_protocol_http::HttpClient;
+    let mut fixture = Fixture::new();
+    // Git for Windows rejects canonicalization's verbatim prefix in worktree destination arguments.
+    let base = fixture.directory.path().to_path_buf();
+    let first = base.join("first");
+    let second = base.join("second");
+    let other = base.join("other");
+    std::fs::create_dir(&first).unwrap();
+    std::fs::create_dir(&other).unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&first)
+            .args(["-c", "core.hooksPath=", "-c", "commit.gpgsign=false"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "--initial-branch=main"]);
+    git(&[
+        "-c",
+        "user.name=Hive Test",
+        "-c",
+        "user.email=hive@example.test",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "seed",
+    ]);
+    git(&["worktree", "add", "-b", "linked", second.to_str().unwrap()]);
+    std::fs::create_dir(first.join("a")).unwrap();
+    std::fs::create_dir(first.join("b")).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(first.join("b"), base.join("alias")).unwrap();
+    let alias = if cfg!(unix) {
+        base.join("alias")
+    } else {
+        first.join("b")
+    };
+    let config = serde_json::from_value(json!({
+        "default_agent":"mock", "projects":{"demo":{"name":"Demo"},"other":{"name":"Other"}},
+        "workspaces":{"first":{"policy":"existing","directory":first},"second":{"policy":"existing","directory":second},"other":{"policy":"existing","directory":other}},
+        "agents":{"mock":{"command":env!("CARGO_BIN_EXE_hive-test-agent"),"versions":["v2"]}}
+    })).unwrap();
+    let broker =
+        hive_daemon::Broker::persistent(config, base.join("state/catalog.sqlite3")).unwrap();
+    fixture.node = broker.mcp_execution_node().await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = hive_daemon::router(broker.clone());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let owner = broker.clone();
+    Client
+        .v2()
+        .connect_with(
+            HttpClient::new(format!("ws://{address}")).unwrap(),
+            async |cx| {
+                cx.send_request(v2::InitializeRequest::new(
+                    ProtocolVersion::V2,
+                    v2::Implementation::new("scope-test", "1"),
+                ))
+                .block_task()
+                .await?;
+                let mut registered = Vec::new();
+                for (policy, project) in [("first", "demo"), ("second", "demo"), ("other", "other")]
+                {
+                    let mut meta = v2::Meta::new();
+                    meta.insert(
+                        "hive".into(),
+                        json!({"workspace":{"kind":"new","project":project,"policy":policy}}),
+                    );
+                    registered.push(
+                        cx.send_request(v2::NewSessionRequest::new(base.clone()).meta(meta))
+                            .block_task()
+                            .await?,
+                    );
+                }
+                let mut sessions = Vec::new();
+                for cwd in [first.join("a"), alias] {
+                    sessions.push(
+                        cx.send_request(v2::NewSessionRequest::new(cwd))
+                            .block_task()
+                            .await?,
+                    );
+                }
+                let a = owner
+                    .bind_scoped_mcp(
+                        &sessions[0].session_id,
+                        fixture.admission(Scope::Workspace, None, 60),
+                    )
+                    .await
+                    .unwrap();
+                let b = owner
+                    .bind_scoped_mcp(
+                        &sessions[1].session_id,
+                        fixture.admission(Scope::Workspace, None, 60),
+                    )
+                    .await
+                    .unwrap();
+                let pid = |binding: hive_daemon::mcp::SessionMcpLease| async move {
+                    binding
+                        .request(tool("pid", json!({})))
+                        .unwrap()
+                        .result()
+                        .await
+                        .unwrap()["pid"]
+                        .clone()
+                };
+                let original = pid(a.clone()).await;
+                assert_eq!(original, pid(b.clone()).await);
+                let linked = owner
+                    .bind_scoped_mcp(
+                        &registered[1].session_id,
+                        fixture.admission(Scope::Workspace, None, 60),
+                    )
+                    .await
+                    .unwrap();
+                assert_ne!(original, pid(linked).await);
+                let distinct = owner
+                    .bind_scoped_mcp(
+                        &registered[2].session_id,
+                        fixture.admission(Scope::Workspace, None, 60),
+                    )
+                    .await
+                    .unwrap();
+                assert_ne!(original, pid(distinct).await);
+                // Project/machine context is explicit and identical, rather than accidentally using each session cwd.
+                for scope in [Scope::Project, Scope::Machine] {
+                    let x = owner
+                        .bind_scoped_mcp(
+                            &registered[0].session_id,
+                            fixture.admission(scope, Some(&base), 60),
+                        )
+                        .await
+                        .unwrap();
+                    let y = owner
+                        .bind_scoped_mcp(
+                            &registered[1].session_id,
+                            fixture.admission(scope, Some(&base), 60),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(pid(x.clone()).await, pid(y).await);
+                    let z = owner
+                        .bind_scoped_mcp(
+                            &registered[2].session_id,
+                            fixture.admission(scope, Some(&base), 60),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        pid(x.clone()).await == pid(z).await,
+                        scope == Scope::Machine
+                    );
+                }
+                let plain = cx
+                    .send_request(v2::NewSessionRequest::new(base.clone()))
+                    .block_task()
+                    .await?;
+                assert!(matches!(
+                    owner
+                        .bind_scoped_mcp(
+                            &plain.session_id,
+                            fixture.admission(Scope::Workspace, None, 60)
+                        )
+                        .await,
+                    Err(hive_daemon::mcp::AdmissionError::Scope)
+                ));
+                let machine = owner
+                    .bind_scoped_mcp(
+                        &plain.session_id,
+                        fixture.admission(Scope::Machine, Some(&base), 60),
+                    )
+                    .await
+                    .unwrap();
+                assert!(pid(machine).await.is_number());
+                let before = fixture
+                    .events()
+                    .iter()
+                    .filter(|event| event["event"] == "spawn")
+                    .count();
+                let mut cancelled = fixture.admission(Scope::Workspace, None, 60);
+                cancelled.definition_id = "cancelled-admission".into();
+                let mut future =
+                    Box::pin(owner.bind_scoped_mcp(&sessions[1].session_id, cancelled));
+                // Poll exactly once, then cancel before the coordinator can acquire a lease.
+                std::future::poll_fn(|cx| {
+                    use std::future::Future;
+                    assert!(future.as_mut().poll(cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                drop(future);
+                let (duplicate, concurrent) = tokio::join!(
+                    owner.bind_scoped_mcp(
+                        &sessions[1].session_id,
+                        fixture.admission(Scope::Workspace, None, 60)
+                    ),
+                    owner.bind_scoped_mcp(
+                        &sessions[1].session_id,
+                        fixture.admission(Scope::Workspace, None, 60)
+                    ),
+                );
+                assert_eq!(b.id(), duplicate.unwrap().id());
+                assert_eq!(b.id(), concurrent.unwrap().id());
+                assert_eq!(
+                    before,
+                    fixture
+                        .events()
+                        .iter()
+                        .filter(|event| event["event"] == "spawn")
+                        .count()
+                );
+                let mut unknown = fixture.admission(Scope::Workspace, None, 60);
+                unknown.security.credentials = Credentials::Unknown;
+                assert!(matches!(
+                    owner
+                        .bind_scoped_mcp(&sessions[1].session_id, unknown)
+                        .await,
+                    Err(hive_daemon::mcp::AdmissionError::Contract(
+                        hive_daemon::mcp::McpError::Security
+                    ))
+                ));
+                let mut foreign = fixture.admission(Scope::Workspace, None, 60);
+                foreign.launch.executable = NodePath::new(
+                    NodeId::new(),
+                    foreign.launch.executable.syntax(),
+                    foreign.launch.executable.as_str().into(),
+                )
+                .unwrap();
+                assert!(matches!(
+                    owner
+                        .bind_scoped_mcp(&sessions[1].session_id, foreign)
+                        .await,
+                    Err(hive_daemon::mcp::AdmissionError::Path)
+                ));
+                cx.send_request(
+                    v2::CloseSessionRequest::new(sessions[0].session_id.clone())
+                        .meta(sessions[0].meta.clone()),
+                )
+                .block_task()
+                .await?;
+                assert_eq!(original, pid(b.clone()).await);
+                owner.release_mcp(&sessions[1].session_id, b.id());
+                let mut rotated = fixture.admission(Scope::Workspace, None, 60);
+                rotated.security.credentials = Credentials::Complete {
+                    external_generations: BTreeMap::from([("keychain".into(), "rotated".into())]),
+                };
+                let rotated = owner
+                    .bind_scoped_mcp(&sessions[1].session_id, rotated)
+                    .await
+                    .unwrap();
+                assert_ne!(original, pid(rotated).await);
+                let mut racing = fixture.admission(Scope::Workspace, None, 60);
+                racing.definition_id = "close-race".into();
+                let (admitted, closed) = tokio::join!(
+                    owner.bind_scoped_mcp(&sessions[1].session_id, racing),
+                    cx.send_request(
+                        v2::CloseSessionRequest::new(sessions[1].session_id.clone())
+                            .meta(sessions[1].meta.clone())
+                    )
+                    .block_task(),
+                );
+                closed?;
+                if let Ok(binding) = admitted {
+                    assert!(matches!(
+                        binding.request(tool("pid", json!({}))),
+                        Err(RuntimeError::Binding)
+                    ));
+                }
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+    broker.shutdown().await;
+    server.abort();
 }
 
 fn tool(name: &str, arguments: Value) -> McpRequest {
@@ -1021,7 +1371,7 @@ async fn worker_exit_retains_only_recoverable_session_ownership_and_allows_offli
             axum::serve(listener, router).await.unwrap();
         });
         let owner = broker.clone();
-        let identity = fixture.identity("normal", 0);
+        let admission = fixture.admission(Scope::Machine, Some(fixture.directory.path()), 0);
         let cwd = fixture.directory.path().to_path_buf();
         let (saved, received) = tokio::sync::oneshot::channel();
         Client
@@ -1039,7 +1389,10 @@ async fn worker_exit_retains_only_recoverable_session_ownership_and_allows_offli
                         .send_request(v2::NewSessionRequest::new(cwd))
                         .block_task()
                         .await?;
-                    let binding = owner.bind_mcp(&opened.session_id, identity).await.unwrap();
+                    let binding = owner
+                        .bind_scoped_mcp(&opened.session_id, admission)
+                        .await
+                        .unwrap();
                     binding
                         .request(tool("echo", json!({})))
                         .unwrap()
@@ -1087,6 +1440,17 @@ async fn worker_exit_retains_only_recoverable_session_ownership_and_allows_offli
             .observed(|events| events.iter().any(|event| event["event"] == "eof"))
             .await;
         broker.shutdown().await;
+        assert!(matches!(
+            broker
+                .bind_scoped_mcp(
+                    &session,
+                    fixture.admission(Scope::Machine, Some(fixture.directory.path()), 0)
+                )
+                .await,
+            Err(hive_daemon::mcp::AdmissionError::Runtime(
+                RuntimeError::Stopping
+            ))
+        ));
         server.abort();
     }
 }
@@ -1138,6 +1502,15 @@ async fn protocol_eof_or_broken_pipe_terminates_a_still_running_leader() {
 
 #[tokio::test]
 async fn closing_a_session_defers_workspace_release_until_previously_released_calls_settle() {
+    released_binding_cleanup(true).await;
+}
+
+#[tokio::test]
+async fn releasing_a_scoped_binding_retires_its_reservation_while_its_session_remains_open() {
+    released_binding_cleanup(false).await;
+}
+
+async fn released_binding_cleanup(close_session: bool) {
     use agent_client_protocol::{
         Client,
         schema::{ProtocolVersion, v2},
@@ -1183,7 +1556,10 @@ async fn closing_a_session_defers_workspace_release_until_previously_released_ca
         .unwrap()
         .to_owned();
     let binding = broker
-        .bind_mcp(&opened.session_id, fixture.identity("normal", 0))
+        .bind_scoped_mcp(
+            &opened.session_id,
+            fixture.admission(Scope::Workspace, None, 1),
+        )
         .await
         .unwrap();
     let call = binding.request(tool("hold", json!({}))).unwrap();
@@ -1192,10 +1568,12 @@ async fn closing_a_session_defers_workspace_release_until_previously_released_ca
         .await;
     broker.release_mcp(&opened.session_id, binding.id());
     assert_eq!(call.result().await, Err(RuntimeError::Cancelled));
-    cx.send_request(v2::CloseSessionRequest::new(opened.session_id).meta(opened.meta))
-        .block_task()
-        .await
-        .unwrap();
+    if close_session {
+        cx.send_request(v2::CloseSessionRequest::new(opened.session_id).meta(opened.meta))
+            .block_task()
+            .await
+            .unwrap();
+    }
     let inspect = || async {
         reqwest::get(format!(
             "http://{address}/v1/workspaces/{workspace}/inspect"
@@ -1206,10 +1584,15 @@ async fn closing_a_session_defers_workspace_release_until_previously_released_ca
         .await
         .unwrap()
     };
-    assert_ne!(inspect().await["safety"]["usage"], "idle");
+    assert_eq!(inspect().await["safety"]["usage"], "unknown");
     std::fs::write(format!("{}.release", fixture.log().display()), b"complete").unwrap();
+    // The response alone cannot release files while a positive-idle process is still alive.
+    fixture
+        .observed(|events| events.iter().any(|event| event["event"] == "eof"))
+        .await;
     tokio::time::timeout(Duration::from_secs(5), async {
-        while inspect().await["safety"]["usage"] != "idle" {
+        let expected = if close_session { "idle" } else { "active" };
+        while inspect().await["safety"]["usage"] != expected {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })

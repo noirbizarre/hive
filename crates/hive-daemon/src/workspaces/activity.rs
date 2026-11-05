@@ -115,7 +115,7 @@ impl Service {
     }
 }
 
-fn short_git(path: &Path, args: &[&str]) -> Result<String, Error> {
+pub(super) fn short_git(path: &Path, args: &[&str]) -> Result<String, Error> {
     execute_with_timeout("git", Some(path), args, false, None, Duration::from_secs(3))
 }
 

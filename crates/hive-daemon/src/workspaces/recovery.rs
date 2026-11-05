@@ -37,6 +37,7 @@ pub struct RecoveryReport {
     repository_findings: Vec<serde_json::Value>,
     orphans: Vec<Orphan>,
     scan_errors: Vec<serde_json::Value>,
+    mcp_reservations: Vec<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -448,7 +449,7 @@ impl Runtime<'_> {
             if !projects.contains(&entry.workspace.intent().project) {
                 classifications.push("project_missing");
             }
-            if sessions.is_empty() && entry.workspace.state() != WorkspaceState::Removed {
+            if !self.has_use(id) && entry.workspace.state() != WorkspaceState::Removed {
                 classifications.push("unreferenced");
             }
             let (inspection, failure) = match self.inspect(id) {
@@ -513,6 +514,10 @@ impl Runtime<'_> {
             repository_findings,
             orphans,
             scan_errors,
+            mcp_reservations: self.state.mcp_reservations.iter().map(|(id, reservation)| serde_json::json!({
+                "id":id, "session":reservation.session, "workspaces":reservation.workspaces,
+                "help":"MCP launch was admitted; after restart, verify all owning server processes have terminated before reconciling this reservation; a missing session is not proof of completion"
+            })).collect(),
         })
     }
 

@@ -171,6 +171,7 @@ pub(crate) struct Instance {
     idle_timer: Mutex<Option<tokio::task::JoinHandle<()>>>,
     slots: Arc<Semaphore>,
     stopping: AtomicBool,
+    resource_waiters: Mutex<Vec<watch::Sender<bool>>>,
 }
 
 /// Runtime clones share process ownership and shutdown admission.
@@ -259,6 +260,7 @@ impl Runtime {
                     idle_timer: Mutex::new(None),
                     slots: Arc::new(Semaphore::new(self.0.policy.max_concurrent_calls)),
                     stopping: AtomicBool::new(false),
+                    resource_waiters: Mutex::new(Vec::new()),
                 });
                 entries.push(instance.clone());
                 instance
@@ -415,6 +417,7 @@ impl Instance {
                 status.send_replace(error.map(Status::Failed).unwrap_or(Status::Stopped));
                 done.send_replace(true);
             }
+            instance.settle_resources(&state);
         });
         Ok(receiver)
     }
@@ -539,6 +542,8 @@ impl Drop for Lease {
     fn drop(&mut self) {
         self.instance.leases.fetch_sub(1, Ordering::AcqRel);
         self.instance.idle();
+        let state = self.instance.state.lock().expect("MCP state lock poisoned");
+        self.instance.settle_resources(&state);
     }
 }
 
@@ -547,11 +552,24 @@ impl Drop for Operation {
     fn drop(&mut self) {
         self.0.operations.fetch_sub(1, Ordering::AcqRel);
         self.0.idle();
+        let state = self.0.state.lock().expect("MCP state lock poisoned");
+        self.0.settle_resources(&state);
         self.1.send_replace(true);
     }
 }
 
 impl Lease {
+    /// Register before release; a waiter must not itself keep the process non-idle.
+    pub(crate) fn resource_settlement(&self) -> watch::Receiver<bool> {
+        let _state = self.instance.state.lock().expect("MCP state lock poisoned");
+        let (sender, receiver) = watch::channel(false);
+        self.instance
+            .resource_waiters
+            .lock()
+            .expect("MCP resource lock poisoned")
+            .push(sender);
+        receiver
+    }
     pub fn identity(&self) -> &InstanceIdentity {
         &self.instance.identity
     }
@@ -673,6 +691,31 @@ impl Lease {
             cancel,
             received: Some(received),
             done,
+        }
+    }
+}
+
+impl Instance {
+    fn settle_resources(&self, state: &Option<Generation>) {
+        // Call under the same fence as acquisition/restart so a later generation cannot be missed.
+        if self.leases.load(Ordering::Acquire) == 0
+            && self.operations.load(Ordering::Acquire) == 0
+            && state.as_ref().is_none_or(|generation| {
+                *generation.done.borrow()
+                    && !matches!(
+                        &*generation.status.borrow(),
+                        Status::Failed(RuntimeError::Cleanup)
+                    )
+            })
+        {
+            for waiter in self
+                .resource_waiters
+                .lock()
+                .expect("MCP resource lock poisoned")
+                .drain(..)
+            {
+                waiter.send_replace(true);
+            }
         }
     }
 }

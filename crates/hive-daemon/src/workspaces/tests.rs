@@ -1619,6 +1619,7 @@ async fn cancelled_persisted_startups_remain_visible_and_keep_their_dispatched_w
         broker: broker.clone(),
         record: Some(Arc::new(std::sync::Mutex::new(record))),
         armed: true,
+        evidence: Arc::default(),
     };
     let (started, running) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {

@@ -1,14 +1,54 @@
 # Hive ACP extensions: remote discovery and control
 
-**Contract version 1 — specified, not implemented.** This is the normative
-deliverable for [#77][issue]. The new capability negotiation, discovery request,
-qualified references and resolver below are not currently usable APIs.
-Implementation belongs to [#79][discovery] and [#80][routing]; remote Streamable
-HTTP validation belongs to [#78][transport]. Existing selection and control
-metadata remain implemented as recorded in the [compatibility matrix][matrix].
+**Contract version 1 — discovery and selection implemented.** This normative
+contract originates in [#77][issue]. Persistent owner Hives implement negotiation,
+agent discovery and selection/startup through [#79][discovery], over the remote
+Streamable HTTP transport validated in [#78][transport]. Qualified references,
+the resolver and cross-Hive routing remain specified for [#80][routing].
+See the [compatibility matrix][matrix] for existing selection/control metadata.
 
 MUST, MUST NOT, SHOULD and MAY express requirements on implementations claiming
-this contract. They do not assert current implementation support.
+this contract. Location requirements remain future work as qualified below.
+
+## Current implementation
+
+Persistent brokers advertise `agents`, `selection` and `control` after a compatible
+offer. They reuse their stored execution-node ID across restart. In-memory embedded
+brokers omit the Hive advertisement. A missing/null offer retains legacy metadata
+behavior; an incompatible offer disables extension operations/selectors while
+ordinary ACP initialization remains available.
+
+Discovery lists the receiving Hive's configured profiles without probing them.
+Capabilities are conservatively `{}`. All clients admitted by the configured
+transport share one administrative principal and the same inventory/launch access;
+there is no per-user resource policy. Explicit private-network trust or shared-token
+authentication is the deployment's access boundary.
+
+Pagination retains one immutable configuration snapshot per connection for five
+minutes. A new listing replaces it; each continuation rotates its opaque token.
+Completed, expired, superseded and foreign cursors fail rather than restart.
+Configuration reload does not mix pages, but discovery never reserves an agent.
+
+Negotiated launches reject malformed Hive metadata, unknown operational fields,
+and nonempty additional-directory/MCP declarations before execution. Unmanaged cwd
+must be an existing absolute owner-side directory. Configured workspace selection
+keeps its existing placeholder-cwd and effective-directory behavior; it does not
+add remote project orchestration. Owner-configured processes use existing adapters
+and remain owner-supervised after disconnect.
+
+Confirmed pre-create startup failures return `launch_failed`. Once downstream
+creation might have been published, response loss or a generic downstream failure
+returns `launch_uncertain`, retaining unavailable catalog evidence and workspace
+holds. A successfully registered session survives loss of its upstream response.
+Neither transport nor peer helper retries session creation.
+
+The reusable Rust peer API is `hive_protocol::remote::Peer`: initialize it on an
+existing `Credentials::peer` connection, call `list(ListParams)`, then
+`start(agent_id, NewSessionRequest)`. It validates version/features, preserves
+standard session responses, and sanitizes remote errors. Ordinary session control
+uses the original ACP connection and returned attachment metadata. Reconnect
+requires initialization and explicit resume of the retained owner-local session;
+qualified session resolution remains #80. Built-in UI migration remains #81.
 
 ## Baseline and minimal extension surface
 
@@ -350,8 +390,8 @@ prompt, transfer control or silently create a replacement.
 
 ## Errors, unknown extensions and evolution
 
-These errors are requirements for the new contract, not a claim about legacy
-handlers' current error payloads. Standard ACP errors retain their standard
+These errors apply to the negotiated contract; legacy handlers retain their
+existing payloads. Location errors remain specified for #80. Standard ACP errors retain their standard
 meaning. An unrecognized method returns `-32601`; unrecognized notifications
 are ignored without a response. Version 1 defines no new notifications.
 
@@ -423,13 +463,14 @@ not authentication and browser-origin checks are not login.
 
 Production Hive defaults to loopback and permits explicitly opted-in remote
 binding with optional shared-token authentication through [#78][transport].
-This does not implement negotiated discovery or session routing. See
+Discovery and selection additionally require extension negotiation; session routing
+remains #80. See
 [transports](transports.md), [deployment](operations.md#private-network-access)
 and [ADR-006](adr/006-local-operational-http-and-acp-boundary.md).
 
 ## Implementation conformance checklist
 
-Future deterministic tests for #79/#80 must cover the complete example flow:
+The combined #79/#80 conformance flow is:
 initialize, discover, select/new, list the qualified reference, disconnect,
 resolve through a gateway, resume and perform ordinary control. They must also
 cover unsupported/absent versions and features, unknown requests/notifications,
@@ -441,7 +482,16 @@ Tests must prove discovery/resolve have no execution or control side effects and
 that gateway aliases cannot change owner identity. #78 must validate the nested
 resolver payload's connection scope over the pinned HTTP adapter. Remote workspace
 provisioning and UI integration remain #88 and #81. These are implementation
-obligations, not completed conformance evidence.
+obligations for the relevant implementation.
+
+Implemented #79 evidence lives in `crates/hive-daemon/tests/support/remote_discovery.rs`,
+the `remote::tests` modules, and
+`negotiated_remote_discovery_starts_bee_and_preserves_standard_control_after_disconnect`
+in `crates/hive-daemon/tests/bee.rs`. It covers negotiation, safe inventory/pagination,
+reload, strict launch admission, v1/v2 selection, launch failure/uncertainty,
+owner-side cwd, standard control and explicit reattachment without duplicate creation.
+The resolver, qualified references, gateway aliases and cross-Hive routing checks
+remain obligations for #80.
 
 [issue]: https://github.com/noirbizarre/hive/issues/77
 [discovery]: https://github.com/noirbizarre/hive/issues/79

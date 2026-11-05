@@ -49,6 +49,7 @@ mod pricing;
 pub mod projects;
 mod prompt_journal;
 pub mod reload;
+mod remote;
 mod session_config;
 mod transcript;
 mod usage;
@@ -84,6 +85,7 @@ struct PendingStartup {
     broker: Broker,
     record: Option<Arc<Mutex<Record>>>,
     armed: bool,
+    evidence: Arc<Mutex<remote::Startup>>,
 }
 
 impl Drop for PendingStartup {
@@ -92,6 +94,10 @@ impl Drop for PendingStartup {
             && let Some(record) = &self.record
             && let Ok(mut record) = record.lock()
         {
+            if let Ok(evidence) = self.evidence.lock() {
+                record.downstream_id = evidence.native_id.clone().unwrap_or_default();
+                record.uncertain = evidence.phase != remote::Phase::BeforeCreate;
+            }
             record.outcome = Outcome::Unavailable;
             record.reason = Some("agent startup did not complete; inspect the original downstream session and workspace before retrying".into());
             self.broker.update_offline(record.clone());
@@ -181,6 +187,8 @@ struct Entry {
 type NativeInterruption = watch::Sender<Option<tokio::time::Instant>>;
 
 struct Control {
+    // Cleanup protection is not proof of dispatch; classify startup from worker publication evidence.
+    startup: Arc<Mutex<remote::Startup>>,
     worktrunk_terminal: Option<(u64, worktrunk::Status)>,
     // Only the initial recovered idle can reuse durable terminal evidence from the previous daemon.
     worktrunk_restore: bool,
@@ -347,6 +355,7 @@ impl Control {
             workspace_context: record.workspace_context.clone(),
             parents: HashMap::new(),
             startup_parent: None,
+            startup: Arc::default(),
             prompt_parents: HashMap::new(),
             client_capabilities: HashMap::new(),
             interaction_epoch: 0,
@@ -416,6 +425,7 @@ impl Control {
             workspace_context: None,
             parents: HashMap::new(),
             startup_parent: None,
+            startup: Arc::default(),
             prompt_parents: HashMap::new(),
             client_capabilities: HashMap::new(),
             interaction_epoch: 0,
@@ -1878,12 +1888,12 @@ impl Broker {
     async fn create(
         &self,
         mut request: v2::NewSessionRequest,
+        negotiated: bool,
         client_id: String,
         gateway: V2ConnectionTo<Client>,
         parent: interactions::Parent,
     ) -> agent_client_protocol::Result<v2::NewSessionResponse> {
         let requested = request.meta.as_mut().and_then(|meta| meta.get_mut("hive"));
-        worktrunk::Publisher::start(self);
         let mut adopt: Option<String> = None;
         let mut workspace_launch: Option<hive_protocol::workspace::Launch> = None;
         let chosen = match requested {
@@ -1891,7 +1901,11 @@ impl Broker {
                 if let Some(value) = hive.remove("workspace") {
                     workspace_launch = Some(serde_json::from_value(value).map_err(|_| {
                         // Parser errors can echo private selector values; expose only the public contract.
-                        Error::invalid_params().data(workspaces::Error::Selector.json())
+                        if negotiated {
+                            hive_protocol::remote::RemoteError::InvalidWorkspace.wire()
+                        } else {
+                            Error::invalid_params().data(workspaces::Error::Selector.json())
+                        }
                     })?);
                 }
                 if let Some(value) = hive.remove("adopt") {
@@ -1938,13 +1952,16 @@ impl Broker {
                 return Err(Error::invalid_request().data("Hive is shutting down"));
             }
             let chosen = chosen.or_else(|| registry.current.default_agent.clone());
-            let chosen = chosen.ok_or_else(|| Error::invalid_params().data("no default agent configured; set default_agent in Hive config or pass _meta.hive.agent in session/new"))?;
+            let chosen = chosen.ok_or_else(|| if negotiated { hive_protocol::remote::RemoteError::UnknownAgent.wire() } else { Error::invalid_params().data("no default agent configured; set default_agent in Hive config or pass _meta.hive.agent in session/new") })?;
             let provider = registry
                 .current
                 .agents
                 .get(&chosen)
                 .cloned()
                 .ok_or_else(|| {
+                    if negotiated {
+                        return hive_protocol::remote::RemoteError::UnknownAgent.wire();
+                    }
                     Error::invalid_params().data(format!(
                         "unknown agent profile '{chosen}'; query GET /v1/providers"
                     ))
@@ -1973,21 +1990,36 @@ impl Broker {
             )
         };
         let kind = provider.kind;
+        if negotiated
+            && (adopt.is_some() || (workspace_launch.is_none() && provider.workspace.is_none()))
+            && !request.cwd.0.is_dir()
+        {
+            return Err(hive_protocol::remote::RemoteError::InvalidWorkspace.wire());
+        }
         if adopt.is_some() && workspace_launch.is_some() {
+            if negotiated {
+                return Err(hive_protocol::remote::RemoteError::InvalidParams.wire());
+            }
             return Err(Error::invalid_params()
                 .data("native adoption cannot provision or select a different workspace"));
         }
         if adopt.is_some() && kind != ProfileKind::OpencodeServer {
+            if negotiated {
+                return Err(hive_protocol::remote::RemoteError::Unsupported.wire());
+            }
             return Err(Error::invalid_params().data(format!(
                 "agent '{chosen}' cannot adopt native sessions; _meta.hive.adopt needs a profile with kind = 'opencode-server'"
             )));
         }
         // Held until this function returns: the session is registered (and findable) or failed.
         let _adoption = match &adopt {
-            Some(native_id) => Some(
-                self.begin_adopt(&chosen, native_id)
-                    .map_err(|error| error.to_acp())?,
-            ),
+            Some(native_id) => Some(self.begin_adopt(&chosen, native_id).map_err(|error| {
+                if negotiated {
+                    hive_protocol::remote::RemoteError::InvalidWorkspace.wire()
+                } else {
+                    error.to_acp()
+                }
+            })?),
             None => None,
         };
         let worktrunk_config = launch_config.worktrunk.unwrap_or_default();
@@ -2001,7 +2033,13 @@ impl Broker {
                 hive_id.to_string(),
             )
             .await
-            .map_err(|error| Error::invalid_request().data(error.json()))?
+            .map_err(|error| {
+                if negotiated {
+                    hive_protocol::remote::RemoteError::InvalidWorkspace.wire()
+                } else {
+                    Error::invalid_request().data(error.json())
+                }
+            })?
         } else {
             // Adoption uses an existing downstream scope; it still needs cleanup protection
             // when that directory belongs to a managed checkout on this node.
@@ -2009,7 +2047,13 @@ impl Broker {
                 workspaces::Service::new(store.clone())
                     .track_directory(request.cwd.0.clone(), hive_id.to_string())
                     .await
-                    .map_err(|error| Error::invalid_request().data(error.json()))?
+                    .map_err(|error| {
+                        if negotiated {
+                            hive_protocol::remote::RemoteError::InvalidWorkspace.wire()
+                        } else {
+                            Error::invalid_request().data(error.json())
+                        }
+                    })?
             } else {
                 None
             }
@@ -2026,8 +2070,15 @@ impl Broker {
                     worktrunk_config,
                 )
                 .await
-                .map_err(|error| Error::invalid_request().data(error.json()))?;
+                .map_err(|error| {
+                    if negotiated {
+                        hive_protocol::remote::RemoteError::InvalidWorkspace.wire()
+                    } else {
+                        Error::invalid_request().data(error.json())
+                    }
+                })?;
         }
+        worktrunk::Publisher::start(self);
         let (tx, rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = oneshot::channel();
         let (active_tx, active_rx) = oneshot::channel();
@@ -2049,6 +2100,11 @@ impl Broker {
             state.worktrunk_local = worktrunk::local_profile(&provider);
         }
         let cwd = request.cwd.clone();
+        let startup_evidence = control
+            .lock()
+            .map_err(|_| Error::internal_error())?
+            .startup
+            .clone();
         let entry_control = control.clone();
         let worker_control = control.clone();
         let id = hive_id.clone();
@@ -2093,6 +2149,7 @@ impl Broker {
             broker: self.clone(),
             record: stored_record.clone(),
             armed: false,
+            evidence: startup_evidence.clone(),
         };
         if let (Some(store), Some(record)) = (&self.store, &stored_record) {
             // An uncertain downstream startup must retain both its workspace hold and session identity.
@@ -2220,7 +2277,37 @@ impl Broker {
             let id = hive_id.clone();
             watch_attachment(cx, control, id, subscriber);
         }
-        match interactions::startup(&entry_control, ready_rx).await {
+        let startup_result = interactions::startup(&entry_control, ready_rx).await;
+        if negotiated && !matches!(&startup_result, Ok(Ok(Ok(_)))) {
+            task.abort();
+            // Join before cleanup so a racing worker cannot publish creation after classification.
+            let _ = task.await;
+            let phase = startup_evidence
+                .lock()
+                .map_err(|_| Error::internal_error())?
+                .phase;
+            if phase == remote::Phase::BeforeCreate {
+                if let Some(store) = &self.store {
+                    if workspaces::Service::new(store.clone())
+                        .release(hive_id.to_string())
+                        .await
+                        .is_err()
+                    {
+                        return Err(hive_protocol::remote::RemoteError::LaunchUncertain.wire());
+                    }
+                    self.offline
+                        .lock()
+                        .map_err(|_| Error::internal_error())?
+                        .remove(&hive_id.to_string());
+                    pending_startup.armed = false;
+                    reservation.retained = false;
+                    self.catalog.send_modify(|revision| *revision += 1);
+                }
+                return Err(hive_protocol::remote::RemoteError::LaunchFailed.wire());
+            }
+            return Err(hive_protocol::remote::RemoteError::LaunchUncertain.wire());
+        }
+        match startup_result {
             Ok(Ok(Ok((mut response, downstream_id)))) => {
                 if let (Some(store), Some(record)) = (&self.store, &stored_record) {
                     let mut record = record.lock().map_err(|_| Error::internal_error())?;
@@ -2267,6 +2354,10 @@ impl Broker {
                 let _ = active_tx.send(());
                 startup_guard.0 = None;
                 pending_startup.armed = false;
+                startup_evidence
+                    .lock()
+                    .map_err(|_| Error::internal_error())?
+                    .phase = remote::Phase::Registered;
                 response.session_id = hive_id;
                 response.meta = Some(
                     entry_control
@@ -3058,8 +3149,9 @@ async fn run_agent(
                 let parent = control.lock().map_err(|_| Error::internal_error())?.startup_parent.take();
                 let prepared = if let Some(parent) = &parent { prepared.forward_cancellation_from(parent.cancellation.clone()) } else { prepared };
                 let _mapping = interactions::ParentMapping::new(&control, prepared.id().clone(), parent);
+                remote::publishing(&control)?;
                 match prepared.block_task().await {
-                    Ok(response) => { let id = response.session_id.clone(); (response, id) }
+                    Ok(response) => { let id = response.session_id.clone(); remote::created(&control, id.to_string())?; (response, id) }
                     Err(error) => {
                         tracing::warn!(code = ?error.code, "agent session/new failed");
                         let _ = ready.send(Err("agent session/new failed; check its capabilities and configuration".into()));
@@ -3539,8 +3631,11 @@ async fn run_v1_agent(
                 };
                 (id, options)
             } else {
-                match cx.send_request(v1::NewSessionRequest::new(request.cwd.0)).block_task().await {
+                let prepared = cx.prepare_request(v1::NewSessionRequest::new(request.cwd.0));
+                remote::publishing(&control)?;
+                match prepared.block_task().await {
                     Ok(response) => {
+                        remote::created(&control, response.session_id.to_string())?;
                         let mut state = control.lock().map_err(|_| Error::internal_error())?;
                         let options = state.legacy_config.discover(session_config::Discovery::v1(response.config_options, response.modes)?)?;
                         (response.session_id, options)
@@ -3956,24 +4051,51 @@ fn watch_attachment(
 
 fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client> {
     let client_id = uuid::Uuid::new_v4().to_string();
+    let remote = Arc::new(Mutex::new(remote::Connection::default()));
     Agent
         .v2()
         .name("hive")
         .on_receive_request(
             {
+                let broker = broker.clone();
+                let remote = remote.clone();
                 let capabilities = broker.client_capabilities.clone();
                 let client_id = client_id.clone();
-                async move |request: v2::InitializeRequest,
-                            responder: Responder<v2::InitializeResponse>,
+                async move |raw: hive_protocol::remote::Initialize,
+                            responder: Responder<serde_json::Value>,
                             cx: V2ConnectionTo<Client>| {
+                    let offer = hive_protocol::remote::offered_versions(&raw.0)?;
+                    let request: v2::InitializeRequest = serde_json::from_value(raw.0).map_err(|_| hive_protocol::remote::RemoteError::InvalidParams.wire())?;
+                    let broker = broker.clone();
+                    let remote = remote.clone();
+                    let capabilities = capabilities.clone();
+                    let client_id = client_id.clone();
+                    let connection = cx.clone();
+                    cx.spawn(async move {
+                    let mut response = serde_json::to_value(v2::InitializeResponse::new(request.protocol_version,
+                        v2::Implementation::new("hive", env!("CARGO_PKG_VERSION")))
+                        .capabilities(v2::AgentCapabilities::new().session(v2::SessionCapabilities::new())))
+                        .map_err(Error::into_internal_error)?;
+                    let mut mode = if offer.is_some() { remote::Mode::Unsupported } else { remote::Mode::Legacy };
+                    if offer.as_ref().is_some_and(|versions| versions.contains(&1)) && let Some(store) = &broker.store {
+                        let node = match workspaces::Service::new(store.clone()).node().await {
+                            Ok(node) => node,
+                            // A spawned initialization task must answer explicitly rather than drop its responder.
+                            Err(_) => return responder.respond_with_error(Error::internal_error().data("Cannot load the persistent Hive node identity; check owner storage")),
+                        };
+                        response["capabilities"]["_meta"] = serde_json::json!({"hive": hive_protocol::remote::advertisement(node.as_str())});
+                        mode = remote::Mode::Negotiated;
+                    }
                     {
                         let mut capabilities = capabilities.lock().map_err(|_| Error::internal_error())?;
                         if capabilities.contains_key(&client_id) { return responder.respond_with_error(Error::invalid_request().data("connection is already initialized; reconnect to change capabilities")); }
                         capabilities.insert(client_id.clone(), request.capabilities.clone());
+                        let mut state = remote.lock().map_err(|_| Error::internal_error())?;
+                        state.initialized = true;
+                        state.mode = mode;
                     }
                     let capabilities = capabilities.clone();
                     let client_id = client_id.clone();
-                    let connection = cx.clone();
                     // A connection-scoped task is dropped before termination is published.
                     tokio::spawn(async move {
                         upstream_ended(&connection).await;
@@ -3981,26 +4103,29 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
                             capabilities.remove(&client_id);
                         }
                     });
-                    responder.respond(
-                        v2::InitializeResponse::new(
-                            request.protocol_version,
-                            v2::Implementation::new("hive", env!("CARGO_PKG_VERSION")),
-                        )
-                        .capabilities(
-                            v2::AgentCapabilities::new().session(v2::SessionCapabilities::new()),
-                        ),
-                    )
+                    responder.respond(response)
+                    })
                 }
             },
             agent_client_protocol::on_receive_request!(),
         )
+        .on_receive_request({
+            let broker = broker.clone();
+            let remote = remote.clone();
+            async move |request: hive_protocol::remote::ListAgents, responder: Responder<hive_protocol::remote::AgentsPage>, _: V2ConnectionTo<Client>| {
+                let result = remote.lock().map_err(|_| Error::internal_error())?.list(&broker, request.0);
+                responder.respond_with_result(result)
+            }
+        }, agent_client_protocol::on_receive_request!())
         .on_receive_request(
             {
                 let broker = broker.clone();
                 let client_id = client_id.clone();
-                async move |request: v2::NewSessionRequest,
+                let remote = remote.clone();
+                async move |raw: hive_protocol::remote::NewSession,
                             responder: Responder<v2::NewSessionResponse>,
                             cx: V2ConnectionTo<Client>| {
+                    let (request, negotiated) = remote::launch(raw.0, &*remote.lock().map_err(|_| Error::internal_error())?)?;
                     let broker = broker.clone();
                     let client_id = client_id.clone();
                     let connection = cx.clone();
@@ -4015,7 +4140,8 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
                         interactions::Parent::new(&responder, connection.clone(), capabilities);
                     cx.spawn(async move {
                         let _end = end;
-                        let result = broker.create(request, client_id, connection, parent).await;
+                        let result = broker.create(request, negotiated, client_id, connection, parent).await;
+                        let result = if negotiated { result.map_err(|error| hive_protocol::remote::RemoteError::sanitized(error, hive_protocol::remote::RemoteError::LaunchUncertain)) } else { result };
                         let _ = responder.respond_with_result(result);
                         Ok(())
                     })
@@ -4596,6 +4722,7 @@ mod control_tests {
             parents: HashMap::new(),
             startup_parent: None,
             prompt_parents: HashMap::new(),
+            startup: Arc::default(),
             client_capabilities: HashMap::new(),
             interaction_epoch: 0,
             pending_interactions: 0,

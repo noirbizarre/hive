@@ -4,6 +4,7 @@ pub use agent_client_protocol::schema::v2;
 pub mod history;
 pub mod interactions;
 pub mod recovery;
+pub mod transport;
 pub mod workspace;
 pub use agent_client_protocol_http::{AcpHttpServer, HttpClient};
 
@@ -77,14 +78,13 @@ impl AgentFailure {
     }
 }
 
-/// All native clients use the same loopback status route; ACP methods stay on /acp.
+/// Native clients share status authentication; ACP methods stay on /acp.
 pub async fn daemon_status(
     base_url: &str,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
     let url = format!("{}/v1/status", base_url.trim_end_matches('/'));
-    Ok(reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .build()?
+    Ok(transport::Credentials::native()?
+        .http(std::time::Duration::from_secs(3))?
         .get(url)
         .send()
         .await?

@@ -16,6 +16,8 @@ use tokio::{
 mod interactions;
 #[path = "support/recovery.rs"]
 mod recovery;
+#[path = "support/remote_http.rs"]
+mod remote_http;
 #[path = "support/workspaces.rs"]
 mod workspaces;
 
@@ -2183,7 +2185,7 @@ async fn exercise_gateway(transport: &str, version: AgentVersion) {
 }
 
 #[tokio::test]
-async fn a_remote_listener_is_rejected_without_authentication() {
+async fn a_remote_listener_is_rejected_without_explicit_opt_in() {
     let error = hive_daemon::serve("0.0.0.0:0".parse().unwrap(), Config::default())
         .await
         .unwrap_err();

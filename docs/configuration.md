@@ -112,7 +112,8 @@ reusing it for another server.
 Reload uses the daemon's environment, including `HIVE_DEFAULT_AGENT`; exporting
 variables in the calling shell does not update a running process. The original
 file path is retained even if the reload caller sets another `HIVE_CONFIG`.
-Listen address, state/runtime locations, and tracing settings require restart.
+Listen address, authentication, allowed browser origins, state/runtime locations,
+and tracing settings require restart.
 
 ## Top-level settings
 
@@ -519,8 +520,9 @@ or files with unsafe permissions can prevent startup. See
 ## Listener and client settings
 
 Listener addresses and client connection options are CLI/environment settings,
-not TOML fields. The daemon defaults to `127.0.0.1:8765` and rejects non-loopback
-listeners. For a different port:
+not TOML fields. The daemon defaults to `127.0.0.1:8765`; non-loopback listeners
+require explicit `--allow-remote`. Authentication is optional and independent of
+this opt-in. For a different local port:
 
 ```sh
 hive daemon --listen 127.0.0.1:9000
@@ -532,3 +534,11 @@ hive web --url http://127.0.0.1:9000
 The daemon/doctor use `HIVE_LISTEN`. Web and status support `HIVE_URL`
 and fall back to `HIVE_LISTEN`. The TUI uses its own `--address` and does not
 read either variable. See the [CLI reference](reference/cli.md) for precedence.
+
+`--auth-token-env NAME` / `HIVE_AUTH_TOKEN_ENV` names the variable holding the
+optional shared token. The same selector is used by native clients, including
+project/workspace commands and TUI catalog/ACP connections. Set it in each
+process's environment. `--allowed-origin` / `HIVE_ALLOWED_ORIGINS` configures exact
+browser origins; `--allow-remote` / `HIVE_ALLOW_REMOTE` controls non-loopback binding.
+These are startup-only settings, not root or fragment TOML fields. See
+[private-network deployment](operations.md#private-network-access).

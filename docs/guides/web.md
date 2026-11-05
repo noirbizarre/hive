@@ -18,6 +18,26 @@ see [development](../development.md#client-checks). The binary needs no Node run
 For another loopback port, use `hive web --url http://127.0.0.1:9000`.
 This command opens a page; it does not start the daemon or check its health.
 
+## Optional token login
+
+When the daemon has `--auth-token-env` configured, the public UI shell displays an
+access-token form before opening ACP or catalog connections. Enter the shared
+daemon token. Successful login sets an opaque HttpOnly, host-only, SameSite=Strict
+cookie; HTTPS login origins receive Secure cookies. The token is not put in URLs
+or local storage. Existing same-origin fetch, EventSource and WebSocket connections
+use the cookie automatically. Authentication-disabled deployments open directly.
+
+Browser sessions last 12 hours, are held in memory, and are bounded to 256 live
+logins per daemon. Restart clears them. **Sign out** invalidates that browser
+session for subsequent requests. Expiry/logout does not forcibly revoke already
+established streams; the browser rechecks on disconnect and periodically, then
+returns to login without reconnecting until authenticated. Signing out detaches
+the browser; it does not close the agent session.
+
+For private-network hostnames, configure the exact browser origin on the daemon;
+see [deployment](../operations.md#private-network-access). Native client bearer
+credentials and the browser cookie are separate from session controller tokens.
+
 ## Open a project session
 
 Create the session in the [TUI](tui.md) from your intended project directory,

@@ -25,8 +25,9 @@ Clients speak ACPv2 over WebSocket or HTTP/SSE. Configured agents use explicit
 ACPv1/v2 adapters or the native OpenCode server adapter. One pilot controls a
 session while observers follow its updates.
 
-The ACPv2 specification and SDK APIs are **draft**. Hive currently serves one
-trusted local user on loopback, without remote multi-user authentication.
+The ACPv2 specification and SDK APIs are **draft**. Hive defaults to a trusted
+local user on loopback. [Private-network access](docs/operations.md#private-network-access)
+supports explicit remote binding and optional shared-token authentication.
 
 ## Installation
 

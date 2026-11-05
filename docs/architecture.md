@@ -275,13 +275,16 @@ See [ADR-003](adr/003-durable-session-catalog-and-conservative-recovery.md) and
 
 ## Trust boundary
 
-Production startup binds only loopback and locks a private per-user runtime
-file. A second daemon cannot use another port in the same runtime namespace.
-These restrictions are enforced at startup, not merely by constructing a router.
+Production startup defaults to loopback and requires explicit remote-bind opt-in.
+It locks a private per-user runtime file; a second daemon cannot use another port
+in the same runtime namespace. Binding policy is enforced at startup.
 
-The boundary is one trusted local OS user. There is no per-client login.
-Untrusted local processes able to reach the listener can access administration
-and sessions. Pilot credentials fence stale clients, not hostile local users.
-Downstream network endpoints have their own configuration/credential rules.
+Optional bearer authentication protects the shared ACP and operational listener.
+Browser login exchanges that token for an ephemeral HttpOnly cookie. Without
+authentication, all reachable clients are trusted with sessions and administration.
+The token represents one administrative principal, not per-user authorization.
+Pilot credentials independently fence stale controllers. Downstream network
+endpoints have their own configuration/credential rules. See
+[deployment choices](operations.md#private-network-access).
 
 See [ADR-006](adr/006-local-operational-http-and-acp-boundary.md).

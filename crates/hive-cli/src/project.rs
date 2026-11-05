@@ -144,10 +144,7 @@ pub async fn run(options: Options) -> miette::Result<()> {
         }
     };
     let url = format!("{}{path}", super::daemon_url(options.url));
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|_| miette::miette!("cannot initialize project HTTP client"))?;
+    let client = super::native_http(Duration::from_secs(10))?;
     let mut request = client.request(method, url);
     if let Some(body) = body {
         request = request.json(&body);

@@ -1,4 +1,4 @@
-//! Loopback ACPv2 gateway with a durable session catalog and live control broker.
+//! ACPv2 gateway with a durable session catalog and live control broker.
 
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
@@ -39,6 +39,7 @@ mod activity;
 pub mod compat;
 pub mod config;
 pub mod doctor;
+pub mod http;
 mod interactions;
 pub mod mcp;
 mod opencode;
@@ -127,7 +128,10 @@ fn transport(profile: &Profile) -> Result<Downstream, String> {
     }
     // Never include endpoint URLs or authentication headers in errors: they may contain credentials.
     HttpClient::builder(endpoint)
-        .configure_http(|http| http.default_headers(headers))
+        .configure_http(|http| {
+            http.default_headers(headers)
+                .redirect(reqwest::redirect::Policy::none())
+        })
         .build()
         .map(Downstream::Network)
         .map_err(|_| "invalid agent endpoint".into())
@@ -3731,26 +3735,38 @@ pub fn router(broker: Broker) -> Router {
 
 /// Only the specified browser origin and its listener-local aliases may initiate an upgrade.
 pub fn router_with_origin(broker: Broker, origin: Option<&str>) -> Router {
+    gateway_router(broker, origin, None)
+}
+
+/// Protect the entire operational surface while leaving the login shell accessible.
+pub fn router_with_policy(broker: Broker, policy: http::Policy) -> Router {
+    let origins = policy.origins().to_owned();
+    gateway_router(broker, Some(&origins), Some(policy))
+}
+
+fn gateway_router(broker: Broker, origin: Option<&str>, policy: Option<http::Policy>) -> Router {
     let reload_origin = origin.map(str::to_owned);
     let state = broker.clone();
     let agent = move || gateway_agent(state.clone());
     let mut server = AcpHttpServer::new(agent);
     if let Some(origin) = origin {
         // The SDK otherwise rejects browser WS upgrades that carry an Origin header.
-        let mut origins = vec![origin.to_owned()];
+        let mut origins: Vec<String> = origin.split(',').map(str::to_owned).collect();
         // Only aliases of this listener's loopback address and exact port are trusted browser origins.
-        if let Some(address) = origin
-            .strip_prefix("http://")
-            .and_then(|address| address.parse::<SocketAddr>().ok())
-            && address.ip().is_loopback()
-        {
-            origins.push(format!("http://localhost:{}", address.port()));
+        for origin in origin.split(',') {
+            if let Some(address) = origin
+                .strip_prefix("http://")
+                .and_then(|address| address.parse::<SocketAddr>().ok())
+                && address.ip().is_loopback()
+            {
+                origins.push(format!("http://localhost:{}", address.port()));
+            }
         }
-        let cors = CorsOptions::allow_origins(origins)
-            .expect("a loopback socket origin is a valid header");
+        let cors =
+            CorsOptions::allow_origins(origins).expect("a validated HTTP origin is a valid header");
         server = server.with_options(ServerOptions::default().with_cors(cors));
     }
-    server
+    let protected = server
         .into_router()
         .merge(projects::router(broker.clone(), origin.map(str::to_owned)))
         .merge(workspaces::router(broker.clone(), origin.map(str::to_owned)))
@@ -3851,7 +3867,14 @@ pub fn router_with_origin(broker: Broker, origin: Option<&str>) -> Router {
                     }
                 }
             }),
-        )
+        );
+    let protected = if let Some(policy) = policy {
+        http::protect(protected, policy.clone()).merge(http::authentication(policy))
+    } else {
+        // Embedded unauthenticated routers also serve the browser's authentication bootstrap.
+        protected.merge(http::authentication(http::Policy::unauthenticated(origin)))
+    };
+    protected
         .route(
             "/ui",
             get(|| async {
@@ -4221,9 +4244,9 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
         )
 }
 
-/// Reject remote binds: this initial gateway has no authentication or TLS.
+/// Default startup remains loopback-only; remote exposure requires explicit serving options.
 pub async fn serve(addr: SocketAddr, registry: Config) -> std::io::Result<()> {
-    serve_inner(addr, registry, None).await
+    serve_inner(addr, registry, None, http::ServeOptions::default()).await
 }
 
 /// Source-backed startup keeps reload metadata out of the public configuration schema.
@@ -4232,24 +4255,33 @@ pub async fn serve_configured(
     source: config::ConfigSource,
 ) -> std::io::Result<()> {
     let registry = source.load().map_err(std::io::Error::other)?;
-    serve_inner(addr, registry, Some(source)).await
+    serve_inner(addr, registry, Some(source), http::ServeOptions::default()).await
+}
+
+pub async fn serve_configured_with_options(
+    addr: SocketAddr,
+    source: config::ConfigSource,
+    options: http::ServeOptions,
+) -> std::io::Result<()> {
+    let registry = source.load().map_err(std::io::Error::other)?;
+    serve_inner(addr, registry, Some(source), options).await
 }
 
 async fn serve_inner(
     addr: SocketAddr,
     registry: Config,
     source: Option<config::ConfigSource>,
+    options: http::ServeOptions,
 ) -> std::io::Result<()> {
-    if !addr.ip().is_loopback() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "remote binding requires authentication; use a loopback address",
-        ));
-    }
+    options
+        .policy(addr)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?;
     let _instance = instance_lock()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(address = %listener.local_addr()?, "Hive listening");
-    let origin = format!("http://{}", listener.local_addr()?);
+    let policy = options
+        .policy(listener.local_addr()?)
+        .map_err(std::io::Error::other)?;
     let broker = Broker::persistent(
         registry,
         persistence::default_path().map_err(std::io::Error::other)?,
@@ -4292,7 +4324,7 @@ async fn serve_inner(
     let _recovery_guard = AbortOnDrop(Some(recovery.abort_handle()));
     let (shutdown_done, shut_down) = oneshot::channel();
     let shutdown_broker = broker.clone();
-    let server = axum::serve(listener, router_with_origin(broker.clone(), Some(&origin)))
+    let server = axum::serve(listener, router_with_policy(broker.clone(), policy))
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
             recovery.abort();

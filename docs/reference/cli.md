@@ -8,7 +8,7 @@ Use `hive <command> --help` for the installed executable's exact help.
 | Command | Purpose | Options |
 | --- | --- | --- |
 | `hive` / `hive tui` | Terminal client | `--address`, `--transport`, `--agent`, `--session` |
-| `hive daemon` | Foreground daemon | `--listen`, `--config` |
+| `hive daemon` | Foreground daemon | `--listen`, `--config`, `--allow-remote`, `--auth-token-env`, `--allowed-origin` |
 | `hive daemon status` | Print daemon status response | `--url` |
 | `hive daemon reload` | Reload the original config for new sessions | `--url` |
 | `hive project <command>` | Manage project definitions and node-local overrides | `--url` |
@@ -28,7 +28,7 @@ prompt submission, native adoption, or session deletion subcommands.
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--address` | `127.0.0.1:8765` | Daemon host and port, without URL scheme |
-| `--transport` | `ws` | `ws` or `http` (HTTP/SSE) |
+| `--transport` | `ws` | `ws`, `http` (HTTP/SSE), `wss`, or `https` |
 | `--agent` | Unset | Preselect a profile in the creation picker |
 | `--session` | Unset | Attach to a known Hive session ID |
 | `--cwd` | Unset | Explicit existing directory, bypassing a profile workspace policy |
@@ -112,8 +112,13 @@ workspaces require explicit `remove`; restart never resumes a saved sweep.
 ## Daemon and doctor
 
 `--listen` is a socket address, defaulting to `127.0.0.1:8765`. Non-loopback
-daemon listeners are refused. `--config` selects a TOML file rather than merging
-with the default. See [configuration](../configuration.md).
+listeners require `--allow-remote`, independently of optional authentication.
+`--auth-token-env NAME` names the environment variable holding the shared token;
+configured missing/empty values fail closed. Repeat `--allowed-origin ORIGIN` for
+exact browser origins. Doctor accepts the same three policy options; `serve`
+accepts the daemon startup options. They require daemon restart to change.
+`--config` selects a TOML file rather than merging with the default. See
+[private-network access](../operations.md#private-network-access).
 
 Doctor checks every profile unless IDs are supplied. `--json` prints one report
 object. Errors exit 1; warnings alone exit 0. It probes initialization without
@@ -148,6 +153,9 @@ status on failure. Unix SIGHUP invokes the same operation. See
 | Variable | Used by | Purpose |
 | --- | --- | --- |
 | `HIVE_CONFIG` | Daemon, doctor, serve | Configuration file |
+| `HIVE_ALLOW_REMOTE` | Daemon, doctor, serve | Explicit non-loopback bind opt-in |
+| `HIVE_AUTH_TOKEN_ENV` | Daemon, doctor and all native clients | Name of the environment variable holding the optional bearer token |
+| `HIVE_ALLOWED_ORIGINS` | Daemon, doctor, serve | Comma-separated allowed browser origins |
 | `HIVE_DEFAULT_AGENT` | Configuration loading | Override default profile ID |
 | `HIVE_LISTEN` | Daemon, doctor, serve | Listen address; URL fallback for status/web/reload/project |
 | `HIVE_URL` | Status, web, reload, project | Daemon base URL |

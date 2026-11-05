@@ -1,13 +1,18 @@
 # Hive operational HTTP API
 
-This surface is loopback-only under production daemon startup and has no
-separate login. It serves discovery and administration for one trusted local
-user. Session conversation/control methods live exclusively on `/acp`.
+This surface serves discovery and administration for a shared administrative
+principal. Production startup defaults to loopback; explicit remote opt-in and
+optional bearer/browser-cookie authentication apply to this API and `/acp`
+together. See [private-network access](operations.md#private-network-access).
+Session conversation/control methods live exclusively on `/acp`.
 
 ## Routes
 
 | Route | Result |
 | --- | --- |
+| `GET /v1/auth` | Public, non-cacheable authentication-required and authenticated booleans |
+| `POST /v1/auth/login` | Public JSON `{ "token": "..." }` exchange for an HttpOnly browser session cookie |
+| `POST /v1/auth/logout` | Invalidate the current browser cookie session for future requests |
 | `GET /v1/health` | `{ "status": "ok" }` when HTTP responds |
 | `GET /v1/ready` | `{ "ready": true }` when listener is active, without probing agents |
 | `GET /v1/status` | Name, build version, live/persisted session counts, default agent, active sessions by agent |

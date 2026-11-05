@@ -4,6 +4,19 @@ Hive loads a root TOML file and any fragments it explicitly includes when the
 daemon starts. Profiles describe how to reach agents. They do not start agents
 until a session needs them.
 
+## MCP server declarations
+
+Hive currently accepts MCP connection declarations through native ACPv2 session
+setup, forwarding and persisting them for the agent. HTTP forwarding passes an
+existing endpoint to the agent; it does not start a server. ACPv1 and OpenCode
+adapters reject nonempty declarations, and bundled clients do not compose them.
+
+The [MCP contract](adr/012-mcp-transport-scope-and-instance-identity.md) defines
+transport, ownership, lifecycle and `machine` / `project` / `workspace` sharing
+scopes as a standalone library schema. It is not an active daemon configuration
+registry: adding MCP tables to the root or fragment TOML still fails unknown-field
+validation. Existing agent profiles and inline ACP declarations need no migration.
+
 ## File location and precedence
 
 The file is selected in this order:

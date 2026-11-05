@@ -31,6 +31,7 @@ by editing the old one. The history is the value.
 - [ADR-009](009-agent-owned-history-and-session-registry.md) — Agent-owned history and the Hive session registry
 - [ADR-010](010-prompt-delivery-evidence-and-recovery.md) — Prompt delivery evidence and recovery acknowledgement
 - [ADR-011](011-project-and-workspace-domain.md) — Project identities, workspace policies, lifecycle and backend contracts
+- [ADR-012](012-mcp-transport-scope-and-instance-identity.md) — MCP transports, resource scopes and safe instance compatibility
 
 ## Subsequent decisions and current interpretation
 

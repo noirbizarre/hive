@@ -218,7 +218,9 @@ pub(super) fn launch(
             if let Some(workspace) = hive.get("workspace") {
                 // Deserialize the complete operational selector before any owner-side effects.
                 serde_json::from_value::<hive_protocol::workspace::Launch>(workspace.clone())
-                    .map_err(|_| RemoteError::InvalidParams.wire())?;
+                    .map_err(|_| RemoteError::InvalidParams.wire())?
+                    .validate()
+                    .map_err(RemoteError::wire)?;
             }
         }
     }

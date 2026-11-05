@@ -1921,7 +1921,10 @@ async fn run_with_clipboard(
             directory: std::path::absolute(directory)?.display().to_string(),
         })
     } else if let Some(id) = &options.workspace_id {
-        Some(hive_protocol::workspace::Launch::Attach { id: id.clone() })
+        Some(hive_protocol::workspace::Launch::Attach {
+            id: id.clone(),
+            owner: None,
+        })
     } else if options.project.is_some()
         || options.workspace.is_some()
         || options.branch.is_some()
@@ -1929,6 +1932,7 @@ async fn run_with_clipboard(
         || options.revision.is_some()
     {
         Some(hive_protocol::workspace::Launch::New {
+            definition: None,
             revision: options.revision.clone(),
             project: options.project.clone(),
             policy: options.workspace.clone(),

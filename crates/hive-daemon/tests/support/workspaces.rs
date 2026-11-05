@@ -126,6 +126,9 @@ impl Fixture {
             .env("HIVE_WORKSPACE_HOST", self.directory.path())
             .env("GIT_CONFIG_GLOBAL", self.path("gitconfig"))
             .env("GIT_CONFIG_NOSYSTEM", "1")
+            // Owner lifecycle tools must not inherit personal hook or approval configuration.
+            .env("HOME", self.directory.path())
+            .env("XDG_CONFIG_HOME", self.path("config"))
             // JJ's per-repository trust/config files must also stay inside this fixture.
             .env("JJ_CONFIG", self.path("jj.toml"))
             // The host is killed deliberately; do not leave partial raw profiles in coverage runs.
@@ -180,6 +183,8 @@ async fn workspace_gateway_host_serves_only_when_requested_by_a_parent_process()
         hive_daemon::Broker::persistent(source.load().unwrap(), base.join("state/catalog.sqlite3"))
             .unwrap()
             .with_config_source(source);
+    // Match daemon startup: settle retained sessions before announcing owner readiness.
+    broker.reconcile().await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     // Readiness is a pipe barrier rather than a timing-dependent startup delay.
     println!("HIVE_WORKSPACE_READY {}", listener.local_addr().unwrap());
@@ -214,6 +219,177 @@ async fn inventory(address: SocketAddr) -> Value {
 }
 
 #[tokio::test]
+async fn remote_project_transfer_provisions_only_on_the_selected_owner_and_distinguishes_failures()
+{
+    use hive_protocol::{remote::Peer, transport::Credentials};
+    for (version, worktrunk) in [
+        (AgentVersion::V1, false),
+        (AgentVersion::V2, false),
+        (AgentVersion::V2, true),
+    ] {
+        if worktrunk
+            && Command::new("wt")
+                .args(["config", "state", "marker", "--help"])
+                .output()
+                .is_err()
+        {
+            eprintln!("skipping remote WorkTrunk case: wt unavailable");
+            continue;
+        }
+        let fixture = Fixture::new(version, false);
+        if worktrunk {
+            std::fs::write(
+                fixture.path("policies.toml"),
+                "[workspaces.task]\npolicy = 'worktree'\n[worktrunk]\nenabled = true\n",
+            )
+            .unwrap();
+        }
+        let config = fixture.source.load().unwrap();
+        let mut definition = config.projects.values().next().unwrap().clone();
+        // Successful startup proves stored preparation metadata did not become executable input.
+        definition.preparation = vec![vec!["hive-nonexistent-preparation-command".into()]];
+        // The selected owner starts with neither project metadata nor a checkout.
+        std::fs::write(fixture.path("projects.toml"), "").unwrap();
+        let agents = std::fs::read_to_string(fixture.path("agents.toml")).unwrap();
+        std::fs::write(
+            fixture.path("agents.toml"),
+            agents
+                .replace("project = 'demo'\n", "")
+                .replace("workspace = 'task'\n", ""),
+        )
+        .unwrap();
+        let initiating = tempfile::tempdir().unwrap();
+        let hub = hive_daemon::Broker::persistent(
+            Config::default(),
+            initiating.path().join("state/catalog.sqlite3"),
+        )
+        .unwrap();
+        hub.register_project(hive_daemon::projects::Registration {
+            id: Some(hive_core::identity::ProjectId::try_from("transferred".to_owned()).unwrap()),
+            definition,
+        })
+        .await
+        .unwrap();
+        let before = hub.projects().unwrap();
+        let definition = before[0].definition.clone();
+        let retained = std::sync::Mutex::new(None);
+        let (address, mut host) = fixture.start().await;
+        timeout(Duration::from_secs(30), Client.v2().connect_with(
+            Credentials::default().peer(&format!("http://{address}/acp")).unwrap(), async |cx| {
+                let peer = Peer::initialize(cx.clone(), v2::InitializeRequest::new(ProtocolVersion::V2, v2::Implementation::new("provisioning-peer", "1"))).await?;
+                let invalid = v2::NewSessionRequest::new(initiating.path().join("absent-placeholder"))
+                    .meta(selector(json!({"kind":"new","project":"invalid","definition":definition,"policy":"task","revision":"main"})));
+                assert_eq!(peer.start("coder", invalid).await.unwrap_err().data.unwrap()["code"], "hive::remote::invalid_workspace");
+                let projects: Value = reqwest::get(format!("http://{address}/v1/projects")).await.unwrap().json().await.unwrap();
+                assert!(projects["projects"].as_array().unwrap().is_empty());
+                assert!(!fixture.path("started").exists());
+                let launch = |definition: Value| v2::NewSessionRequest::new(initiating.path().join("absent-placeholder"))
+                    .meta(selector(json!({"kind":"new", "project":"transferred", "definition":definition, "policy":"task"})));
+                let opened = peer.start("coder", launch(serde_json::to_value(&definition).unwrap())).await;
+                assert!(opened.is_ok(), "remote startup failed: {opened:?}; owner resources: {}", inventory(address).await);
+                let opened = opened?;
+                let meta = &opened.meta.as_ref().unwrap()["hive"];
+                let context = &meta["workspace"];
+                assert_eq!(context["owner"], peer.node);
+                assert_eq!(meta["session"], json!({"owner":peer.node,"id":opened.session_id}));
+                let cwd = PathBuf::from(context["effectiveCwd"].as_str().unwrap());
+                assert!(cwd.starts_with(fixture.path("state")));
+                assert!(cwd.join("committed.txt").is_file());
+                assert!(!initiating.path().join("absent-placeholder").exists());
+                fixture.assert_downstream_cwd(&cwd);
+                if worktrunk {
+                    let resources = inventory(address).await;
+                    assert_eq!(resources["workspaces"][0]["selection"]["provisioner"], "worktrunk");
+                    cx.send_request(v2::PromptRequest::new(opened.session_id.clone(), vec!["hello".into()]).meta(controlled(&opened.meta, "remote-marker"))).block_task().await?;
+                    timeout(Duration::from_secs(10), async {
+                        loop {
+                            let output = Command::new("git").arg("-C").arg(&cwd).args(["config", "--get-regexp", "worktrunk.state.*.marker"]).output().unwrap();
+                            if String::from_utf8_lossy(&output.stdout).contains("Hive") { break; }
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                    }).await.unwrap();
+                }
+                let resumed = cx.send_request(v2::ResumeSessionRequest::new(opened.session_id.clone(), cwd)).block_task().await?;
+                assert_eq!(resumed.meta.as_ref().unwrap()["hive"]["session"], meta["session"]);
+                cx.send_request(v2::CloseSessionRequest::new(opened.session_id).meta(resumed.meta)).block_task().await?;
+
+                // The owner can subsequently resolve the transferred project by identity alone.
+                let request = v2::NewSessionRequest::new(initiating.path().join("absent-placeholder"))
+                    .meta(selector(json!({"kind":"new","project":"transferred","policy":"task"})));
+                let known = peer.start("coder", request).await?;
+                assert_eq!(known.meta.as_ref().unwrap()["hive"]["workspace"]["project"], "transferred");
+                *retained.lock().unwrap() = Some((known.session_id, known.meta.unwrap()["hive"].clone()));
+
+                let mut conflict = serde_json::to_value(&definition).unwrap();
+                conflict["name"] = json!("Conflicting project");
+                let error = peer.start("coder", launch(conflict)).await.unwrap_err();
+                assert_eq!(error.data.unwrap()["code"], "hive::remote::project_conflict");
+
+                let foreign = hive_core::identity::NodeId::new();
+                let request = v2::NewSessionRequest::new(initiating.path().join("absent-placeholder"))
+                    .meta(selector(json!({"kind":"attach","owner":foreign,"id":context["workspace"]})));
+                assert_eq!(peer.start("coder", request).await.unwrap_err().data.unwrap()["code"], "hive::remote::invalid_workspace");
+
+                // An unreachable source is mapped only inside the owner subprocess; no network is used.
+                let mut missing = serde_json::to_value(&definition).unwrap();
+                missing["repository_source"] = json!("https://example.test/project/missing");
+                let request = v2::NewSessionRequest::new(initiating.path().join("absent-placeholder"))
+                    .meta(selector(json!({"kind":"new","project":"unavailable","definition":missing,"policy":"task"})));
+                let error = peer.start("coder", request).await.unwrap_err();
+                assert_eq!(error.data.unwrap()["code"], "hive::remote::provisioning_failed");
+                assert_eq!(inventory(address).await["workspaces"].as_array().unwrap().len(), 3);
+                Ok(())
+            },
+        )).await.unwrap().unwrap();
+        assert_eq!(hub.projects().unwrap().len(), before.len());
+        assert!(!initiating.path().join("repositories").exists());
+        assert!(!initiating.path().join("state/worktrunk-config").exists());
+        hub.shutdown().await;
+        host.kill().await.unwrap();
+        host.wait().await.unwrap();
+        let (id, metadata) = retained.into_inner().unwrap().unwrap();
+        let (address, mut restarted) = fixture.start().await;
+        timeout(
+            Duration::from_secs(30),
+            Client.v2().connect_with(
+                Credentials::default()
+                    .peer(&format!("http://{address}/acp"))
+                    .unwrap(),
+                async |cx| {
+                    let peer = Peer::initialize(
+                        cx.clone(),
+                        v2::InitializeRequest::new(
+                            ProtocolVersion::V2,
+                            v2::Implementation::new("restarted-peer", "1"),
+                        ),
+                    )
+                    .await?;
+                    assert_eq!(metadata["session"]["owner"], peer.node);
+                    let cwd =
+                        PathBuf::from(metadata["workspace"]["effectiveCwd"].as_str().unwrap());
+                    let resumed = cx
+                        .send_request(v2::ResumeSessionRequest::new(id.clone(), cwd))
+                        .block_task()
+                        .await?;
+                    let actual = &resumed.meta.as_ref().unwrap()["hive"];
+                    assert_eq!(actual["session"], metadata["session"]);
+                    assert_eq!(actual["workspace"], metadata["workspace"]);
+                    cx.send_request(v2::CloseSessionRequest::new(id.clone()).meta(resumed.meta))
+                        .block_task()
+                        .await?;
+                    Ok(())
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        restarted.kill().await.unwrap();
+        restarted.wait().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn workspace_worktrees_reach_both_acp_adapters_from_composed_config_in_either_order() {
     for version in [AgentVersion::V1, AgentVersion::V2] {
         for reverse in [false, true] {
@@ -235,7 +411,7 @@ async fn workspace_worktrees_reach_both_acp_adapters_from_composed_config_in_eit
                         }
                         let opened = cx.send_request(request).block_task().await?;
                         let context = &opened.meta.as_ref().unwrap()["hive"]["workspace"];
-                        assert_eq!(context.as_object().unwrap().len(), 3);
+                        assert_eq!(context.as_object().unwrap().len(), 4);
                         assert_eq!(context["project"], "demo");
                         let cwd = PathBuf::from(context["effectiveCwd"].as_str().unwrap());
                         assert_ne!(cwd, fixture.seed);
@@ -298,7 +474,7 @@ async fn workspace_jj_projects_reach_both_acp_adapters_with_native_revision_and_
                 let request = v2::NewSessionRequest::new(fixture.path("placeholder")).meta(selector(json!({"kind":"new","project":"demo","policy":"task","revision":"latest(main@origin)"})));
                 let opened = cx.send_request(request).block_task().await?;
                 let context = &opened.meta.as_ref().unwrap()["hive"]["workspace"];
-                assert_eq!(context.as_object().unwrap().len(), 3);
+                assert_eq!(context.as_object().unwrap().len(), 4);
                 let cwd = PathBuf::from(context["effectiveCwd"].as_str().unwrap());
                 assert!(cwd.join(".jj").is_dir());
                 assert!(!cwd.join(".git").exists());

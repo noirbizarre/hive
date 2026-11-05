@@ -48,6 +48,71 @@ fn diagnostic(error: Error, code: &str) {
 }
 
 #[tokio::test]
+async fn a_peer_without_workspace_capability_never_receives_a_workspace_launch() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let requests = Arc::new(AtomicUsize::new(0));
+    let observed = requests.clone();
+    let node = hive_core::identity::NodeId::new().to_string();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, agent_client_protocol_http::AcpHttpServer::new(move || {
+            let requests = requests.clone();
+            let node = node.clone();
+            Agent.v2()
+                .on_receive_request(async move |_: Initialize, responder: Responder<Value>, _: V2ConnectionTo<Client>| {
+                    // A selection-capable older owner must remain usable for plain ACP launches.
+                    responder.respond(json!({"protocolVersion":2,"info":{"name":"old-owner","version":"1"},"capabilities":{"session":{},"_meta":{"hive":{"version":1,"node":node,"features":{"agents":{},"selection":{},"control":{}}}}}}))
+                }, agent_client_protocol::on_receive_request!())
+                .on_receive_request(async move |_: v2::NewSessionRequest, responder: Responder<v2::NewSessionResponse>, _: V2ConnectionTo<Client>| {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    responder.respond(v2::NewSessionResponse::new(v2::SessionId::new("plain")))
+                }, agent_client_protocol::on_receive_request!())
+        }).into_router()).await.unwrap();
+    });
+    Client
+        .v2()
+        .connect_with(
+            Credentials::default()
+                .peer(&format!("http://{address}/acp"))
+                .unwrap(),
+            async |cx| {
+                let peer = Peer::initialize(
+                    cx,
+                    v2::InitializeRequest::new(
+                        ProtocolVersion::V2,
+                        v2::Implementation::new("peer", "1"),
+                    ),
+                )
+                .await?;
+                let mut request = v2::NewSessionRequest::new(std::env::current_dir().unwrap());
+                request.meta = Some(v2::Meta::from_iter([(
+                    "hive".into(),
+                    json!({"workspace":{"kind":"new","project":"demo","policy":"task"}}),
+                )]));
+                diagnostic(
+                    peer.start("coder", request).await.unwrap_err(),
+                    "unsupported",
+                );
+                assert_eq!(observed.load(Ordering::SeqCst), 0);
+                peer.start(
+                    "coder",
+                    v2::NewSessionRequest::new(std::env::current_dir().unwrap()),
+                )
+                .await?;
+                assert_eq!(observed.load(Ordering::SeqCst), 1);
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+    server.abort();
+}
+
+#[tokio::test]
 async fn discovery_is_safe_paginated_and_keeps_one_snapshot_through_reload() {
     let temporary = tempfile::tempdir().unwrap();
     let mut config = config_with_agent(

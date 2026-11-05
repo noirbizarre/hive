@@ -289,6 +289,35 @@ impl Broker {
         .await
     }
 
+    /// Transfer preserves identity: equal definitions are reusable, never implicit updates.
+    pub(crate) async fn ensure_project(
+        &self,
+        id: ProjectId,
+        definition: ProjectDefinition,
+    ) -> Result<ProjectDefinition, RegistryError> {
+        definition.validate()?;
+        self.project_write(move |_, registry, store| {
+            if let Some(existing) = registry
+                .current
+                .projects
+                .get(&id)
+                .or_else(|| registry.managed_projects.get(&id))
+            {
+                return if existing == &definition {
+                    Ok(existing.clone())
+                } else {
+                    Err(RegistryError::Conflict)
+                };
+            }
+            store
+                .write_project(&id, Some(&definition))
+                .map_err(|_| RegistryError::Storage)?;
+            registry.managed_projects.insert(id, definition.clone());
+            Ok(definition)
+        })
+        .await
+    }
+
     pub async fn replace_project(
         &self,
         id: ProjectId,
@@ -549,6 +578,48 @@ mod tests {
             json!({"name":name,"repository_source":"git@example.test:team/repo"}),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn transferred_definitions_preserve_configured_ownership_and_register_one_durable_identity()
+     {
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("state/catalog.sqlite3");
+        let mut config = Config::default();
+        let configured = ProjectId::from_name("configured");
+        let managed = ProjectId::from_name("transferred");
+        config
+            .projects
+            .insert(configured.clone(), definition("Configured"));
+        let broker = Broker::persistent(config.clone(), path.clone()).unwrap();
+        broker
+            .ensure_project(configured.clone(), definition("Configured"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            broker
+                .ensure_project(configured, definition("Different"))
+                .await,
+            Err(RegistryError::Conflict)
+        ));
+        let (first, second) = tokio::join!(
+            broker.ensure_project(managed.clone(), definition("Transferred")),
+            broker.ensure_project(managed.clone(), definition("Transferred")),
+        );
+        assert_eq!(first.unwrap(), second.unwrap());
+        assert!(matches!(
+            broker
+                .ensure_project(managed, definition("Different"))
+                .await,
+            Err(RegistryError::Conflict)
+        ));
+        drop(broker);
+        let broker = Broker::persistent(config, path).unwrap();
+        let projects = broker.projects().unwrap();
+        assert_eq!(projects.len(), 2);
+        assert_eq!(projects[0].origin, "config");
+        assert_eq!(projects[1].origin, "managed");
+        assert_eq!(projects[1].definition, definition("Transferred"));
     }
 
     #[tokio::test]

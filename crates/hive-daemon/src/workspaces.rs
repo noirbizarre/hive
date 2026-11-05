@@ -84,6 +84,7 @@ impl crate::Broker {
         let launch = launch.or_else(|| {
             profile.workspace.as_ref().map(|_| Launch::New {
                 project: None,
+                definition: None,
                 policy: None,
                 base_ref: None,
                 revision: None,
@@ -113,7 +114,11 @@ impl crate::Broker {
         }
         let service = self.workspace_service()?;
         let entry = match launch {
-            Launch::Attach { id } => {
+            Launch::Attach { id, owner } => {
+                // Reject foreign identities before touching any same-looking local resource.
+                if owner.is_some() && owner != Some(service.node().await?) {
+                    return Err(Error::Request);
+                }
                 service
                     .attach(
                         WorkspaceId::try_from(id).map_err(|_| Error::Request)?,
@@ -123,11 +128,15 @@ impl crate::Broker {
             }
             Launch::New {
                 project,
+                definition,
                 policy,
                 base_ref,
                 revision,
                 branch,
             } => {
+                if definition.is_some() && project.is_none() {
+                    return Err(Error::Request);
+                }
                 let project = project
                     .map(ProjectId::try_from)
                     .transpose()
@@ -142,12 +151,20 @@ impl crate::Broker {
                     .get(&policy)
                     .cloned()
                     .ok_or(Error::Request)?;
+                let transferred = definition;
                 let definition = config
                     .projects
                     .get(&project)
                     .or_else(|| managed.get(&project))
                     .cloned()
+                    .or_else(|| transferred.clone())
                     .ok_or(Error::Unknown)?;
+                if transferred
+                    .as_ref()
+                    .is_some_and(|supplied| supplied != &definition)
+                {
+                    return Err(Error::ProjectConflict);
+                }
                 let create = CreateRequest {
                     operation: OperationId::new(),
                     project,
@@ -158,6 +175,18 @@ impl crate::Broker {
                         .transpose()
                         .map_err(|_| Error::Request)?,
                     branch: branch.map(GitRef::try_from).transpose()?,
+                };
+                // Invalid portable intent must not leave a newly registered project behind.
+                create.validate_definition(&definition)?;
+                let definition = if let Some(transferred) = transferred {
+                    self.ensure_project(create.project.clone(), transferred)
+                        .await
+                        .map_err(|error| match error {
+                            crate::projects::RegistryError::Conflict => Error::ProjectConflict,
+                            _ => Error::Storage,
+                        })?
+                } else {
+                    definition
                 };
                 service
                     .create(
@@ -179,6 +208,7 @@ impl crate::Broker {
             .to_owned();
         request.cwd = hive_protocol::v2::AbsolutePath::new(PathBuf::from(&cwd));
         Ok(Some(hive_protocol::workspace::Context {
+            owner: Some(entry.workspace.intent().node.clone()),
             project: entry.workspace.intent().project.to_string(),
             workspace: entry.workspace.id().to_string(),
             effective_cwd: cwd,
@@ -188,6 +218,10 @@ impl crate::Broker {
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error(
+        "project definition conflicts with the execution node; select another ID or explicitly update the owner definition"
+    )]
+    ProjectConflict,
     #[error(
         "JJ is unavailable or lacks required capabilities; install Jujutsu 0.46 or newer on the execution node"
     )]
@@ -249,8 +283,21 @@ pub enum Error {
 }
 
 impl Error {
+    /// Federation preserves the failure stage without exporting backend output or paths.
+    pub(crate) fn remote(&self) -> hive_protocol::remote::RemoteError {
+        use hive_protocol::remote::RemoteError;
+        match self {
+            Self::ProjectConflict => RemoteError::ProjectConflict,
+            Self::Selector | Self::Request | Self::Unknown | Self::JjRevision => {
+                RemoteError::InvalidWorkspace
+            }
+            Self::Uncertain => RemoteError::ProvisioningUncertain,
+            _ => RemoteError::ProvisioningFailed,
+        }
+    }
     pub fn code(&self) -> &'static str {
         match self {
+            Self::ProjectConflict => "hive::workspace::project_conflict",
             Self::JjUnavailable => "hive::jj::unavailable",
             Self::Jj(_) => "hive::jj::execution",
             Self::JjRevision => "hive::jj::revision",
@@ -273,6 +320,9 @@ impl Error {
 
     pub fn json(&self) -> serde_json::Value {
         let help = match self {
+            Self::ProjectConflict => {
+                "select another project ID or explicitly update the definition on the owning node"
+            }
             Self::JjUnavailable => {
                 "install JJ 0.46 or newer on the owning node and ensure its executable is on the daemon's PATH"
             }
@@ -326,6 +376,31 @@ pub struct CreateRequest {
     pub policy: WorkspaceTemplate,
     pub base_ref: Option<GitRef>,
     pub branch: Option<GitRef>,
+}
+
+impl CreateRequest {
+    fn uses_jj(&self) -> bool {
+        matches!(&self.policy, WorkspaceTemplate::Jj { .. })
+            || matches!(&self.policy, WorkspaceTemplate::Ephemeral { backing, .. } if backing == "jj")
+    }
+
+    /// Shared inert checks precede remote registration as well as local resource admission.
+    fn validate_definition(&self, definition: &ProjectDefinition) -> Result<(), Error> {
+        self.policy.validate().map_err(|_| Error::Request)?;
+        definition.validate().map_err(|_| Error::Request)?;
+        if !self.policy.supports_scm(definition.scm)
+            || (self.uses_jj() && (self.base_ref.is_some() || self.branch.is_some()))
+            || (!self.uses_jj() && self.revision.is_some())
+            || matches!(&self.policy, WorkspaceTemplate::Ephemeral { backing, base_ref: Some(_), .. } if backing == "jj")
+            || (matches!(&self.policy, WorkspaceTemplate::Existing { .. })
+                && (self.branch.is_some() || self.base_ref.is_some()))
+            || (!matches!(&self.policy, WorkspaceTemplate::Existing { .. })
+                && definition.repository_source.is_none())
+        {
+            return Err(Error::Request);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -643,6 +718,7 @@ impl Service {
             if let Some(entry) = selected {
                 rt.reserve_use(session, entry.workspace.id().clone())?;
                 let context = hive_protocol::workspace::Context {
+                    owner: Some(entry.workspace.intent().node.clone()),
                     project: entry.workspace.intent().project.to_string(),
                     workspace: entry.workspace.id().to_string(),
                     // Keep legacy ACP path spelling consistent with the downstream scope;
@@ -1167,20 +1243,10 @@ impl Runtime<'_> {
             }
         }
         // Reject inert invalid input before reserving an operation with no resource to reconcile.
-        let jj = matches!(&request.policy, WorkspaceTemplate::Jj { .. })
-            || matches!(&request.policy, WorkspaceTemplate::Ephemeral { backing, .. } if backing == "jj");
-        if !request.policy.supports_scm(definition.scm)
-            || (jj && (request.base_ref.is_some() || request.branch.is_some()))
-            || (!jj && request.revision.is_some())
-            || matches!(&request.policy, WorkspaceTemplate::Ephemeral { backing, base_ref: Some(_), .. } if backing == "jj")
-        {
-            return Err(Error::Request);
-        }
+        let jj = request.uses_jj();
+        request.validate_definition(&definition)?;
         let existing_directory = if let WorkspaceTemplate::Existing { directory } = &request.policy
         {
-            if request.branch.is_some() || request.base_ref.is_some() {
-                return Err(Error::Request);
-            }
             let directory = directory
                 .clone()
                 .or(self
@@ -1193,10 +1259,6 @@ impl Runtime<'_> {
             }
             Some(self.path(&directory.canonicalize().map_err(|_| Error::Request)?)?)
         } else {
-            definition.validate().map_err(|_| Error::Request)?;
-            if definition.repository_source.is_none() {
-                return Err(Error::Request);
-            }
             None
         };
         let id = WorkspaceId::new();

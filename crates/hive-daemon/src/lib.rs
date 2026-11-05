@@ -195,6 +195,8 @@ struct Control {
     // Connection locality is pinned with the worker, not reselected from reloaded profile definitions.
     worktrunk_local: bool,
     workspace_context: Option<hive_protocol::workspace::Context>,
+    // Owner-local identity is stable even when the downstream adapter replaces its session ID.
+    workspace_session: Option<String>,
     // Only live hop mappings can identify a request-scoped question's original requester.
     parents: HashMap<v1::RequestId, interactions::Parent>,
     startup_parent: Option<interactions::Parent>,
@@ -353,6 +355,7 @@ impl Control {
             worktrunk_restore: true,
             worktrunk_local: false,
             workspace_context: record.workspace_context.clone(),
+            workspace_session: Some(record.id.clone()),
             parents: HashMap::new(),
             startup_parent: None,
             startup: Arc::default(),
@@ -423,6 +426,7 @@ impl Control {
             worktrunk_restore: false,
             worktrunk_local: false,
             workspace_context: None,
+            workspace_session: None,
             parents: HashMap::new(),
             startup_parent: None,
             startup: Arc::default(),
@@ -496,6 +500,13 @@ impl Control {
             "recoveryRequired": self.recovery_required,
             "role": if self.pilot.as_deref() == Some(client_id) { "pilot" } else { "observer" },
         });
+        // Workspace ownership identifies the scope without promising cross-Hive route resolution.
+        if let Some(context) = &self.workspace_context
+            && let Some(owner) = &context.owner
+            && let Some(id) = &self.workspace_session
+        {
+            hive["session"] = serde_json::json!({"owner": owner, "id": id});
+        }
         // Observers must never receive the credential that authorizes mutations.
         if self.pilot.as_deref() == Some(client_id) {
             hive["token"] = serde_json::json!(self.token);
@@ -2038,7 +2049,7 @@ impl Broker {
             .await
             .map_err(|error| {
                 if negotiated {
-                    hive_protocol::remote::RemoteError::InvalidWorkspace.wire()
+                    error.remote().wire()
                 } else {
                     Error::invalid_request().data(error.json())
                 }
@@ -2075,7 +2086,7 @@ impl Broker {
                 .await
                 .map_err(|error| {
                     if negotiated {
-                        hive_protocol::remote::RemoteError::InvalidWorkspace.wire()
+                        error.remote().wire()
                     } else {
                         Error::invalid_request().data(error.json())
                     }
@@ -2100,6 +2111,7 @@ impl Broker {
                 .insert(client_id.clone(), parent.capabilities.clone());
             state.startup_parent = Some(parent);
             state.workspace_context = workspace_context.clone();
+            state.workspace_session = Some(hive_id.to_string());
             state.worktrunk_local = worktrunk::local_profile(&provider);
         }
         let cwd = request.cwd.clone();
@@ -4717,6 +4729,7 @@ mod control_tests {
         let (changed, _) = watch::channel(1);
         let (catalog, _) = watch::channel(0);
         Control {
+            workspace_session: None,
             worktrunk_terminal: None,
             worktrunk_restore: false,
             worktrunk_local: false,

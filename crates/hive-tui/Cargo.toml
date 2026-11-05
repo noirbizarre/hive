@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 base64 = { workspace = true }
+image = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
 agent-client-protocol = { workspace = true }

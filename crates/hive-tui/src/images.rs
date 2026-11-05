@@ -3,7 +3,12 @@
 //! Callers allocate transcript rows before calling [`ImageFrame::render`]. A frame
 //! records desired placements; only the terminal owner writes graphics commands.
 
-use std::{collections::BTreeMap, io, io::Write, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    io,
+    io::Write,
+    sync::{Arc, OnceLock},
+};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use crossterm::{cursor, queue};
@@ -18,6 +23,183 @@ const MAX_PIXELS: u64 = 40_000_000;
 const MAX_DIMENSION: u32 = 16_384;
 const CHUNK_BYTES: usize = 4096;
 
+/// Encoded message data stays independent of terminal capabilities and survives reflow.
+#[derive(Debug)]
+pub struct EncodedImage {
+    // Keep payload and metadata immutable once preparation has established an upload identity.
+    data: String,
+    mime_type: String,
+    uri: Option<String>,
+    dimensions: OnceLock<Result<(u32, u32), PrepareError>>,
+    prepared: OnceLock<Result<ImageSource, PrepareError>>,
+}
+
+impl PartialEq for EncodedImage {
+    fn eq(&self, other: &Self) -> bool {
+        // Cache population is a rendering detail, not a change to conversation content.
+        self.data == other.data && self.mime_type == other.mime_type && self.uri == other.uri
+    }
+}
+
+impl Eq for EncodedImage {}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PrepareError {
+    #[error("unsupported image format {0}; provide PNG, JPEG, or WebP")]
+    Unsupported(String),
+    #[error("invalid base64 image data; provide base64-encoded image bytes")]
+    Base64,
+    #[error(transparent)]
+    Source(#[from] ImageError),
+    #[error("could not decode or convert image: {0}; provide a valid, smaller PNG, JPEG, or WebP")]
+    Decode(#[from] image::ImageError),
+}
+
+impl EncodedImage {
+    pub fn new(data: String, mime_type: String, uri: Option<String>) -> Self {
+        Self {
+            data,
+            mime_type,
+            uri,
+            dimensions: OnceLock::new(),
+            prepared: OnceLock::new(),
+        }
+    }
+
+    pub fn source(&self) -> Result<&ImageSource, &PrepareError> {
+        self.dimensions()?;
+        // Retain failures too: malformed agent data must not be decoded on every caret tick.
+        self.prepared.get_or_init(|| self.prepare()).as_ref()
+    }
+
+    pub fn dimensions(&self) -> Result<(u32, u32), &PrepareError> {
+        self.dimensions
+            .get_or_init(|| self.inspect())
+            .as_ref()
+            .copied()
+    }
+
+    pub(crate) fn failed(&self) -> bool {
+        self.prepared.get().is_some_and(Result::is_err)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_prepared(&self) -> bool {
+        self.prepared.get().is_some()
+    }
+
+    pub fn caption(&self, ordinal: usize) -> String {
+        // Fallback labels and off-screen layout need headers, never a full pixel conversion.
+        let details = match self.prepared.get() {
+            Some(Err(error)) => error.to_string(),
+            _ => match self.dimensions() {
+                Ok((width, height)) => format!("{width}×{height}"),
+                Err(error) => error.to_string(),
+            },
+        };
+        let uri = self.uri.as_deref().unwrap_or_default();
+        // Agent-provided metadata must remain one logical caption, even with control characters.
+        format!("[image {ordinal}: {}] {details} {uri}", self.mime_type)
+            .chars()
+            .filter(|ch| !ch.is_control() || ch.is_whitespace())
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn format(&self) -> Result<image::ImageFormat, PrepareError> {
+        match self.mime_type.as_str() {
+            "image/png" => Ok(image::ImageFormat::Png),
+            "image/jpeg" => Ok(image::ImageFormat::Jpeg),
+            "image/webp" => Ok(image::ImageFormat::WebP),
+            other => Err(PrepareError::Unsupported(other.to_owned())),
+        }
+    }
+
+    fn bytes(&self) -> Result<Vec<u8>, PrepareError> {
+        // Bound allocation before decoding base64, not only after creating a byte vector.
+        if self.data.len() > MAX_BYTES.div_ceil(3) * 4 {
+            return Err(ImageError::TooLarge.into());
+        }
+        let bytes = STANDARD
+            .decode(&self.data)
+            .map_err(|_| PrepareError::Base64)?;
+        if bytes.len() > MAX_BYTES {
+            return Err(ImageError::TooLarge.into());
+        }
+        Ok(bytes)
+    }
+
+    fn reader(
+        bytes: Vec<u8>,
+        format: image::ImageFormat,
+    ) -> image::ImageReader<io::Cursor<Vec<u8>>> {
+        let mut reader = image::ImageReader::with_format(io::Cursor::new(bytes), format);
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(MAX_DIMENSION);
+        limits.max_image_height = Some(MAX_DIMENSION);
+        limits.max_alloc = Some(MAX_PIXELS * 4);
+        reader.limits(limits);
+        reader
+    }
+
+    fn inspect(&self) -> Result<(u32, u32), PrepareError> {
+        let format = self.format()?;
+        let bytes = self.bytes()?;
+        let (width, height) = if format == image::ImageFormat::Png {
+            ImageSource::png(bytes)?.dimensions()
+        } else {
+            let decoder = Self::reader(bytes, format).into_decoder()?;
+            image::ImageDecoder::dimensions(&decoder)
+        };
+        // The pixel-count limit is stricter than the per-dimension decoder limit.
+        if u64::from(width) * u64::from(height) > MAX_PIXELS {
+            return Err(ImageError::Dimensions { width, height }.into());
+        }
+        Ok((width, height))
+    }
+
+    fn prepare(&self) -> Result<ImageSource, PrepareError> {
+        let format = self.format()?;
+        let bytes = self.bytes()?;
+        if format == image::ImageFormat::Png {
+            return Ok(ImageSource::png(bytes)?);
+        }
+        let decoder = Self::reader(bytes, format).into_decoder()?;
+        let (width, height) = image::ImageDecoder::dimensions(&decoder);
+        let decoded = image::DynamicImage::from_decoder(decoder)?.into_rgba8();
+        let mut output = BoundedPng(Vec::new());
+        image::ImageEncoder::write_image(
+            image::codecs::png::PngEncoder::new(&mut output),
+            &decoded,
+            width,
+            height,
+            image::ExtendedColorType::Rgba8,
+        )?;
+        Ok(ImageSource::png(output.0)?)
+    }
+}
+
+// PNG output can exceed compressed input; stop the encoder before an oversized allocation.
+struct BoundedPng(Vec<u8>);
+
+impl Write for BoundedPng {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > MAX_BYTES.saturating_sub(self.0.len()) {
+            return Err(io::Error::other(
+                "converted PNG exceeds the 16 MiB transfer limit",
+            ));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// A rejected source can still be represented by its caller's textual metadata.
 #[derive(Debug, thiserror::Error)]
 pub enum ImageError {
@@ -25,10 +207,10 @@ pub enum ImageError {
         "image is not a PNG with a complete IHDR header; provide PNG data or display its metadata"
     )]
     InvalidPng,
-    #[error("image exceeds the {MAX_BYTES}-byte transfer limit; provide a smaller PNG")]
+    #[error("image exceeds the {MAX_BYTES}-byte transfer limit; provide a smaller image")]
     TooLarge,
     #[error(
-        "PNG dimensions {width}×{height} exceed supported bounds; resize the image before displaying it"
+        "image dimensions {width}×{height} exceed supported bounds; resize the image before displaying it"
     )]
     Dimensions { width: u32, height: u32 },
 }
@@ -111,6 +293,28 @@ pub struct ImageFrame {
 }
 
 impl ImageFrame {
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    #[cfg(test)]
+    pub(crate) fn areas(&self) -> Vec<Rect> {
+        self.placements
+            .iter()
+            .map(|placement| placement.area)
+            .collect()
+    }
+
+    /// Captions participate in transcript selection; only reserve pixels here.
+    pub(crate) fn place(&mut self, source: &ImageSource, area: Rect) {
+        if self.enabled && !area.is_empty() {
+            self.placements.push(Placement {
+                source: source.clone(),
+                area,
+            });
+        }
+    }
+
     pub fn new(capabilities: &TerminalCapabilities) -> Self {
         Self {
             enabled: capabilities.kitty_graphics.is_usable(),
@@ -343,6 +547,21 @@ pub(crate) fn fixture_source() -> ImageSource {
 }
 
 #[cfg(test)]
+pub(crate) fn fixture_block() -> serde_json::Value {
+    serde_json::json!({"type":"image", "mimeType":"image/png", "data": STANDARD.encode(&fixture_source().png)})
+}
+
+#[cfg(test)]
+pub(crate) fn second_fixture_block() -> serde_json::Value {
+    let pixels = image::RgbaImage::from_pixel(3, 2, image::Rgba([200, 20, 40, 255]));
+    let mut bytes = io::Cursor::new(Vec::new());
+    pixels
+        .write_to(&mut bytes, image::ImageFormat::Png)
+        .unwrap();
+    serde_json::json!({"type":"image", "mimeType":"image/png", "data":STANDARD.encode(bytes.into_inner())})
+}
+
+#[cfg(test)]
 pub(crate) fn fixture_scene(frame: &mut Frame, images: &mut ImageFrame, source: &ImageSource) {
     let area = frame.area();
     frame.render_widget(
@@ -384,6 +603,147 @@ mod tests {
 
     pub(super) fn source() -> ImageSource {
         fixture_source()
+    }
+
+    #[test]
+    fn common_formats_prepare_once_and_preserve_dimensions_and_pixels() {
+        for (mime, format) in [
+            ("image/png", image::ImageFormat::Png),
+            ("image/jpeg", image::ImageFormat::Jpeg),
+            ("image/webp", image::ImageFormat::WebP),
+        ] {
+            let pixels = image::RgbImage::from_pixel(3, 2, image::Rgb([20, 80, 150]));
+            let mut bytes = io::Cursor::new(Vec::new());
+            pixels.write_to(&mut bytes, format).unwrap();
+            let encoded = EncodedImage::new(STANDARD.encode(bytes.into_inner()), mime.into(), None);
+            let source = encoded.source().unwrap();
+            assert_eq!(source.dimensions(), (3, 2));
+            assert_eq!(source.key, encoded.source().unwrap().key);
+            let decoded = image::load_from_memory(&source.png).unwrap().into_rgb8();
+            for channel in 0..3 {
+                // JPEG is lossy; PNG/WebP fixtures are lossless.
+                assert!(decoded[(0, 0)][channel].abs_diff(pixels[(0, 0)][channel]) <= 3);
+            }
+            assert!(encoded.caption(2).contains(&format!("image 2: {mime}")));
+        }
+    }
+
+    #[test]
+    fn animated_webp_conversion_uses_the_first_frame_and_preserves_transparency() {
+        fn chunk(output: &mut Vec<u8>, kind: &[u8; 4], bytes: &[u8]) {
+            output.extend_from_slice(kind);
+            output.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            output.extend_from_slice(bytes);
+            if !bytes.len().is_multiple_of(2) {
+                output.push(0);
+            }
+        }
+        let mut first = image::RgbaImage::from_pixel(2, 1, image::Rgba([200, 20, 40, 255]));
+        first[(1, 0)] = image::Rgba([0, 0, 0, 0]);
+        let second = image::RgbaImage::from_pixel(2, 1, image::Rgba([10, 220, 30, 255]));
+        let mut webp = b"RIFF\0\0\0\0WEBP".to_vec();
+        // A 2×1 animated alpha canvas; explicit container chunks distinguish frame selection.
+        chunk(&mut webp, b"VP8X", &[0x12, 0, 0, 0, 1, 0, 0, 0, 0, 0]);
+        chunk(&mut webp, b"ANIM", &[0; 6]);
+        for frame in [&first, &second] {
+            let mut encoded = io::Cursor::new(Vec::new());
+            frame
+                .write_to(&mut encoded, image::ImageFormat::WebP)
+                .unwrap();
+            // Origin 0,0, dimensions 2×1, 10 ms, replace rather than blend with the background.
+            let mut payload = vec![0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 10, 0, 0, 2];
+            payload.extend_from_slice(&encoded.into_inner()[12..]);
+            chunk(&mut webp, b"ANMF", &payload);
+        }
+        let length = (webp.len() - 8) as u32;
+        webp[4..8].copy_from_slice(&length.to_le_bytes());
+        let encoded = EncodedImage::new(STANDARD.encode(webp), "image/webp".into(), None);
+        assert_eq!(encoded.dimensions().unwrap(), (2, 1));
+        assert!(!encoded.is_prepared());
+        let converted = image::load_from_memory(&encoded.source().unwrap().png)
+            .unwrap()
+            .into_rgba8();
+        assert_eq!(converted, first);
+    }
+
+    #[test]
+    fn invalid_encoded_sources_cache_actionable_fallbacks_without_exposing_payloads() {
+        for (mime, data, reason) in [
+            (
+                "image/gif",
+                "secret-payload".into(),
+                "unsupported image format",
+            ),
+            ("image/png", "secret-payload".into(), "invalid base64"),
+            ("image/png", STANDARD.encode(b"secret-payload"), "not a PNG"),
+            (
+                "image/jpeg",
+                STANDARD.encode(b"secret-payload"),
+                "could not decode",
+            ),
+            (
+                "image/webp",
+                STANDARD.encode(b"secret-payload"),
+                "could not decode",
+            ),
+        ] {
+            let encoded = EncodedImage::new(data, mime.into(), Some("file:///image".into()));
+            assert!(encoded.caption(1).contains(reason));
+            assert!(encoded.caption(1).contains("file:///image"));
+            assert!(!encoded.caption(1).contains("secret-payload"));
+            assert!(std::ptr::eq(
+                encoded.source().unwrap_err(),
+                encoded.source().unwrap_err()
+            ));
+        }
+    }
+
+    #[test]
+    fn encoded_input_and_conversion_output_are_bounded_before_growing_buffers() {
+        let encoded = EncodedImage::new(
+            "A".repeat(MAX_BYTES.div_ceil(3) * 4 + 1),
+            "image/png".into(),
+            None,
+        );
+        assert!(matches!(
+            encoded.source(),
+            Err(PrepareError::Source(ImageError::TooLarge))
+        ));
+        let mut output = BoundedPng(vec![0; MAX_BYTES - 1]);
+        assert!(output.write_all(&[1, 2]).is_err());
+        assert_eq!(output.0.len(), MAX_BYTES - 1);
+        let mut bytes = fixture_source().png.to_vec();
+        bytes[16..20].copy_from_slice(&(MAX_DIMENSION + 1).to_be_bytes());
+        let encoded = EncodedImage::new(STANDARD.encode(bytes), "image/png".into(), None);
+        assert!(matches!(
+            encoded.source(),
+            Err(PrepareError::Source(ImageError::Dimensions { .. }))
+        ));
+    }
+
+    #[test]
+    fn conversion_rejects_excessive_dimensions_before_decoding_pixels() {
+        let pixels = image::RgbImage::from_pixel(1, 1, image::Rgb([0, 0, 0]));
+        let mut jpeg = io::Cursor::new(Vec::new());
+        pixels
+            .write_to(&mut jpeg, image::ImageFormat::Jpeg)
+            .unwrap();
+        let original = jpeg.into_inner();
+        let header = original
+            .windows(2)
+            .position(|bytes| bytes == [0xff, 0xc0])
+            .unwrap();
+        for (width, height) in [(MAX_DIMENSION + 1, 1), (8000, 8000)] {
+            let mut bytes = original.clone();
+            // Alter only SOF dimensions: a decoder must reject bounds before reading missing pixels.
+            bytes[header + 5..header + 7].copy_from_slice(&(height as u16).to_be_bytes());
+            bytes[header + 7..header + 9].copy_from_slice(&(width as u16).to_be_bytes());
+            let encoded = EncodedImage::new(STANDARD.encode(bytes), "image/jpeg".into(), None);
+            assert!(encoded.source().is_err());
+            assert!(
+                encoded.caption(1).contains("smaller") || encoded.caption(1).contains("resize")
+            );
+        }
     }
 
     fn scene(

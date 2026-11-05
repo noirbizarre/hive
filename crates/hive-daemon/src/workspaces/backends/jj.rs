@@ -5,6 +5,24 @@ use std::io::Write;
 
 pub(super) struct Jj;
 
+pub(in crate::workspaces) fn storage_key(id: &RepositoryId) -> Result<String, Error> {
+    let mut value = uuid::Uuid::parse_str(
+        id.as_str()
+            .strip_prefix("repository-")
+            .ok_or(Error::Conflict)?,
+    )
+    .map_err(|_| Error::Conflict)?
+    .as_u128();
+    // JJ appends 128-character index names. Encode all UUID bits in case-insensitive
+    // base32 rather than truncating identity or exhausting Windows' legacy path limit.
+    let mut key = [b'0'; 26];
+    for digit in key.iter_mut().rev() {
+        *digit = b"0123456789abcdefghijklmnopqrstuv"[(value & 31) as usize];
+        value >>= 5;
+    }
+    String::from_utf8(key.to_vec()).map_err(|_| Error::Storage)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Storage {
@@ -71,7 +89,7 @@ pub(in crate::workspaces) fn handle(repository: &Repository) -> Result<Repositor
                     repository.repository.node().clone(),
                     repository.repository.root.syntax(),
                     Path::new(repository.repository.root.as_str())
-                        .with_extension("jj-incomplete")
+                        .with_extension("t")
                         .to_str()
                         .ok_or(Error::Request)?
                         .into(),
@@ -292,7 +310,8 @@ impl RepositoryBackend for Jj {
             return RepositoryBackend::verify(self, repository);
         }
         let staging = Path::new(store.staging.as_str());
-        let candidate = staging.join("repository");
+        // Short staging components leave room for JJ's content-addressed index names on Windows.
+        let candidate = staging.join("r");
         let parent = root.parent().ok_or(Error::Conflict)?;
         std::fs::create_dir_all(parent).map_err(|_| Error::Storage)?;
         if staging.try_exists().map_err(|_| Error::Conflict)? {

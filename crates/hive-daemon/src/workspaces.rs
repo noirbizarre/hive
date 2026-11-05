@@ -1012,7 +1012,10 @@ impl Runtime<'_> {
         let id = RepositoryId::new();
         // Project slugs are unbounded portable identifiers, not filesystem components.
         // Stable resource IDs avoid inflating Windows linked-worktree metadata paths.
-        let project_root = self.root().join(id.as_str());
+        let project_root = self.root().join(match definition.scm {
+            hive_core::project::Scm::Git => id.to_string(),
+            hive_core::project::Scm::Jj => backends::jj::storage_key(&id)?,
+        });
         let mut repo = Repository {
             repository: NodeRepository {
                 id,
@@ -2142,15 +2145,6 @@ fn execute_output_mode(
             }
         })?;
     if !status.success() {
-        #[cfg(all(test, windows))]
-        if program == "jj" && TEST_GIT_CONFIG.with(|config| config.borrow().is_some()) {
-            // Windows fixtures use isolated offline remotes/configuration; retain failure evidence
-            // in test output while production diagnostics never expose subprocess stderr.
-            eprintln!(
-                "isolated JJ fixture failed: {}",
-                String::from_utf8_lossy(&diagnostic)
-            );
-        }
         // Classify without exposing stderr: remote helpers and hooks can print secrets.
         let diagnostic = String::from_utf8_lossy(&diagnostic).to_ascii_lowercase();
         return Err(if worktrunk {

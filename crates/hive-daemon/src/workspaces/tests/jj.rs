@@ -1,5 +1,35 @@
 use super::*;
 
+#[test]
+fn jj_storage_keys_preserve_uuid_suffixes_and_leave_room_for_native_windows_indexes() {
+    let first =
+        RepositoryId::try_from("repository-00000000-0000-0000-0000-000000000001".to_owned())
+            .unwrap();
+    let second =
+        RepositoryId::try_from("repository-00000000-0000-0000-0000-000000000002".to_owned())
+            .unwrap();
+    let first = backends::jj::storage_key(&first).unwrap();
+    let second = backends::jj::storage_key(&second).unwrap();
+    assert_ne!(
+        first, second,
+        "compaction must retain UUID suffix bits, not truncate IDs"
+    );
+    assert!(
+        first
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'v').contains(&b))
+    );
+    // Match the runner's ordinary state root and JJ's actual index filename length.
+    let path = format!(
+        r"C:\Users\runneradmin\AppData\Local\Temp\.tmp123456\state\repositories\{first}\jj.t\r\.jj\repo\index\segments\{}",
+        "f".repeat(128)
+    );
+    assert!(
+        path.len() < 260,
+        "native JJ's index path exceeds MAX_PATH: {path}"
+    );
+}
+
 fn command(root: &Path, args: &[&str]) -> String {
     let mut argv = vec![
         "--no-pager",

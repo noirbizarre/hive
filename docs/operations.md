@@ -94,10 +94,11 @@ checkouts elsewhere; include those actual paths in backups. Back up resource fil
 and the database together while Hive is stopped. Moving a bare repository without
 repairing Git's linked-worktree metadata breaks its checkouts.
 
-Native JJ repositories live under `repositories/<repository-id>/jj` with sibling
+Native JJ repositories live under `repositories/<compact-repository-key>/jj` with sibling
 task workspaces. Back up their shared `.jj` repository and the actual recorded
 workspace roots together. Inspect `hive.jj.*` metadata for workspace/change IDs;
-do not reconstruct roots from names. Normal JJ cleanup requires an empty current
+do not reconstruct roots from names. The compact key encodes the complete repository
+UUID and leaves room for JJ's long index filenames on Windows. Normal JJ cleanup requires an empty current
 working-copy change and an unchanged physical tree, including ignored/untracked
 files. Current history is retained by `hive-retained-<workspace-id>` bookmarks.
 If deletion finishes but native deregistration is interrupted, replay the exact

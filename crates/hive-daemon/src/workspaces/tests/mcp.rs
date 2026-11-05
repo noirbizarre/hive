@@ -476,6 +476,7 @@ async fn scoped_evidence_rejects_stale_context_nested_checkouts_and_duplicate_ro
         .unwrap();
     let root = PathBuf::from(entry.workspace.location().unwrap().root.as_str());
     let context = hive_protocol::workspace::Context {
+        owner: Some(entry.workspace.intent().node.clone()),
         project: entry.workspace.intent().project.to_string(),
         workspace: entry.workspace.id().to_string(),
         effective_cwd: root.to_str().unwrap().into(),

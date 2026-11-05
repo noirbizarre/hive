@@ -199,13 +199,18 @@ impl Runtime<'_> {
         let root = PathBuf::from(root.trim())
             .canonicalize()
             .map_err(|_| Error::Conflict)?;
-        if !snapshot
-            .cwd
-            .canonicalize()
-            .map_err(|_| Error::Conflict)?
-            .starts_with(&root)
-        {
+        let cwd = snapshot.cwd.canonicalize().map_err(|_| Error::Conflict)?;
+        if !cwd.starts_with(&root) {
             return Err(Error::Conflict);
+        }
+        // External/adopted directories have no repository handle: colocated JJ's .git is not Git selection.
+        for directory in cwd.ancestors() {
+            if directory.join(".jj").is_dir() {
+                return Ok(None);
+            }
+            if directory == root {
+                break;
+            }
         }
         if let Some(id) = &snapshot.workspace {
             let entry = &self.state.workspaces[id];

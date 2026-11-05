@@ -361,6 +361,19 @@ async fn foreign_node_activity_is_rejected_before_wt_or_path_inspection() {
 }
 
 #[tokio::test]
+async fn colocated_jj_directories_never_probe_worktrunk_for_adopted_sessions() {
+    let fixture = Fixture::new();
+    install_marker_cli(&fixture);
+    std::fs::create_dir(fixture.seed.join(".jj")).unwrap();
+    let subdirectory = fixture.seed.join("subdirectory");
+    std::fs::create_dir(&subdirectory).unwrap();
+    let mut value = snapshot(&fixture, "adopted-jj", Status::Running, 0);
+    value.cwd = subdirectory;
+    publish(&fixture, vec![value]).await;
+    assert!(!fixture._directory.path().join("wt-calls").exists());
+}
+
+#[tokio::test]
 async fn missing_marker_capabilities_fail_required_mode_and_auto_mode_leaves_markers_alone() {
     let fixture = Fixture::new();
     let executable = fixture._directory.path().join("fake-wt");

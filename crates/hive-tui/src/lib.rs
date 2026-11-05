@@ -1536,6 +1536,7 @@ fn clipboard_request(
     interaction: &Option<Interaction>,
     command: char,
     clipboard: &clipboard::Clipboard,
+    output: &mut impl std::io::Write,
 ) {
     let target = if let Some(Interaction::Elicitation(request, _, draft)) = interaction {
         if command != 'v'
@@ -1575,13 +1576,16 @@ fn clipboard_request(
             return;
         }
     };
-    let _ = clipboard.requests.send(clipboard::Request {
+    let request = clipboard::Request {
         operation,
         session: app.active.clone(),
         original: app.input.clone(),
         editor: app.editor.clone(),
         target,
-    });
+    };
+    if let Some(completion) = clipboard.dispatch(request, &app.terminal_capabilities, output) {
+        clipboard::complete(app, completion);
+    }
 }
 
 fn apply_configuration(cx: &V2ConnectionTo<Agent>, app: &mut App) {
@@ -2158,7 +2162,12 @@ async fn run_with_clipboard(
                               };
                               dirty = true;
                               if key.kind == KeyEventKind::Release { continue; }
-                              if let Some(command) = clipboard::command(key) { editor_prefix = None; clipboard_request(&mut app, &interaction, command, &clipboard); continue; }
+                               if let Some(command) = clipboard::command(key) {
+                                   editor_prefix = None;
+                                   // The UI owns terminal output; workers must never interleave escapes with a redraw or editor.
+                                   if editing.is_none() { clipboard_request(&mut app, &interaction, command, &clipboard, terminal.backend_mut()); }
+                                   continue;
+                               }
                               let prefix = editor_prefix.take().is_some_and(|started| started.elapsed() < Duration::from_secs(2));
                               if app.page == Page::Chat && app.dialog.is_none() && app.picker.is_none() {
                                   if prefix && key.code == KeyCode::Char('e') && key.modifiers == KeyModifiers::CONTROL {

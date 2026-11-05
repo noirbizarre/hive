@@ -58,7 +58,7 @@ automatic detection. They work on both `hive` and `hive tui`.
 
 `on` asserts support for that operation; for reads it also explicitly opts into
 attempting clipboard access. Read and write settings are independent. The
-terminal may still deny access. `off` disables that operation, and unknown
+terminal may still deny access. `off` disables that terminal operation, and unknown
 automatic support falls back without using the protocol. A non-TTY stdin or
 stdout, or `TERM=dumb`, makes all six operations unavailable even with `on`.
 
@@ -67,8 +67,13 @@ hive tui --terminal-kitty-graphics off --terminal-osc52-write on
 HIVE_TERMINAL_OSC52_WRITE=on hive --terminal-osc52-write auto
 ```
 
-These options configure the shared capability foundation; they do not install
-protocol backends. Current native clipboard operations remain independent.
+OSC 52 writes are preferred for copy/cut when permitted; otherwise Hive uses the
+native clipboard. Terminal writes have a 64 KiB UTF-8 text limit and no acceptance
+acknowledgement. Native clipboard operations remain independent of these options.
+Programmatic OSC 52 reads are not implemented: the input backend cannot receive
+clipboard replies, so even read `on` never sends a query. Paste uses the native
+clipboard or terminal-native bracketed paste. Rich clipboard and program status
+backends remain follow-up work.
 See [terminal capabilities](../guides/tui.md#terminal-capabilities) for detection
 limitations and the TUI diagnostic legend.
 

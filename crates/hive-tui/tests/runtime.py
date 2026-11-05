@@ -1,5 +1,6 @@
 """Drive the instrumented TUI test binary through its real terminal and ACP event loop."""
 
+import base64
 import errno
 import faulthandler
 from concurrent.futures import ThreadPoolExecutor
@@ -36,6 +37,7 @@ def main():
         mode = directory / "mode"
         mode.write_text("success")
         create = sys.argv[2] == "create"
+        osc52 = sys.argv[2] == "osc52"
         editor.write_text(
             "from pathlib import Path\nimport sys, time\n"
             "root = Path(__file__).parent\n"
@@ -57,6 +59,9 @@ def main():
                 env.pop(marker, None)
             # The child injects a failing clipboard backend rather than touching the native clipboard.
             env["XDG_RUNTIME_DIR"] = str(directory)
+            env.pop("HIVE_RUNTIME_OSC52", None)
+            if osc52:
+                env["HIVE_RUNTIME_OSC52"] = "1"
             if create:
                 env["HIVE_RUNTIME_CREATE"] = "1"
             else:
@@ -130,6 +135,15 @@ def main():
                 wait(lambda: state()["creations"] == 1 and b"\x1b[?25h" in output)
             else:
                 wait(lambda: state()["resumes"] == 1 and b"\x1b[?25h" in output)
+            if osc52:
+                selection = "copy 界 👩‍💻\nsecond"
+                sequence = b"\x1b]52;c;" + base64.b64encode(selection.encode()) + b"\x1b\\"
+                send(b"\x1b[200~" + selection.encode() + b"\x1b[201~\x01\x1bc")
+                wait(lambda: output.count(sequence) == 1)
+                send(b"\x1bx")
+                wait(lambda: output.count(sequence) == 2)
+                assert not state()["prompts"], "copy/cut submitted a prompt"
+                # Editor read-back below also proves the successful cut left an empty composer.
             send(b"az\x1b[Db\x1b[C\x1b[200~\npasted\x1b[201~")
             # Editor read-back verifies the actual draft, rather than terminal diff fragments.
             send(b"\x18\x05")
@@ -156,7 +170,7 @@ def main():
             release.touch()
             wait(lambda: output.count(b"\x1b[?1049h") >= 3)
             # Headless clipboard failure must not cut, replace, submit, or cancel this draft.
-            send(b"\x01\x1bc\x1bx\x1bv")
+            send(b"\x1bv" if osc52 else b"\x01\x1bc\x1bx\x1bv")
             wait(lambda: screen.contains("Clipboard"))
             send(b"\r")
             wait(lambda: len(state()["prompts"]) == 1)
@@ -231,8 +245,9 @@ def main():
                 raise AssertionError("TUI failed to shut down")
             assert settings(master) == original, "terminal modes were not restored"
             # Detection must not inject capability queries into the terminal's input conversation.
-            for protocol in (b"\x1b_G", b"\x1b]52;", b"\x1b]5522;", b"\x1b]7501;"):
+            for protocol in (b"\x1b_G", b"\x1b]5522;", b"\x1b]7501;", b"\x1b]52;c;?"):
                 assert protocol not in output, "capability detection emitted a protocol sequence"
+            assert output.count(b"\x1b]52;") == (2 if osc52 else 0)
         except BaseException:
             sys.stderr.write(output.decode(errors="replace"))
             raise

@@ -191,9 +191,9 @@ pub enum Error {
     )]
     JjUnavailable,
     #[error(
-        "JJ command failed; check repository compatibility, node-local credentials and permissions, then inspect before retrying"
+        "JJ {0} failed; check repository compatibility, node-local credentials and permissions, then inspect before retrying"
     )]
-    Jj,
+    Jj(&'static str),
     #[error(
         "JJ base revision did not resolve to one commit; select a single existing revision or change ID"
     )]
@@ -250,7 +250,7 @@ impl Error {
     pub fn code(&self) -> &'static str {
         match self {
             Self::JjUnavailable => "hive::jj::unavailable",
-            Self::Jj => "hive::jj::execution",
+            Self::Jj(_) => "hive::jj::execution",
             Self::JjRevision => "hive::jj::revision",
             Self::Selector => "hive::workspace::selector",
             Self::Storage => "hive::workspace::storage",
@@ -277,7 +277,7 @@ impl Error {
             Self::JjRevision => {
                 "use a single conflict-free JJ revision/change ID; inspect bookmarks and narrow ambiguous revsets"
             }
-            Self::Jj => {
+            Self::Jj(_) => {
                 "check the owning node's JJ/Git/SSH configuration and repository permissions, then inspect the original operation before retrying"
             }
             Self::Domain(error) => error.help(),
@@ -2142,6 +2142,15 @@ fn execute_output_mode(
             }
         })?;
     if !status.success() {
+        #[cfg(all(test, windows))]
+        if program == "jj" && TEST_GIT_CONFIG.with(|config| config.borrow().is_some()) {
+            // Windows fixtures use isolated offline remotes/configuration; retain failure evidence
+            // in test output while production diagnostics never expose subprocess stderr.
+            eprintln!(
+                "isolated JJ fixture failed: {}",
+                String::from_utf8_lossy(&diagnostic)
+            );
+        }
         // Classify without exposing stderr: remote helpers and hooks can print secrets.
         let diagnostic = String::from_utf8_lossy(&diagnostic).to_ascii_lowercase();
         return Err(if worktrunk {
@@ -2152,7 +2161,7 @@ fn execute_output_mode(
             Error::Authentication
         } else {
             if program == "jj" {
-                Error::Jj
+                Error::Jj("execution")
             } else {
                 Error::Git("execution")
             }

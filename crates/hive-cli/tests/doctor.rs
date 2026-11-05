@@ -190,6 +190,11 @@ async fn a_running_daemon_is_recognised_instead_of_reported_as_a_conflict() {
         "--config",
         config.to_str().unwrap(),
     ]))
+    // This fixture force-kills its daemon rather than permitting coverage-runtime teardown.
+    .env(
+        "LLVM_PROFILE_FILE",
+        if cfg!(windows) { "NUL" } else { "/dev/null" },
+    )
     .kill_on_drop(true)
     .spawn()
     .unwrap();

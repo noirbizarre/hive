@@ -25,6 +25,11 @@ async fn cli_reload_and_hangup_apply_the_original_file_and_invalid_edits_leave_t
         .env("XDG_STATE_HOME", &runtime)
         .env_remove("HIVE_DEFAULT_AGENT")
         .env_remove("HIVE_CONFIG")
+        // Forced shutdown can leave corrupt profile headers even when every assertion passed.
+        .env(
+            "LLVM_PROFILE_FILE",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        )
         .kill_on_drop(true)
         .spawn()
         .unwrap();
@@ -158,6 +163,10 @@ async fn a_second_daemon_cannot_start_on_another_port_for_the_same_user() {
     let address = reserve.local_addr().unwrap();
     drop(reserve);
     let first = tokio::process::Command::new(env!("CARGO_BIN_EXE_hive"))
+        .env(
+            "LLVM_PROFILE_FILE",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        )
         .args(["daemon", "--listen", &address.to_string()])
         .env("XDG_RUNTIME_DIR", &runtime)
         .env("XDG_STATE_HOME", &runtime)
@@ -245,6 +254,10 @@ async fn a_second_daemon_cannot_start_on_another_port_for_the_same_user() {
     #[cfg(not(unix))]
     first.kill().await.unwrap();
     let third = tokio::process::Command::new(env!("CARGO_BIN_EXE_hive"))
+        .env(
+            "LLVM_PROFILE_FILE",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        )
         .args(["serve", "--listen", &address.to_string()])
         .env("XDG_RUNTIME_DIR", &runtime)
         .env("XDG_STATE_HOME", &runtime)

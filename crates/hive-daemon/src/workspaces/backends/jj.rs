@@ -118,7 +118,18 @@ fn run_output(root: &Path, args: &[&str], digest: bool) -> Result<Vec<u8>, Error
         argv.push("--ignore-working-copy");
     }
     argv.extend_from_slice(args);
-    execute_output_mode("jj", Some(root), &argv, false, None, digest)
+    execute_output_mode("jj", Some(root), &argv, false, None, digest).map_err(|error| match error {
+        Error::Jj(_) => Error::Jj(if args.starts_with(&["git", "clone"]) {
+            "repository clone"
+        } else if args.starts_with(&["git", "fetch"]) {
+            "repository fetch"
+        } else if args.starts_with(&["workspace", "add"]) {
+            "workspace creation"
+        } else {
+            "repository inspection or maintenance"
+        }),
+        other => other,
+    })
 }
 
 fn capabilities() -> Result<(), Error> {
@@ -369,7 +380,7 @@ impl RepositoryBackend for Jj {
             revision.as_str(),
         )
         .map_err(|error| match error {
-            Error::Jj => Error::JjRevision,
+            Error::Jj(_) => Error::JjRevision,
             other => other,
         })?;
         let [Commit(commit, change, _, conflict)] = result.as_slice() else {

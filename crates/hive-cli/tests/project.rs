@@ -15,6 +15,11 @@ async fn daemon(runtime: &Path, address: std::net::SocketAddr) -> tokio::process
         .env("XDG_STATE_HOME", runtime)
         .env_remove("HIVE_DEFAULT_AGENT")
         .env_remove("HIVE_CONFIG")
+        // This daemon is killed to exercise restart, so its partial coverage must not be merged.
+        .env(
+            "LLVM_PROFILE_FILE",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        )
         .kill_on_drop(true)
         .spawn()
         .unwrap();

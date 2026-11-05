@@ -16,6 +16,8 @@ use tokio::{
 mod interactions;
 #[path = "support/recovery.rs"]
 mod recovery;
+#[path = "support/remote_discovery.rs"]
+mod remote_discovery;
 #[path = "support/remote_http.rs"]
 mod remote_http;
 #[path = "support/workspaces.rs"]

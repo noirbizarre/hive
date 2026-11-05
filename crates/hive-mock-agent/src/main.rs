@@ -196,6 +196,12 @@ async fn main() -> agent_client_protocol::Result<()> {
                         save(&state)?;
                         id
                     };
+                    // Persist creation first: a lost response must never justify a duplicate launch.
+                    match std::env::var("HIVE_MOCK_STARTUP").as_deref() {
+                        Ok("lose-response") => std::process::exit(0),
+                        Ok("error-after-create") => return responder.respond_with_error(Error::internal_error().data("PRIVATE_SENTINEL")),
+                        _ => {}
+                    }
                     // No unsolicited `idle` here. Hive only routes updates for a session once it has
                     // handled this response, so such an idle was either dropped or, on a loaded
                     // machine, arrived after the client's first prompt and closed that turn with

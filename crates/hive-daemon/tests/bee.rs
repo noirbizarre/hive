@@ -8,6 +8,135 @@ use bee::{Event, controlled, native, run, text};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
+#[tokio::test]
+async fn negotiated_remote_discovery_starts_bee_and_preserves_standard_control_after_disconnect() {
+    use agent_client_protocol::{Agent, Client, V2ConnectionTo, schema::ProtocolVersion};
+    use hive_protocol::{
+        remote::{ListParams, Peer},
+        transport::Credentials,
+    };
+    for scenario in ["success", "cancel"] {
+        run(scenario, move |gateway| async move {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let directory = gateway.cwd.clone();
+            let (updates, mut received) = tokio::sync::mpsc::unbounded_channel();
+            Client
+                .v2()
+                .on_receive_notification(
+                    async move |update: v2::UpdateSessionNotification, _: V2ConnectionTo<Agent>| {
+                        updates.send(update).map_err(Error::into_internal_error)
+                    },
+                    agent_client_protocol::on_receive_notification!(),
+                )
+                .connect_with(
+                    Credentials::default()
+                        .peer(&format!("http://{}/acp", gateway.address))
+                        .map_err(Error::into_internal_error)?,
+                    async move |cx| {
+                        let peer = Peer::initialize(
+                            cx.clone(),
+                            v2::InitializeRequest::new(
+                                ProtocolVersion::V2,
+                                v2::Implementation::new("hive-peer-bee", "1"),
+                            ),
+                        )
+                        .await
+                        .expect("persistent owner must negotiate discovery");
+                        let agents = peer.list(ListParams::default()).await?;
+                        assert_eq!(agents.agents.len(), 1);
+                        assert_eq!(agents.agents[0].id, "bee");
+                        let opened = peer
+                            .start("bee", v2::NewSessionRequest::new(directory))
+                            .await
+                            .expect("negotiated owner must start Bee");
+                        cx.send_request(
+                            v2::PromptRequest::new(
+                                opened.session_id.clone(),
+                                vec!["Run the fixture".into()],
+                            )
+                            .meta(controlled(&opened.meta, "remote")),
+                        )
+                        .block_task()
+                        .await?;
+                        let mut cancelled = false;
+                        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                            loop {
+                                let update = received
+                                    .recv()
+                                    .await
+                                    .expect("owner must retain the Bee event stream");
+                                let value = serde_json::to_value(update.update).unwrap();
+                                if scenario == "cancel"
+                                    && value["sessionUpdate"] == "agent_message_chunk"
+                                    && !cancelled
+                                {
+                                    cx.send_notification(
+                                        v2::CancelSessionNotification::new(
+                                            opened.session_id.clone(),
+                                        )
+                                        .meta(opened.meta.clone()),
+                                    )?;
+                                    cancelled = true;
+                                }
+                                if value["sessionUpdate"] == "state_update"
+                                    && value["state"] == "idle"
+                                    && value["stopReason"].is_string()
+                                {
+                                    assert_eq!(
+                                        value["stopReason"],
+                                        if scenario == "cancel" {
+                                            "cancelled"
+                                        } else {
+                                            "end_turn"
+                                        }
+                                    );
+                                    break;
+                                }
+                            }
+                            Ok::<(), Error>(())
+                        })
+                        .await
+                        .map_err(Error::into_internal_error)??;
+                        tx.send(opened.session_id).unwrap();
+                        Ok(())
+                    },
+                )
+                .await?;
+            let id = rx.await.map_err(Error::into_internal_error)?;
+            let before = gateway.identity_and_receipts(&id);
+            let cwd = gateway.cwd.clone();
+            Client
+                .v2()
+                .connect_with(
+                    Credentials::default()
+                        .peer(&format!("http://{}/acp", gateway.address))
+                        .map_err(Error::into_internal_error)?,
+                    async move |cx| {
+                        let _peer = Peer::initialize(
+                            cx.clone(),
+                            v2::InitializeRequest::new(
+                                ProtocolVersion::V2,
+                                v2::Implementation::new("hive-peer-bee", "1"),
+                            ),
+                        )
+                        .await?;
+                        let resumed = cx
+                            .send_request(v2::ResumeSessionRequest::new(id.clone(), cwd))
+                            .block_task()
+                            .await?;
+                        assert_eq!(gateway.identity_and_receipts(&id), before);
+                        cx.send_request(v2::CloseSessionRequest::new(id).meta(resumed.meta))
+                            .block_task()
+                            .await?;
+                        Ok(())
+                    },
+                )
+                .await
+        })
+        .await;
+    }
+}
+
 fn assert_sequences(events: &[Value]) {
     let sequences: Vec<_> = events
         .iter()

@@ -87,8 +87,9 @@ Missing, empty or invalid configured tokens fail startup rather than disabling
 authentication. Listener options, token values and allowed origins require restart;
 agent-registry reload does not change them. Pilot fencing remains independent of
 listener authentication. See [transport guarantees](transports.md#sdk-audit-and-limits)
-for live reattachment and current SDK limitations. Remote discovery and routed
-session ownership are subsequent federation features, not implied by connectivity.
+for live reattachment and current SDK limitations. [Remote discovery and selection](acp-extensions.md#current-implementation)
+require Hive extension negotiation and a persistent owner. Routed session location
+remains #80; connectivity alone does not negotiate either feature.
 
 ## Health and diagnosis
 

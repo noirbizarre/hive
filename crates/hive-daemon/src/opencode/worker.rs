@@ -190,6 +190,9 @@ pub(crate) async fn run_opencode_agent(
     let directory = request.cwd.0.display().to_string();
     let attached = match &attach {
         Attach::New => {
+            if crate::remote::publishing(&control).is_err() {
+                return;
+            }
             api::Native::create(&client, Flavor::for_new(&capabilities), &directory).await
         }
         Attach::Adopt(id) => api::resolve(&client, &capabilities, id, &directory, None).await,
@@ -201,6 +204,10 @@ pub(crate) async fn run_opencode_agent(
         Ok(attached) => attached,
         Err(error) => fail!(error),
     };
+    if matches!(attach, Attach::New) && crate::remote::created(&control, native.id.clone()).is_err()
+    {
+        return;
+    }
     if !matches!(attach, Attach::New) && !same_directory(&session.directory, &directory) {
         fail!(OpencodeError::DirectoryMismatch {
             native: session.directory.clone(),

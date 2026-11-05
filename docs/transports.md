@@ -19,8 +19,8 @@ session ID and routing. No transport `Last-Event-ID` resumption is claimed.
 
 The [Hive ACP extension specification](acp-extensions.md) defines versioned agent
 discovery, selection and qualified session location through standard ACP transport.
-Its new negotiation/discovery/location surfaces are specified, not implemented.
-Transport validation does not implement these discovery or routing features.
+Persistent owners implement negotiated discovery and selected startup; qualified
+session location/routing remains #80. See the [current extension implementation](acp-extensions.md#current-implementation).
 
 Production startup defaults to loopback. Explicit `--allow-remote` permits the
 shared listener on a private interface, with optional bearer authentication.
@@ -75,8 +75,10 @@ Hive-side consumers construct the reusable `hive_protocol::transport::Credential
 from an explicitly named token variable (or use its unauthenticated default),
 then call `peer("http://100.64.0.10:8765/acp")`. The returned `PeerTransport`
 implements the SDK's `ConnectTo<Client>` and can be passed to `Client.v2().connect_with`.
-It creates no catalog record or session. There is deliberately no inactive
-`[peers]` TOML registry ahead of the discovery/routing consumers in #79/#80.
+It creates no catalog record or session. The reusable `hive_protocol::remote::Peer`
+negotiates extensions, lists safe profiles, and explicitly starts a selected agent
+through standard `session/new`. Neither helper retries startup after a lost response.
+There is no `[peers]` TOML routing registry; cross-Hive session routing remains #80.
 
 [sdk-http]: https://github.com/agentclientprotocol/rust-sdk/blob/305aefda6fbe88be6ae8b9088003e383f909b135/md/http-transport.md
 [sdk-source]: https://github.com/agentclientprotocol/rust-sdk/tree/305aefda6fbe88be6ae8b9088003e383f909b135/src/agent-client-protocol-http/src

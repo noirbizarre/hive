@@ -5,6 +5,7 @@ use agent_client_protocol::schema::v2;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::fmt::Write;
 
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
@@ -30,7 +31,12 @@ impl Fingerprint {
         // Changing the canonical encoding must introduce a new fingerprint version.
         digest.update(b"hive:prompt-content:sha256-v1\0");
         digest.update(bytes);
-        Ok(Self(format!("sha256-v1:{:x}", digest.finalize())))
+        let mut fingerprint = String::from("sha256-v1:");
+        // Persisted identities require two lowercase digits per byte, including leading zeroes.
+        for byte in digest.finalize() {
+            write!(fingerprint, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        Ok(Self(fingerprint))
     }
 
     pub fn legacy(content: &str) -> Result<Self, JournalError> {

@@ -2,6 +2,7 @@
 
 use std::{
     collections::HashMap,
+    fmt::Write,
     sync::{Arc, Mutex},
 };
 
@@ -87,7 +88,12 @@ pub(crate) fn identity(profile: &Profile) -> Option<String> {
         &profile.password_env,
     ))
     .expect("connection identity contains only serializable values");
-    Some(format!("v1:{:x}", Sha256::digest(input)))
+    let mut identity = String::from("v1:");
+    // Persisted identities require two lowercase digits per byte, including leading zeroes.
+    for byte in Sha256::digest(input) {
+        write!(identity, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    Some(identity)
 }
 
 pub(crate) struct Binding {
@@ -261,6 +267,20 @@ mod tests {
         format!(
             "default_agent = 'a'\n[agents.a]\nkind = 'opencode-server'\nendpoint = '{endpoint}'\n"
         )
+    }
+
+    #[test]
+    fn connection_identities_preserve_their_versioned_hex_encoding() {
+        let fixture = Fixture::new();
+        let config = fixture
+            .config(&opencode("http://127.0.0.1:10001"))
+            .load()
+            .unwrap();
+        // Independently computed SHA-256 includes zero-padded bytes used by durable records.
+        assert_eq!(
+            identity(&config.agents["a"]).as_deref(),
+            Some("v1:dc70bb3904594c437273dfda184663290acb3897db75403ed35f7ba833c32b6f")
+        );
     }
 
     #[tokio::test]

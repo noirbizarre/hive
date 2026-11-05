@@ -134,6 +134,17 @@ errors retain the normal error status contract. Reapply the same plan to retry.
 Restart never automatically applies persisted plans. See the
 [retention policy](operations.md#recovery-inventory-and-ephemeral-sweeps).
 
+### Backend provenance in resource responses
+
+Repository records additionally expose a `handle` with stable identity, owning
+node, repository `backend`, `storage` kind and versioned `metadata`. Workspace
+records expose `selection` with independent `provisioner` and repository handle;
+these identities remain pinned across restarts and configuration reloads. Location
+`observations` carry versioned backend evidence. Existing Git policy, branch,
+commit and path response fields remain v1 projections; generic backend dispatch
+does not interpret them. Original operation requests and frozen sweep cleanup
+requests are returned unchanged, including after persisted-record migration.
+
 ### Session launch selectors
 
 A profile's configured workspace policy activates automatically before downstream

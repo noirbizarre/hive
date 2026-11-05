@@ -3,6 +3,9 @@ use super::*;
 #[path = "tests/recovery.rs"]
 mod recovery_tests;
 
+#[path = "tests/backends.rs"]
+mod backend_tests;
+
 #[path = "../../tests/support/fake_opencode.rs"]
 mod fake_opencode;
 
@@ -22,6 +25,7 @@ async fn worktrunk_chooses_its_own_path_and_removes_the_checkout_in_the_foregrou
     }
     let fixture = Fixture::new();
     let request = fixture.request();
+    let native = fixture.create(fixture.request()).await.unwrap();
     let wt_config = fixture._directory.path().join("config/worktrunk");
     std::fs::create_dir_all(&wt_config).unwrap();
     let custom = fixture._directory.path().join("custom-worktrees");
@@ -36,7 +40,7 @@ async fn worktrunk_chooses_its_own_path_and_removes_the_checkout_in_the_foregrou
     let entry = fixture
         .service
         .create(
-            request,
+            request.clone(),
             fixture.definition.clone(),
             WorktrunkConfig {
                 enabled: Some(true),
@@ -49,6 +53,25 @@ async fn worktrunk_chooses_its_own_path_and_removes_the_checkout_in_the_foregrou
     assert_eq!(location.backend.0, "worktrunk");
     assert!(Path::new(location.root.as_str()).is_dir());
     assert!(Path::new(location.root.as_str()).starts_with(custom));
+    assert_eq!(entry.repository, native.repository);
+    assert_eq!(
+        entry.selection.as_ref().unwrap().repository,
+        native.selection.as_ref().unwrap().repository
+    );
+    assert_eq!(fixture.service.repositories().await.unwrap().len(), 1);
+    let restarted = Service::new(fixture.service.store.clone());
+    let replayed = restarted
+        .create(
+            request,
+            fixture.definition.clone(),
+            WorktrunkConfig {
+                enabled: Some(false),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(replayed.selection, entry.selection);
     fixture
         .service
         .remove(entry.workspace.id().clone(), OperationId::new(), false)
@@ -186,6 +209,7 @@ impl Fixture {
         store.save_resource("test_git_config", &config).unwrap();
         let service = Service {
             store,
+            manager: Arc::new(backends::manager()),
             git_config: Some(config),
         };
         let definition = ProjectDefinition {
@@ -453,6 +477,7 @@ async fn restart_preserves_use_holds_and_never_recreates_missing_resources() {
             .unwrap(),
         ),
         git_config: fixture.service.git_config.clone(),
+        manager: fixture.service.manager.clone(),
     };
     assert_eq!(
         reopened.node().await.unwrap(),
@@ -886,6 +911,9 @@ async fn native_cleanup_reconciles_a_lost_response_without_repeating_removal_or_
                     commit: None,
                     path: Some(PathBuf::from(location.root.as_str())),
                     effects_started: true,
+                    selection: entry.selection.clone(),
+                    kind: Some(OperationKind::Cleanup),
+                    prepared: None,
                 },
             );
             rt.state
@@ -1351,6 +1379,9 @@ async fn interrupted_archive_copies_and_publication_reconcile_without_losing_the
                         commit: None,
                         path: Some(source.to_owned()),
                         effects_started: true,
+                        selection: entry.selection.clone(),
+                        kind: Some(OperationKind::Cleanup),
+                        prepared: None,
                     },
                 );
                 rt.state.workspaces.insert(target.to_string(), entry);

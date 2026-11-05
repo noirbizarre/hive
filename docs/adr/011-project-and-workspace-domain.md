@@ -104,12 +104,47 @@ means allocating a replacement with a different identity.
 ### Backend interface and retry contract
 
 `WorkspaceBackend` provides object-safe `provision`, `inspect`, and `cleanup`
-methods returning boxed `Send` futures. Core chooses neither a runtime nor a
-subprocess implementation. Requests carry identity, intent, node affinity, and
-operation keys. Backends execute on the owning node, verify repository and backend
-identity, and coordinate mutations for each resource.
+methods returning boxed `Send` futures at the service boundary. Its concrete
+implementation is shared orchestration, composed from two independent contracts:
 
-Before external effects, persist the operation ID, selected backend identity, and
+- `RepositoryBackend` acquires and updates storage, verifies its identity and
+  inspects backend-specific revisions. `RepositoryHandle` pins the repository ID,
+  project, owning node, `RepositoryBackendId`, `StorageKind` and versioned metadata.
+- `WorkspaceProvisioner` prepares, creates, inspects, reconciles and removes working
+  environments. `ProvisionerId` is independent of the repository backend ID.
+  Descriptors declare accepted backend/storage pairs and capabilities for linked
+  workspaces, independent checkouts, uncertain hooks and activity reporting.
+- `BackendManager` resolves compatible pairs and dispatches recorded identities.
+  Compatibility and payload validation precede acquisition or checkout effects.
+  Unknown implementations, storage kinds or payload versions fail explicitly;
+  they never select a fallback during recovery or cleanup.
+- The workspace service retains operation history, state transitions, persistence,
+  admission, session holds, retention and cleanup policy. Implementations receive
+  immutable inputs and a narrow checkpoint writer, not the service's store or
+  lifecycle state. A failed durable barrier prevents the next effect.
+
+Core chooses neither an executor nor a subprocess implementation. Synchronous
+implementation contracts run inside the daemon's admitted blocking job, without
+re-entering its cross-process gate. Requests retain node affinity and operation
+keys. Commands and filesystem inspection execute on the owning node.
+
+The built-in repository backend is `git`, with storage kind `git.bare-cache`.
+Provisioners `git.worktree`, `git.clone` and `worktrunk` all consume the same Git
+repository handle; WorkTrunk is explicitly Git-only, not a separate SCM.
+`external.directory` requires no repository and cannot remove directories.
+Repository layout/registration discovery is implementation-provided read-only
+evidence and never grants authority over an orphan.
+
+New managed policies carry a `BackendSelection` and `BackendData` intent envelope
+(`schema`, `version`, `data`). Preparation pins backend-specific resolution in
+durable checkpoints; observations use the same envelope. Generic lifecycle code
+does not require Git branches or worktrees. Git-specific shorthand and legacy
+response projections are decoded at the Git boundary. A future SCM can register
+its own storage/provisioner pair and codecs without changing the state machine or
+emulating Git. Native Jujutsu support is separate work (#137).
+
+Before external effects, persist the operation ID, both selected identities, the
+compatible repository handle/reference, and
 complete intent. Workspace records retain backend identity even before a path is
 known; retries and reconciliation cannot switch integrations. Repeating
 the same ID and intent reconciles the same resource. Changing intent under an
@@ -134,6 +169,28 @@ execution. Partial resource observations survive failure for later inspection.
 Backend results must persist the effective root, cwd, and backend provenance before
 publishing readiness. Later configuration changes cannot reinterpret that identity
 or route removal to an unrelated backend.
+
+#### Persisted provenance migration
+
+The resource snapshot has an explicit schema version. Versionless snapshots migrate
+atomically under resource admission to version 1 before further effects. Legacy
+`native`, `clone`, and `worktrunk` identities map deterministically to `git` plus
+`git.worktree`, `git.clone`, and `worktrunk`; `existing` maps to
+`external.directory` without a fabricated SCM. Legacy Git policy records remain
+decodable. Existing IDs, repository layouts, actual paths, partial observations,
+resolved commits, uncertainty markers, archives and session holds survive migration.
+When a legacy WorkTrunk response was lost before its path was recorded, migration
+retains a pathless checkpoint. Explicit hook acknowledgement and repository/branch/base
+verification bind the supplied observed directory; recovery never guesses a path or replays hooks.
+
+Immutable submitted request JSON is separate from resolved execution checkpoints.
+Migration does not rewrite original create/cleanup requests or frozen sweep
+requests, so unchanged retries still compare identically and changed snapshots
+still conflict. Explicit operation kinds replace request-field heuristics after
+legacy decoding. Configuration changes and auto-detection never reselect a pinned
+implementation. Unsupported future snapshot versions are rejected. Downgrading
+an upgraded snapshot requires restoring a matching pre-upgrade database/filesystem
+backup; older binaries do not understand the new provenance contract.
 
 ### Cleanup safety and diagnostics
 

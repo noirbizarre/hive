@@ -239,10 +239,7 @@ impl Runtime<'_> {
     }
 
     fn uncertain_hooks(&self, entry: &Entry) -> bool {
-        entry
-            .workspace
-            .backend()
-            .is_some_and(|backend| backend.0 == "worktrunk")
+        self.uncertain_backend(entry).unwrap_or(true)
             && matches!(
                 entry.workspace.state(),
                 WorkspaceState::Provisioning
@@ -335,11 +332,7 @@ impl Runtime<'_> {
         self.save()?;
         let entries: Vec<_> = self.state.workspaces.values().cloned().collect();
         for mut entry in entries {
-            if entry
-                .workspace
-                .backend()
-                .is_some_and(|backend| backend.0 == "worktrunk")
-                || self.has_use(entry.workspace.id())
+            if self.uncertain_backend(&entry).unwrap_or(true) || self.has_use(entry.workspace.id())
             {
                 continue;
             }
@@ -376,76 +369,48 @@ impl Runtime<'_> {
         self.save()
     }
 
-    fn completed_creation(&self, entry: &Entry) -> Result<Option<WorkspaceLocation>, Error> {
+    pub(super) fn completed_creation(
+        &self,
+        entry: &Entry,
+    ) -> Result<Option<WorkspaceLocation>, Error> {
         let operation = self
             .state
             .operations
             .get(entry.workspace.operation().ok_or(Error::Conflict)?.as_str())
             .ok_or(Error::Conflict)?;
-        if !operation.effects_started || operation.request.get("project").is_none() {
+        if !operation.effects_started || !operation.is_create() {
             return Ok(None);
         }
         let Inspection::Present { location, .. } = self.inspect(entry.workspace.id())? else {
             return Ok(None);
         };
-        let path = Path::new(location.root.as_str());
-        // A marker alone cannot settle interrupted provisioning: prove the original base and registration.
-        // These creation checks do not constrain later user edits/rebases in an already-ready workspace.
-        let location = self.location(
-            entry,
-            path,
-            Some(operation.commit.as_ref().ok_or(Error::Conflict)?),
+        let selection = self.selection(entry)?;
+        let manager = self.manager;
+        let provisioner = manager.provisioner(&selection)?;
+        let intent = provisioner.at_location(
+            operation.prepared.as_ref().ok_or(Error::Conflict)?,
+            &location.root,
+            true,
         )?;
-        let repository = self
-            .state
-            .repositories
-            .get(entry.repository.as_ref().ok_or(Error::Conflict)?.as_str())
-            .ok_or(Error::Conflict)?;
-        if location.backend.0 == "clone" {
-            if git(path, &["config", "--get", "remote.origin.url"], "inspect")?.trim()
-                != repository.source
-            {
-                return Err(Error::Conflict);
-            }
-        } else {
-            let registrations = git(
-                Path::new(repository.repository.root.as_str()),
-                &["worktree", "list", "--porcelain", "-z"],
-                "inspect",
-            )?;
-            if !registered_worktree(&registrations, path)? {
-                return Err(Error::Conflict);
-            }
-        }
-        Ok(Some(location))
+        // A marker alone cannot settle interrupted provisioning; backends prove their own registration/base.
+        let observation = provisioner.verify_created(selection.repository.as_ref(), &intent)?;
+        Ok(Some(backends::location(
+            observation,
+            location.backend,
+            operation.commit.as_deref(),
+        )?))
     }
 
     pub(super) fn verified_archive(&self, entry: &Entry, operation: &OperationId) -> bool {
-        let Some(plan) = self.state.archives.get(operation.as_str()) else {
-            return false;
+        let verify = || -> Result<bool, Error> {
+            let selection = self.selection(entry)?;
+            self.manager.provisioner(&selection)?.verify_preserved(
+                entry.archive.as_ref(),
+                self.cleanup_checkpoint(operation)?.as_ref(),
+                operation,
+            )
         };
-        let path = &plan.destination;
-        entry
-            .archive
-            .as_ref()
-            .is_some_and(|archive| Path::new(archive.as_str()) == path)
-            && path
-                .symlink_metadata()
-                .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
-            && git(
-                path,
-                &["config", "--get", "hive.archiveOperation"],
-                "archive",
-            )
-            .is_ok_and(|value| value.trim() == operation.as_str())
-            && git(path, &["rev-parse", "HEAD"], "archive").is_ok_and(|value| value == plan.head)
-            && git(
-                path,
-                &["for-each-ref", "--format=%(objectname) %(refname)"],
-                "archive",
-            )
-            .is_ok_and(|value| value == plan.refs)
-            && git(path, &["fsck", "--no-reflogs"], "archive").is_ok()
+        verify().unwrap_or(false)
     }
 
     fn report(&self, projects: &BTreeSet<ProjectId>) -> Result<RecoveryReport, Error> {
@@ -456,7 +421,7 @@ impl Runtime<'_> {
                 .state
                 .operations
                 .values()
-                .find(|op| &op.workspace == id && op.request.get("project").is_some());
+                .find(|op| &op.workspace == id && op.is_create());
             let path = entry
                 .workspace
                 .location()
@@ -528,8 +493,8 @@ impl Runtime<'_> {
         }
         let (orphans, scan_errors) = self.discover_orphans();
         let repository_findings = self.state.repositories.values().map(|repository| {
-            let root = Path::new(repository.repository.root.as_str());
-            let staging = root.parent().map(|parent| parent.join(".git-incomplete"));
+            let staging = self.repository_layout(repository).ok().and_then(|layout| layout.staging.into_iter().next())
+                .map(|path| PathBuf::from(path.as_str()));
             let failure = self.verify_repository(repository).err().map(|error| error.json());
             serde_json::json!({
                 "repository":repository.repository.id,
@@ -564,19 +529,41 @@ impl Runtime<'_> {
                 .values()
                 .filter_map(|op| op.path.clone()),
         );
+        let mut roots = Vec::new();
         for repository in self.state.repositories.values() {
-            if let Some(parent) = Path::new(repository.repository.root.as_str()).parent() {
-                known.insert(parent.join(".git-incomplete"));
+            if let Ok(layout) = self.repository_layout(repository) {
+                known.extend(
+                    layout
+                        .staging
+                        .iter()
+                        .map(|path| PathBuf::from(path.as_str())),
+                );
+                roots.extend(
+                    layout
+                        .scan_roots
+                        .iter()
+                        .map(|path| PathBuf::from(path.as_str())),
+                );
             }
         }
-        let mut roots = vec![self.store.state_directory().join("clones")];
-        roots.extend(self.state.repositories.values().filter_map(|repo| {
-            Path::new(repo.repository.root.as_str())
-                .parent()
-                .map(Path::to_path_buf)
-        }));
         let mut orphans = Vec::new();
         let mut errors = Vec::new();
+        if let Ok(directory) = self.path(self.store.state_directory()) {
+            for provisioner in self.manager.provisioners() {
+                match provisioner.discovery_roots(&directory) {
+                    Ok(paths) => {
+                        for path in paths {
+                            if path.node() != &self.state.node {
+                                errors.push(Error::Conflict.json());
+                            } else {
+                                roots.push(PathBuf::from(path.as_str()));
+                            }
+                        }
+                    }
+                    Err(error) => errors.push(error.json()),
+                }
+            }
+        }
         let mut remaining = 4096usize;
         // Scan only fixed layout levels, never recurse into checkout contents or symlinks.
         roots.push(self.root());
@@ -625,28 +612,29 @@ impl Runtime<'_> {
             if self.verify_repository(repo).is_err() {
                 continue;
             }
-            match git(
-                Path::new(repo.repository.root.as_str()),
-                &["worktree", "list", "--porcelain", "-z"],
-                "inspect",
-            ) {
-                Ok(list) => {
-                    for field in list.split('\0') {
-                        if let Some(path) = field.strip_prefix("worktree ") {
-                            let path = PathBuf::from(path);
-                            if !known.contains(&path)
-                                && path != Path::new(repo.repository.root.as_str())
-                            {
-                                if remaining == 0 {
-                                    errors.push(blocker(
-                                        "scan_truncated",
-                                        "inspect remaining registered worktrees manually",
-                                    ));
-                                    break;
-                                }
-                                remaining -= 1;
-                                orphans.push(Orphan { path, reason: "unrecorded_registration", help: "inspect this known repository's worktree registration manually; Hive has no deletion authority" });
+            let paths = repo
+                .handle
+                .as_ref()
+                .ok_or(Error::Conflict)
+                .and_then(|handle| self.manager.repository(handle)?.workspace_paths(handle));
+            match paths {
+                Ok(paths) => {
+                    for path in paths {
+                        if path.node() != &self.state.node {
+                            errors.push(Error::Conflict.json());
+                            continue;
+                        }
+                        let path = PathBuf::from(path.as_str());
+                        if !known.contains(&path) {
+                            if remaining == 0 {
+                                errors.push(blocker(
+                                    "scan_truncated",
+                                    "inspect remaining registered workspaces manually",
+                                ));
+                                break;
                             }
+                            remaining -= 1;
+                            orphans.push(Orphan { path, reason: "unrecorded_registration", help: "inspect this known repository's workspace registration manually; Hive has no deletion authority" });
                         }
                     }
                 }
@@ -777,10 +765,7 @@ impl Runtime<'_> {
                     entry.workspace.state(),
                     WorkspaceState::Cleaning | WorkspaceState::CleanupFailed
                 )
-                && !entry
-                    .workspace
-                    .backend()
-                    .is_some_and(|backend| backend.0 == "worktrunk")
+                && !self.uncertain_backend(&entry)?
                 && self.verified_removal_absence(&entry)?
             {
                 let mut entry = entry;

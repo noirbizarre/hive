@@ -20,10 +20,81 @@ struct Context {
 }
 type Response = Result<Json<Value>, (StatusCode, Json<Value>)>;
 
+/// v1 exposes Git policy conveniences while storage keeps versioned backend intent.
+/// Frozen operation/sweep requests must never be rewritten by a response presenter.
+fn present(mut value: Value) -> Value {
+    match &mut value {
+        Value::Array(items) => {
+            for item in items {
+                *item = present(item.take());
+            }
+        }
+        Value::Object(fields) => {
+            if let Some(workspace) = fields.get_mut("workspace")
+                && let Some(policy) = workspace.pointer_mut("/intent/policy")
+            {
+                let backing = if policy["policy"] == "managed" {
+                    Some(policy.clone())
+                } else if policy["policy"] == "ephemeral" && policy["backing"]["kind"] == "backend"
+                {
+                    Some(policy["backing"].clone())
+                } else {
+                    None
+                };
+                if let Some(backing) = backing {
+                    let id = backing["selection"]["provisioner"]
+                        .as_str()
+                        .unwrap_or_default();
+                    if backing["intent"]["schema"] == "hive.git.intent"
+                        && backing["intent"]["version"] == 1
+                        && matches!(id, "git.clone" | "git.worktree" | "worktrunk")
+                    {
+                        let mut legacy = json!({"kind": if id == "git.clone" { "clone" } else { "worktree" }, "git":backing["intent"]["data"]});
+                        if id != "git.clone" {
+                            legacy["repository"] = backing["selection"]["repository"]["id"].clone();
+                        }
+                        if policy["policy"] == "ephemeral" {
+                            policy["backing"] = legacy;
+                        } else {
+                            legacy["policy"] = legacy["kind"].take();
+                            legacy
+                                .as_object_mut()
+                                .expect("policy object")
+                                .remove("kind");
+                            *policy = legacy;
+                        }
+                    }
+                }
+            }
+            for (key, item) in fields {
+                // Never reinterpret opaque backend payloads or immutable request snapshots.
+                if !matches!(
+                    key.as_str(),
+                    "request"
+                        | "cleanup"
+                        | "metadata"
+                        | "observations"
+                        | "selection"
+                        | "intent"
+                        | "handle"
+                ) {
+                    *item = present(item.take());
+                }
+            }
+        }
+        _ => {}
+    }
+    value
+}
+
 fn response(error: Error) -> (StatusCode, Json<Value>) {
     let status = match &error {
         Error::Unknown => StatusCode::NOT_FOUND,
         Error::Request => StatusCode::UNPROCESSABLE_ENTITY,
+        Error::Domain(
+            hive_core::workspace::WorkspaceError::IncompatibleBackends { .. }
+            | hive_core::workspace::WorkspaceError::UnsupportedBackendData { .. },
+        ) => StatusCode::UNPROCESSABLE_ENTITY,
         Error::Storage => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::CONFLICT,
     };
@@ -65,14 +136,14 @@ pub(crate) fn router(broker: crate::Broker, origin: Option<String>) -> Router {
 
 async fn recovery(State(cx): State<Context>) -> Response {
     let projects = cx.broker.recovery_projects().map_err(response)?;
-    Ok(Json(json!(
+    Ok(Json(present(json!(
         cx.broker
             .workspace_service()
             .map_err(response)?
             .recovery(projects)
             .await
             .map_err(response)?
-    )))
+    ))))
 }
 
 async fn plan_sweep(
@@ -171,9 +242,9 @@ async fn fetch(State(cx): State<Context>, Path(id): Path<String>, headers: Heade
     )))
 }
 async fn list(State(cx): State<Context>) -> Response {
-    Ok(Json(
+    Ok(Json(present(
         json!({"workspaces":cx.broker.workspace_service().map_err(response)?.list().await.map_err(response)?}),
-    ))
+    )))
 }
 async fn show(State(cx): State<Context>, Path(id): Path<String>) -> Response {
     let id = WorkspaceId::try_from(id).map_err(|_| response(Error::Request))?;
@@ -187,7 +258,7 @@ async fn show(State(cx): State<Context>, Path(id): Path<String>) -> Response {
         .into_iter()
         .find(|e| e.workspace.id() == &id)
         .ok_or_else(|| response(Error::Unknown))?;
-    Ok(Json(json!(entry)))
+    Ok(Json(present(json!(entry))))
 }
 async fn inspect(State(cx): State<Context>, Path(id): Path<String>) -> Response {
     let id = WorkspaceId::try_from(id).map_err(|_| response(Error::Request))?;
@@ -261,7 +332,7 @@ async fn create(
             value["operation"] = json!(body.operation);
             (status, Json(value))
         })?;
-    Ok(Json(json!(entry)))
+    Ok(Json(present(json!(entry))))
 }
 
 #[derive(Deserialize)]
@@ -288,12 +359,12 @@ async fn reconcile(
     cx.authorize(&headers)?;
     let Json(body) = body.map_err(|_| response(Error::Request))?;
     let id = WorkspaceId::try_from(id).map_err(|_| response(Error::Request))?;
-    Ok(Json(json!(
+    Ok(Json(present(json!(
         cx.broker
             .reconcile_workspace(id, body.directory, body.hooks_reconciled)
             .await
             .map_err(response)?
-    )))
+    ))))
 }
 async fn remove(
     State(cx): State<Context>,
@@ -304,10 +375,34 @@ async fn remove(
     cx.authorize(&headers)?;
     let Json(body) = body.map_err(|_| response(Error::Request))?;
     let id = WorkspaceId::try_from(id).map_err(|_| response(Error::Request))?;
-    Ok(Json(json!(
+    Ok(Json(present(json!(
         cx.broker
             .remove_workspace(id, body.operation, body.discard_changes)
             .await
             .map_err(response)?
-    )))
+    ))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v1_policy_projection_preserves_opaque_evidence_and_frozen_requests_in_nested_reports() {
+        let policy = json!({"policy":"managed", "selection":{"provisioner":"git.worktree", "repository":{"id":"repository-recorded"}},
+            "intent":{"schema":"hive.git.intent", "version":1,"data":{"base_ref":"main","branch":null}}});
+        let opaque = json!({"workspace":{"intent":{"policy":policy}}});
+        let entry = json!({"workspace":{"intent":{"policy":policy}, "location":{"observations":opaque}}, "selection":opaque});
+        let frozen = json!({"workspace":entry, "request":entry, "cleanup":entry});
+        let report = present(json!({"workspaces":[frozen]}));
+        let projected = &report["workspaces"][0]["workspace"];
+        assert_eq!(
+            projected["workspace"]["intent"]["policy"],
+            json!({"policy":"worktree","repository":"repository-recorded","git":{"base_ref":"main","branch":null}})
+        );
+        assert_eq!(projected["selection"], opaque);
+        assert_eq!(projected["workspace"]["location"]["observations"], opaque);
+        assert_eq!(report["workspaces"][0]["request"], entry);
+        assert_eq!(report["workspaces"][0]["cleanup"], entry);
+    }
 }

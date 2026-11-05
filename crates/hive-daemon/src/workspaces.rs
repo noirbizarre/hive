@@ -10,6 +10,9 @@ use std::{
 };
 
 use crate::{config::WorkspaceTemplate, persistence::Store};
+use hive_core::workspace::backend::{
+    BackendData, BackendSelection, CheckpointWriter, ProvisionerId, RepositoryHandle,
+};
 use hive_core::{
     identity::{NodeId, OperationId, ProjectId, RepositoryId, WorkspaceId},
     project::{NodeRepository, ProjectDefinition, RepositoryRole},
@@ -25,6 +28,8 @@ use hive_core::{
     },
 };
 use serde::{Deserialize, Serialize};
+mod backends;
+mod persistence;
 mod recovery;
 mod routes;
 pub use recovery::{RecoveryReport, Sweep, SweepRequest};
@@ -245,6 +250,7 @@ impl Error {
 
     pub fn json(&self) -> serde_json::Value {
         let help = match self {
+            Self::Domain(error) => error.help(),
             Self::Selector => {
                 "send a supported _meta.hive.workspace object with correctly typed fields; see the session launch selectors in Hive's API documentation"
             }
@@ -263,6 +269,8 @@ pub struct Repository {
     pub source: String,
     pub status: String,
     pub failure: Option<String>,
+    #[serde(default)]
+    pub handle: Option<RepositoryHandle>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -272,6 +280,8 @@ pub struct Entry {
     pub failure: Option<String>,
     #[serde(default)]
     pub archive: Option<NodePath>,
+    #[serde(default)]
+    pub selection: Option<BackendSelection>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -285,6 +295,13 @@ pub struct CreateRequest {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OperationKind {
+    Create,
+    Cleanup,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 struct Operation {
     request: serde_json::Value,
     workspace: WorkspaceId,
@@ -292,6 +309,18 @@ struct Operation {
     commit: Option<String>,
     path: Option<PathBuf>,
     effects_started: bool,
+    #[serde(default)]
+    selection: Option<BackendSelection>,
+    #[serde(default)]
+    kind: Option<OperationKind>,
+    #[serde(default)]
+    prepared: Option<BackendData>,
+}
+
+impl Operation {
+    fn is_create(&self) -> bool {
+        matches!(self.kind, Some(OperationKind::Create))
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -304,6 +333,8 @@ struct ArchivePlan {
 
 #[derive(Serialize, Deserialize)]
 struct State {
+    #[serde(default)]
+    version: u32,
     node: NodeId,
     repositories: BTreeMap<String, Repository>,
     workspaces: BTreeMap<String, Entry>,
@@ -329,6 +360,7 @@ struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
+            version: 1,
             node: NodeId::new(),
             repositories: BTreeMap::new(),
             workspaces: BTreeMap::new(),
@@ -348,6 +380,7 @@ impl Default for State {
 #[derive(Clone)]
 pub struct Service {
     store: Arc<Store>,
+    manager: Arc<hive_core::workspace::backend::BackendManager<Error>>,
     #[cfg(test)]
     git_config: Option<PathBuf>,
 }
@@ -361,6 +394,7 @@ impl Service {
         let git_config = store.resource("test_git_config").unwrap_or(None);
         Self {
             store,
+            manager: Arc::new(backends::manager()),
             #[cfg(test)]
             git_config,
         }
@@ -371,6 +405,7 @@ impl Service {
         work: impl FnOnce(&mut Runtime<'_>) -> Result<T, Error> + Send + 'static,
     ) -> Result<T, Error> {
         let store = self.store.clone();
+        let manager = self.manager.clone();
         #[cfg(test)]
         let config = self.git_config.clone();
         tokio::task::spawn_blocking(move || {
@@ -390,9 +425,11 @@ impl Service {
             let state = stored.unwrap_or_default();
             let mut runtime = Runtime {
                 store: &store,
+                manager: &manager,
                 state,
             };
-            if initialize {
+            let migrated = runtime.migrate_backends()?;
+            if initialize || migrated {
                 runtime.save()?;
             }
             work(&mut runtime)
@@ -599,6 +636,7 @@ impl From<crate::persistence::StoreError> for Error {
 
 struct Runtime<'a> {
     store: &'a Store,
+    manager: &'a hive_core::workspace::backend::BackendManager<Error>,
     state: State,
 }
 
@@ -649,9 +687,8 @@ impl hive_core::workspace::backend::WorkspaceBackend for Service {
                         default_ref: None,
                         preparation: vec![],
                     },
-                    WorktrunkConfig {
-                        enabled: Some(request.backend.0 == "worktrunk"),
-                    },
+                    // Retry dispatch uses the persisted selection before configuration is consulted.
+                    WorktrunkConfig::default(),
                 )?;
                 Ok(hive_core::workspace::backend::ProvisionResult {
                     workspace: request.workspace,
@@ -820,7 +857,7 @@ impl Runtime<'_> {
                             .values()
                             .find(|operation| {
                                 operation.workspace == *entry.workspace.id()
-                                    && operation.request.get("project").is_some()
+                                    && operation.is_create()
                             })
                             .and_then(|operation| operation.path.clone())
                     });
@@ -886,35 +923,9 @@ impl Runtime<'_> {
         self.store.state_directory().join("repositories")
     }
     fn verify_repository(&self, repo: &Repository) -> Result<(), Error> {
-        if repo.repository.node() != &self.state.node {
-            return Err(Error::Conflict);
-        }
-        let root = Path::new(repo.repository.root.as_str());
-        if root
-            .symlink_metadata()
-            .map_err(|_| Error::Conflict)?
-            .file_type()
-            .is_symlink()
-        {
-            return Err(Error::Conflict);
-        }
-        let actual = git(root, &["rev-parse", "--absolute-git-dir"], "inspect")?;
-        if Path::new(actual.trim())
-            .canonicalize()
-            .map_err(|_| Error::Conflict)?
-            != root.canonicalize().map_err(|_| Error::Conflict)?
-        {
-            return Err(Error::Conflict);
-        }
-        let source = git(root, &["config", "--get", "remote.origin.url"], "inspect")?;
-        let identity = git(root, &["config", "--get", "hive.repository"], "inspect")?;
-        if source.trim() != repo.source
-            || identity.trim() != repo.repository.id.as_str()
-            || git(root, &["rev-parse", "--is-bare-repository"], "inspect")?.trim() != "true"
-        {
-            return Err(Error::Conflict);
-        }
-        Ok(())
+        let manager = self.manager;
+        let handle = self.repository_handle(repo)?;
+        manager.repository(handle)?.verify(handle)
     }
     fn fetch(&mut self, repo: &mut Repository) -> Result<(), Error> {
         self.verify_repository(repo)?;
@@ -924,19 +935,9 @@ impl Runtime<'_> {
             .repositories
             .insert(repo.repository.id.to_string(), repo.clone());
         self.save()?;
-        let result = git(
-            Path::new(repo.repository.root.as_str()),
-            &[
-                "fetch",
-                "--atomic",
-                "--no-tags",
-                "origin",
-                "+refs/heads/*:refs/remotes/origin/*",
-                "refs/tags/*:refs/tags/*",
-            ],
-            "fetch",
-        )
-        .and_then(|_| refresh_remote_head(Path::new(repo.repository.root.as_str()), "fetch"));
+        let manager = self.manager;
+        let handle = self.repository_handle(repo)?;
+        let result = manager.repository(handle)?.update(handle);
         repo.status = if result.is_ok() { "ready" } else { "failed" }.into();
         repo.failure = result.as_ref().err().map(|e| e.code().into());
         self.state
@@ -968,7 +969,7 @@ impl Runtime<'_> {
         // Project slugs are unbounded portable identifiers, not filesystem components.
         // Stable resource IDs avoid inflating Windows linked-worktree metadata paths.
         let project_root = self.root().join(id.as_str());
-        let repo = Repository {
+        let mut repo = Repository {
             repository: NodeRepository {
                 id,
                 project: project.clone(),
@@ -979,7 +980,9 @@ impl Runtime<'_> {
             source: source.clone(),
             status: "cloning".into(),
             failure: None,
+            handle: None,
         };
+        repo.handle = Some(backends::handle(&repo)?);
         self.state
             .repositories
             .insert(repo.repository.id.to_string(), repo.clone());
@@ -987,136 +990,9 @@ impl Runtime<'_> {
         Ok(repo)
     }
     fn acquire(&mut self, mut repo: Repository) -> Result<Repository, Error> {
-        let destination = Path::new(repo.repository.root.as_str());
-        let parent = destination.parent().ok_or(Error::Request)?;
-        std::fs::create_dir_all(parent).map_err(|_| Error::Storage)?;
-        let staging = parent.join(".git-incomplete");
-        // A partial acquisition is owned by the durable repository ID; never remove arbitrary occupied paths.
-        let result = (|| {
-            if !staging.exists() {
-                git(
-                    parent,
-                    &["init", "--bare", staging.to_str().ok_or(Error::Request)?],
-                    "clone",
-                )?;
-            }
-            git(
-                &staging,
-                &["config", "extensions.worktreeConfig", "true"],
-                "clone",
-            )?;
-            #[cfg(windows)]
-            git(&staging, &["config", "core.longpaths", "true"], "clone")?;
-            git(
-                &staging,
-                &["config", "--worktree", "core.bare", "true"],
-                "clone",
-            )?;
-            // With worktreeConfig enabled, bare=true must not leak into linked worktrees.
-            let _ = git(
-                &staging,
-                &["config", "--local", "--unset-all", "core.bare"],
-                "clone",
-            );
-            // Templates can contribute checkout-specific config; the extension removes
-            // Git's old main-worktree exception, so these settings must not remain shared.
-            for name in [
-                "core.worktree",
-                "core.sparseCheckout",
-                "core.sparseCheckoutCone",
-            ] {
-                if let Ok(value) = git(&staging, &["config", "--local", "--get", name], "clone") {
-                    git(
-                        &staging,
-                        &["config", "--worktree", name, value.trim()],
-                        "clone",
-                    )?;
-                    git(
-                        &staging,
-                        &["config", "--local", "--unset-all", name],
-                        "clone",
-                    )?;
-                }
-            }
-            let common = git(
-                &staging,
-                &["config", "--local", "--list", "--null"],
-                "clone",
-            )?;
-            if common.split('\0').any(|entry| {
-                entry.starts_with("core.bare\n") || entry.starts_with("core.worktree\n")
-            }) {
-                return Err(Error::Git("clone"));
-            }
-            git(
-                &staging,
-                &["config", "remote.origin.url", &repo.source],
-                "clone",
-            )?;
-            git(
-                &staging,
-                &["config", "hive.repository", repo.repository.id.as_str()],
-                "clone",
-            )?;
-            git(
-                &staging,
-                &[
-                    "config",
-                    "remote.origin.fetch",
-                    "+refs/heads/*:refs/remotes/origin/*",
-                ],
-                "clone",
-            )?;
-            git(
-                &staging,
-                &[
-                    "fetch",
-                    "--no-tags",
-                    "origin",
-                    "+refs/heads/*:refs/remotes/origin/*",
-                    "refs/tags/*:refs/tags/*",
-                ],
-                "clone",
-            )?;
-            let head = git(
-                &staging,
-                &["ls-remote", "--symref", "origin", "HEAD"],
-                "clone",
-            )?;
-            if let Some(branch) = head.lines().find_map(|line| {
-                line.strip_prefix("ref: refs/heads/")
-                    .and_then(|s| s.split_once('\t'))
-                    .map(|(branch, _)| branch)
-            }) {
-                git(
-                    &staging,
-                    &[
-                        "symbolic-ref",
-                        "refs/remotes/origin/HEAD",
-                        &format!("refs/remotes/origin/{branch}"),
-                    ],
-                    "clone",
-                )?;
-                // Seed only a fresh repository's default branch/HEAD. Later fetches update
-                // remote-tracking refs exclusively, preserving any checked-out local branch.
-                git(
-                    &staging,
-                    &[
-                        "update-ref",
-                        &format!("refs/heads/{branch}"),
-                        &format!("refs/remotes/origin/{branch}"),
-                    ],
-                    "clone",
-                )?;
-                git(
-                    &staging,
-                    &["symbolic-ref", "HEAD", &format!("refs/heads/{branch}")],
-                    "clone",
-                )?;
-            }
-            std::fs::rename(&staging, destination).map_err(|_| Error::Storage)?;
-            Ok::<_, Error>(())
-        })();
+        let manager = self.manager;
+        let handle = self.repository_handle(&repo)?;
+        let result = manager.repository(handle)?.acquire(handle);
         repo.status = if result.is_ok() { "ready" } else { "failed" }.into();
         repo.failure = result.as_ref().err().map(|e| e.code().into());
         self.state
@@ -1177,17 +1053,7 @@ impl Runtime<'_> {
                     .workspaces
                     .insert(original.workspace.to_string(), entry.clone());
                 self.save()?;
-                let intent = match &entry.workspace.intent().policy {
-                    WorkspacePolicy::Worktree { git, .. } | WorkspacePolicy::Clone { git } => {
-                        Some(git.clone())
-                    }
-                    WorkspacePolicy::Ephemeral {
-                        backing:
-                            ManagedBacking::Worktree { git, .. } | ManagedBacking::Clone { git },
-                    } => Some(git.clone()),
-                    _ => None,
-                };
-                match self.provision(&entry, intent.as_ref(), &key) {
+                match self.provision(&entry, &key) {
                     Ok(location) => {
                         entry.failure = None;
                         entry
@@ -1219,25 +1085,12 @@ impl Runtime<'_> {
                 Inspection::Present { .. } if entry.workspace.state() == WorkspaceState::Ready => {
                     return Ok(entry);
                 }
-                Inspection::Present { location, .. }
-                    if original.effects_started
-                        && entry
-                            .workspace
-                            .backend()
-                            .is_some_and(|b| b.0 != "worktrunk") =>
+                Inspection::Present { .. }
+                    if original.effects_started && !self.uncertain_backend(&entry)? =>
                 {
                     let mut entry = entry;
                     entry.failure = None;
-                    if let Some(base) = original.commit.as_ref()
-                        && original.commit != location.commit
-                    {
-                        git(
-                            Path::new(location.root.as_str()),
-                            &["merge-base", "--is-ancestor", base, "HEAD"],
-                            "base verification",
-                        )
-                        .map_err(|_| Error::Conflict)?;
-                    }
+                    let location = self.completed_creation(&entry)?.ok_or(Error::Uncertain)?;
                     entry
                         .workspace
                         .transition(WorkspaceEvent::ReconciledReady { location })?;
@@ -1276,7 +1129,6 @@ impl Runtime<'_> {
         };
         let id = WorkspaceId::new();
         let mut repository = None;
-        let mut git_intent = None;
         let retention = match &request.policy {
             WorkspaceTemplate::Ephemeral { retention, .. } => retention.clone(),
             _ => Retention::Retain,
@@ -1303,6 +1155,9 @@ impl Runtime<'_> {
                 commit: None,
                 path: None,
                 effects_started: false,
+                selection: None,
+                kind: Some(OperationKind::Create),
+                prepared: None,
             },
         );
         let policy = if let Some(directory) = existing_directory {
@@ -1326,23 +1181,23 @@ impl Runtime<'_> {
                 branch: request.branch.clone(),
             };
             repository = Some(repo.repository.id.clone());
-            git_intent = Some(git.clone());
-            let backing = if clone {
-                ManagedBacking::Clone { git }
-            } else {
-                ManagedBacking::Worktree {
-                    repository: repo.repository.id,
-                    git,
-                }
+            let selection = BackendSelection {
+                provisioner: persistence::legacy_provisioner(&BackendId(backend.into()))?,
+                repository: repo.handle.clone(),
             };
+            self.manager.resolve(&selection)?;
+            let intent = backends::data("hive.git.intent", &git)?;
             if matches!(request.policy, WorkspaceTemplate::Ephemeral { .. }) {
-                WorkspacePolicy::Ephemeral { backing }
+                WorkspacePolicy::Ephemeral {
+                    backing: ManagedBacking::Backend {
+                        selection: Box::new(selection),
+                        intent,
+                    },
+                }
             } else {
-                match backing {
-                    ManagedBacking::Clone { git } => WorkspacePolicy::Clone { git },
-                    ManagedBacking::Worktree { repository, git } => {
-                        WorkspacePolicy::Worktree { repository, git }
-                    }
+                WorkspacePolicy::Managed {
+                    selection: Box::new(selection),
+                    intent,
                 }
             }
         };
@@ -1361,13 +1216,33 @@ impl Runtime<'_> {
         })?;
         let mut entry = Entry {
             workspace,
-            repository,
+            repository: repository.clone(),
             failure: None,
             archive: None,
+            selection: Some(BackendSelection {
+                provisioner: persistence::legacy_provisioner(&BackendId(backend.into()))?,
+                repository: repository
+                    .as_ref()
+                    .map(|id| {
+                        self.state
+                            .repositories
+                            .get(id.as_str())
+                            .and_then(|r| r.handle.clone())
+                            .ok_or(Error::Conflict)
+                    })
+                    .transpose()?,
+            }),
         };
+        self.manager
+            .resolve(entry.selection.as_ref().ok_or(Error::Conflict)?)?;
+        self.state
+            .operations
+            .get_mut(&key)
+            .ok_or(Error::Conflict)?
+            .selection = entry.selection.clone();
         self.state.workspaces.insert(id.to_string(), entry.clone());
         self.save()?;
-        let result = self.provision(&entry, git_intent.as_ref(), &key);
+        let result = self.provision(&entry, &key);
         match result {
             Ok(location) => {
                 #[cfg(test)]
@@ -1394,315 +1269,129 @@ impl Runtime<'_> {
         Ok(entry)
     }
 
-    fn provision(
-        &mut self,
-        entry: &Entry,
-        intent: Option<&GitIntent>,
-        key: &str,
-    ) -> Result<WorkspaceLocation, Error> {
+    fn provision(&mut self, entry: &Entry, key: &str) -> Result<WorkspaceLocation, Error> {
+        let selection = self.selection(entry)?;
         let backend = entry.workspace.backend().ok_or(Error::Conflict)?.clone();
-        if let WorkspacePolicy::Existing { directory } = &entry.workspace.intent().policy {
-            self.state
-                .operations
-                .get_mut(key)
+        let manager = self.manager;
+        let intent = backends::intent(entry)?;
+        manager.provisioner(&selection)?.validate_intent(&intent)?;
+        if let Some(repository) = &selection.repository {
+            let mut repo = self
+                .state
+                .repositories
+                .get(repository.id.as_str())
                 .ok_or(Error::Conflict)?
-                .path = Some(PathBuf::from(directory.as_str()));
-            self.save()?;
-            return Ok(WorkspaceLocation {
-                root: directory.clone(),
-                working_directory: directory.clone(),
-                backend,
-                resolved_base: None,
-                branch: None,
-                commit: None,
-            });
-        }
-        let git_intent = intent.ok_or(Error::Request)?;
-        let branch = git_intent.effective_branch(entry.workspace.id());
-        let mut repo = self
-            .state
-            .repositories
-            .get(entry.repository.as_ref().ok_or(Error::Conflict)?.as_str())
-            .ok_or(Error::Conflict)?
-            .clone();
-        if Path::new(repo.repository.root.as_str()).exists() {
-            self.fetch(&mut repo)?;
-        } else {
-            repo = self.acquire(repo)?;
-        }
-        let bare = Path::new(repo.repository.root.as_str());
-        if self
-            .state
-            .operations
-            .get(key)
-            .and_then(|o| o.commit.as_ref())
-            .is_none()
-        {
-            let resolved = resolve(bare, &git_intent.base_ref)?;
-            self.state
-                .operations
-                .get_mut(key)
-                .ok_or(Error::Conflict)?
-                .commit = Some(resolved);
-        }
-        self.save()?;
-        git(
-            bare,
-            &["check-ref-format", "--branch", &branch],
-            "branch validation",
-        )?;
-        if git(
-            bare,
-            &["show-ref", "--verify", &format!("refs/heads/{branch}")],
-            "inspect",
-        )
-        .is_ok()
-        {
-            return Err(Error::Conflict);
-        }
-        let commit = self
-            .state
-            .operations
-            .get(key)
-            .and_then(|o| o.commit.clone())
-            .ok_or(Error::Conflict)?;
-        let target = if backend.0 == "clone" {
-            self.store
-                .state_directory()
-                .join("clones")
-                .join(entry.workspace.id().as_str())
-        } else {
-            bare.parent()
-                .ok_or(Error::Conflict)?
-                .join(entry.workspace.id().as_str())
-        };
-        if backend.0 != "worktrunk" && target.try_exists().map_err(|_| Error::Conflict)? {
-            return Err(Error::Conflict);
-        }
-        let operation = self.state.operations.get_mut(key).ok_or(Error::Conflict)?;
-        operation.path = (backend.0 != "worktrunk").then_some(target.clone());
-        operation.effects_started = backend.0 != "worktrunk";
-        self.save()?;
-        let actual = if backend.0 == "worktrunk" {
-            // Bare repositories have no checkout from which wt can read branch-specific hooks.
-            let configured = std::env::var_os("WORKTRUNK_PROJECT_CONFIG_PATH")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(".config/wt.toml"));
-            let project_config = if configured.is_absolute() {
-                Some(configured)
+                .clone();
+            if Path::new(repo.repository.root.as_str()).exists() {
+                self.fetch(&mut repo)?;
             } else {
-                match git(
-                    bare,
-                    &[
-                        "show",
-                        &format!("{commit}:{}", configured.to_str().ok_or(Error::Request)?),
-                    ],
-                    "hook configuration",
-                ) {
-                    Ok(contents) => {
-                        let directory = self.store.state_directory().join("worktrunk-config");
-                        std::fs::create_dir_all(&directory).map_err(|_| Error::Storage)?;
-                        let path = directory.join(format!("{key}.toml"));
-                        std::fs::write(&path, contents).map_err(|_| Error::Storage)?;
-                        Some(path)
-                    }
-                    Err(Error::Git(_)) => None,
-                    Err(error) => return Err(error),
-                }
-            };
-            check_approvals_with_config(bare, project_config.as_deref())?;
-            self.state
-                .operations
-                .get_mut(key)
-                .ok_or(Error::Conflict)?
-                .effects_started = true;
-            self.save()?;
-            let output = wt_with_config(
-                bare,
-                &[
-                    "switch", "--create", "--base", &commit, "--no-cd", "--format", "json", &branch,
-                ],
-                project_config.as_deref(),
-            )?;
-            let value: serde_json::Value =
-                serde_json::from_str(&output).map_err(|_| Error::Uncertain)?;
-            if value["action"].as_str() != Some("created")
-                || value["created_branch"] != true
-                || value["branch"].as_str() != Some(branch.as_str())
-            {
-                return Err(Error::Uncertain);
+                self.acquire(repo)?;
             }
-            PathBuf::from(
-                value
-                    .get("path")
-                    .and_then(|p| p.as_str())
-                    .ok_or(Error::Uncertain)?,
-            )
-        } else if backend.0 == "clone" {
-            std::fs::create_dir_all(target.parent().ok_or(Error::Request)?)
-                .map_err(|_| Error::Storage)?;
-            git(
-                bare,
-                &[
-                    "clone",
-                    "--no-hardlinks",
-                    "--no-checkout",
-                    bare.to_str().ok_or(Error::Request)?,
-                    target.to_str().ok_or(Error::Request)?,
-                ],
-                "clone",
-            )?;
-            git(
-                &target,
-                &["remote", "set-url", "origin", &repo.source],
-                "clone",
-            )?;
-            #[cfg(windows)]
-            git(&target, &["config", "core.longpaths", "true"], "clone")?;
-            git(&target, &["checkout", "-b", &branch, &commit], "checkout")?;
-            target
-        } else {
-            git(
-                bare,
-                &[
-                    "worktree",
-                    "add",
-                    "-b",
-                    &branch,
-                    target.to_str().ok_or(Error::Request)?,
-                    &commit,
-                ],
-                "worktree creation",
-            )?;
-            target
-        };
-        if !actual.is_absolute() {
-            return Err(Error::Uncertain);
         }
-        let actual = actual.canonicalize().map_err(|_| Error::Conflict)?;
-        // The branch/path alone cannot distinguish our checkout from a replacement repository.
-        git(
-            &actual,
-            &[
-                "config",
-                if backend.0 == "clone" {
-                    "--local"
-                } else {
-                    "--worktree"
-                },
-                "hive.workspace",
-                entry.workspace.id().as_str(),
-            ],
-            "ownership",
-        )?;
-        self.state
+        let directory = self.path(self.store.state_directory())?;
+        let operation_id = OperationId::try_from(key.to_owned()).map_err(|_| Error::Request)?;
+        let previous = self
+            .state
             .operations
-            .get_mut(key)
+            .get(key)
             .ok_or(Error::Conflict)?
-            .path = Some(actual.clone());
+            .prepared
+            .clone();
+        let provisioner = manager.provisioner(&selection)?;
+        let prepared = provisioner.prepare(
+            selection.repository.as_ref(),
+            &intent,
+            hive_core::workspace::backend::PreparationContext {
+                workspace: entry.workspace.id(),
+                operation: &operation_id,
+                directory: &directory,
+                previous: previous.as_ref(),
+            },
+            &mut persistence::OperationCheckpoints { runtime: self, key },
+        )?;
+        let operation = self.state.operations.get_mut(key).ok_or(Error::Conflict)?;
+        operation.prepared = Some(prepared.intent.clone());
+        operation.path = prepared
+            .path
+            .as_ref()
+            .map(|path| PathBuf::from(path.as_str()));
+        operation.effects_started = !manager
+            .resolve(&selection)?
+            .capabilities
+            .uncertain_external_effects;
         self.save()?;
-        self.location(entry, &actual, Some(&commit))
+        let observation = provisioner.create(
+            selection.repository.as_ref(),
+            &prepared.intent,
+            &mut persistence::OperationCheckpoints { runtime: self, key },
+        )?;
+        entry
+            .workspace
+            .intent()
+            .check_node(observation.root.node())?;
+        entry
+            .workspace
+            .intent()
+            .check_node(observation.working_directory.node())?;
+        let pinned = self
+            .state
+            .operations
+            .get(key)
+            .and_then(|o| o.commit.as_deref());
+        backends::location(observation, backend, pinned)
     }
 
+    #[cfg(test)]
     fn location(
         &self,
         entry: &Entry,
         path: &Path,
         expected: Option<&str>,
     ) -> Result<WorkspaceLocation, Error> {
-        let backend = entry.workspace.backend().ok_or(Error::Conflict)?.clone();
-        let root = self.path(path)?;
-        if backend.0 == "existing" {
-            if !path.is_dir() {
-                return Err(Error::Conflict);
-            }
-            return Ok(WorkspaceLocation {
-                root: root.clone(),
-                working_directory: root,
-                backend,
-                resolved_base: None,
-                branch: None,
-                commit: None,
-            });
-        }
-        let top = git(path, &["rev-parse", "--show-toplevel"], "inspect")?;
-        let ownership = git(path, &["config", "--get", "hive.workspace"], "inspect")?;
-        if ownership.trim() != entry.workspace.id().as_str() {
-            return Err(Error::Conflict);
-        }
-        if Path::new(top.trim())
-            .canonicalize()
-            .map_err(|_| Error::Conflict)?
-            != path
-        {
-            return Err(Error::Conflict);
-        }
-        if backend.0 != "clone" {
-            let common = git(
-                path,
-                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-                "inspect",
-            )?;
-            let repo = self
-                .state
-                .repositories
-                .get(entry.repository.as_ref().ok_or(Error::Conflict)?.as_str())
-                .ok_or(Error::Conflict)?;
-            self.verify_repository(repo)?;
-            if Path::new(common.trim())
-                .canonicalize()
-                .map_err(|_| Error::Conflict)?
-                != Path::new(repo.repository.root.as_str())
-                    .canonicalize()
-                    .map_err(|_| Error::Conflict)?
-            {
-                return Err(Error::Conflict);
-            }
-        }
-        let branch = git(path, &["symbolic-ref", "--short", "HEAD"], "inspect")?;
-        let git_intent = match &entry.workspace.intent().policy {
-            WorkspacePolicy::Worktree { git, .. } | WorkspacePolicy::Clone { git } => git,
-            WorkspacePolicy::Ephemeral {
-                backing: ManagedBacking::Worktree { git, .. } | ManagedBacking::Clone { git },
-            } => git,
-            _ => return Err(Error::Conflict),
-        };
-        if branch.trim() != git_intent.effective_branch(entry.workspace.id()) {
-            return Err(Error::Conflict);
-        }
-        let commit = git(path, &["rev-parse", "HEAD"], "inspect")?
-            .trim()
-            .to_owned();
-        if let Some(expected) = expected
-            && commit != expected
-        {
-            // Lifecycle hooks can legitimately commit setup work; retain the observed HEAD
-            // while proving the task still descends from the exact requested base.
-            git(
-                path,
-                &["merge-base", "--is-ancestor", expected, "HEAD"],
-                "base verification",
-            )
-            .map_err(|_| Error::Conflict)?;
-        }
-        let pinned = self
-            .state
+        let observation = self.observe_at(entry, path, expected.is_some())?;
+        let pinned = self.creation(entry)?.commit.as_deref();
+        backends::location(
+            observation,
+            entry.workspace.backend().cloned().ok_or(Error::Conflict)?,
+            pinned,
+        )
+    }
+
+    fn creation(&self, entry: &Entry) -> Result<&Operation, Error> {
+        self.state
             .operations
             .values()
-            .find(|operation| {
-                &operation.workspace == entry.workspace.id()
-                    && operation.request.get("project").is_some()
-            })
-            .and_then(|operation| operation.commit.clone())
+            .find(|operation| &operation.workspace == entry.workspace.id() && operation.is_create())
+            .ok_or(Error::Conflict)
+    }
+
+    fn observe_at(
+        &self,
+        entry: &Entry,
+        path: &Path,
+        verify_creation: bool,
+    ) -> Result<hive_core::workspace::backend::WorkspaceObservation, Error> {
+        let selection = self.selection(entry)?;
+        let manager = self.manager;
+        let root = self.path(path)?;
+        let prepared = self
+            .creation(entry)?
+            .prepared
+            .as_ref()
             .ok_or(Error::Conflict)?;
-        Ok(WorkspaceLocation {
-            root: root.clone(),
-            working_directory: root,
-            backend,
-            resolved_base: Some(GitRef::try_from(pinned)?),
-            branch: Some(GitRef::try_from(branch.trim().to_owned())?),
-            commit: Some(commit),
-        })
+        let provisioner = manager.provisioner(&selection)?;
+        let intent = provisioner.at_location(prepared, &root, verify_creation)?;
+        let observation = provisioner.inspect(selection.repository.as_ref(), &intent)?;
+        // Backend evidence must remain node-local before it can participate in cleanup admission.
+        entry
+            .workspace
+            .intent()
+            .check_node(observation.root.node())?;
+        entry
+            .workspace
+            .intent()
+            .check_node(observation.working_directory.node())?;
+        Ok(observation)
     }
 
     fn inspect(&self, id: &WorkspaceId) -> Result<Inspection, Error> {
@@ -1711,6 +1400,7 @@ impl Runtime<'_> {
             .workspaces
             .get(id.as_str())
             .ok_or(Error::Unknown)?;
+        self.selection(entry)?;
         if entry.workspace.intent().node != self.state.node {
             return Ok(Inspection::IdentityConflict);
         }
@@ -1718,7 +1408,7 @@ impl Runtime<'_> {
             .state
             .operations
             .values()
-            .find(|o| &o.workspace == id && o.request.get("project").is_some());
+            .find(|o| &o.workspace == id && o.is_create());
         let path = entry
             .workspace
             .location()
@@ -1757,29 +1447,18 @@ impl Runtime<'_> {
         if metadata.is_some_and(|metadata| metadata.file_type().is_symlink()) {
             return Ok(Inspection::IdentityConflict);
         }
-        let location = match self.location(entry, &path, None) {
-            Ok(location) => location,
+        let observation = match self.observe_at(entry, &path, false) {
+            Ok(observation) => observation,
+            Err(error @ Error::Domain(_)) => return Err(error),
             Err(_) => return Ok(Inspection::IdentityConflict),
         };
-        let cleanliness = if entry.workspace.intent().ownership() == Ownership::External {
-            Cleanliness::Unknown
-        } else {
-            match git(
-                &path,
-                &[
-                    "status",
-                    "--porcelain=v1",
-                    "--untracked-files=all",
-                    "--ignored",
-                    "--ignore-submodules=none",
-                ],
-                "inspect",
-            ) {
-                Ok(status) if status.is_empty() => Cleanliness::Clean,
-                Ok(_) => Cleanliness::Dirty,
-                Err(_) => Cleanliness::Unknown,
-            }
-        };
+        let cleanliness = observation.cleanliness;
+        let ownership_verified = observation.ownership_verified;
+        let location = backends::location(
+            observation,
+            entry.workspace.backend().cloned().ok_or(Error::Conflict)?,
+            self.creation(entry)?.commit.as_deref(),
+        )?;
         let holders: Vec<_> = self
             .state
             .uses
@@ -1805,7 +1484,7 @@ impl Runtime<'_> {
         Ok(Inspection::Present {
             location,
             safety: SafetyEvidence {
-                ownership_verified: true,
+                ownership_verified,
                 cleanliness,
                 usage,
             },
@@ -1825,6 +1504,7 @@ impl Runtime<'_> {
             .get(id.as_str())
             .cloned()
             .ok_or(Error::Unknown)?;
+        let selection = self.selection(&entry)?;
         let cleanup = durable.unwrap_or(CleanupRequest {
             operation: operation.clone(),
             target: ResourceTarget {
@@ -1854,12 +1534,7 @@ impl Runtime<'_> {
             if entry.workspace.state() == WorkspaceState::Removed {
                 return Ok(entry);
             }
-            if entry
-                .workspace
-                .backend()
-                .is_some_and(|backend| backend.0 == "worktrunk")
-                && original.effects_started
-            {
+            if self.uncertain_backend(&entry)? && original.effects_started {
                 return Err(Error::Uncertain);
             }
             if !matches!(
@@ -1887,12 +1562,21 @@ impl Runtime<'_> {
             return Err(Error::Conflict);
         };
         cleanup.check_safety(&safety)?;
-        if location.backend.0 == "worktrunk" {
-            check_approvals(Path::new(location.root.as_str()))?;
-        }
+        let manager = self.manager;
+        let provisioner = manager.provisioner(&selection)?;
+        let removal_intent = provisioner.at_location(
+            self.creation(&entry)?
+                .prepared
+                .as_ref()
+                .ok_or(Error::Conflict)?,
+            &location.root,
+            false,
+        )?;
+        provisioner.prepare_cleanup(selection.repository.as_ref(), &removal_intent)?;
         entry.workspace.transition(WorkspaceEvent::Cleanup {
             operation: operation.clone(),
         })?;
+        let prior_checkpoint = self.cleanup_checkpoint(&operation)?;
         self.state.operations.insert(
             operation.to_string(),
             Operation {
@@ -1901,58 +1585,50 @@ impl Runtime<'_> {
                 commit: None,
                 path: Some(PathBuf::from(location.root.as_str())),
                 effects_started: true,
+                selection: entry.selection.clone(),
+                kind: Some(OperationKind::Cleanup),
+                prepared: prior_checkpoint,
             },
         );
         self.state.workspaces.insert(id.to_string(), entry.clone());
         self.save()?;
         let path = Path::new(location.root.as_str());
-        let result = if location.backend.0 == "clone" {
-            (|| {
-                if !discard {
-                    entry.archive = Some(self.archive_clone(&entry, &operation, path)?);
+        let result = (|| {
+            if !discard {
+                let directory = self.path(self.store.state_directory())?;
+                let previous = self.cleanup_checkpoint(&operation)?;
+                let archive = provisioner.preserve(
+                    selection.repository.as_ref(),
+                    &removal_intent,
+                    hive_core::workspace::backend::PreparationContext {
+                        workspace: &id,
+                        operation: &operation,
+                        directory: &directory,
+                        previous: previous.as_ref(),
+                    },
+                    &mut persistence::OperationCheckpoints {
+                        runtime: self,
+                        key: operation.as_str(),
+                    },
+                )?;
+                if let Some(archive) = archive {
+                    entry.archive = Some(archive);
                     self.state.workspaces.insert(id.to_string(), entry.clone());
                     self.save()?;
                 }
-                std::fs::remove_dir_all(path).map_err(|_| Error::Removal)
-            })()
-        } else {
-            let repo = self
-                .state
-                .repositories
-                .get(entry.repository.as_ref().ok_or(Error::Conflict)?.as_str())
-                .ok_or(Error::Conflict)?;
-            let bare = Path::new(repo.repository.root.as_str());
-            if location.backend.0 == "worktrunk" {
-                let mut args = vec![
-                    "remove",
-                    "--foreground",
-                    "--no-delete-branch",
-                    "--format",
-                    "json",
-                ];
-                if discard {
-                    args.push("--force");
-                }
-                args.push(location.root.as_str());
-                let config = std::env::var_os("WORKTRUNK_PROJECT_CONFIG_PATH")
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| PathBuf::from(".config/wt.toml"));
-                let config = if config.is_absolute() {
-                    config
-                } else {
-                    path.join(config)
-                };
-                wt_with_config(bare, &args, config.is_file().then_some(config.as_path()))
-                    .map(|_| ())
-            } else {
-                let mut args = vec!["worktree", "remove"];
-                if discard {
-                    args.push("--force");
-                }
-                args.push(location.root.as_str());
-                git(bare, &args, "worktree removal").map(|_| ())
             }
-        };
+            let manager = self.manager;
+            let provisioner = manager.provisioner(&selection)?;
+            let intent = provisioner.at_location(
+                self.creation(&entry)?
+                    .prepared
+                    .as_ref()
+                    .ok_or(Error::Conflict)?,
+                &location.root,
+                false,
+            )?;
+            provisioner.remove(selection.repository.as_ref(), &intent, discard)
+        })();
         let result = result.and_then(|()| {
             if path.try_exists().map_err(|_| Error::Conflict)? {
                 Err(Error::Uncertain)
@@ -1982,109 +1658,8 @@ impl Runtime<'_> {
         Ok(entry)
     }
 
-    fn archive_clone(
-        &mut self,
-        entry: &Entry,
-        operation: &OperationId,
-        source: &Path,
-    ) -> Result<NodePath, Error> {
-        let head = git(source, &["rev-parse", "HEAD"], "archive")?;
-        let refs = git(
-            source,
-            &["for-each-ref", "--format=%(objectname) %(refname)"],
-            "archive",
-        )?;
-        let directory = self.store.state_directory().join("archives");
-        let destination = directory.join(format!("{}.git", entry.workspace.id()));
-        let plan = if let Some(plan) = self.state.archives.get(operation.as_str()) {
-            if plan.head != head || plan.refs != refs || plan.destination != destination {
-                return Err(Error::Conflict);
-            }
-            plan.clone()
-        } else {
-            let staging =
-                directory.join(format!(".{}-{operation}.incomplete", entry.workspace.id()));
-            if destination.try_exists().map_err(|_| Error::Storage)?
-                || staging.try_exists().map_err(|_| Error::Storage)?
-            {
-                return Err(Error::Conflict);
-            }
-            let plan = ArchivePlan {
-                destination,
-                staging,
-                head,
-                refs,
-            };
-            // Persist ownership and source refs before creating backup files, closing both
-            // the completed-clone and rename-before-publication crash windows.
-            self.state
-                .archives
-                .insert(operation.to_string(), plan.clone());
-            self.save()?;
-            plan
-        };
-        let complete = |path: &Path| -> bool {
-            git(path, &["rev-parse", "HEAD"], "archive").is_ok_and(|head| head == plan.head)
-                && git(
-                    path,
-                    &["for-each-ref", "--format=%(objectname) %(refname)"],
-                    "archive",
-                )
-                .is_ok_and(|refs| refs == plan.refs)
-                && git(path, &["fsck", "--no-reflogs"], "archive").is_ok()
-        };
-        if plan.destination.exists() {
-            if !complete(&plan.destination)
-                || git(
-                    &plan.destination,
-                    &["config", "--get", "hive.archiveOperation"],
-                    "archive",
-                )?
-                .trim()
-                    != operation.as_str()
-            {
-                return Err(Error::Conflict);
-            }
-        } else {
-            std::fs::create_dir_all(&directory).map_err(|_| Error::Removal)?;
-            if plan.staging.exists() && !complete(&plan.staging) {
-                // Only an operation-owned temporary copy is retried, and only while the
-                // original checkout still matches the durable source snapshot above.
-                std::fs::remove_dir_all(&plan.staging).map_err(|_| Error::Removal)?;
-            }
-            if !plan.staging.exists() {
-                git(
-                    source,
-                    &[
-                        "clone",
-                        "--mirror",
-                        "--no-hardlinks",
-                        source.to_str().ok_or(Error::Request)?,
-                        plan.staging.to_str().ok_or(Error::Request)?,
-                    ],
-                    "archive",
-                )?;
-            }
-            if !complete(&plan.staging) {
-                return Err(Error::Conflict);
-            }
-            git(
-                &plan.staging,
-                &["config", "hive.archiveOperation", operation.as_str()],
-                "archive",
-            )?;
-            #[cfg(windows)]
-            git(
-                &plan.staging,
-                &["config", "core.longpaths", "true"],
-                "archive",
-            )?;
-            std::fs::rename(&plan.staging, &plan.destination).map_err(|_| Error::Removal)?;
-        }
-        self.path(&plan.destination)
-    }
-
     fn verified_removal_absence(&self, entry: &Entry) -> Result<bool, Error> {
+        let selection = self.selection(entry)?;
         let location = entry.workspace.location().ok_or(Error::Conflict)?;
         match Path::new(location.root.as_str()).symlink_metadata() {
             Ok(_) => return Ok(false),
@@ -2094,33 +1669,29 @@ impl Runtime<'_> {
         if self.has_use(entry.workspace.id()) {
             return Err(Error::Conflict);
         }
-        if location.backend.0 == "clone" {
-            // The original discard mode or durable archive distinguishes safe completed deletion.
-            let operation = self
-                .state
-                .operations
-                .get(entry.workspace.operation().ok_or(Error::Conflict)?.as_str())
-                .ok_or(Error::Conflict)?;
-            let request: CleanupRequest =
-                serde_json::from_value(operation.request.clone()).map_err(|_| Error::Conflict)?;
-            return Ok(request.mode == CleanupMode::DiscardChanges
-                || self.verified_archive(entry, &request.operation));
-        }
-        let repository = self
+        let operation = self
             .state
-            .repositories
-            .get(entry.repository.as_ref().ok_or(Error::Conflict)?.as_str())
+            .operations
+            .get(entry.workspace.operation().ok_or(Error::Conflict)?.as_str())
             .ok_or(Error::Conflict)?;
-        self.verify_repository(repository)?;
-        let registrations = git(
-            Path::new(repository.repository.root.as_str()),
-            &["worktree", "list", "--porcelain", "-z"],
-            "inspect",
+        let request: CleanupRequest =
+            serde_json::from_value(operation.request.clone()).map_err(|_| Error::Conflict)?;
+        if request.mode != CleanupMode::DiscardChanges
+            && !self.verified_archive(entry, &request.operation)
+        {
+            return Ok(false);
+        }
+        let manager = self.manager;
+        let provisioner = manager.provisioner(&selection)?;
+        let intent = provisioner.at_location(
+            self.creation(entry)?
+                .prepared
+                .as_ref()
+                .ok_or(Error::Conflict)?,
+            &location.root,
+            false,
         )?;
-        Ok(!registered_worktree(
-            &registrations,
-            Path::new(location.root.as_str()),
-        )?)
+        provisioner.is_absent(selection.repository.as_ref(), &intent)
     }
 
     fn reconcile(
@@ -2149,8 +1720,8 @@ impl Runtime<'_> {
             .get(&key)
             .cloned()
             .ok_or(Error::Conflict)?;
-        let backend = entry.workspace.backend().ok_or(Error::Conflict)?.0.as_str();
-        if backend == "worktrunk" && !hooks_reconciled {
+        let selection = self.selection(&entry)?;
+        if self.uncertain_backend(&entry)? && !hooks_reconciled {
             return Err(Error::Uncertain);
         }
         if matches!(
@@ -2192,99 +1763,30 @@ impl Runtime<'_> {
                 return Err(Error::Request);
             }
             let path = path.canonicalize().map_err(|_| Error::Conflict)?;
-            if backend != "worktrunk" {
-                let intended = operation
-                    .path
-                    .as_ref()
-                    .ok_or(Error::Conflict)?
-                    .canonicalize()
-                    .map_err(|_| Error::Conflict)?;
-                if intended != path {
-                    return Err(Error::Conflict);
-                }
-            }
-            let repository = self
-                .state
-                .repositories
-                .get(entry.repository.as_ref().ok_or(Error::Conflict)?.as_str())
-                .ok_or(Error::Conflict)?;
-            self.verify_repository(repository)?;
-            if backend != "clone" {
-                let common = git(
-                    &path,
-                    &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-                    "inspect",
-                )?;
-                if Path::new(common.trim())
-                    .canonicalize()
-                    .map_err(|_| Error::Conflict)?
-                    != Path::new(repository.repository.root.as_str())
-                        .canonicalize()
-                        .map_err(|_| Error::Conflict)?
-                {
-                    return Err(Error::Conflict);
-                }
-                let list = git(
-                    Path::new(repository.repository.root.as_str()),
-                    &["worktree", "list", "--porcelain", "-z"],
-                    "inspect",
-                )?;
-                if !registered_worktree(&list, &path)? {
-                    return Err(Error::Conflict);
-                }
-            } else if git(&path, &["config", "--get", "remote.origin.url"], "inspect")?.trim()
-                != repository.source
-            {
-                return Err(Error::Conflict);
-            }
-            let commit = operation.commit.as_ref().ok_or(Error::Conflict)?;
-            if git(&path, &["rev-parse", "HEAD"], "inspect")?.trim() != commit {
-                git(
-                    &path,
-                    &["merge-base", "--is-ancestor", commit, "HEAD"],
-                    "base verification",
-                )
-                .map_err(|_| Error::Conflict)?;
-            }
-            let intent = match &entry.workspace.intent().policy {
-                WorkspacePolicy::Worktree { git, .. }
-                | WorkspacePolicy::Clone { git }
-                | WorkspacePolicy::Ephemeral {
-                    backing: ManagedBacking::Worktree { git, .. } | ManagedBacking::Clone { git },
-                } => git,
-                _ => return Err(Error::Conflict),
-            };
-            if git(&path, &["symbolic-ref", "--short", "HEAD"], "inspect")?.trim()
-                != intent.effective_branch(&id)
-            {
-                return Err(Error::Conflict);
-            }
-            if let Ok(marker) = git(&path, &["config", "--get", "hive.workspace"], "inspect")
-                && marker.trim() != id.as_str()
-            {
-                return Err(Error::Conflict);
-            }
-            // Claim only the exact registered repository/branch/commit dispatched by this operation.
-            git(
-                &path,
-                &[
-                    "config",
-                    if backend == "clone" {
-                        "--local"
-                    } else {
-                        "--worktree"
-                    },
-                    "hive.workspace",
-                    id.as_str(),
-                ],
-                "ownership",
+            let manager = self.manager;
+            let provisioner = manager.provisioner(&selection)?;
+            let intent = provisioner.at_location(
+                operation.prepared.as_ref().ok_or(Error::Conflict)?,
+                &self.path(&path)?,
+                true,
             )?;
-            let location = self.location(&entry, &path, Some(commit))?;
+            let observation = provisioner.reconcile(selection.repository.as_ref(), &intent)?;
+            let location = backends::location(
+                observation,
+                entry.workspace.backend().cloned().ok_or(Error::Conflict)?,
+                operation.commit.as_deref(),
+            )?;
             self.state
                 .operations
                 .get_mut(&key)
                 .ok_or(Error::Conflict)?
                 .path = Some(path);
+            // Publish the verified binding so subsequent inspection never needs a guessed path.
+            self.state
+                .operations
+                .get_mut(&key)
+                .ok_or(Error::Conflict)?
+                .prepared = Some(intent);
             entry
                 .workspace
                 .transition(WorkspaceEvent::ReconciledReady { location })?;

@@ -9,6 +9,9 @@ use super::{
 };
 use crate::identity::{NodeId, OperationId, WorkspaceId};
 
+pub mod repository;
+pub use repository::*;
+
 pub use super::error::{CleanupFailure, ProvisionFailure};
 
 /// Object-safe async dispatch without choosing an executor for library consumers.

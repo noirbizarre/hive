@@ -42,6 +42,12 @@ user. Session conversation/control methods live exclusively on `/acp`.
 Provider discovery omits commands, endpoints, arguments, environment, and headers.
 It describes configuration rather than successful availability probes.
 
+The [Hive ACP extension specification](acp-extensions.md) defines future profile
+discovery and session-location operations for remote peers through ACP. Those
+extensions are not implemented yet; this local operational API remains the
+implemented discovery surface. Both surfaces are intended to derive their
+authorized inventory from the same broker, without duplicating conversation control.
+
 ## Configuration reload
 
 `POST /v1/config/reload` takes no body or source-path parameter. It reloads the

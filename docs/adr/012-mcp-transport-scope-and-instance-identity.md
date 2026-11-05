@@ -144,7 +144,7 @@ different effective cwd, environment, roots or credentials needs another instanc
 Lifecycle policies also participate so one instance cannot acquire conflicting
 cleanup policies.
 
-Resolution performs no filesystem, environment, credential-helper or network
+Identity construction performs no filesystem, environment, credential-helper or network
 operations. `NodePath` carries owning-node path syntax. The resolver must provide
 canonical observed paths and the complete effective environment, including
 non-Unicode values supported by `OsString`; explicit definition overrides must
@@ -168,6 +168,61 @@ is deliberately available for configuration; do not treat it as redacted output.
 Forwarded HTTP identity describes declaration compatibility only. It does not
 authorize pooling the agent's connection or remote MCP session, whose complete
 initialization and security state Hive may not know.
+
+### Scoped Broker admission
+
+`Broker::bind_scoped_mcp(session, StdioAdmission)` resolves managed stdio scope
+from a live session and the execution node's registered resources. Its input
+contains a definition ID/definition, `StdioLaunch` (resolved executable, complete
+effective environment and optional cwd), initialization, security, and explicit
+`Sharing::Shared` or `Sharing::Private`. Security assertions retain the contract
+above; private admissions use fresh nonces. Aggregate Debug output is redacted.
+
+Machine scope needs no registered workspace, including for an in-memory Broker.
+Project/workspace scope requires a persistent registry, a local session's verified
+attachment, a still-registered project and an inspectable Ready workspace. Missing
+context never falls back to machine scope. Foreign-node paths, duplicate concrete
+root registrations, nested checkouts and broad external registrations that do not
+identify the actual Git top-level are rejected. Register the concrete root rather
+than a Git subdirectory. Native JJ workspace evidence remains backend-specific;
+external JJ directories require native registration for scoped admission.
+
+Workspace launch cwd defaults to its canonical concrete root, independent of the
+session subdirectory or symlink spelling. Machine/project launches require an
+explicit stable cwd; Hive does not choose the first project checkout. Explicit
+cwd and initialization roots remain behavior-affecting inputs. The owning node
+canonicalizes the supplied executable, cwd and roots, but does not search PATH,
+reread inherited environment, add session roots or discover credentials.
+
+Before process acquisition, scoped admission durably reserves affected registered
+managed resources under the resource admission lock. This includes resources
+containing the executable/cwd/roots, managed descendants exposed by a directory,
+and the concrete workspace itself for workspace scope. This protects declared
+launch paths, not arbitrary filesystem accesses or paths embedded in arguments
+and environment values. Additional reservations do not replace the session's
+ordinary workspace attachment. Equal rebinding retains the existing binding,
+adopts missing protection (including low-level bindings), and removes only already
+covered reservations. Each unread delivery has its own claim; caller cancellation
+cannot revoke another caller's accepted binding. Close/shutdown fences prevent
+late binding publication.
+
+Resource reservations survive explicit unbind and session close until the instance
+has no leases/operations and confirmed process termination, including positive idle
+timeout. They do not count as leases or change the timeout. A surviving binding
+keeps protection across lazy restart. Retired bindings can conservatively retain
+reservations while another session keeps their shared instance alive. Unconfirmed
+cleanup or failed durable release retains protection.
+
+The node resource snapshot is version 2 so older daemons reject resource state
+whose MCP reservations they cannot enforce. Only reservation/session/resource IDs
+are persisted, never resolved identity or security snapshots. Admission publishes
+a single conservative launch-authorized reservation before acquisition; a crash
+between publication and acquisition can therefore retain an unused hold. After
+restart, missing sessions or runtime state cannot prove termination. Recovery
+reports list unresolved `mcp_reservations`; trusted owners can call
+`Broker::release_mcp_reservation_after_verified_termination` on a fresh Broker,
+before MCP initialization, only after independently establishing that every
+process admitted by that reservation has terminated.
 
 ### Shared stdio runtime
 

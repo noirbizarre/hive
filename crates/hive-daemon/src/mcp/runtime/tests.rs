@@ -1,5 +1,74 @@
 use super::*;
 
+#[tokio::test(start_paused = true)]
+async fn resource_protection_outlives_idle_timeout_and_waits_for_confirmed_process_exit() {
+    let (instance, stopping) = idle_instance(60);
+    instance.leases.store(1, Ordering::Release);
+    let lease = Lease {
+        instance: instance.clone(),
+    };
+    let done = lease.resource_settlement();
+    drop(lease);
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(60)).await;
+    tokio::task::yield_now().await;
+    assert!(
+        *stopping.borrow(),
+        "a resource waiter must not prevent idle shutdown"
+    );
+    assert!(!*done.borrow(), "sending stop does not prove termination");
+    let mut state = instance.state.lock().unwrap();
+    let generation = state.as_mut().unwrap();
+    generation.done = watch::channel(true).1;
+    generation.status = watch::channel(Status::Failed(RuntimeError::Cleanup)).1;
+    instance.settle_resources(&state);
+    assert!(
+        !*done.borrow(),
+        "unconfirmed cleanup must retain protection"
+    );
+    state.as_mut().unwrap().status = watch::channel(Status::Stopped).1;
+    instance.settle_resources(&state);
+    assert!(*done.borrow());
+}
+
+#[tokio::test(start_paused = true)]
+async fn resource_waiters_cover_reacquisition_operations_and_replacement_generations() {
+    let (instance, _) = idle_instance(60);
+    instance.leases.store(1, Ordering::Release);
+    let lease = Lease {
+        instance: instance.clone(),
+    };
+    let done = lease.resource_settlement();
+    drop(lease);
+    {
+        let mut state = instance.state.lock().unwrap();
+        instance.leases.store(1, Ordering::Release);
+        instance.cancel_idle();
+        state.as_mut().unwrap().done = watch::channel(true).1;
+        state.as_mut().unwrap().status = watch::channel(Status::Failed(RuntimeError::Connection)).1;
+        instance.settle_resources(&state);
+        assert!(
+            !*done.borrow(),
+            "a surviving restart-capable lease still needs files"
+        );
+        state.as_mut().unwrap().done = watch::channel(false).1;
+        state.as_mut().unwrap().status = watch::channel(Status::Starting).1;
+    }
+    instance.operations.store(1, Ordering::Release);
+    drop(Lease {
+        instance: instance.clone(),
+    });
+    {
+        let mut state = instance.state.lock().unwrap();
+        state.as_mut().unwrap().done = watch::channel(true).1;
+        state.as_mut().unwrap().status = watch::channel(Status::Stopped).1;
+        instance.settle_resources(&state);
+        assert!(!*done.borrow(), "operations can outlive their lease");
+    }
+    drop(Operation(instance, watch::channel(false).0));
+    assert!(*done.borrow());
+}
+
 // Synthetic generations test idle scheduling without coupling virtual time to OS pipes.
 fn idle_instance(seconds: u64) -> (Arc<Instance>, watch::Receiver<bool>) {
     let mut identity = super::super::tests::identity();
@@ -11,6 +80,7 @@ fn idle_instance(seconds: u64) -> (Arc<Instance>, watch::Receiver<bool>) {
     let (_, done) = watch::channel(false);
     (
         Arc::new(Instance {
+            resource_waiters: Mutex::new(Vec::new()),
             identity,
             policy: RuntimePolicy::default(),
             state: Mutex::new(Some(Generation {

@@ -174,8 +174,10 @@ Sources: [v1 tool calls][v1-tools], [v2 tool calls][v2-tools],
 
 [ADR-012](adr/012-mcp-transport-scope-and-instance-identity.md) audits the existing
 MCP paths and defines the standalone transport, lifecycle and instance identity
-contract, with `machine`, `project` and `workspace` scopes. Managed runtime and
-routing are not activated by that contract; the support status below still applies.
+contract, with `machine`, `project` and `workspace` scopes. Trusted Rust embedders
+can use the shared stdio runtime and `Broker::bind_scoped_mcp` for registered
+session/resource resolution. Daemon configuration and agent routing do not select
+managed servers yet; the protocol support status below still applies.
 
 Every additional protocol gate below is disabled except end-turn usage (listed above).
 The `unstable` umbrella is not enabled; it would not implicitly enable protocol v2 anyway.

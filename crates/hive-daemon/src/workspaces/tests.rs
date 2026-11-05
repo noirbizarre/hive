@@ -6,6 +6,9 @@ mod recovery_tests;
 #[path = "tests/backends.rs"]
 mod backend_tests;
 
+#[path = "tests/mcp.rs"]
+mod mcp_tests;
+
 #[path = "tests/jj.rs"]
 mod jj_tests;
 

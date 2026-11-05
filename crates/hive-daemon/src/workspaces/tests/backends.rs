@@ -102,7 +102,7 @@ async fn legacy_records_upgrade_atomically_without_rewriting_requests_paths_or_s
         );
     }
     let after: serde_json::Value = restarted.store.resource("node").unwrap().unwrap();
-    assert_eq!(after["version"], 1);
+    assert_eq!(after["version"], 2);
     assert_eq!(after["uses"], legacy["uses"]);
     for (id, request) in requests {
         assert_eq!(after["operations"][&id]["request"], request);

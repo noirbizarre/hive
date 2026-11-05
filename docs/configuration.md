@@ -17,13 +17,28 @@ scopes as a standalone library schema. It is not an active daemon configuration
 registry: adding MCP tables to the root or fragment TOML still fails unknown-field
 validation. Existing agent profiles and inline ACP declarations need no migration.
 
-Trusted Rust embedders can use `Broker::mcp_execution_node`, `Broker::bind_mcp`
-and `Broker::release_mcp` with fully resolved identities. The Broker owns the
+Trusted Rust embedders can use `Broker::bind_scoped_mcp` with a `StdioAdmission`
+to resolve scope from registered session resources. Workspace scope defaults to
+the canonical concrete root; machine/project scope requires an explicit launch
+cwd. Embedders still supply the resolved executable, complete effective
+environment, initialization and trusted security/credential evidence. Hive does
+not search PATH or infer credential completeness.
+
+`Broker::mcp_execution_node`, low-level `Broker::bind_mcp` with fully resolved
+identities, and `Broker::release_mcp` are also available. The Broker owns the
 shared stdio runtime and durable session leases; client disconnects do not release
 them. This library API does not yet select managed servers from configuration or
 make their tools available through agent connections. See the
 [runtime contract](adr/012-mcp-transport-scope-and-instance-identity.md#shared-stdio-runtime)
 for initialization, cancellation, restart and cleanup behavior.
+
+Scoped admission reserves managed workspaces exposed by the executable, cwd and
+roots, including additional resources beyond the session's primary workspace.
+Reservations last through idle timeout and confirmed process termination. After
+a daemon restart, unresolved reservations appear in workspace recovery reports;
+missing sessions alone do not authorize releasing them. See the
+[scoped admission contract](adr/012-mcp-transport-scope-and-instance-identity.md#scoped-broker-admission)
+for registration and recovery requirements.
 
 ## File location and precedence
 

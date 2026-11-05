@@ -30,6 +30,7 @@ use hive_core::{
 use serde::{Deserialize, Serialize};
 pub(crate) mod activity;
 mod backends;
+pub(crate) mod mcp;
 mod persistence;
 mod recovery;
 mod routes;
@@ -388,12 +389,15 @@ struct State {
     last_used: BTreeMap<String, u64>,
     #[serde(default)]
     sweeps: BTreeMap<String, Sweep>,
+    // Independent of primary attachments: machine-scoped bindings can protect files too.
+    #[serde(default)]
+    mcp_reservations: BTreeMap<String, mcp::Reservation>,
 }
 
 impl Default for State {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: 2,
             node: NodeId::new(),
             repositories: BTreeMap::new(),
             workspaces: BTreeMap::new(),
@@ -405,6 +409,7 @@ impl Default for State {
             lifecycle: BTreeMap::new(),
             last_used: BTreeMap::new(),
             sweeps: BTreeMap::new(),
+            mcp_reservations: BTreeMap::new(),
         }
     }
 }
@@ -856,10 +861,12 @@ impl Runtime<'_> {
     }
 
     fn has_use(&self, id: &WorkspaceId) -> bool {
-        self.state
-            .uses
-            .keys()
-            .any(|session| self.holds(session, id))
+        self.mcp_holds(id)
+            || self
+                .state
+                .uses
+                .keys()
+                .any(|session| self.holds(session, id))
     }
 
     fn reserve_use(&mut self, session: String, primary: WorkspaceId) -> Result<(), Error> {
@@ -1558,7 +1565,10 @@ impl Runtime<'_> {
             .filter(|(session, _)| self.holds(session, id))
             .map(|(session, _)| session)
             .collect();
-        let usage = if holders.is_empty() {
+        let usage = if self.mcp_holds(id) {
+            // After restart there is no process-local evidence authorizing deletion.
+            ResourceUse::Unknown
+        } else if holders.is_empty() {
             ResourceUse::Idle
         } else {
             let sessions = self.store.records()?;

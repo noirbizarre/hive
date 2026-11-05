@@ -1,7 +1,7 @@
 //! Managed MCP contracts and shared stdio runtime, not a daemon configuration registry.
 //!
-//! Resolution is deliberately pure: the owning node must supply observed paths,
-//! effective environment, registered resource identities and credential snapshots.
+//! Identity validation is pure; scoped Broker admission observes registered local
+//! resources while trusted callers supply effective environment and security evidence.
 
 use std::{collections::BTreeMap, ffi::OsString, fmt};
 
@@ -14,6 +14,8 @@ use miette::Diagnostic;
 use serde::{Deserialize, Serialize};
 
 mod process;
+mod resolution;
+pub use resolution::{AdmissionError, Sharing, StdioAdmission, StdioLaunch};
 pub mod runtime;
 mod sessions;
 pub use sessions::SessionMcpLease;
@@ -227,7 +229,7 @@ pub struct ScopeContext {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum ScopeIdentity {
+pub(crate) enum ScopeIdentity {
     Machine(NodeId),
     Project(NodeId, ProjectId),
     Workspace(NodeId, ProjectId, WorkspaceId),
@@ -286,9 +288,9 @@ pub struct SecurityContext {
 pub struct InstanceIdentity {
     definition_id: String,
     definition: ServerDefinition,
-    scope: ScopeIdentity,
-    transport: ResolvedTransport,
-    initialization: Initialization,
+    pub(crate) scope: ScopeIdentity,
+    pub(crate) transport: ResolvedTransport,
+    pub(crate) initialization: Initialization,
     security: SecurityContext,
     private_nonce: Option<uuid::Uuid>,
 }

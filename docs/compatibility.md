@@ -296,6 +296,22 @@ infer it merely from negotiating protocol v2.
 | `_hive_usage`, usage snapshot/cost estimates | 🔀 A | Hive accounting depends on agent reports and optional price identity; both UIs show available totals | [Token usage and costs](#token-usage-and-costs) |
 | `_hive_error`, `_hive_opencode_error` | ✅ S | Controlled failure diagnostics rendered by both clients, not standard `notice` support | [Protocol boundary](#protocol-boundary), [OpenCode diagnostics](#opencode-diagnostics) |
 | HTTP catalog, provider/native-session discovery, invalidation feed | ✅ S | Operational API alongside ACP; no implication of standard ACP providers/auth or arbitrary native ACP session adoption | [Operational API](hive-api.md), [OpenCode adapter](#opencode-server-adapter) |
+| Versioned `capabilities._meta.hive` negotiation and `_hive/agents/list` | ❌ U | Version 1 is specified, not implemented; existing HTTP discovery is a separate implemented surface | [Hive ACP extension specification](acp-extensions.md); implementation [#79](https://github.com/noirbizarre/hive/issues/79) |
+| Qualified `_meta.hive.session` references and `_hive/sessions/resolve` | ❌ U | Specified owner-qualified identity and gateway route lookup; no remote routing or resume claim | [Session location contract](acp-extensions.md#session-identity-catalog-and-location); implementation [#80](https://github.com/noirbizarre/hive/issues/80) |
+
+### Federation specification boundary
+
+The [version 1 extension specification](acp-extensions.md) reuses standard ACP
+`initialize`, `session/new`, `session/list`, `session/resume`, mutations and
+`session/update`. Only profile discovery and qualified session resolution add
+methods. Profile selection, ownership fencing, prompt keys and replay metadata
+are Hive-specific even when carried on standard ACP methods.
+
+The existing selector/control contracts above are implemented; the new negotiated
+advertisement, discovery method and cross-Hive location contract are not. Clients
+cannot infer them from ACPv2 support or the existing operational HTTP catalog.
+The specification does not change the loopback-only production security boundary
+or establish validated remote Streamable HTTP conformance.
 
 ## Maintaining this audit
 

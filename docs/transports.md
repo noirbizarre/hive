@@ -14,6 +14,19 @@ HTTP/SSE uses connection- and session-scoped GET streams for server events;
 requests and cancellation travel by POST. The SDK handles its connection ID,
 session ID and routing. No transport `Last-Event-ID` resumption is claimed.
 
+## Remote Hive specification boundary
+
+The [Hive ACP extension specification](acp-extensions.md) defines versioned agent
+discovery, selection and qualified session location through standard ACP transport.
+Its new negotiation/discovery/location surfaces are specified, not implemented.
+The existing HTTP/SSE tests above do not establish end-to-end federation support.
+
+[Remote transport validation (#78)](https://github.com/noirbizarre/hive/issues/78)
+tracks Streamable HTTP constraints, configured private-network peers and safe
+binding. Production startup currently accepts loopback listeners only. Private
+connectivity does not replace peer authentication or owner-side authorization,
+and controller tokens are not authentication credentials.
+
 ## Reconnect, recovery, and replay
 
 These are separate guarantees:

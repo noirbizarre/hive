@@ -40,3 +40,17 @@ Implementation: [router and startup](https://github.com/noirbizarre/hive/blob/ma
 [public profiles](https://github.com/noirbizarre/hive/blob/main/crates/hive-daemon/src/config.rs), and
 [browser client](https://github.com/noirbizarre/hive/blob/main/clients/hive-web/app.js).
 See the [API reference](../hive-api.md).
+
+## Federation clarification — 2026-11-05
+
+The [Hive ACP extension specification](../acp-extensions.md), defined for
+[#77](https://github.com/noirbizarre/hive/issues/77), adds a specified remote-peer
+discovery surface on ACP. A remote Hive should discover profiles and locate
+sessions through its ACP connection, using standard session methods for control.
+The local operational API continues to serve simple local integrations; both
+discovery views derive from the same broker rather than separate authorities.
+
+The new negotiation, discovery and session-location extensions are not implemented
+by this decision record. Remote transport validation, authenticated/authorized
+deployment and safe non-loopback binding remain follow-up implementation work.
+The retrospective local trust boundary above still describes current production.

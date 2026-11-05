@@ -180,7 +180,7 @@ the resource gate; the gate coordinates Hive operations, not arbitrary external
 filesystem writers. Sweeps never discard dirty work, delete repository caches or
 archives, or delete a workspace just because a prompt/session ended. Worktree
 branches and independent-clone archives retain the normal removal guarantees.
-Activity-marker aggregation and stale-marker recovery belong to #118.
+Activity-marker recovery is independent of these cleanup protections.
 
 For interrupted checkout creation, `hive workspace reconcile <id>` validates
 the recorded Git identity without recreating it. If WorkTrunk's path response
@@ -197,6 +197,39 @@ including interruption between copying, renaming and recording the final path.
 Timed-out Git/WorkTrunk commands terminate their process group (Windows Job) and
 cancel output collection; successfully detached WorkTrunk hooks retain their
 normal background lifetime.
+
+### WorkTrunk activity recovery
+
+Hive publishes ACP session activity itself; agent-CLI plugins do not observe Hive
+sessions automatically. The global integration uses WorkTrunk's branch markers,
+visible in `wt list`. Sessions in directory aliases or subdirectories share one
+physical repository/branch aggregate. Needs-input outranks running; otherwise the
+latest explicit completed, cancelled, or failed outcome remains while its session
+is open. Unknown execution never implies a successful turn. Prompt insertion
+receipts, history replay, and individual tool completion are not turn completion.
+
+The durable activity ledger records verified node/repository/branch bindings,
+contributor evidence, confirmed marker values and pending writes before effects.
+Unique ownership suffixes let recovery identify a set whose response was lost.
+Restart withdraws stale execution claims and replaces them with recovered current
+state; lost/unavailable sessions stop contributing live activity. This does not
+release workspace-use holds or authorize cleanup of uncertain resources. Closed
+session rows are not required to find previously published markers.
+
+Publication runs outside session locks, coalesces events, and retries failures.
+Commands use short deadlines and sanitized diagnostics. Check daemon warnings
+with `hive::workspace::activity` or `hive::workspace::activity_conflict` for missing
+tools, inaccessible repositories, or external marker changes. Repair access or
+install compatible `wt`; the publisher retries without replaying agent work.
+Disabled integration performs no marker commands and defers reconciliation.
+
+WorkTrunk exposes one shared marker per branch, with no atomic ownership API.
+Hive claims absent markers and compares the complete recorded marker and timestamp
+before replacing or clearing one. Observed foreign values are preserved, including
+values written by another Hive instance. The supported CLI still has a race with
+an external writer between comparison and mutation; avoid running competing
+marker integrations on the same branch when strict ownership is necessary.
+Hive never clears all markers or guesses ownership from an emoji or marker age.
 
 ### Database contents
 

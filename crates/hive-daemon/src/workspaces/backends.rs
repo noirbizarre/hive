@@ -562,7 +562,7 @@ impl WorkspaceProvisioner for GitProvisioner {
                 linked_workspace: !matches!(self, Self::Clone),
                 independent_checkout: matches!(self, Self::Clone),
                 uncertain_external_effects: matches!(self, Self::Worktrunk),
-                activity_reporting: false,
+                activity_reporting: matches!(self, Self::Worktrunk),
             },
         }
     }

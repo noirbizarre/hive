@@ -255,8 +255,9 @@ enabled = true
 
 `WorktrunkConfig::select` short-circuits explicit disablement before invoking its
 probe callback. Detection considers capabilities, not merely executable presence.
-Selection governs lifecycle delegation now; Hive activity publication will consume
-the same global selection in #118. It is never a per-profile or per-file switch.
+Selection governs lifecycle delegation and Hive activity publication. It is never
+a per-profile or per-file switch. Marker capability detection is independent of
+dispatching previously pinned lifecycle operations.
 
 WorkTrunk-specific commands, hook handling, marker formats, and path templates stay
 behind the integration boundary. Creation/removal must delegate to WorkTrunk when
@@ -266,9 +267,18 @@ own template. Commands and markers execute on the workspace-owning node.
 Activity publication must aggregate sessions sharing a worktree: one session ending
 cannot clear another session's activity. The integration must document mappings for
 running, waiting/needs-input, completed, cancelled, and failed activity and reconcile
-stale markers after restart or lost sessions. Marker mappings and stale-marker
-recovery are #118 work. Lifecycle commands, configuration composition and backend
-pinning across reload are implemented by the workspace service.
+stale markers after restart or lost sessions. The daemon's activity publisher
+implements these mappings for verified local Git worktrees, including externally
+created worktrees. Needs-input outranks running, followed by the latest terminal
+outcome among open sessions. Unknown work does not imply success. Branch-scoped
+aggregation reflects WorkTrunk's actual marker key, including directory aliases.
+
+Publication uses a durable ledger and the supported marker CLI outside session
+locks. Full-value ownership checks preserve observed foreign markers, while the
+CLI's lack of atomic compare-and-mutate leaves a documented external-writer race.
+Restart reconciliation withdraws stale activity without releasing workspace
+cleanup holds. Disabling integration defers marker cleanup without invoking `wt`;
+lifecycle retries and cleanup still use their recorded provisioner.
 
 ### Implementation boundaries
 

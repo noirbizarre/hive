@@ -9,6 +9,10 @@ mod backend_tests;
 #[path = "tests/jj.rs"]
 mod jj_tests;
 
+#[cfg(unix)]
+#[path = "tests/activity.rs"]
+mod activity_tests;
+
 #[path = "../../tests/support/fake_opencode.rs"]
 mod fake_opencode;
 
@@ -815,7 +819,7 @@ async fn disabled_worktrunk_never_probes_and_command_failures_do_not_fall_back_o
     let fixture = Fixture::new();
     let executable = fixture._directory.path().join("fake-wt");
     let log = fixture._directory.path().join("wt-calls");
-    std::fs::write(&executable, format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n'switch --help') printf '%s' '--format --no-cd --create';;\n'remove --help') printf '%s' '--foreground --no-delete-branch --format';;\n'config approvals list --help') printf '%s' '--format';;\n'config approvals list --format=json') printf '%s' '{{\"state\":\"no_commands\"}}';;\n*) printf '%s' 'secret-sentinel' >&2; exit 1;;\nesac\n", log.display())).unwrap();
+    std::fs::write(&executable, format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n'switch --help') printf '%s' '--format --no-cd --create';;\n'remove --help') printf '%s' '--foreground --no-delete-branch --format';;\n'config approvals list --help') printf '%s' '--format';;\n'config state marker'*'--help') printf '%s' 'get set clear --format --branch';;\n'config approvals list --format=json') printf '%s' '{{\"state\":\"no_commands\"}}';;\n*) printf '%s' 'secret-sentinel' >&2; exit 1;;\nesac\n", log.display())).unwrap();
     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
     fixture.create(fixture.request()).await.unwrap();
     assert!(!log.exists());
@@ -2140,6 +2144,7 @@ case "$*" in
   'switch --help') printf '%s' '--format --no-cd --create';;
   'remove --help') printf '%s' '--foreground --no-delete-branch --format';;
   'config approvals list --help') printf '%s' '--format';;
+  'config state marker'*'--help') printf '%s' 'get set clear --format --branch';;
   'config approvals list --format=json') printf '%s' '{"state":"no_commands"}';;
   switch\ --create*)
     for last do :; done

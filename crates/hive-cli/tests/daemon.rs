@@ -3,6 +3,105 @@ use std::time::Duration;
 use tokio::time::timeout;
 
 #[tokio::test]
+async fn remote_opt_in_supports_both_authenticated_and_unauthenticated_shared_listeners() {
+    for authenticated in [false, true] {
+        let runtime =
+            std::env::temp_dir().join(format!("hive-remote-cli-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&runtime).unwrap();
+        std::fs::write(runtime.join("config.toml"), "").unwrap();
+        let reserve = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let address = reserve.local_addr().unwrap();
+        let base = format!("http://127.0.0.1:{}", address.port());
+        drop(reserve);
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_hive"));
+        command
+            .args([
+                "daemon",
+                "--allow-remote",
+                "--listen",
+                &address.to_string(),
+                "--config",
+                "config.toml",
+            ])
+            .current_dir(&runtime)
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("XDG_STATE_HOME", &runtime)
+            .env_remove("HIVE_DEFAULT_AGENT")
+            .env_remove("HIVE_CONFIG")
+            .env_remove("HIVE_AUTH_TOKEN_ENV")
+            .env(
+                "LLVM_PROFILE_FILE",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
+            .kill_on_drop(true);
+        if authenticated {
+            command
+                .args(["--auth-token-env", "HIVE_TEST_TOKEN"])
+                .env("HIVE_TEST_TOKEN", "test-private-token");
+        }
+        let mut daemon = command.spawn().unwrap();
+        let status_url = format!("{base}/v1/status");
+        timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(response) = reqwest::get(&status_url).await {
+                    assert_eq!(
+                        response.status().as_u16(),
+                        if authenticated { 401 } else { 200 }
+                    );
+                    break;
+                }
+                assert!(daemon.try_wait().unwrap().is_none());
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
+        if authenticated {
+            let rejected = tokio::process::Command::new(env!("CARGO_BIN_EXE_hive"))
+                .args(["daemon", "status", "--url", &base])
+                .env_remove("HIVE_AUTH_TOKEN_ENV")
+                .output()
+                .await
+                .unwrap();
+            assert!(!rejected.status.success());
+            let diagnostic = String::from_utf8_lossy(&rejected.stderr);
+            assert!(diagnostic.contains("hive::http::unauthorized"));
+            assert!(diagnostic.contains("HIVE_AUTH_TOKEN_ENV"));
+            assert!(!diagnostic.contains("test-private-token"));
+        }
+        for args in [
+            vec!["daemon", "status"],
+            vec!["daemon", "reload"],
+            vec!["project", "list"],
+            vec!["workspace", "list"],
+            vec!["repository", "list"],
+        ] {
+            let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_hive"));
+            command
+                .args(args)
+                .env("HIVE_LISTEN", address.to_string())
+                .env_remove("HIVE_URL")
+                .env_remove("HIVE_AUTH_TOKEN_ENV");
+            if authenticated {
+                command
+                    .env("HIVE_AUTH_TOKEN_ENV", "HIVE_TEST_TOKEN")
+                    .env("HIVE_TEST_TOKEN", "test-private-token");
+            }
+            let result = command.output().await.unwrap();
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert!(!String::from_utf8_lossy(&result.stdout).contains("test-private-token"));
+        }
+        daemon.kill().await.unwrap();
+        daemon.wait().await.unwrap();
+        std::fs::remove_dir_all(runtime).unwrap();
+    }
+}
+
+#[tokio::test]
 async fn cli_reload_and_hangup_apply_the_original_file_and_invalid_edits_leave_the_daemon_running()
 {
     let runtime = std::env::temp_dir().join(format!("hive-reload-cli-{}", uuid::Uuid::new_v4()));

@@ -223,15 +223,16 @@ pub(crate) fn allowed_origin(headers: &HeaderMap, origin: Option<&str>) -> bool 
     let Some(origin) = origin else {
         return false;
     };
-    if value == origin {
-        return true;
-    }
-    origin
-        .strip_prefix("http://")
-        .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
-        .is_some_and(|address| {
-            address.ip().is_loopback() && value == format!("http://localhost:{}", address.port())
-        })
+    origin.split(',').any(|origin| {
+        value == origin
+            || origin
+                .strip_prefix("http://")
+                .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
+                .is_some_and(|address| {
+                    address.ip().is_loopback()
+                        && value == format!("http://localhost:{}", address.port())
+                })
+    })
 }
 
 #[cfg(test)]

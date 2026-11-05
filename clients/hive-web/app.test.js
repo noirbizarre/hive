@@ -68,6 +68,23 @@ test('failed initialization rejects pending clicks and reconnect opens only the 
   client.close();
 });
 
+test('reconnect waits for slow authentication checks and retries checks without unauthorized upgrades', async () => {
+  const sockets = transport();
+  let authorize;
+  const client = connect('ws://localhost/acp', undefined, () => new Promise(resolve => { authorize = resolve; }));
+  await client.initialized;
+  sockets[0].close();
+  await new Promise(resolve => setTimeout(resolve, 800));
+  assert.equal(sockets.length, 1);
+  authorize(false);
+  await new Promise(resolve => setTimeout(resolve, 800));
+  assert.equal(sockets.length, 1);
+  authorize(true);
+  await new Promise(resolve => setTimeout(resolve, 800));
+  assert.equal(sockets.length, 2);
+  client.close();
+});
+
 test('an explicit session can select its model before the first inference and blocks prompts during the change', async () => {
   let setter;
   const sockets = transport((socket, message, result) => {

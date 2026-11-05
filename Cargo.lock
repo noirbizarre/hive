@@ -1486,6 +1486,7 @@ dependencies = [
  "clap_complete",
  "hive-core",
  "hive-daemon",
+ "hive-protocol",
  "hive-tui",
  "miette",
  "reqwest",

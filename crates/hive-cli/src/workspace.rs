@@ -242,10 +242,7 @@ async fn request(
     route: String,
     body: Option<Value>,
 ) -> miette::Result<()> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
-        .build()
-        .map_err(|_| miette::miette!("cannot initialize resource HTTP client"))?;
+    let client = super::native_http(std::time::Duration::from_secs(300))?;
     let mut request = client.request(method, format!("{}{route}", super::daemon_url(url)));
     if let Some(body) = body {
         request = request.json(&body);

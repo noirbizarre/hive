@@ -82,6 +82,15 @@ struct ServeOptions {
     listen: SocketAddr,
     #[arg(long, env = "HIVE_CONFIG")]
     config: Option<PathBuf>,
+    /// Explicitly allow the shared API to bind outside loopback.
+    #[arg(long, env = "HIVE_ALLOW_REMOTE")]
+    allow_remote: bool,
+    /// Name of the environment variable containing the optional bearer token.
+    #[arg(long, env = "HIVE_AUTH_TOKEN_ENV")]
+    auth_token_env: Option<String>,
+    /// Browser origin permitted to access this listener (repeatable).
+    #[arg(long, env = "HIVE_ALLOWED_ORIGINS", value_delimiter = ',')]
+    allowed_origin: Vec<String>,
 }
 
 #[derive(Args)]
@@ -91,6 +100,12 @@ struct DoctorOptions {
     listen: SocketAddr,
     #[arg(long, env = "HIVE_CONFIG")]
     config: Option<PathBuf>,
+    #[arg(long, env = "HIVE_ALLOW_REMOTE")]
+    allow_remote: bool,
+    #[arg(long, env = "HIVE_AUTH_TOKEN_ENV")]
+    auth_token_env: Option<String>,
+    #[arg(long, env = "HIVE_ALLOWED_ORIGINS", value_delimiter = ',')]
+    allowed_origin: Vec<String>,
     /// Print the report as JSON on stdout, for scripts.
     #[arg(long)]
     json: bool,
@@ -107,7 +122,23 @@ struct StatusOptions {
 fn daemon_url(url: Option<String>) -> String {
     url.unwrap_or_else(|| {
         std::env::var("HIVE_LISTEN")
-            .map(|listen| format!("http://{listen}"))
+            .map(|listen| {
+                // Wildcard addresses describe listeners, not destinations for native clients.
+                let listen = listen
+                    .parse::<SocketAddr>()
+                    .map(|mut address| {
+                        if address.ip().is_unspecified() {
+                            address.set_ip(if address.is_ipv4() {
+                                std::net::Ipv4Addr::LOCALHOST.into()
+                            } else {
+                                std::net::Ipv6Addr::LOCALHOST.into()
+                            });
+                        }
+                        address.to_string()
+                    })
+                    .unwrap_or(listen);
+                format!("http://{listen}")
+            })
             .unwrap_or_else(|_| "http://127.0.0.1:8765".into())
     })
     .trim_end_matches('/')
@@ -119,17 +150,32 @@ async fn serve(options: ServeOptions) -> miette::Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     let source = ConfigSource::new(options.config).map_err(miette::Report::new)?;
-    hive_daemon::serve_configured(options.listen, source)
-        .await
-        .map_err(|error| miette::miette!("cannot serve Hive on {}: {error}", options.listen))
+    hive_daemon::serve_configured_with_options(
+        options.listen,
+        source,
+        hive_daemon::http::ServeOptions {
+            allow_remote: options.allow_remote,
+            auth_token_env: options.auth_token_env,
+            allowed_origins: options.allowed_origin,
+        },
+    )
+    .await
+    .map_err(|error| {
+        // Preserve the library's public diagnostic code across the I/O startup boundary.
+        if let Some(policy) = error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<hive_daemon::http::PolicyError>())
+        {
+            miette::Report::new(policy.clone())
+        } else {
+            miette::miette!("cannot serve Hive on {}: {error}", options.listen)
+        }
+    })
 }
 
 async fn reload(options: StatusOptions) -> miette::Result<()> {
     let url = format!("{}/v1/config/reload", daemon_url(options.url));
-    let response = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|error| miette::miette!("HTTP client: {error}"))?
+    let response = native_http(Duration::from_secs(10))?
         .post(&url)
         .send()
         .await
@@ -161,10 +207,7 @@ async fn reload(options: StatusOptions) -> miette::Result<()> {
 
 async fn status(options: StatusOptions) -> miette::Result<()> {
     let url = format!("{}/v1/status", daemon_url(options.url));
-    let response = reqwest::Client::builder()
-        .timeout(Duration::from_secs(3))
-        .build()
-        .map_err(|error| miette::miette!("HTTP client: {error}"))?
+    let response = native_http(Duration::from_secs(3))?
         .get(&url)
         .send()
         .await
@@ -172,7 +215,13 @@ async fn status(options: StatusOptions) -> miette::Result<()> {
             miette::miette!("daemon unavailable at {url}: {error}; start `hive daemon`")
         })?
         .error_for_status()
-        .map_err(|error| miette::miette!("daemon status failed: {error}"))?;
+        .map_err(|error| {
+            if error.status().is_some_and(|status| matches!(status.as_u16(), 401 | 403)) {
+                miette::miette!(code = "hive::http::unauthorized", help = "set HIVE_AUTH_TOKEN_ENV to the name of the environment variable containing the daemon token", "daemon authentication was rejected")
+            } else {
+                miette::miette!("daemon status failed: {error}; check the daemon endpoint and retry")
+            }
+        })?;
     println!(
         "{}",
         response
@@ -187,6 +236,11 @@ async fn doctor(options: DoctorOptions) -> miette::Result<()> {
     let mut checks = hive_daemon::doctor::Options::new(options.listen);
     checks.config = options.config;
     checks.agents = options.agents;
+    checks.serving = hive_daemon::http::ServeOptions {
+        allow_remote: options.allow_remote,
+        auth_token_env: options.auth_token_env,
+        allowed_origins: options.allowed_origin,
+    };
     let report = hive_daemon::doctor::run(checks).await;
     // The report is the diagnostic; a miette error on top would print it twice.
     if !doctor::print(&report, options.json)? {
@@ -198,6 +252,12 @@ async fn doctor(options: DoctorOptions) -> miette::Result<()> {
 fn web(url: Option<String>) -> miette::Result<()> {
     let url = web_url(url);
     open_web(&url, webbrowser::open)
+}
+
+fn native_http(timeout: Duration) -> miette::Result<reqwest::Client> {
+    hive_protocol::transport::Credentials::native()
+        .and_then(|credentials| credentials.http(timeout))
+        .map_err(|error| miette::miette!(code = error.code(), "{error}"))
 }
 
 fn open_web(url: &str, open: impl FnOnce(&str) -> std::io::Result<()>) -> miette::Result<()> {

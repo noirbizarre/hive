@@ -53,4 +53,15 @@ discovery views derive from the same broker rather than separate authorities.
 The new negotiation, discovery and session-location extensions are not implemented
 by this decision record. Remote transport validation, authenticated/authorized
 deployment and safe non-loopback binding remain follow-up implementation work.
-The retrospective local trust boundary above still describes current production.
+The retrospective local trust boundary above described production at that time.
+
+## Shared private-network listener — 2026-11-05
+
+[#78](https://github.com/noirbizarre/hive/issues/78) extends the deployment boundary:
+loopback remains the default, while explicit remote opt-in exposes the same ACP
+and operational listener. Authentication is optional according to deployment
+topology. When enabled, shared bearer credentials or ephemeral browser-login
+cookies protect both surfaces. There are no per-user roles. The ACP/operational
+protocol separation and owner-side session supervision remain unchanged.
+See [current deployment guidance](../operations.md#private-network-access) and
+[SDK validation/limitations](../transports.md#sdk-audit-and-limits).

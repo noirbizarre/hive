@@ -33,6 +33,63 @@ refresh provider choices. Invalid, missing, or unreadable files leave the previo
 configuration active. Reload does not launch probes or retry offline recovery.
 See [reload semantics and identity conflicts](configuration.md#reloading-changes).
 
+## Private-network access
+
+Use connectivity already provided by your private network, such as Tailscale or
+NetBird. On the owning machine, keep local agent profiles as stdio declarations;
+the agent itself needs no networking. For example, a config can still contain:
+
+```toml
+[agents.coder]
+command = "claude-agent-acp"
+```
+
+Bind the shared listener explicitly to that machine's private address:
+
+```sh
+# Set HIVE_PEER_TOKEN in the daemon environment using your existing secret mechanism.
+hive daemon --listen 100.64.0.10:8765 --allow-remote \
+  --auth-token-env HIVE_PEER_TOKEN --allowed-origin http://100.64.0.10:8765
+```
+
+On the initiating machine, use the same secret through its variable name:
+
+```sh
+export HIVE_AUTH_TOKEN_ENV=HIVE_PEER_TOKEN
+hive daemon status --url http://100.64.0.10:8765
+hive tui --address 100.64.0.10:8765 --transport http
+hive web --url http://100.64.0.10:8765
+```
+
+The browser prompts for the token separately. It does not receive it in the URL.
+Allowed browser origins must match the actual scheme, hostname and port, with no
+trailing path. Repeat `--allowed-origin` for other private hostnames or an existing
+HTTPS reverse proxy. Wildcard bind addresses are not browser origins: supply the
+concrete origin and use `HIVE_URL` for a remote client destination. Local commands
+normalize wildcard `HIVE_LISTEN` destinations to loopback.
+
+Authentication is optional, independently of remote opt-in. A topology that trusts
+all clients able to reach the private listener can deliberately omit the token:
+
+```sh
+hive daemon --listen 100.64.0.10:8765 --allow-remote
+```
+
+This exposes **both ACP and operational/admin APIs**, including project/workspace
+operations and configuration reload. With authentication enabled, bearer or
+browser-cookie authentication protects those routes and health endpoints alike;
+the static UI shell and authentication bootstrap/login remain public. This is
+one shared administrative principal, not per-user permissions. Plain HTTP carries
+credentials without application-layer TLS; protection then comes from the chosen
+network. Hive implements no VPN, tunnel or custom TLS layer.
+
+Missing, empty or invalid configured tokens fail startup rather than disabling
+authentication. Listener options, token values and allowed origins require restart;
+agent-registry reload does not change them. Pilot fencing remains independent of
+listener authentication. See [transport guarantees](transports.md#sdk-audit-and-limits)
+for live reattachment and current SDK limitations. Remote discovery and routed
+session ownership are subsequent federation features, not implied by connectivity.
+
 ## Health and diagnosis
 
 ```sh
@@ -353,10 +410,11 @@ See [pricing configuration](configuration.md#pricing) and the
 
 ## Trust boundary
 
-Hive serves one trusted local OS user. Its daemon listener is loopback-only
-and has no per-client login. Other local processes able to reach it can access
-sessions and administration. Pilot tokens fence stale clients; they do not
-create a multi-user authentication boundary.
+Hive defaults to one trusted local OS user on loopback without login. Explicit
+remote opt-in extends access to the chosen network; optional shared-token
+authentication applies to local and remote clients alike. Without authentication,
+any reachable client can access sessions and administration. Pilot tokens fence
+stale clients; they do not create a multi-user authentication boundary.
 
 Downstream endpoints have separate policies. OpenCode server credentials let
 Hive act on that server, and discovery can reveal native titles/directories.

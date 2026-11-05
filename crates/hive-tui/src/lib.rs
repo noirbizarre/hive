@@ -36,7 +36,6 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use hive_protocol::HttpClient;
 use tokio::sync::{mpsc, oneshot};
 
 use ui::{App, Page, SessionSnapshot};
@@ -63,7 +62,7 @@ pub struct Options {
     pub branch: Option<String>,
     #[arg(long, default_value = "127.0.0.1:8765")]
     pub address: String,
-    #[arg(long, default_value = "ws", value_parser = ["ws", "http"])]
+    #[arg(long, default_value = "ws", value_parser = ["ws", "http", "wss", "https"])]
     pub transport: String,
     #[arg(long)]
     pub agent: Option<String>,
@@ -814,12 +813,8 @@ fn apply_update(app: &mut App, update: v2::UpdateSessionNotification) -> bool {
     true
 }
 
-async fn refresh(address: &str, app: &mut App) -> Result<(), String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|error| error.to_string())?;
-    let catalog = load_catalog(&client, address).await?;
+async fn refresh(client: &reqwest::Client, address: &str, app: &mut App) -> Result<(), String> {
+    let catalog = load_catalog(client, address).await?;
     apply_catalog(app, catalog);
     Ok(())
 }
@@ -831,7 +826,7 @@ struct Catalog {
 
 async fn load_catalog(client: &reqwest::Client, address: &str) -> Result<Catalog, String> {
     let response = client
-        .get(format!("http://{address}/v1/sessions"))
+        .get(format!("{address}/v1/sessions"))
         .send()
         .await
         .map_err(|error| error.to_string())?
@@ -839,7 +834,7 @@ async fn load_catalog(client: &reqwest::Client, address: &str) -> Result<Catalog
         .map_err(|error| error.to_string())?;
     let snapshot: SessionSnapshot = response.json().await.map_err(|error| error.to_string())?;
     let providers = client
-        .get(format!("http://{address}/v1/providers"))
+        .get(format!("{address}/v1/providers"))
         .send()
         .await
         .map_err(|error| error.to_string())?
@@ -1939,11 +1934,21 @@ async fn run_with_clipboard(
     } else {
         None
     };
-    let providers: serde_json::Value =
-        reqwest::get(format!("http://{}/v1/providers", options.address))
-            .await?
-            .json()
-            .await?;
+    let credentials = hive_protocol::transport::Credentials::native()?;
+    let http = credentials.http(Duration::from_secs(5))?;
+    let scheme = if matches!(options.transport.as_str(), "https" | "wss") {
+        "https"
+    } else {
+        "http"
+    };
+    let operational = format!("{scheme}://{}", options.address);
+    let providers: serde_json::Value = http
+        .get(format!("{operational}/v1/providers"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
     update_profiles(&mut app, &providers);
     if let Some(agent) = &options.agent {
         if options.session.is_none() {
@@ -1959,9 +1964,6 @@ async fn run_with_clipboard(
     let reader = tokio::task::spawn_blocking(move || terminal_reader(keys_tx, controls));
     let mut editing = None;
     let mut editor_prefix: Option<std::time::Instant> = None;
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()?;
     let mut quit = false;
     let mut connected_once = false;
     while !quit {
@@ -1969,7 +1971,7 @@ async fn run_with_clipboard(
         let (updates_tx, mut updates) = mpsc::unbounded_channel();
         let (interaction_tx, mut interactions) = mpsc::unbounded_channel();
         let (completion_tx, mut completions) = mpsc::unbounded_channel();
-        let result = interaction_client(updates_tx, interaction_tx, completion_tx, HttpClient::new(url)?, async |cx| {
+        let result = interaction_client(updates_tx, interaction_tx, completion_tx, credentials.acp(&url)?, async |cx| {
                 cx.send_request(v2::InitializeRequest::new(ProtocolVersion::V2,
                     v2::Implementation::new("hive-tui", env!("CARGO_PKG_VERSION")))
                     .capabilities(v2::ClientCapabilities::new().elicitation(v2::ElicitationCapabilities::new()
@@ -1978,7 +1980,7 @@ async fn run_with_clipboard(
                  let reconnecting = connected_once;
                  connected_once = true;
                  app.connected = true;
-                 if let Err(error) = refresh(&options.address, &mut app).await { app.status = error; }
+                 if let Err(error) = refresh(&http, &operational, &mut app).await { app.status = error; }
                 if app.page == Page::Profiles && app.active.is_none() {
                     app.profile_selected = options.agent.as_ref().and_then(|agent| app.profiles.iter().position(|id| id == agent)).unwrap_or(0);
                 }
@@ -2008,7 +2010,7 @@ async fn run_with_clipboard(
                         app.refresh_requested = false;
                         refreshing = true;
                         let client = http.clone();
-                        let address = options.address.clone();
+                        let address = operational.clone();
                         let results = catalog_tx.clone();
                         tokio::spawn(async move { let _ = results.send(load_catalog(&client, &address).await); });
                     }
@@ -2213,7 +2215,11 @@ async fn run_with_clipboard(
         if quit {
             break;
         }
-        app.status = format!("Disconnected ({result:?}); reconnecting to the same Hive session…");
+        // Network failures can embed arbitrary server bodies; display only the protocol code.
+        app.status = format!(
+            "Disconnected (code {:?}); reconnecting to the same Hive session…",
+            result.as_ref().err().map(|error| error.code)
+        );
         if editing.is_none() {
             restore_draft(&mut app);
             let capabilities = app.terminal_capabilities;

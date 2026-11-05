@@ -11,6 +11,7 @@ name = "hive"
 path = "src/main.rs"
 
 [dependencies]
+hive-protocol = { path = "../hive-protocol" }
 clap = { workspace = true }
 clap_complete = { workspace = true }
 hive-daemon = { path = "../hive-daemon" }

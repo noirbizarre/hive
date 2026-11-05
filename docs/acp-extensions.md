@@ -415,14 +415,16 @@ session responses where needed for standard resume.
 
 Peers and endpoint credentials are explicitly configured. A private network
 such as Tailscale or NetBird provides connectivity, not ACP capability or
-operation authorization. Remote deployment must establish authenticated peer/user
-identity and owner-side authorization through the deployment/transport contract;
-this document introduces no tunnel, VPN or authentication RPC. Pilot fencing is
+operation authorization. The deployment/transport contract chooses authenticated
+peer identity or explicitly trusts clients admitted by its network topology;
+owner-side operation authorization remains distinct from transport access.
+This document introduces no tunnel, VPN or authentication RPC. Pilot fencing is
 not authentication and browser-origin checks are not login.
 
-Current production Hive remains trusted-user **loopback-only**. Neither this
-specification nor existing local HTTP/SSE support enables safe remote binding;
-that boundary is tracked separately in [#78][transport]. See [transports](transports.md)
+Production Hive defaults to loopback and permits explicitly opted-in remote
+binding with optional shared-token authentication through [#78][transport].
+This does not implement negotiated discovery or session routing. See
+[transports](transports.md), [deployment](operations.md#private-network-access)
 and [ADR-006](adr/006-local-operational-http-and-acp-boundary.md).
 
 ## Implementation conformance checklist

@@ -35,8 +35,10 @@ supports every operation.
 
 ## Current boundaries
 
-Hive serves one trusted local OS user on loopback. It is not an authenticated
-remote multi-user service. ACPv2 and its SDK interfaces are draft.
+Hive defaults to one trusted local OS user on loopback. Private-network binding
+is explicit, with optional shared-token authentication; it is not a remote
+multi-user service. ACPv2 and its SDK interfaces are draft. See
+[private-network access](operations.md#private-network-access).
 
 Client detach leaves work running, but daemon restart requires downstream
 recovery support. Replay is bounded and not durable conversation history.

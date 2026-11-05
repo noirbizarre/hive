@@ -228,7 +228,7 @@ export function validateContent(schema, content) {
   return content;
 }
 
-export function connect(url, onChange = () => {}) {
+export function connect(url, onChange = () => {}, onDisconnect = () => true) {
   const store = typeof localStorage === 'undefined' ? null : localStorage;
   let socket;
   let pending = new Map();
@@ -536,7 +536,14 @@ export function connect(url, onChange = () => {}) {
       pending.clear();
       status = closed ? 'Disconnected' : 'Disconnected — reconnecting to the same session…';
       publish();
-      if (!closed) retryTimer = setTimeout(openSocket, 750);
+      async function retryWhenAuthorized() {
+        let authorized = false;
+        try { authorized = (await onDisconnect()) !== false; } catch { /* A failed auth check cannot authorize a new socket. */ }
+        if (closed || socket !== ws) return;
+        // Retry the authentication check after transient failures, not the WebSocket upgrade.
+        retryTimer = setTimeout(authorized ? openSocket : retryWhenAuthorized, 750);
+      }
+      if (!closed) void retryWhenAuthorized();
     };
     ws.onerror = () => { if (socket === ws) { status = 'Hive connection failed'; publish(); } };
   }

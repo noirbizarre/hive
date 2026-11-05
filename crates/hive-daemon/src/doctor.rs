@@ -62,9 +62,20 @@ pub enum DoctorError {
     #[error("the listen address is not a loopback address")]
     #[diagnostic(
         code(hive::doctor::listen_not_loopback),
-        help("the daemon refuses remote binds until it has authentication; use 127.0.0.1 or ::1")
+        help(
+            "use 127.0.0.1 or ::1, or explicitly enable --allow-remote for your network topology"
+        )
     )]
     ListenNotLoopback,
+
+    #[error("daemon authentication failed")]
+    #[diagnostic(
+        code(hive::doctor::authentication),
+        help(
+            "set HIVE_AUTH_TOKEN_ENV to the name of the environment variable containing the daemon token"
+        )
+    )]
+    Authentication,
 
     #[error("the listen address is already in use by another program")]
     #[diagnostic(
@@ -240,6 +251,7 @@ impl Report {
 }
 
 pub struct Options {
+    pub serving: crate::http::ServeOptions,
     pub config: Option<PathBuf>,
     pub listen: SocketAddr,
     /// Profile ids to check; empty means every profile.
@@ -254,6 +266,7 @@ pub struct Options {
 impl Options {
     pub fn new(listen: SocketAddr) -> Self {
         Self {
+            serving: crate::http::ServeOptions::default(),
             config: None,
             listen,
             agents: Vec::new(),
@@ -650,11 +663,19 @@ async fn check_daemon(options: &Options) -> DaemonReport {
             "listen address {} is a loopback address",
             options.listen
         )));
-    } else {
+    } else if !options.serving.allow_remote {
         findings.push(Finding::from_diagnostic(
             Status::Fail,
             &DoctorError::ListenNotLoopback,
         ));
+    } else {
+        findings.push(Finding::pass("remote binding explicitly enabled"));
+    }
+    if let Err(error) = options.serving.policy(options.listen) {
+        // The stable loopback diagnostic above already explains a missing remote opt-in.
+        if options.listen.ip().is_loopback() || options.serving.allow_remote {
+            findings.push(Finding::from_diagnostic(Status::Fail, &error));
+        }
     }
 
     let runtime = options.runtime_dir.clone().map_or_else(runtime_base, Ok);
@@ -670,13 +691,16 @@ async fn check_daemon(options: &Options) -> DaemonReport {
     };
     match lock {
         Err(error) => findings.push(Finding::from_diagnostic(Status::Fail, &error)),
-        Ok(Lock::Held) => match running_daemon(options.listen).await {
-            Some(summary) => findings.push(Finding::pass(summary)),
-            None => findings.push(Finding::from_diagnostic(
-                Status::Warn,
-                &DoctorError::DaemonLocked,
-            )),
-        },
+        Ok(Lock::Held) => {
+            match running_daemon(options.listen, options.serving.auth_token_env.as_deref()).await {
+                Ok(Some(summary)) => findings.push(Finding::pass(summary)),
+                Err(error) => findings.push(Finding::from_diagnostic(Status::Fail, &error)),
+                Ok(None) => findings.push(Finding::from_diagnostic(
+                    Status::Warn,
+                    &DoctorError::DaemonLocked,
+                )),
+            }
+        }
         Ok(state) => {
             findings.push(Finding::pass(if state == Lock::Absent {
                 "no daemon has run yet (no lock file)"
@@ -723,26 +747,47 @@ async fn check_daemon(options: &Options) -> DaemonReport {
 
 /// Asks the daemon on `listen` to identify itself. Transport errors are discarded: their
 /// text embeds the URL.
-async fn running_daemon(listen: SocketAddr) -> Option<String> {
-    let body: serde_json::Value = reqwest::Client::builder()
-        .timeout(DAEMON_TIMEOUT)
-        .build()
-        .ok()?
+async fn running_daemon(
+    mut listen: SocketAddr,
+    token_env: Option<&str>,
+) -> Result<Option<String>, DoctorError> {
+    if listen.ip().is_unspecified() {
+        listen.set_ip(if listen.is_ipv4() {
+            std::net::Ipv4Addr::LOCALHOST.into()
+        } else {
+            std::net::Ipv6Addr::LOCALHOST.into()
+        });
+    }
+    let credentials = hive_protocol::transport::Credentials::from_env(token_env)
+        .map_err(|_| DoctorError::Authentication)?;
+    let client = credentials
+        .http(DAEMON_TIMEOUT)
+        .map_err(|_| DoctorError::Authentication)?;
+    let response = client
         .get(format!("http://{listen}/v1/status"))
         .send()
-        .await
-        .ok()?
-        .error_for_status()
-        .ok()?
-        .json()
-        .await
-        .ok()?;
-    let version = compat::sanitize(body.get("version")?.as_str()?);
+        .await;
+    let Ok(response) = response else {
+        return Ok(None);
+    };
+    if matches!(response.status().as_u16(), 401 | 403) {
+        return Err(DoctorError::Authentication);
+    }
+    let Ok(response) = response.error_for_status() else {
+        return Ok(None);
+    };
+    let Ok(body) = response.json::<serde_json::Value>().await else {
+        return Ok(None);
+    };
+    let Some(version) = body.get("version").and_then(|value| value.as_str()) else {
+        return Ok(None);
+    };
+    let version = compat::sanitize(version);
     let sessions = body.get("sessions").and_then(serde_json::Value::as_u64);
-    Some(format!(
+    Ok(Some(format!(
         "Hive {version} is already running on {listen}{}",
         sessions.map_or(String::new(), |n| format!(" ({n} session(s))"))
-    ))
+    )))
 }
 
 #[cfg(test)]
@@ -770,6 +815,7 @@ mod tests {
             DoctorError::NoAgents,
             DoctorError::MissingPrerequisite { what: "x" },
             DoctorError::ListenNotLoopback,
+            DoctorError::Authentication,
             DoctorError::PortInUse,
             DoctorError::DaemonLocked,
             DoctorError::UnsafeRuntimeDir { path: "x".into() },
@@ -789,6 +835,7 @@ mod tests {
                 "hive::doctor::no_agents",
                 "hive::doctor::missing_prerequisite",
                 "hive::doctor::listen_not_loopback",
+                "hive::doctor::authentication",
                 "hive::doctor::port_in_use",
                 "hive::doctor::daemon_locked",
                 "hive::doctor::unsafe_runtime_dir",

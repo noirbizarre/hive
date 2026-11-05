@@ -203,7 +203,7 @@ The `unstable` umbrella is not enabled; it would not implicitly enable protocol 
 | Newline-delimited stdio ([v1][v1-transports], [v2][v2-transports]) | ✅ S | SDK stdio client; explicit profile | Downstream process transport; not the client-facing daemon endpoint | Both use daemon network endpoints instead | [Compatibility tests][compat-tests]; [transports](transports.md) |
 | HTTP/SSE and WebSocket ([transport documentation](transports.md)) | ✅ S | SDK endpoint clients for declared versions/transports | Both upstream adapter shapes tested; this is transport support, not proof of full remote-transport RFD conformance | Both connect through supported daemon transports | [Gateway tests][gateway-tests]; [transport guide](transports.md) |
 | JSON-RPC batch behavior ([v2 transports][v2-transports]) | ❔ Not assessed / unknown | SDK-managed parsing; no dedicated Hive batch-conformance evidence found | Do not infer lifecycle ordering/conformance from individual RPC tests | Built-ins send individual operations | [Gateway tests][gateway-tests]; [SDK provenance][sdk-pin] |
-| Remote security / transport authentication ([transport guide](transports.md)) | 🟡 P | Configured agent endpoints may use TLS/headers | Hive gateway is trusted-user loopback only, not authenticated remote multi-user hosting | Both operate within that trust boundary | `a_remote_listener_is_rejected_without_authentication` in [gateway tests][gateway-tests]; [operations](operations.md) |
+| Remote security / transport authentication ([transport guide](transports.md)) | 🟡 P | Configured agent endpoints may use TLS/headers | Explicit remote-bind opt-in, optional shared bearer/cookie auth; no per-user roles | Native clients share bearer credentials; browser token login | `a_remote_listener_is_rejected_without_explicit_opt_in` and `remote_http` in [gateway tests][gateway-tests]; `http::tests` in [daemon][daemon]; [operations](operations.md) |
 
 ### Capability index
 
@@ -315,8 +315,8 @@ are Hive-specific even when carried on standard ACP methods.
 The existing selector/control contracts above are implemented; the new negotiated
 advertisement, discovery method and cross-Hive location contract are not. Clients
 cannot infer them from ACPv2 support or the existing operational HTTP catalog.
-The specification does not change the loopback-only production security boundary
-or establish validated remote Streamable HTTP conformance.
+The specification is separate from the implemented optional-auth remote listener
+and [Streamable HTTP transport validation](transports.md#sdk-audit-and-limits).
 
 ## Maintaining this audit
 
@@ -1082,7 +1082,7 @@ named) and prints the diagnostics above with their help text:
   declared protocol version.
 - **`opencode-server` profiles**: the health and version probes, with
   `hive::opencode::*` codes.
-- **Daemon**: the listen address (loopback only), whether another daemon holds
+- **Daemon**: the listen address and explicit remote-bind/auth policy, whether another daemon holds
   the lock (and answers there), and the permissions of the state directory.
   Doctor never creates the lock or state files.
 
@@ -1110,7 +1110,8 @@ printable characters. A missing-binary message does name the configured
 | `hive::doctor::unknown_agent` | A named profile is not configured. |
 | `hive::doctor::no_agents` | No profile is configured (warning). |
 | `hive::doctor::missing_prerequisite` | Node.js 22+ or `pi` needed by `pi-acp` was not found (warning). |
-| `hive::doctor::listen_not_loopback` | The daemon refuses non-loopback listen addresses. |
+| `hive::doctor::listen_not_loopback` | A non-loopback listen address requires explicit remote opt-in. |
+| `hive::doctor::authentication` | The configured token is unavailable or the daemon rejects authentication. |
 | `hive::doctor::port_in_use` | Another program holds the listen address. |
 | `hive::doctor::daemon_locked` | Another daemon holds the lock but does not answer on the listen address (warning). |
 | `hive::doctor::no_runtime_dir` | Neither `XDG_RUNTIME_DIR` nor `HOME` is set, so the lock cannot be located (warning). |
@@ -1499,9 +1500,9 @@ endpoint, headers, credentials or server response bodies.
   set on the server. Set it, and give Hive the variable *name* in `password_env`.
   Profile validation refuses plain `http://` to a non-loopback host and
   credentials embedded in the endpoint; use `https://` or an SSH tunnel.
-- Anyone who can reach Hive's own (loopback) gateway can act through its
+- Anyone admitted to Hive's gateway by the deployment's optional authentication can act through its
   OpenCode credentials, and the native-sessions route reveals session titles and
-  directories. The existing single-user loopback policy applies.
+  directories. The shared administrative trust boundary applies.
 
 Unsupported workflows:
 

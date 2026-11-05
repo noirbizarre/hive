@@ -2,9 +2,9 @@
 
 ## Status
 
-Accepted. Defines the executable contract for [#93][issue], part of the
-[managed MCP lifecycle epic][epic]. Runtime management, scope discovery and
-agent routing follow in #94, #95 and #96 respectively.
+Accepted. Defines the executable identity contract for [#93][issue] and shared
+stdio runtime for #94, part of the [managed MCP lifecycle epic][epic]. Scope
+discovery and agent routing follow in #95 and #96 respectively.
 
 ## Context
 
@@ -41,8 +41,8 @@ capabilities; those inputs can change server behavior and matter for reuse.
 HTTP sessions may be stateful. Sharing an HTTP URL is not permission to share
 one initialized MCP session.
 
-Today HTTP forwarding sends the URL and headers to the agent. Hive neither
-launches a local HTTP process nor connects/pools MCP clients. The native ACP
+HTTP forwarding sends the URL and headers to the agent. Hive neither
+launches a local HTTP process nor pools HTTP MCP clients. The native ACP
 declarations are persisted as supplied, including literal environment/header
 credentials. The new contract does not change that existing persistence behavior.
 
@@ -52,8 +52,8 @@ credentials. The new contract does not change that existing persistence behavior
 
 `hive_daemon::mcp::ServerDefinition` is a checked standalone library schema.
 It is **not yet accepted in daemon configuration files** and does not register
-or activate servers. Add configuration selectors with a runtime consumer rather
-than accept settings that have no effect.
+or activate servers. Trusted Rust callers can admit resolved identities to the
+runtime below; configuration selectors remain future work.
 
 | Dimension | Values and meaning |
 | --- | --- |
@@ -93,8 +93,8 @@ the caller remains responsible for choosing an appropriate transport for secrets
 For on-demand lifetime, zero timeout means stop after the last lease and
 in-flight operation; a positive timeout retains an unused instance for that
 many seconds. Active leases or operations prevent idle cleanup. A client
-disconnect alone does not release a durable session's lease. This is a runtime
-contract, not implemented scheduling, automatic restart or exactly-once execution.
+disconnect alone does not release a durable session's lease. The runtime below
+implements this scheduling contract without claiming exactly-once execution.
 
 ### Scope uses the existing resource domain
 
@@ -169,6 +169,94 @@ Forwarded HTTP identity describes declaration compatibility only. It does not
 authorize pooling the agent's connection or remote MCP session, whose complete
 initialization and security state Hive may not know.
 
+### Shared stdio runtime
+
+`Broker::bind_mcp` accepts a fully resolved local managed-stdio identity for a live,
+non-closing session. It returns a revocable `SessionMcpLease`; the Broker retains
+ownership even if callers drop their handles. Rebinding an equal identity to the
+same session returns the existing binding. `Broker::release_mcp` revokes it and
+also works while its session is offline. `Broker::mcp_execution_node` supplies the
+existing persistent resource node, or one ephemeral node for an in-memory Broker.
+The standalone `mcp::runtime::Runtime` API supports other trusted Rust owners.
+
+One process and one initialization handshake serve equal identities. Startup is
+single-flight. The runtime launches the exact resolved executable, arguments,
+cwd and complete environment, without inheriting new daemon environment values.
+The pinned ACP SDK's standalone MCP roles and JSON-RPC engine provide request IDs
+and concurrent response correlation. This is not MCP-over-ACP or an agent route.
+
+The initial runtime profile supports protocol `2025-11-25`, object client info
+with name/version, and client capabilities `{}` or `{"roots": {}}`. Initialization
+options are extra top-level parameters; reserved protocolVersion/clientInfo/
+capabilities collisions are rejected. Unknown accepted options remain significant
+and are sent unchanged. The server must negotiate the admitted protocol version.
+Readiness follows successful initialization and the initialized notification.
+
+Immutable roots are served as file URIs through `roots/list`, not an invented
+initialize field. Server ping is supported; sampling, elicitation and unknown
+requests receive method-not-found. Notifications are not broadcast to sessions.
+The checked request API permits ping, tools list/call, resources list/templates/
+read and prompts list/get, subject to server capabilities. It excludes lifecycle,
+subscription and task operations whose cross-session ownership is not yet defined.
+Task augmentation on ordinary tool calls is also rejected, since task creation
+does not establish that the underlying work has finished. Oversized local requests
+are rejected before publication without terminating other callers' connections.
+
+Cancellation before publication sends no request. After publication it sends MCP
+`notifications/cancelled`, translating the SDK's ACP cancellation notification.
+The caller can receive cancellation immediately, but the operation hold and
+response consumer survive until a response or process termination. Late responses
+are consumed. An ignored cancellation does not kill a shared process or interrupt
+other callers, and can therefore prevent idle cleanup indefinitely. There is no
+default tool-execution timeout. Applications should not infer that cancellation
+prevented a side effect.
+
+Failed startup, process exit, malformed/oversized protocol output and transport
+failure produce controlled typed diagnostics. Published operations can have an
+uncertain outcome. The runtime never automatically replays them. Existing leases
+can start/join a replacement on a later explicit request: restart failures use
+250 ms exponential backoff capped at 30 seconds, with at most three starts per
+identity in a rolling minute. Cooldowns survive immediate release/reacquisition;
+normal idle stops do not count as crash loops. A sustained healthy minute resets
+consecutive failures. No background timer starts replacement processes.
+If process cleanup cannot be confirmed, the identity stays unavailable and
+operation resource protection remains in place; inspect remaining processes
+before restarting the daemon, rather than launching a potentially overlapping copy.
+
+Default library policy allows 15 seconds for initialization, 64 outstanding calls
+per instance (including startup waiters), and 8 MiB per protocol frame. Busy calls
+fail promptly. These bounds do not promise a total-memory cap against unsolicited
+notification floods. Policy can be supplied to standalone runtimes in Rust; it is
+not daemon TOML configuration. Stderr is drained separately and discarded. Raw
+server messages/data and admitted secrets are omitted from public errors, and SDK
+payload logging is suppressed within managed connection drivers.
+
+Client disconnect and pilot handoff retain bindings. Worker exit cancels that
+session's callers; persistent recoverable sessions retain ownership and reject
+offline invocation, while nonpersistent removed sessions release ownership.
+Same-daemon recovery can reuse bindings. Resolved identities/bindings are never
+serialized or restored after a daemon restart: a trusted resolver must readmit
+them. Explicit close revokes bindings and cancels their work without killing
+other sessions' instances. Workspace release is deferred while published MCP
+operations can still access its files, including operations from bindings that
+were explicitly released before close.
+Before acknowledging such a close, Hive persists a `closed_pending_cleanup`
+record. It is excluded from session recovery after restart while its workspace
+holds remain protected until completion is established. A restart cannot recover
+the process-local evidence needed to release those holds automatically.
+
+Normal idle cleanup closes stdin, waits up to two seconds for exit, then kills
+and reaps the process group/Windows Job if necessary. Daemon shutdown fences
+admission and permits five seconds of operation draining before this bounded
+termination. Dropped owners also signal cleanup; task abortion kills the group.
+Active leases/operations prevent idle cleanup; shutdown and process/transport
+failure are separate terminal paths.
+
+Tests in `src/mcp/runtime/tests.rs` cover virtual-time idle races, and
+`tests/mcp_runtime.rs` exercises real subprocess sharing, response reordering,
+cancellation, lazy restart, diagnostics and Broker session ownership using an
+independent native JSON-RPC fixture. Paths are relative to `crates/hive-daemon/`.
+
 ## Consequences
 
 - Existing daemon configs, inline ACP declarations and saved records keep their
@@ -179,9 +267,10 @@ initialization and security state Hive may not know.
 - Structural keys retain effective secrets in memory and do not provide a hash
   index. Runtime code may assign opaque handles or add a private keyed index
   later while retaining these compatibility rules.
-- Runtime startup/multiplexing (#94), authoritative scope discovery (#95) and
-  agent routing/HTTP preservation (#96) must consume this contract. This ADR
-  does not upgrade advertised protocol capabilities or activate MCP tools.
+- Runtime startup/multiplexing (#94) consumes this contract. Authoritative scope
+  discovery (#95) and agent routing/HTTP preservation (#96) must also consume it.
+  The runtime API does not upgrade advertised ACP capabilities or activate
+  managed tools on agent connections.
 
 [issue]: https://github.com/noirbizarre/hive/issues/93
 [epic]: https://github.com/noirbizarre/hive/issues/92

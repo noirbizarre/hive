@@ -927,6 +927,8 @@ impl Runtime<'_> {
         // a newly admitted startup reservation before it has saved its session row.
         let registry = broker.registry.lock().map_err(|_| Error::Storage)?;
         self.state.uses.retain(|session, _| {
+            // Closed/pending-cleanup rows still own holds: restart loses MCP completion evidence,
+            // and absence from the broker's recoverable catalog does not prove files are idle.
             self.state.dispatched.contains(session)
                 || sessions.iter().any(|record| &record.id == session)
                 || registry.bindings.contains_key(session)

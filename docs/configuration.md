@@ -17,6 +17,14 @@ scopes as a standalone library schema. It is not an active daemon configuration
 registry: adding MCP tables to the root or fragment TOML still fails unknown-field
 validation. Existing agent profiles and inline ACP declarations need no migration.
 
+Trusted Rust embedders can use `Broker::mcp_execution_node`, `Broker::bind_mcp`
+and `Broker::release_mcp` with fully resolved identities. The Broker owns the
+shared stdio runtime and durable session leases; client disconnects do not release
+them. This library API does not yet select managed servers from configuration or
+make their tools available through agent connections. See the
+[runtime contract](adr/012-mcp-transport-scope-and-instance-identity.md#shared-stdio-runtime)
+for initialization, cancellation, restart and cleanup behavior.
+
 ## File location and precedence
 
 The file is selected in this order:

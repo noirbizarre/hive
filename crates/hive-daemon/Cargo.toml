@@ -10,12 +10,19 @@ publish = false
 name = "hive-test-agent"
 path = "../hive-mock-agent/src/main.rs"
 
+[[bin]]
+name = "hive-test-mcp"
+path = "tests/fixtures/mcp_server.rs"
+
 [dependencies]
 command-group = { workspace = true }
 agent-client-protocol = { workspace = true }
 agent-client-protocol-http = { workspace = true }
 axum = { workspace = true }
 fs2 = { workspace = true }
+futures = { workspace = true }
+tokio-util = { workspace = true }
+url = { workspace = true }
 glob = { workspace = true }
 hive-core = { path = "../hive-core" }
 hive-protocol = { path = "../hive-protocol" }
@@ -33,6 +40,7 @@ rusqlite = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+tracing-subscriber = { workspace = true }
 serde = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }

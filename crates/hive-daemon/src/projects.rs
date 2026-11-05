@@ -131,6 +131,9 @@ pub struct Registration {
 #[serde(deny_unknown_fields)]
 struct DefinitionRequest {
     name: String,
+    #[serde(default)]
+    scm: hive_core::project::Scm,
+    default_revision: Option<hive_core::project::Revision>,
     repository_source: Option<String>,
     default_ref: Option<GitRef>,
     #[serde(default)]
@@ -141,6 +144,8 @@ impl DefinitionRequest {
     fn checked(self) -> Result<ProjectDefinition, RegistryError> {
         let definition = ProjectDefinition {
             name: self.name,
+            scm: self.scm,
+            default_revision: self.default_revision,
             repository_source: self.repository_source,
             default_ref: self.default_ref,
             preparation: self.preparation,

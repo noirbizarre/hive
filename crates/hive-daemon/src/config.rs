@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "policy", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkspaceTemplate {
+    Jj {
+        revision: Option<hive_core::project::Revision>,
+    },
     Worktree {
         base_ref: Option<hive_core::workspace::GitRef>,
     },
@@ -30,17 +33,38 @@ pub enum WorkspaceTemplate {
 }
 
 impl WorkspaceTemplate {
+    pub(crate) fn supports_scm(&self, scm: hive_core::project::Scm) -> bool {
+        use hive_core::project::Scm;
+        match self {
+            Self::Existing { .. } => true,
+            Self::Jj { .. } => scm == Scm::Jj,
+            Self::Worktree { .. } | Self::Clone { .. } => scm == Scm::Git,
+            Self::Ephemeral { backing, .. } => match backing.as_str() {
+                "jj" => scm == Scm::Jj,
+                "worktree" | "clone" => scm == Scm::Git,
+                _ => false,
+            },
+        }
+    }
+
     pub fn validate(&self) -> Result<(), &'static str> {
         match self {
+            Self::Ephemeral {
+                backing,
+                base_ref: Some(_),
+                ..
+            } if backing == "jj" => Err(
+                "JJ ephemeral policies use project default_revision or a requested revision, not base_ref",
+            ),
             Self::Existing {
                 directory: Some(path),
             } if !path.is_absolute() => Err("existing workspace directory must be absolute"),
             Self::Ephemeral {
                 backing, retention, ..
-            } if !matches!(backing.as_str(), "worktree" | "clone")
+            } if !matches!(backing.as_str(), "worktree" | "clone" | "jj")
                 || matches!(retention, hive_core::workspace::Retention::Retain) =>
             {
-                Err("ephemeral policies need worktree/clone backing and finite retention")
+                Err("ephemeral policies need worktree/clone/jj backing and finite retention")
             }
             _ => Ok(()),
         }
@@ -537,6 +561,21 @@ impl Config {
             {
                 found.push(ConfigError::Project(format!(
                     "agent '{id}' references an unconfigured project"
+                )));
+            }
+            // Validate only resolved references here so missing declarations retain their diagnostics.
+            if let Some(policy) = profile
+                .workspace
+                .as_ref()
+                .and_then(|id| self.workspaces.get(id))
+                && let Some(project) = profile
+                    .project
+                    .as_ref()
+                    .and_then(|id| self.projects.get(id))
+                && !policy.supports_scm(project.scm)
+            {
+                found.push(ConfigError::Workspace(format!(
+                    "agent '{id}' workspace policy is incompatible with its project SCM; use a JJ policy for JJ projects or a Git policy for Git projects"
                 )));
             }
             validate_profile(id, profile, &mut found);
@@ -1207,6 +1246,75 @@ mod tests {
                 .unwrap_err()
                 .contains("only apply to kind")
         );
+    }
+
+    #[test]
+    fn incompatible_configured_scm_policies_are_rejected_before_agent_startup() {
+        use serde_json::json;
+        for (scm, policy) in [
+            ("jj", json!({"policy":"worktree"})),
+            ("jj", json!({"policy":"clone"})),
+            ("git", json!({"policy":"jj"})),
+            (
+                "jj",
+                json!({"policy":"ephemeral", "backing":"worktree", "retention":{"kind":"until", "expires_at":0}}),
+            ),
+            (
+                "jj",
+                json!({"policy":"ephemeral", "backing":"clone", "retention":{"kind":"until", "expires_at":0}}),
+            ),
+            (
+                "git",
+                json!({"policy":"ephemeral", "backing":"jj", "retention":{"kind":"until", "expires_at":0}}),
+            ),
+        ] {
+            let config: Config = serde_json::from_value(json!({
+                "projects":{"demo":{"name":"Demo", "scm":scm}},
+                "workspaces":{"task":policy},
+                "agents":{"coder":{"command":"mock", "project":"demo", "workspace":"task"}},
+            }))
+            .unwrap();
+            let problems = config.problems();
+            assert_eq!(problems.len(), 1);
+            assert_eq!(problems[0].agent.as_deref(), Some("coder"));
+            assert!(
+                matches!(&problems[0].error, ConfigError::Workspace(message) if message.contains("incompatible"))
+            );
+        }
+    }
+
+    #[test]
+    fn compatible_scm_policies_and_existing_directories_validate_for_configured_projects() {
+        use serde_json::json;
+        for (scm, policies) in [
+            (
+                "jj",
+                vec![
+                    json!({"policy":"jj"}),
+                    json!({"policy":"existing"}),
+                    json!({"policy":"ephemeral", "backing":"jj", "retention":{"kind":"until", "expires_at":0}}),
+                ],
+            ),
+            (
+                "git",
+                vec![
+                    json!({"policy":"worktree"}),
+                    json!({"policy":"clone"}),
+                    json!({"policy":"existing"}),
+                    json!({"policy":"ephemeral", "backing":"clone", "retention":{"kind":"until", "expires_at":0}}),
+                ],
+            ),
+        ] {
+            for policy in policies {
+                let config: Config = serde_json::from_value(json!({
+                    "projects":{"demo":{"name":"Demo", "scm":scm}},
+                    "workspaces":{"task":policy},
+                    "agents":{"coder":{"command":"mock", "project":"demo", "workspace":"task"}},
+                }))
+                .unwrap();
+                config.validate().unwrap();
+            }
+        }
     }
 
     #[test]

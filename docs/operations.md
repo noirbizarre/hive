@@ -84,7 +84,7 @@ backend, actual paths and fresh cleanup evidence. `hive workspace create --proje
 hive --policy task` provisions independently of sessions. Commands print operation
 IDs before network I/O; preserve the key with `--operation <id>` on identical
 retries. `hive workspace operation <id>` shows original intent, pinned commit,
-partial path, hook snapshot and session holds. Branch/ref/path conflicts never
+partial path, pinned backend selection/preparation, hook snapshot and session holds. SCM/path conflicts never
 force checkout or adopt an unrelated directory.
 
 Resources reside beside the session database under `repositories/`, `clones/`,
@@ -93,6 +93,16 @@ caches use `<project-root>/.git` with sibling checkouts. WorkTrunk can place its
 checkouts elsewhere; include those actual paths in backups. Back up resource files
 and the database together while Hive is stopped. Moving a bare repository without
 repairing Git's linked-worktree metadata breaks its checkouts.
+
+Native JJ repositories live under `repositories/<repository-id>/jj` with sibling
+task workspaces. Back up their shared `.jj` repository and the actual recorded
+workspace roots together. Inspect `hive.jj.*` metadata for workspace/change IDs;
+do not reconstruct roots from names. Normal JJ cleanup requires an empty current
+working-copy change and an unchanged physical tree, including ignored/untracked
+files. Current history is retained by `hive-retained-<workspace-id>` bookmarks.
+If deletion finishes but native deregistration is interrupted, replay the exact
+cleanup operation to verify preservation and finish deregistration; startup never
+performs it automatically. Other uncertain partial states require inspection.
 
 Resource snapshots pin separate repository-backend and workspace-provisioner
 identities. On first access after upgrading, versionless records migrate atomically

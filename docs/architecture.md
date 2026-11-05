@@ -73,7 +73,7 @@ integration live in the daemon's node-local workspace service. It provisions bef
 downstream startup when a profile selects a workspace policy, retaining legacy cwd
 launches otherwise. Durable resource intent and session-use holds are independent
 of client attachment and session catalog lifetime. A cross-process resource gate
-serializes Git mutations and cleanup admission without holding SQLite locks over
+serializes SCM mutations and cleanup admission without holding SQLite locks over
 subprocess execution.
 
 Repository storage and workspace provisioning have independent identities and
@@ -82,6 +82,8 @@ dispatches a pinned repository handle to a compatible provisioner. Native Git
 worktrees, independent clones and WorkTrunk reuse one Git acquisition/cache backend;
 WorkTrunk is Git-only. Managed intent and observations are versioned backend data,
 so another SCM can supply its own model without changing lifecycle orchestration.
+JJ supplies `jj`/`jj.git` repository storage and `jj.workspace` provisioning using
+native non-colocated workspaces, separate from WorkTrunk and Git worktree policy.
 Concrete implementations and Git response adapters live under
 `crates/hive-daemon/src/workspaces/backends.rs` and its submodules; shared admission,
 durable checkpoints,

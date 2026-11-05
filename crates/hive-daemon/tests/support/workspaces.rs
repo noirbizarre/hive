@@ -1,4 +1,4 @@
-//! Session admission tests observe both the Git checkout and the downstream ACP scope.
+//! Session admission tests observe the native SCM checkout and downstream ACP scope.
 
 use super::*;
 use hive_daemon::config::ConfigSource;
@@ -126,6 +126,8 @@ impl Fixture {
             .env("HIVE_WORKSPACE_HOST", self.directory.path())
             .env("GIT_CONFIG_GLOBAL", self.path("gitconfig"))
             .env("GIT_CONFIG_NOSYSTEM", "1")
+            // JJ's per-repository trust/config files must also stay inside this fixture.
+            .env("JJ_CONFIG", self.path("jj.toml"))
             // The host is killed deliberately; do not leave partial raw profiles in coverage runs.
             .env(
                 "LLVM_PROFILE_FILE",
@@ -274,6 +276,49 @@ async fn workspace_worktrees_reach_both_acp_adapters_from_composed_config_in_eit
             host.kill().await.unwrap();
             host.wait().await.unwrap();
         }
+    }
+}
+
+#[tokio::test]
+async fn workspace_jj_projects_reach_both_acp_adapters_with_native_revision_and_stable_context() {
+    for version in [AgentVersion::V1, AgentVersion::V2] {
+        let fixture = Fixture::new(version, false);
+        std::fs::write(fixture.path("projects.toml"), "[projects.demo]\nname = 'Demo'\nscm = 'jj'\nrepository_source = 'https://example.test/project'\ndefault_revision = 'main@origin'\n").unwrap();
+        // Requiring WorkTrunk catches any accidental Git-only integration selection/probe.
+        std::fs::write(
+            fixture.path("policies.toml"),
+            "[workspaces.task]\npolicy = 'jj'\n[worktrunk]\nenabled = true\n",
+        )
+        .unwrap();
+        std::fs::write(fixture.path("jj.toml"), "[user]\nname = 'Hive Test'\nemail = 'hive@example.test'\n[signing]\nbehavior = 'drop'\n").unwrap();
+        let (address, mut host) = fixture.start().await;
+        timeout(Duration::from_secs(30), Client.v2().connect_with(
+            HttpClient::new(format!("ws://{address}")).unwrap(), async |cx| {
+                cx.send_request(v2::InitializeRequest::new(ProtocolVersion::V2, v2::Implementation::new("jj-workspace-test", "1"))).block_task().await?;
+                let request = v2::NewSessionRequest::new(fixture.path("placeholder")).meta(selector(json!({"kind":"new","project":"demo","policy":"task","revision":"latest(main@origin)"})));
+                let opened = cx.send_request(request).block_task().await?;
+                let context = &opened.meta.as_ref().unwrap()["hive"]["workspace"];
+                assert_eq!(context.as_object().unwrap().len(), 3);
+                let cwd = PathBuf::from(context["effectiveCwd"].as_str().unwrap());
+                assert!(cwd.join(".jj").is_dir());
+                assert!(!cwd.join(".git").exists());
+                assert_eq!(std::fs::read_to_string(cwd.join("committed.txt")).unwrap(), "workspace seed\n");
+                fixture.assert_downstream_cwd(&cwd);
+                let resources = inventory(address).await;
+                let entry = &resources["workspaces"][0];
+                assert_eq!(entry["selection"]["provisioner"], "jj.workspace");
+                assert_eq!(entry["selection"]["repository"]["backend"], "jj");
+                let blocked = reqwest::Client::new().post(format!("http://{address}/v1/workspaces/{}/remove", context["workspace"].as_str().unwrap())).json(&json!({"operation":hive_core::identity::OperationId::new(),"discard_changes":true})).send().await.unwrap();
+                assert!(!blocked.status().is_success());
+                cx.send_request(v2::CloseSessionRequest::new(opened.session_id).meta(opened.meta.clone())).block_task().await?;
+                let attached = cx.send_request(v2::NewSessionRequest::new(fixture.path("placeholder")).meta(selector(json!({"kind":"attach","id":context["workspace"]})))).block_task().await?;
+                assert_eq!(&attached.meta.as_ref().unwrap()["hive"]["workspace"], context);
+                cx.send_request(v2::CloseSessionRequest::new(attached.session_id).meta(attached.meta)).block_task().await?;
+                Ok(())
+            },
+        )).await.unwrap().unwrap();
+        host.kill().await.unwrap();
+        host.wait().await.unwrap();
     }
 }
 

@@ -641,6 +641,7 @@ async fn shared_non_git_lifecycle_protects_partial_and_ready_aliases_across_rest
     let alias = service
         .create(
             CreateRequest {
+                revision: None,
                 operation: OperationId::new(),
                 project: entry.workspace.intent().project.clone(),
                 policy: WorkspaceTemplate::Existing {
@@ -650,6 +651,8 @@ async fn shared_non_git_lifecycle_protects_partial_and_ready_aliases_across_rest
                 branch: None,
             },
             ProjectDefinition {
+                scm: hive_core::project::Scm::Git,
+                default_revision: None,
                 name: "Non-Git alias".into(),
                 repository_source: None,
                 default_ref: None,

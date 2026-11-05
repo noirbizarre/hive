@@ -19,7 +19,7 @@ enum Command {
         #[command(subcommand)]
         command: SweepCommand,
     },
-    /// Reconcile an interrupted operation against its exact registered Git identity.
+    /// Reconcile an interrupted operation against its exact registered SCM identity.
     Reconcile {
         id: String,
         /// Actual path discovered manually when an integration's response was lost.
@@ -48,12 +48,15 @@ enum Command {
         policy: String,
         #[arg(long)]
         base_ref: Option<String>,
+        /// JJ revision expression or change ID (JJ policies only).
+        #[arg(long)]
+        revision: Option<String>,
         #[arg(long)]
         branch: Option<String>,
         #[arg(long)]
         operation: Option<String>,
     },
-    /// Remove an idle managed workspace, preserving its branch.
+    /// Remove an idle managed workspace, preserving its history.
     Remove {
         id: String,
         /// Discard local data; never overrides ownership or active-use checks.
@@ -175,6 +178,7 @@ pub async fn run(options: Options) -> miette::Result<()> {
             project,
             policy,
             base_ref,
+            revision,
             branch,
             operation: key,
         } => {
@@ -187,7 +191,7 @@ pub async fn run(options: Options) -> miette::Result<()> {
                 reqwest::Method::POST,
                 "/v1/workspaces".into(),
                 Some(
-                    json!({"project":project,"policy":policy,"operation":operation,"base_ref":base_ref,"branch":branch}),
+                    json!({"project":project,"policy":policy,"operation":operation,"base_ref":base_ref,"branch":branch,"revision":revision}),
                 ),
             )
         }

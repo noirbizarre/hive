@@ -128,7 +128,7 @@ implementation contracts run inside the daemon's admitted blocking job, without
 re-entering its cross-process gate. Requests retain node affinity and operation
 keys. Commands and filesystem inspection execute on the owning node.
 
-The built-in repository backend is `git`, with storage kind `git.bare-cache`.
+The built-in Git repository backend is `git`, with storage kind `git.bare-cache`.
 Provisioners `git.worktree`, `git.clone` and `worktrunk` all consume the same Git
 repository handle; WorkTrunk is explicitly Git-only, not a separate SCM.
 `external.directory` requires no repository and cannot remove directories.
@@ -141,7 +141,25 @@ durable checkpoints; observations use the same envelope. Generic lifecycle code
 does not require Git branches or worktrees. Git-specific shorthand and legacy
 response projections are decoded at the Git boundary. A future SCM can register
 its own storage/provisioner pair and codecs without changing the state machine or
-emulating Git. Native Jujutsu support is separate work (#137).
+emulating Git. Native Jujutsu uses repository backend `jj`, storage kind `jj.git`,
+and provisioner `jj.workspace`. Portable project `scm` selection defaults to Git;
+JJ's `default_revision` and `jj` policy remain independent of Git-only WorkTrunk
+selection. JJ's initial backing store is its explicit Git interoperability model,
+acquired non-colocated and operated through native JJ workspace commands.
+
+JJ ownership evidence combines stable Hive repository/workspace/operation IDs,
+native workspace registration and root, shared repository identity, and markers
+inside `.jj`. Revision resolution pins both a JJ change ID and immutable commit ID.
+Read-only inspection compares the current JJ tree with physical files without
+snapshotting, including ignored/untracked data. Nonempty working-copy changes remain
+dirty after snapshotting. Cleanup retains history with a stable Hive bookmark and
+checkpoints preservation before deleting files or forgetting registration.
+
+The provisioner contract supports checkpointed removal and explicit completion of
+native deregistration after filesystem absence. Only a matching cleanup operation,
+durable preservation proof, exact native identity and no usage holds authorize that
+completion; startup recovery never dispatches it. Partial or conflicting state
+remains uncertain. Federation startup transport remains separate work (#88).
 
 Before external effects, persist the operation ID, both selected identities, the
 compatible repository handle/reference, and

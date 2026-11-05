@@ -200,6 +200,7 @@ async fn runtime_fixture() {
             workspace: None,
             workspace_id: None,
             base_ref: None,
+            revision: None,
             branch: None,
             address: address.to_string(),
             transport: "ws".into(),

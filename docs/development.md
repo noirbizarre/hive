@@ -4,6 +4,10 @@
 
 Install Rust through rustup and development tools with `mise install`.
 This includes Bee, the deterministic external agent used by the ordinary test suite.
+It also installs JJ 0.46 for native Jujutsu repository/workspace lifecycle tests on
+all CI platforms. These tests require JJ and Git rather than silently skipping when
+JJ is missing. For focused coverage, run
+`mise test -p hive-daemon -E 'test(jj_tests) | test(workspace_jj)'`.
 See [CONTRIBUTING.md](https://github.com/noirbizarre/hive/blob/main/CONTRIBUTING.md)
 for hooks, commit conventions, and releases.
 

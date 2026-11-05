@@ -2,6 +2,45 @@
 
 use serde::{Deserialize, Serialize};
 
+/// SCM selection is independent of how a task workspace is provisioned.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Scm {
+    #[default]
+    Git,
+    Jj,
+}
+impl Scm {
+    fn is_git(&self) -> bool {
+        *self == Self::Git
+    }
+}
+
+/// JJ expressions are not Git refs: revsets and change IDs remain intact.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct Revision(String);
+
+impl TryFrom<String> for Revision {
+    type Error = ProjectError;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        if value.trim().is_empty() || value.chars().any(char::is_control) {
+            return Err(ProjectError::Revision);
+        }
+        Ok(Self(value))
+    }
+}
+impl From<Revision> for String {
+    fn from(value: Revision) -> Self {
+        value.0
+    }
+}
+impl Revision {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 use crate::{
     identity::{NodeId, ProjectId, RepositoryId},
     workspace::{GitRef, NodePath, Ownership},
@@ -20,6 +59,10 @@ pub struct Project {
 #[serde(try_from = "UncheckedDefinition")]
 pub struct ProjectDefinition {
     pub name: String,
+    #[serde(skip_serializing_if = "Scm::is_git")]
+    pub scm: Scm,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_revision: Option<Revision>,
     pub repository_source: Option<String>,
     pub default_ref: Option<GitRef>,
     pub preparation: Vec<Vec<String>>,
@@ -29,6 +72,9 @@ pub struct ProjectDefinition {
 #[serde(deny_unknown_fields)]
 struct UncheckedDefinition {
     name: String,
+    #[serde(default)]
+    scm: Scm,
+    default_revision: Option<Revision>,
     repository_source: Option<String>,
     default_ref: Option<GitRef>,
     #[serde(default)]
@@ -41,6 +87,8 @@ impl TryFrom<UncheckedDefinition> for ProjectDefinition {
     fn try_from(value: UncheckedDefinition) -> Result<Self, Self::Error> {
         let definition = Self {
             name: value.name,
+            scm: value.scm,
+            default_revision: value.default_revision,
             repository_source: value.repository_source,
             default_ref: value.default_ref,
             preparation: value.preparation,
@@ -53,6 +101,10 @@ impl TryFrom<UncheckedDefinition> for ProjectDefinition {
 /// Controlled reasons prevent diagnostics from copying remote tokens or command arguments.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ProjectError {
+    #[error(
+        "invalid SCM revision configuration; use default_ref for Git or default_revision with a nonempty JJ revset for JJ"
+    )]
+    Revision,
     #[error("project name must not be blank or contain control characters")]
     Name,
     #[error("project remote must be a credential-free HTTPS or SSH Git locator")]
@@ -64,6 +116,7 @@ pub enum ProjectError {
 impl ProjectError {
     pub fn code(&self) -> &'static str {
         match self {
+            Self::Revision => "hive::project::revision",
             Self::Name => "hive::project::name",
             Self::Remote => "hive::project::remote",
             Self::Preparation => "hive::project::preparation",
@@ -72,6 +125,9 @@ impl ProjectError {
 
     pub fn help(&self) -> &'static str {
         match self {
+            Self::Revision => {
+                "select scm = 'jj' for default_revision; do not mix Git refs and JJ revsets"
+            }
             Self::Name => "give the project a nonblank display name",
             Self::Remote => {
                 "use https://host/repo, ssh://user@host/repo or user@host:repo; configure credentials on the execution node"
@@ -85,6 +141,11 @@ impl ProjectError {
 
 impl ProjectDefinition {
     pub fn validate(&self) -> Result<(), ProjectError> {
+        if (self.scm == Scm::Git && self.default_revision.is_some())
+            || (self.scm == Scm::Jj && self.default_ref.is_some())
+        {
+            return Err(ProjectError::Revision);
+        }
         if self.name.trim().is_empty() || self.name.chars().any(char::is_control) {
             return Err(ProjectError::Name);
         }
@@ -172,6 +233,30 @@ mod tests {
     use crate::workspace::PathSyntax;
 
     #[test]
+    fn jj_revsets_remain_native_while_legacy_projects_keep_their_git_defaults() {
+        let legacy: ProjectDefinition =
+            serde_json::from_value(serde_json::json!({"name":"old", "default_ref":"main"}))
+                .unwrap();
+        assert_eq!(legacy.scm, Scm::Git);
+        let serialized = serde_json::to_value(legacy).unwrap();
+        assert!(serialized.get("scm").is_none());
+        assert!(serialized.get("default_revision").is_none());
+        let jj: ProjectDefinition = serde_json::from_value(serde_json::json!({"name":"JJ", "scm":"jj", "default_revision":"latest(trunk() | mine())"})).unwrap();
+        assert_eq!(
+            jj.default_revision.unwrap().as_str(),
+            "latest(trunk() | mine())"
+        );
+        for invalid in [
+            serde_json::json!({"name":"mixed", "scm":"jj", "default_ref":"main"}),
+            serde_json::json!({"name":"mixed", "default_revision":"@"}),
+            serde_json::json!({"name":"empty", "scm":"jj", "default_revision":" "}),
+            serde_json::json!({"name":"control", "scm":"jj", "default_revision":"@\n"}),
+        ] {
+            assert!(serde_json::from_value::<ProjectDefinition>(invalid).is_err());
+        }
+    }
+
+    #[test]
     fn portable_definitions_accept_ssh_and_https_without_contacting_a_repository() {
         for source in [
             "https://example.test/team/repo.git",
@@ -233,6 +318,8 @@ mod tests {
         let mut project = Project {
             id: ProjectId::new(),
             definition: ProjectDefinition {
+                scm: Scm::Git,
+                default_revision: None,
                 name: "original".to_owned(),
                 repository_source: None,
                 default_ref: None,

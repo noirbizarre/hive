@@ -9,6 +9,8 @@ pub enum Launch {
         policy: Option<String>,
         #[serde(rename = "baseRef")]
         base_ref: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        revision: Option<String>,
         branch: Option<String>,
     },
     Attach {

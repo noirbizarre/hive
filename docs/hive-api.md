@@ -94,8 +94,17 @@ Creation failures return the operation ID for inspection. Removal accepts
 managed-data removal but never bypasses use/ownership checks. Removal retains task
 branches; independent-clone archival appears in its `archive` field.
 
+For a project with `scm: "jj"`, select a `jj` policy and optionally send `revision`
+instead of `base_ref`/`branch`. The value is a JJ revset/change ID resolving to one
+commit, such as `"revision": "latest(main@origin)"`. Git-only selectors are rejected
+for JJ. Versioned `hive.jj.*` observations contain native workspace/change/commit
+identities; operation inspection includes pinned `selection` and `prepared` data.
+Cleanup protects nonempty JJ working-copy changes even after snapshotting and
+retains history under `hive-retained-<workspace-id>` bookmarks.
+
 Mutations use reload's same-origin policy. Error bodies contain `code`, `message`
-and `help`; failures use stable `hive::repository::*` / `hive::workspace::*` codes.
+and `help`; failures use stable `hive::repository::*`, `hive::workspace::*` or
+`hive::jj::*` codes.
 Unknown IDs return 404, invalid requests 422, unavailable persistence 503, origin
 rejection 403 and lifecycle/Git/safety conflicts 409. Raw subprocess stderr is
 never forwarded. Poll workspace/operation routes for interrupted commands before
@@ -164,6 +173,8 @@ startup. `project` alone leaves ordinary ACP cwd behavior intact. Optional
 ```
 
 `new` may also supply `branch`; omitted project/policy use profile defaults.
+For JJ, use `revision` instead of Git's `baseRef`/`branch`. The returned stable
+workspace context has the same shape for either SCM.
 `{"kind":"attach","id":"workspace-…"}` attaches a ready resource.
 `{"kind":"existing","directory":"/absolute/path"}` bypasses managed creation.
 A selector can omit `agent` when a default profile exists. Hive consumes selectors
@@ -208,6 +219,10 @@ with either configured or managed projects. Allocation is serialized, so concurr
 registrations cannot choose the same ID. A successful registration returns the allocated `id`,
 `origin: "managed"`, and the metadata (absent optional source/ref fields serialize
 as null). `GET /v1/projects` returns `{ "projects": [...] }` sorted by ID.
+
+Projects default to Git. Set `"scm": "jj"` and optionally `"default_revision":
+"trunk()"` to select JJ; `default_ref` is Git-only. Omitted/default Git SCM and absent
+`default_revision` are omitted from serialized definitions for backward compatibility.
 Configured entries have `origin: "config"`. `PUT` accepts the same metadata
 without `id` and replaces all mutable fields. Unknown fields are rejected.
 

@@ -46,16 +46,19 @@ pub struct Options {
     #[command(flatten)]
     pub terminal: capabilities::TerminalOptions,
     /// Explicitly use a directory instead of a profile's managed workspace policy.
-    #[arg(long, conflicts_with_all = ["workspace", "workspace_id", "project", "base_ref", "branch", "session"])]
+    #[arg(long, conflicts_with_all = ["workspace", "workspace_id", "project", "base_ref", "branch", "revision", "session"])]
     pub cwd: Option<std::path::PathBuf>,
     #[arg(long, conflicts_with_all = ["workspace_id", "session"])]
     pub project: Option<String>,
     #[arg(long, conflicts_with_all = ["workspace_id", "session"])]
     pub workspace: Option<String>,
-    #[arg(long, conflicts_with_all = ["session", "base_ref", "branch"])]
+    #[arg(long, conflicts_with_all = ["session", "base_ref", "branch", "revision"])]
     pub workspace_id: Option<String>,
     #[arg(long, conflicts_with = "session")]
     pub base_ref: Option<String>,
+    /// JJ revision/change expression for a new managed workspace.
+    #[arg(long, conflicts_with_all = ["base_ref", "branch", "session"])]
+    pub revision: Option<String>,
     #[arg(long, conflicts_with = "session")]
     pub branch: Option<String>,
     #[arg(long, default_value = "127.0.0.1:8765")]
@@ -1924,8 +1927,10 @@ async fn run_with_clipboard(
         || options.workspace.is_some()
         || options.branch.is_some()
         || options.base_ref.is_some()
+        || options.revision.is_some()
     {
         Some(hive_protocol::workspace::Launch::New {
+            revision: options.revision.clone(),
             project: options.project.clone(),
             policy: options.workspace.clone(),
             base_ref: options.base_ref.clone(),

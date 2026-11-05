@@ -21,6 +21,11 @@ async fn daemon(root: &Path, address: SocketAddr) -> tokio::process::Child {
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env_remove("HIVE_DEFAULT_AGENT")
         .env_remove("HIVE_CONFIG")
+        // Forced restart cannot flush a valid LLVM profile; ordinary CLI commands still contribute.
+        .env(
+            "LLVM_PROFILE_FILE",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        )
         .kill_on_drop(true)
         .spawn()
         .unwrap();

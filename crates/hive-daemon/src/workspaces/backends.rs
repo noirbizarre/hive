@@ -2,6 +2,7 @@
 
 use super::*;
 mod archive;
+pub(super) mod jj;
 use hive_core::workspace::backend::{
     BackendData, BackendManager, CheckpointWriter, PreparationContext, PreparedWorkspace,
     ProvisionerCapabilities, ProvisionerDescriptor, ProvisionerId, RepositoryBackend,
@@ -1053,6 +1054,18 @@ impl WorkspaceProvisioner for GitProvisioner {
 
 pub(super) fn manager() -> BackendManager<Error> {
     let mut registry = BackendManager::default();
+    registry
+        .register_repository(
+            RepositoryCompatibility {
+                backend: RepositoryBackendId("jj".into()),
+                storage: StorageKind("jj.git".into()),
+            },
+            Arc::new(jj::Jj),
+        )
+        .expect("unique JJ repository identity");
+    registry
+        .register_provisioner(Arc::new(jj::Jj))
+        .expect("unique JJ provisioner identity");
     registry
         .register_repository(
             RepositoryCompatibility {

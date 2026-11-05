@@ -36,6 +36,7 @@ prompt submission, native adoption, or session deletion subcommands.
 | `--workspace` | Profile default | Named workspace policy |
 | `--workspace-id` | Unset | Attach a ready workspace to a new session |
 | `--base-ref` / `--branch` | Policy/task default | Base ref or fresh branch for managed creation |
+| `--revision` | JJ policy/project default, then `trunk()` | Native JJ revision/change expression; conflicts with Git ref/branch selectors |
 
 These work on both `hive` and `hive tui`. The TUI does not derive its address
 from `HIVE_URL` or `HIVE_LISTEN`.
@@ -80,6 +81,7 @@ from the profile picker, not when resuming one.
 ```sh
 hive --agent coder --project hive --workspace task
 hive workspace create --project hive --policy task
+hive workspace create --project jj-project --policy jj-task --revision 'latest(main@origin)'
 hive workspace list
 hive workspace show <workspace-id>
 hive workspace inspect <workspace-id>
@@ -172,6 +174,8 @@ CLI persist in the daemon's database, independently of TOML-owned definitions.
 ```sh
 hive project register --name Hive --remote https://github.com/noirbizarre/hive.git \
   --default-ref main --preparation '[["mise","install"]]'
+hive project register --name "JJ project" --scm jj \
+  --remote https://example.com/team/project.git --default-revision 'trunk()'
 hive project list
 hive project show hive
 hive project update hive --name "Hive renamed"
@@ -185,6 +189,9 @@ omit `--remote` for local-only projects. Update replaces all metadata: omitted
 remote/ref fields are cleared and preparation defaults to `[]`. Registration and
 update do not clone or execute preparation. Config-owned update/removal is rejected;
 edit TOML and run `hive daemon reload` instead.
+`--scm` defaults to `git` on registration and replacement. JJ uses
+`--default-revision`; Git uses `--default-ref`. Workspace provisioning still requires
+a compatible named policy; see [native JJ configuration](../configuration.md#native-jujutsu-workspaces).
 
 Directory overrides require an explicit stable node ID; Hive does not allocate a
 new node identity for each request:

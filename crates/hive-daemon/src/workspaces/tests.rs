@@ -6,6 +6,9 @@ mod recovery_tests;
 #[path = "tests/backends.rs"]
 mod backend_tests;
 
+#[path = "tests/jj.rs"]
+mod jj_tests;
+
 #[path = "../../tests/support/fake_opencode.rs"]
 mod fake_opencode;
 
@@ -174,11 +177,25 @@ async fn worktrunk_requires_prior_approval_for_branch_specific_project_hooks() {
 }
 
 impl Fixture {
+    fn jj() -> Self {
+        let mut fixture = Self::new();
+        fixture.definition.scm = hive_core::project::Scm::Jj;
+        fixture.definition.default_revision =
+            Some(hive_core::project::Revision::try_from("main@origin".to_owned()).unwrap());
+        fixture
+    }
+    fn jj_request(&self) -> CreateRequest {
+        CreateRequest {
+            policy: WorkspaceTemplate::Jj { revision: None },
+            ..self.request()
+        }
+    }
     fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
         let seed = directory.path().join("seed");
         let remote = directory.path().join("remote.git");
         let config = directory.path().join("gitconfig");
+        std::fs::write(directory.path().join("jj.toml"), "[user]\nname = 'Hive Tests'\nemail = 'hive@example.test'\n[signing]\nbehavior = 'drop'\n").unwrap();
         // Isolate even fixture bootstrap from developer signing, hooks, templates and credentials.
         std::fs::write(&config, format!("[url \"{}\"]\n insteadOf = https://example.test/project\n[protocol \"file\"]\n allow = always\n[user]\n name = Hive Tests\n email = hive@example.test\n", reqwest::Url::from_file_path(&remote).unwrap())).unwrap();
         TEST_GIT_CONFIG.with(|current| *current.borrow_mut() = Some(config.clone()));
@@ -213,6 +230,8 @@ impl Fixture {
             git_config: Some(config),
         };
         let definition = ProjectDefinition {
+            scm: hive_core::project::Scm::Git,
+            default_revision: None,
             name: "Project".into(),
             repository_source: Some("https://example.test/project".into()),
             default_ref: None,
@@ -228,6 +247,7 @@ impl Fixture {
     }
     fn request(&self) -> CreateRequest {
         CreateRequest {
+            revision: None,
             operation: OperationId::new(),
             project: ProjectId::from_name("project"),
             policy: WorkspaceTemplate::Worktree { base_ref: None },

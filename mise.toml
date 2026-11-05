@@ -246,6 +246,10 @@ format = "raw"
 bin = "bee"
 platforms.windows-x64 = { bin = "bee.exe" }
 
+[tools.jj]
+# Native workspace lifecycle tests must run on every CI platform, not silently skip.
+version = "0.46.0"
+
 [tasks."hive:web"]
 description = "Build and test the embedded Vue browser client"
 depends = ["hive:web:build"]

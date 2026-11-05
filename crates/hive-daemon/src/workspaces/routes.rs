@@ -275,6 +275,7 @@ async fn inspect(State(cx): State<Context>, Path(id): Path<String>) -> Response 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct New {
+    revision: Option<hive_core::project::Revision>,
     operation: OperationId,
     project: ProjectId,
     policy: String,
@@ -319,6 +320,7 @@ async fn create(
         project: body.project,
         policy,
         base_ref: body.base_ref,
+        revision: body.revision,
         branch: body.branch,
     };
     let entry = cx

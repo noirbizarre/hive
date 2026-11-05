@@ -44,6 +44,10 @@ enum Command {
 
 #[derive(Args)]
 struct Definition {
+    #[arg(long, value_parser = ["git", "jj"], default_value = "git")]
+    scm: String,
+    #[arg(long)]
+    default_revision: Option<String>,
     #[arg(long)]
     name: String,
     #[arg(long)]
@@ -62,7 +66,7 @@ impl Definition {
                 miette::miette!("invalid preparation; provide a JSON array of argv arrays")
             })?;
         Ok(
-            json!({"name":self.name,"repository_source":self.remote,"default_ref":self.default_ref,"preparation":preparation}),
+            json!({"name":self.name,"scm":self.scm,"default_revision":self.default_revision,"repository_source":self.remote,"default_ref":self.default_ref,"preparation":preparation}),
         )
     }
 }

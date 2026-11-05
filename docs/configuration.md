@@ -134,7 +134,9 @@ command = "some-acp-agent"
 project = "hive"
 ```
 
-`name` is required and nonblank. Other project fields are optional. Remotes accept
+`name` is required and nonblank. `scm` defaults to `"git"`; select `"jj"` for
+Jujutsu. Use `default_ref` for Git or `default_revision` for JJ; mixing them is an
+error. Other project fields are optional. Remotes accept
 HTTPS, SSH URLs, and SCP-style SSH (`git@host:team/repo.git`); filesystem sources,
 other schemes, passwords, HTTP userinfo, query strings, and fragments are rejected.
 Configure Git/SSH credentials on each execution node. Preparation stores argv
@@ -203,7 +205,7 @@ workspaces are never reset by fetch. Identical operation retries retain their
 original resolved base and backend. Changing a project source creates a new cache
 generation rather than repointing existing workspaces.
 
-`ephemeral` policies specify `backing = "worktree"` or `"clone"` and a finite
+`ephemeral` policies specify `backing = "worktree"`, `"clone"` or `"jj"` and a finite
 `retention` (for example `retention = { kind = "until", expires_at = 1800000000 }`).
 This records lifetime intent; automatic expiration execution is separate work.
 Session shutdown never implies removal.
@@ -214,6 +216,58 @@ downstream-only paths when using a remote agent. Explicit existing-directory
 selections are node-local. A workspace-ID selector attaches to that ready resource
 instead of provisioning.
 Native adoption and session resume cannot request a replacement workspace.
+
+### Native Jujutsu workspaces
+
+Install JJ 0.46 or newer and Git on the owning Hive node, then opt in explicitly:
+
+```toml
+[projects.jj-project]
+name = "JJ project"
+scm = "jj"
+repository_source = "https://example.com/team/project.git"
+default_revision = "trunk()"
+
+[workspaces.jj-task]
+policy = "jj"
+# revision = "main@origin" # optional policy override
+
+[agents.jj-coder]
+command = "some-acp-agent"
+project = "jj-project"
+workspace = "jj-task"
+```
+
+JJ uses a non-colocated repository acquired with `jj git clone` and isolated native
+`jj workspace add` working copies. It creates neither Git branches nor Git worktrees.
+The global `[worktrunk]` setting is ignored for JJ, including explicit enablement.
+Git policies and JJ policies must match the selected project SCM.
+
+Base selection is request `revision`, policy `revision`, project `default_revision`,
+then JJ's `trunk()`. Expressions can use JJ change IDs, commit IDs, bookmarks and
+revsets; they must resolve to exactly one conflict-free commit. Hive pins that
+commit before creating a new working-copy change on top of it. Identical operation
+retries keep that resolution. JJ ephemeral policies use `backing = "jj"` and the
+project/request revision rather than Git's `base_ref`.
+
+Initial remotes use JJ's explicit Git interoperability over the same HTTPS/SSH
+formats as Git projects. Filesystem sources and external/colocated repositories
+are not acquired through this policy. JJ/Git credential helpers, URL rewrites and
+SSH credentials remain node-local. The Git CLI is used to inspect the original
+stored remote locator through `jj git root`; provisioning uses native JJ commands.
+Hive disables signing for its unattended JJ operations.
+
+Inspection does not snapshot the working copy. A nonempty working-copy change is
+dirty even after JJ has snapshotted it; filesystem edits, untracked and ignored
+files also block normal cleanup. Unsupported or incomplete evidence blocks cleanup,
+including discard. Explicit discard permits deleting dirty data only when ownership
+and idle usage are verified. Cleanup retains the current change/history under a
+`hive-retained-<workspace-id>` bookmark in the shared repository, removes the actual
+workspace root, and forgets its native registration. Review retained bookmarks
+before deleting them manually. Other workspaces and repository history are retained.
+
+All operations run on the owning daemon. Cross-node provisioning/startup is tracked
+separately in [#88](https://github.com/noirbizarre/hive/issues/88).
 
 ### Global WorkTrunk integration
 

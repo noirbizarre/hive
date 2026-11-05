@@ -327,6 +327,27 @@ pub trait WorkspaceProvisioner: Send + Sync {
         self.inspect(repository, intent)
     }
     /// Called only after fresh shared ownership, cleanliness and active-use checks.
+    fn remove_checkpointed(
+        &self,
+        repository: Option<&RepositoryHandle>,
+        intent: &BackendData,
+        discard: bool,
+        _operation: &OperationId,
+        _checkpoints: &mut dyn CheckpointWriter<Error = Self::Error>,
+    ) -> Result<(), Self::Error> {
+        self.remove(repository, intent, discard)
+    }
+    /// Explicit cleanup retry only: finish native deregistration after proven filesystem removal.
+    /// Implementations must verify the durable cleanup checkpoint before any effect.
+    fn finish_removal(
+        &self,
+        _repository: Option<&RepositoryHandle>,
+        _intent: &BackendData,
+        _checkpoint: Option<&BackendData>,
+        _operation: &OperationId,
+    ) -> Result<bool, Self::Error> {
+        Ok(false)
+    }
     fn remove(
         &self,
         repository: Option<&RepositoryHandle>,

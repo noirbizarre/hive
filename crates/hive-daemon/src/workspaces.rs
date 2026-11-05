@@ -84,6 +84,7 @@ impl crate::Broker {
                 project: None,
                 policy: None,
                 base_ref: None,
+                revision: None,
                 branch: None,
             })
         });
@@ -122,6 +123,7 @@ impl crate::Broker {
                 project,
                 policy,
                 base_ref,
+                revision,
                 branch,
             } => {
                 let project = project
@@ -149,6 +151,10 @@ impl crate::Broker {
                     project,
                     policy,
                     base_ref: base_ref.map(GitRef::try_from).transpose()?,
+                    revision: revision
+                        .map(hive_core::project::Revision::try_from)
+                        .transpose()
+                        .map_err(|_| Error::Request)?,
                     branch: branch.map(GitRef::try_from).transpose()?,
                 };
                 service
@@ -181,7 +187,19 @@ impl crate::Broker {
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(
-        "invalid _meta.hive.workspace selector; use kind 'new' with optional project/policy/baseRef/branch, 'attach' with id, or 'existing' with directory"
+        "JJ is unavailable or lacks required capabilities; install Jujutsu 0.46 or newer on the execution node"
+    )]
+    JjUnavailable,
+    #[error(
+        "JJ {0} failed; check repository compatibility, node-local credentials and permissions, then inspect before retrying"
+    )]
+    Jj(&'static str),
+    #[error(
+        "JJ base revision did not resolve to one commit; select a single existing revision or change ID"
+    )]
+    JjRevision,
+    #[error(
+        "invalid _meta.hive.workspace selector; use kind 'new' with optional project/policy/baseRef/branch/revision, 'attach' with id, or 'existing' with directory"
     )]
     Selector,
     #[error(
@@ -205,7 +223,7 @@ pub enum Error {
     )]
     Uncertain,
     #[error(
-        "resource identity conflicts with the recorded repository, path or branch; inspect the resource before reconciling"
+        "resource identity conflicts with the recorded repository, path or SCM identity; inspect the resource before reconciling"
     )]
     Conflict,
     #[error(
@@ -213,7 +231,7 @@ pub enum Error {
     )]
     RetryConflict,
     #[error(
-        "invalid workspace policy, path or ref; check the configured project, policy and requested branch/base"
+        "invalid workspace policy, path or revision; check project SCM/policy compatibility and the requested base"
     )]
     Request,
     #[error(
@@ -231,6 +249,9 @@ pub enum Error {
 impl Error {
     pub fn code(&self) -> &'static str {
         match self {
+            Self::JjUnavailable => "hive::jj::unavailable",
+            Self::Jj(_) => "hive::jj::execution",
+            Self::JjRevision => "hive::jj::revision",
             Self::Selector => "hive::workspace::selector",
             Self::Storage => "hive::workspace::storage",
             Self::Unknown => "hive::workspace::unknown",
@@ -250,6 +271,15 @@ impl Error {
 
     pub fn json(&self) -> serde_json::Value {
         let help = match self {
+            Self::JjUnavailable => {
+                "install JJ 0.46 or newer on the owning node and ensure its executable is on the daemon's PATH"
+            }
+            Self::JjRevision => {
+                "use a single conflict-free JJ revision/change ID; inspect bookmarks and narrow ambiguous revsets"
+            }
+            Self::Jj(_) => {
+                "check the owning node's JJ/Git/SSH configuration and repository permissions, then inspect the original operation before retrying"
+            }
             Self::Domain(error) => error.help(),
             Self::Selector => {
                 "send a supported _meta.hive.workspace object with correctly typed fields; see the session launch selectors in Hive's API documentation"
@@ -287,6 +317,8 @@ pub struct Entry {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<hive_core::project::Revision>,
     pub operation: OperationId,
     pub project: ProjectId,
     pub policy: WorkspaceTemplate,
@@ -454,7 +486,7 @@ impl Service {
             let operation = rt.state.operations.get(id.as_str()).ok_or(Error::Unknown)?;
             let uses: Vec<_> = rt.state.uses.keys().filter(|session| rt.holds(session, &operation.workspace)).cloned().collect();
             let config = rt.store.state_directory().join("worktrunk-config").join(format!("{id}.toml"));
-            Ok(serde_json::json!({"operation":id,"request":operation.request,"workspace":operation.workspace,"commit":operation.commit,"path":operation.path,"effectsStarted":operation.effects_started,"sessions":uses,"worktrunkConfig":config.is_file().then_some(config)}))
+            Ok(serde_json::json!({"operation":id,"request":operation.request,"workspace":operation.workspace,"commit":operation.commit,"path":operation.path,"selection":operation.selection,"prepared":operation.prepared,"effectsStarted":operation.effects_started,"sessions":uses,"worktrunkConfig":config.is_file().then_some(config)}))
         }).await
     }
     pub async fn fetch(&self, id: RepositoryId) -> Result<Repository, Error> {
@@ -682,6 +714,8 @@ impl hive_core::workspace::backend::WorkspaceBackend for Service {
                 let result = rt.create(
                     create,
                     ProjectDefinition {
+                        scm: hive_core::project::Scm::Git,
+                        default_revision: None,
                         name: "Registered workspace".into(),
                         repository_source: source,
                         default_ref: None,
@@ -960,7 +994,17 @@ impl Runtime<'_> {
             .state
             .repositories
             .values()
-            .find(|r| &r.repository.project == project && &r.source == source)
+            .find(|r| {
+                &r.repository.project == project
+                    && &r.source == source
+                    && r.handle.as_ref().is_some_and(|h| {
+                        h.backend.0
+                            == match definition.scm {
+                                hive_core::project::Scm::Git => "git",
+                                hive_core::project::Scm::Jj => "jj",
+                            }
+                    })
+            })
             .cloned()
         {
             return Ok(repo);
@@ -968,12 +1012,18 @@ impl Runtime<'_> {
         let id = RepositoryId::new();
         // Project slugs are unbounded portable identifiers, not filesystem components.
         // Stable resource IDs avoid inflating Windows linked-worktree metadata paths.
-        let project_root = self.root().join(id.as_str());
+        let project_root = self.root().join(match definition.scm {
+            hive_core::project::Scm::Git => id.to_string(),
+            hive_core::project::Scm::Jj => backends::jj::storage_key(&id)?,
+        });
         let mut repo = Repository {
             repository: NodeRepository {
                 id,
                 project: project.clone(),
-                root: self.path(&project_root.join(".git"))?,
+                root: self.path(&project_root.join(match definition.scm {
+                    hive_core::project::Scm::Git => ".git",
+                    hive_core::project::Scm::Jj => "jj",
+                }))?,
                 role: RepositoryRole::Cache,
                 ownership: Ownership::HiveManaged,
             },
@@ -982,7 +1032,10 @@ impl Runtime<'_> {
             failure: None,
             handle: None,
         };
-        repo.handle = Some(backends::handle(&repo)?);
+        repo.handle = Some(match definition.scm {
+            hive_core::project::Scm::Git => backends::handle(&repo)?,
+            hive_core::project::Scm::Jj => backends::jj::handle(&repo)?,
+        });
         self.state
             .repositories
             .insert(repo.repository.id.to_string(), repo.clone());
@@ -1104,6 +1157,15 @@ impl Runtime<'_> {
             }
         }
         // Reject inert invalid input before reserving an operation with no resource to reconcile.
+        let jj = matches!(&request.policy, WorkspaceTemplate::Jj { .. })
+            || matches!(&request.policy, WorkspaceTemplate::Ephemeral { backing, .. } if backing == "jj");
+        if !request.policy.supports_scm(definition.scm)
+            || (jj && (request.base_ref.is_some() || request.branch.is_some()))
+            || (!jj && request.revision.is_some())
+            || matches!(&request.policy, WorkspaceTemplate::Ephemeral { backing, base_ref: Some(_), .. } if backing == "jj")
+        {
+            return Err(Error::Request);
+        }
         let existing_directory = if let WorkspaceTemplate::Existing { directory } = &request.policy
         {
             if request.branch.is_some() || request.base_ref.is_some() {
@@ -1138,6 +1200,8 @@ impl Runtime<'_> {
             || matches!(&request.policy, WorkspaceTemplate::Ephemeral { backing, .. } if backing == "clone");
         let backend = if existing {
             "existing"
+        } else if jj {
+            "jj.workspace"
         } else if clone {
             "clone"
         } else {
@@ -1164,29 +1228,50 @@ impl Runtime<'_> {
             WorkspacePolicy::Existing { directory }
         } else {
             let repo = self.repository(&request.project, &definition)?;
-            let configured_base = match &request.policy {
-                WorkspaceTemplate::Worktree { base_ref }
-                | WorkspaceTemplate::Clone { base_ref }
-                | WorkspaceTemplate::Ephemeral { base_ref, .. } => base_ref.clone(),
-                _ => None,
-            };
-            let base = request
-                .base_ref
-                .clone()
-                .or(configured_base)
-                .or(definition.default_ref)
-                .unwrap_or(GitRef::try_from("refs/remotes/origin/HEAD".to_string())?);
-            let git = GitIntent {
-                base_ref: base,
-                branch: request.branch.clone(),
-            };
-            repository = Some(repo.repository.id.clone());
             let selection = BackendSelection {
-                provisioner: persistence::legacy_provisioner(&BackendId(backend.into()))?,
+                provisioner: if jj {
+                    hive_core::workspace::backend::ProvisionerId("jj.workspace".into())
+                } else {
+                    persistence::legacy_provisioner(&BackendId(backend.into()))?
+                },
                 repository: repo.handle.clone(),
             };
             self.manager.resolve(&selection)?;
-            let intent = backends::data("hive.git.intent", &git)?;
+            let intent = if jj {
+                let configured = match &request.policy {
+                    WorkspaceTemplate::Jj { revision } => revision.clone(),
+                    _ => None,
+                };
+                let revision = request
+                    .revision
+                    .clone()
+                    .or(configured)
+                    .or(definition.default_revision.clone())
+                    .unwrap_or(
+                        hive_core::project::Revision::try_from("trunk()".to_owned())
+                            .map_err(|_| Error::Request)?,
+                    );
+                backends::data("hive.jj.intent", &revision)?
+            } else {
+                let configured_base = match &request.policy {
+                    WorkspaceTemplate::Worktree { base_ref }
+                    | WorkspaceTemplate::Clone { base_ref }
+                    | WorkspaceTemplate::Ephemeral { base_ref, .. } => base_ref.clone(),
+                    _ => None,
+                };
+                let base = request
+                    .base_ref
+                    .clone()
+                    .or(configured_base)
+                    .or(definition.default_ref)
+                    .unwrap_or(GitRef::try_from("refs/remotes/origin/HEAD".to_string())?);
+                let git = GitIntent {
+                    base_ref: base,
+                    branch: request.branch.clone(),
+                };
+                backends::data("hive.git.intent", &git)?
+            };
+            repository = Some(repo.repository.id.clone());
             if matches!(request.policy, WorkspaceTemplate::Ephemeral { .. }) {
                 WorkspacePolicy::Ephemeral {
                     backing: ManagedBacking::Backend {
@@ -1220,7 +1305,11 @@ impl Runtime<'_> {
             failure: None,
             archive: None,
             selection: Some(BackendSelection {
-                provisioner: persistence::legacy_provisioner(&BackendId(backend.into()))?,
+                provisioner: if jj {
+                    hive_core::workspace::backend::ProvisionerId("jj.workspace".into())
+                } else {
+                    persistence::legacy_provisioner(&BackendId(backend.into()))?
+                },
                 repository: repository
                     .as_ref()
                     .map(|id| {
@@ -1543,6 +1632,25 @@ impl Runtime<'_> {
             ) {
                 return Err(Error::Conflict);
             }
+            if !self.has_use(&id)
+                && entry.workspace.location().is_some_and(|location| {
+                    std::fs::symlink_metadata(location.root.as_str())
+                        .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+                })
+            {
+                // Only an explicit retry can finish native deregistration. Startup remains read-only.
+                let intent = self
+                    .creation(&entry)?
+                    .prepared
+                    .as_ref()
+                    .ok_or(Error::Conflict)?;
+                self.manager.provisioner(&selection)?.finish_removal(
+                    selection.repository.as_ref(),
+                    intent,
+                    original.prepared.as_ref(),
+                    &operation,
+                )?;
+            }
             if self.verified_removal_absence(&entry)? {
                 self.finish_cleanup(&mut entry, &operation)?;
                 self.state.workspaces.insert(id.to_string(), entry.clone());
@@ -1627,7 +1735,16 @@ impl Runtime<'_> {
                 &location.root,
                 false,
             )?;
-            provisioner.remove(selection.repository.as_ref(), &intent, discard)
+            provisioner.remove_checkpointed(
+                selection.repository.as_ref(),
+                &intent,
+                discard,
+                &operation,
+                &mut persistence::OperationCheckpoints {
+                    runtime: self,
+                    key: operation.as_str(),
+                },
+            )
         })();
         let result = result.and_then(|()| {
             if path.try_exists().map_err(|_| Error::Conflict)? {
@@ -1935,14 +2052,42 @@ fn execute_with_config(
     worktrunk: bool,
     project_config: Option<&Path>,
 ) -> Result<String, Error> {
+    String::from_utf8(execute_output(
+        program,
+        path,
+        args,
+        worktrunk,
+        project_config,
+    )?)
+    .map_err(|_| Error::Uncertain)
+}
+
+fn execute_output(
+    program: &str,
+    path: Option<&Path>,
+    args: &[&str],
+    worktrunk: bool,
+    project_config: Option<&Path>,
+) -> Result<Vec<u8>, Error> {
+    execute_output_mode(program, path, args, worktrunk, project_config, false)
+}
+
+fn execute_output_mode(
+    program: &str,
+    path: Option<&Path>,
+    args: &[&str],
+    worktrunk: bool,
+    project_config: Option<&Path>,
+    digest: bool,
+) -> Result<Vec<u8>, Error> {
     #[cfg(test)]
     let replacement = TEST_GIT_CONFIG.with(|config| {
         config
             .borrow()
             .as_ref()
             .and_then(|path| path.parent())
-            .map(|parent| parent.join("fake-wt"))
-            .filter(|path| program == "wt" && path.is_file())
+            .map(|parent| parent.join(format!("fake-{program}")))
+            .filter(|path| matches!(program, "wt" | "jj") && path.is_file())
     });
     let mut command = Command::new({
         #[cfg(test)]
@@ -1966,7 +2111,8 @@ fn execute_with_config(
             if let Some(parent) = path.parent() {
                 command
                     .env("HOME", parent)
-                    .env("XDG_CONFIG_HOME", parent.join("config"));
+                    .env("XDG_CONFIG_HOME", parent.join("config"))
+                    .env("JJ_CONFIG", parent.join("jj.toml"));
             }
         }
     });
@@ -1991,7 +2137,13 @@ fn execute_with_config(
         command.current_dir(path);
     }
     let (status, output, diagnostic) =
-        capture_command(command, Duration::from_secs(120), worktrunk)?;
+        capture_output(command, Duration::from_secs(120), worktrunk, digest).map_err(|error| {
+            if program == "jj" && matches!(error, Error::Git(_)) {
+                Error::JjUnavailable
+            } else {
+                error
+            }
+        })?;
     if !status.success() {
         // Classify without exposing stderr: remote helpers and hooks can print secrets.
         let diagnostic = String::from_utf8_lossy(&diagnostic).to_ascii_lowercase();
@@ -2002,40 +2154,50 @@ fn execute_with_config(
         {
             Error::Authentication
         } else {
-            Error::Git("execution")
+            if program == "jj" {
+                Error::Jj("execution")
+            } else {
+                Error::Git("execution")
+            }
         });
     }
-    String::from_utf8(output).map_err(|_| Error::Uncertain)
+    // JJ may report unreadable file contents as a warning with a successful exit.
+    // Its empty stdout must never be accepted as the digest of an empty tracked file.
+    if digest && !diagnostic.is_empty() {
+        return Err(Error::Uncertain);
+    }
+    Ok(output)
+}
+
+fn physical_path(path: &Path) -> std::io::Result<PathBuf> {
+    // Missing leaves still need a physical parent identity to detect stale registrations
+    // after an interrupted removal; canonicalizing only existing worktrees is insufficient.
+    let mut current = path;
+    let mut suffix = Vec::new();
+    loop {
+        match current.canonicalize() {
+            Ok(mut root) => {
+                root.extend(suffix.into_iter().rev());
+                return Ok(root);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                suffix.push(current.file_name().ok_or(error)?.to_owned());
+                current = current
+                    .parent()
+                    .ok_or_else(|| std::io::Error::other("no path parent"))?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn registered_worktree(list: &str, expected: &Path) -> Result<bool, Error> {
-    // Missing leaves still need a physical parent identity to detect stale registrations
-    // after an interrupted removal; canonicalizing only existing worktrees is insufficient.
-    fn identity(path: &Path) -> std::io::Result<PathBuf> {
-        let mut current = path;
-        let mut suffix = Vec::new();
-        loop {
-            match current.canonicalize() {
-                Ok(mut root) => {
-                    root.extend(suffix.into_iter().rev());
-                    return Ok(root);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    suffix.push(current.file_name().ok_or(error)?.to_owned());
-                    current = current
-                        .parent()
-                        .ok_or_else(|| std::io::Error::other("no path parent"))?;
-                }
-                Err(error) => return Err(error),
-            }
-        }
-    }
-    let expected = identity(expected).map_err(|_| Error::Conflict)?;
+    let expected = physical_path(expected).map_err(|_| Error::Conflict)?;
     for path in list
         .split('\0')
         .filter_map(|field| field.strip_prefix("worktree "))
     {
-        if identity(Path::new(path)).map_err(|_| Error::Conflict)? == expected {
+        if physical_path(Path::new(path)).map_err(|_| Error::Conflict)? == expected {
             return Ok(true);
         }
     }
@@ -2058,10 +2220,20 @@ fn git_path_argument(argument: &str) -> String {
     argument.into()
 }
 
+#[cfg(test)]
 fn capture_command(
     command: Command,
     limit: Duration,
     worktrunk: bool,
+) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), Error> {
+    capture_output(command, limit, worktrunk, false)
+}
+
+fn capture_output(
+    command: Command,
+    limit: Duration,
+    worktrunk: bool,
+    digest: bool,
 ) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), Error> {
     use command_group::AsyncCommandGroup;
     use tokio::io::AsyncReadExt;
@@ -2087,17 +2259,34 @@ fn capture_command(
                     })?;
                     async fn drain(
                         mut pipe: impl tokio::io::AsyncRead + Unpin,
+                        digest: bool,
                     ) -> std::io::Result<Vec<u8>> {
+                        use sha2::{Digest, Sha256};
+                        let mut hash = Sha256::new();
                         let mut output = Vec::new();
+                        let mut truncated = false;
                         let mut buffer = [0; 8192];
                         loop {
                             let count = pipe.read(&mut buffer).await?;
                             if count == 0 {
-                                return Ok(output);
+                                if digest {
+                                    return Ok(hash.finalize().to_vec());
+                                }
+                                // A truncated manifest cannot be evidence that a checkout is clean.
+                                return if truncated {
+                                    Err(std::io::Error::other("command output limit exceeded"))
+                                } else {
+                                    Ok(output)
+                                };
+                            }
+                            if digest {
+                                hash.update(&buffer[..count]);
+                                continue;
                             }
                             let retained =
                                 count.min((1024 * 1024_usize).saturating_sub(output.len()));
                             output.extend_from_slice(&buffer[..retained]);
+                            truncated |= retained != count;
                         }
                     }
                     let stdout = child.inner().stdout.take().ok_or(Error::Uncertain)?;
@@ -2105,7 +2294,11 @@ fn capture_command(
                     // Wait for the leader and both EOFs, not all background hooks. WorkTrunk's
                     // successfully detached hooks keep their documented asynchronous lifetime.
                     let result = tokio::time::timeout(limit, async {
-                        tokio::try_join!(child.inner().wait(), drain(stdout), drain(stderr))
+                        tokio::try_join!(
+                            child.inner().wait(),
+                            drain(stdout, digest),
+                            drain(stderr, false)
+                        )
                     })
                     .await;
                     match result {

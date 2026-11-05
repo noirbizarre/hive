@@ -385,6 +385,32 @@ mod tests {
     }
 
     #[test]
+    fn jj_revision_selectors_work_in_both_tui_entry_points_and_reject_conflicting_launch_intent() {
+        for prefix in [vec!["hive"], vec!["hive", "tui"]] {
+            let mut args = prefix.clone();
+            args.extend(["--revision", "latest(trunk())"]);
+            let cli = Cli::try_parse_from(args.clone()).unwrap();
+            let options = match cli.command {
+                Some(Command::Tui(options)) => options,
+                None => cli.tui,
+                _ => panic!("expected TUI"),
+            };
+            assert_eq!(options.revision.as_deref(), Some("latest(trunk())"));
+            for (flag, value) in [
+                ("--base-ref", "main"),
+                ("--branch", "task"),
+                ("--cwd", "/tmp"),
+                ("--session", "session-id"),
+                ("--workspace-id", "workspace-id"),
+            ] {
+                let mut conflicting = args.clone();
+                conflicting.extend([flag, value]);
+                assert!(Cli::try_parse_from(conflicting).is_err(), "{flag}");
+            }
+        }
+    }
+
+    #[test]
     fn a_bare_command_and_explicit_tui_accept_the_same_client_options() {
         let bare =
             Cli::try_parse_from(["hive", "--agent", "example", "--transport", "http"]).unwrap();

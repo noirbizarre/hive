@@ -194,7 +194,16 @@ async fn runtime_fixture() {
     });
     run_with_clipboard(
         Options {
-            terminal: capabilities::TerminalOptions::default(),
+            terminal: capabilities::TerminalOptions {
+                // Keep headless failure tests independent of the host's terminal and overrides.
+                osc52_write: if std::env::var_os("HIVE_RUNTIME_OSC52").is_some() {
+                    capabilities::CapabilityOverride::On
+                } else {
+                    capabilities::CapabilityOverride::Off
+                },
+                osc52_read: capabilities::CapabilityOverride::On,
+                ..Default::default()
+            },
             cwd: None,
             project: None,
             workspace: None,
@@ -216,7 +225,7 @@ async fn runtime_fixture() {
 
 #[test]
 fn the_real_event_loop_keeps_paste_and_external_edits_unsent_until_enter() {
-    for scenario in ["resume", "create"] {
+    for scenario in ["resume", "create", "osc52"] {
         // Reuse this instrumented executable so child-process execution contributes to coverage too.
         let output = std::process::Command::new("python3")
             .arg("-B")

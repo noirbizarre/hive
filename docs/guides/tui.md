@@ -86,10 +86,20 @@ the same key as plain Control; use the Alt bindings in that case. `Ctrl-C`
 continues to cancel foreground work. Terminal-native paste also works through
 bracketed paste; hold Shift to use terminal-native mouse selection where needed.
 
-Clipboard actions use the system clipboard of the machine running Hive. Over
-SSH this may be the remote machine's clipboard. If no desktop clipboard service
-is available, Hive reports the failure and leaves the draft intact; terminal
-copy/paste remains available.
+Copy and cut prefer the terminal's clipboard through OSC 52 when write support
+is detected or explicitly enabled. Over SSH this reaches the clipboard of the
+machine running your terminal. When write support is unknown or disabled, Hive
+uses the native clipboard of the machine running Hive, which may be remote.
+`Alt-V` always reads that native clipboard; terminal-native paste remains
+available through bracketed paste, independently of clipboard read permissions.
+
+OSC 52 copies are limited to 64 KiB of UTF-8 text before Base64 encoding (up to
+87,384 encoded payload bytes). Larger selections are rejected without truncation;
+select less text or disable OSC 52 writes to use the native clipboard. A terminal
+may impose a smaller limit or silently deny a write: a successful copy status
+means Hive sent the sequence, not that the terminal accepted it. Output failures
+and unavailable native clipboards are reported without deleting a cut selection.
+Failed OSC writes do not silently switch to a different machine's clipboard.
 
 ## Use an external editor
 
@@ -195,9 +205,10 @@ protocol, and `OSC7501` is program status reporting. Clipboard entries distingui
 
 The line clips in compact layouts. It reports permission to attempt an operation,
 not guaranteed terminal acceptance. ACP message images use the PNG Kitty backend.
-OSC clipboard operations and program status reporting remain follow-up work. Existing text
-rendering, native clipboard operations, and terminal-native paste remain usable
-without any positive capability decision.
+OSC 52 writes use the shared clipboard service. Terminal clipboard reads, rich
+clipboard operations, and program status reporting remain follow-up work.
+Existing text rendering, native clipboard operations, and terminal-native paste
+remain usable without any positive capability decision.
 
 Automatic detection is deliberately conservative and sends no terminal queries:
 
@@ -215,8 +226,11 @@ settings vary. Kitty-specific incidental variables do not establish support for
 newer protocols. Overrides assert support but neither implement multiplexer
 passthrough nor guarantee that the terminal will accept an operation.
 
-Clipboard write support never grants read permission. Explicit read `on` opts
-into attempts for only that operation; a terminal can still refuse them. See
+Clipboard write support never grants read permission. Explicit read `on` expresses
+consent for that operation, but this version's input backend cannot receive OSC 52
+replies, so Hive never sends clipboard read queries, even with `on`. Native paste
+is still used; if it fails, use terminal-native paste. The diagnostic reports
+capability policy, not the presence of a read implementation. See
 [capability overrides](../reference/cli.md#terminal-capability-overrides) for all
 CLI options and environment variables. For example:
 

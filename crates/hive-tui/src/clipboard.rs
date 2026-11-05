@@ -1,6 +1,10 @@
-//! Keep clipboard ownership alive and potentially blocking desktop IPC off the UI thread.
+//! Route clipboard operations while keeping desktop IPC off the UI thread.
 
+use base64::Engine;
 use tokio::sync::mpsc;
+
+// Terminals impose different limits; bound allocation and wire traffic without truncating selections.
+const MAX_OSC52_BYTES: usize = 64 * 1024;
 
 pub enum Operation {
     Copy(String),
@@ -33,16 +37,44 @@ pub enum ClipboardError {
         "Clipboard unavailable: {0}; check your desktop clipboard service or use terminal copy/paste"
     )]
     Backend(String),
+    #[error(
+        "Selection is {bytes} bytes; terminal clipboard copies are limited to {MAX_OSC52_BYTES} bytes; select less text or disable OSC 52 writes to use the native clipboard"
+    )]
+    TooLarge { bytes: usize },
+    #[error("Could not send text to the terminal clipboard: {0}; check terminal output and retry")]
+    Terminal(#[source] std::io::Error),
+    #[error("Clipboard worker stopped; restart Hive or use terminal copy/paste")]
+    WorkerStopped,
     #[error(transparent)]
     Import(#[from] crate::editor::ImportTooLarge),
 }
 
 pub struct Clipboard {
-    pub requests: std::sync::mpsc::Sender<Request>,
+    requests: std::sync::mpsc::Sender<Request>,
     pub completions: mpsc::UnboundedReceiver<Completion>,
 }
 
 impl Clipboard {
+    pub fn dispatch(
+        &self,
+        request: Request,
+        capabilities: &crate::capabilities::TerminalCapabilities,
+        output: &mut impl std::io::Write,
+    ) -> Option<Completion> {
+        // Prefer the user's terminal over a remote desktop clipboard when running through SSH.
+        if capabilities.osc52_write.is_usable()
+            && let Operation::Copy(text) | Operation::Cut(text) = &request.operation
+        {
+            let result = write_osc52(output, text).map(|()| None);
+            return Some(Completion { request, result });
+        }
+        // Crossterm cannot expose OSC replies: even explicit read consent must not emit a query.
+        self.requests.send(request).err().map(|error| Completion {
+            request: error.0,
+            result: Err(ClipboardError::WorkerStopped),
+        })
+    }
+
     pub fn new() -> Self {
         Self::worker(|| {
             let mut clipboard = None;
@@ -87,6 +119,19 @@ impl Clipboard {
     }
 }
 
+fn write_osc52(output: &mut impl std::io::Write, text: &str) -> Result<(), ClipboardError> {
+    if text.len() > MAX_OSC52_BYTES {
+        return Err(ClipboardError::TooLarge { bytes: text.len() });
+    }
+    // Only Base64 reaches the payload, so selected escape characters cannot inject terminal commands.
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    let sequence = format!("\x1b]52;c;{encoded}\x1b\\");
+    output
+        .write_all(sequence.as_bytes())
+        .and_then(|()| output.flush())
+        .map_err(ClipboardError::Terminal)
+}
+
 pub fn command(key: crossterm::event::KeyEvent) -> Option<char> {
     use crossterm::event::{KeyCode, KeyModifiers};
     let KeyCode::Char(ch) = key.code else {
@@ -106,7 +151,16 @@ pub fn complete(app: &mut crate::ui::App, completion: Completion) {
             .map_err(ClipboardError::Import)
     });
     match result {
-        Err(error) => app.status = error.to_string(),
+        Err(error) => {
+            app.status = error.to_string();
+            if matches!(completion.request.operation, Operation::Paste)
+                && app.terminal_capabilities.osc52_read.is_usable()
+            {
+                app.status.push_str(
+                    "; terminal clipboard reads are not implemented; use terminal-native paste",
+                );
+            }
+        }
         Ok(value) => {
             let request = completion.request;
             if matches!(request.operation, Operation::Copy(_)) {
@@ -187,6 +241,230 @@ mod tests {
             editor: app.editor.clone(),
             target: Target::Chat,
         }
+    }
+
+    fn capabilities(write: bool, read: bool) -> crate::capabilities::TerminalCapabilities {
+        use crate::capabilities::{Capability, Support, TerminalCapabilities};
+        let permitted = Capability {
+            effective: Support::Supported,
+            ..Default::default()
+        };
+        TerminalCapabilities {
+            osc52_write: if write {
+                permitted
+            } else {
+                Capability::default()
+            },
+            osc52_read: if read {
+                permitted
+            } else {
+                Capability::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn terminal_copies_encode_unicode_and_control_characters_as_data() {
+        for (text, expected) in [
+            ("", ""),
+            ("hello", "aGVsbG8="),
+            ("界\n\x1b\x07", "55WMChsH"),
+        ] {
+            let mut output = Vec::new();
+            write_osc52(&mut output, text).unwrap();
+            assert_eq!(output, format!("\x1b]52;c;{expected}\x1b\\").as_bytes());
+        }
+    }
+
+    #[test]
+    fn terminal_copy_limits_count_utf8_bytes_before_emitting_any_output() {
+        let mut text = "界".repeat(MAX_OSC52_BYTES / 3);
+        text.push('a');
+        assert_eq!(text.len(), MAX_OSC52_BYTES);
+        let mut output = Vec::new();
+        write_osc52(&mut output, &text).unwrap();
+        assert_eq!(output.len(), 87_384 + 9);
+        output.clear();
+        text.push('a');
+        assert!(matches!(
+            write_osc52(&mut output, &text),
+            Err(ClipboardError::TooLarge { bytes }) if bytes == MAX_OSC52_BYTES + 1
+        ));
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn terminal_copy_and_cut_do_not_touch_the_native_clipboard() {
+        let clipboard = Clipboard::worker(|| {
+            |_: &Operation| panic!("terminal copies must not use the native clipboard")
+        });
+        let mut app = crate::ui::App {
+            input: "selected 界".into(),
+            ..Default::default()
+        };
+        app.editor.key(
+            &mut app.input,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+        );
+        for operation in [
+            Operation::Copy(app.input.clone()),
+            Operation::Cut(app.input.clone()),
+        ] {
+            let mut output = Vec::new();
+            let completion = clipboard
+                .dispatch(
+                    request(&app, operation),
+                    &capabilities(true, false),
+                    &mut output,
+                )
+                .unwrap();
+            assert!(completion.result.is_ok());
+            assert!(output.starts_with(b"\x1b]52;c;"));
+            complete(&mut app, completion);
+        }
+        assert!(app.input.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unknown_disabled_and_unavailable_terminal_writes_use_native_copy() {
+        use crate::capabilities::{CapabilitySource, Support};
+        let clipboard = &mut Clipboard::worker(|| {
+            |operation: &Operation| {
+                assert!(matches!(operation, Operation::Copy(text) if text == "native"));
+                Ok(None)
+            }
+        });
+        for (support, source) in [
+            (Support::Unknown, CapabilitySource::Automatic),
+            (Support::Unsupported, CapabilitySource::Override),
+            (Support::Unsupported, CapabilitySource::UnavailableTransport),
+        ] {
+            let mut policy = capabilities(false, false);
+            policy.osc52_write.effective = support;
+            policy.osc52_write.source = source;
+            let mut output = Vec::new();
+            assert!(
+                clipboard
+                    .dispatch(
+                        request(&crate::ui::App::default(), Operation::Copy("native".into())),
+                        &policy,
+                        &mut output,
+                    )
+                    .is_none()
+            );
+            assert!(clipboard.completions.recv().await.unwrap().result.is_ok());
+            assert!(output.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn read_opt_in_never_emits_queries_and_native_paste_failures_explain_the_limitation() {
+        let mut clipboard = Clipboard::worker(|| {
+            let mut first = true;
+            move |operation: &Operation| {
+                assert!(matches!(operation, Operation::Paste));
+                if std::mem::take(&mut first) {
+                    Ok(Some("native paste".into()))
+                } else {
+                    Err(ClipboardError::Backend("no display".into()))
+                }
+            }
+        });
+        let mut app = crate::ui::App {
+            terminal_capabilities: capabilities(true, true),
+            ..Default::default()
+        };
+        let mut output = Vec::new();
+        for _ in 0..2 {
+            assert!(
+                clipboard
+                    .dispatch(
+                        request(&app, Operation::Paste),
+                        &app.terminal_capabilities,
+                        &mut output,
+                    )
+                    .is_none()
+            );
+            complete(&mut app, clipboard.completions.recv().await.unwrap());
+        }
+        assert_eq!(app.input, "native paste");
+        assert!(
+            app.status
+                .contains("terminal clipboard reads are not implemented")
+        );
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn terminal_write_and_flush_failures_preserve_cut_selections() {
+        struct BrokenOutput {
+            fail_flush: bool,
+        }
+        impl std::io::Write for BrokenOutput {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.fail_flush {
+                    Ok(bytes.len())
+                } else {
+                    Err(std::io::ErrorKind::BrokenPipe.into())
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        let clipboard = Clipboard::worker(|| {
+            |_: &Operation| panic!("failed terminal output must not switch clipboard destinations")
+        });
+        for fail_flush in [false, true] {
+            let mut app = crate::ui::App {
+                input: "keep me".into(),
+                ..Default::default()
+            };
+            app.editor.key(
+                &mut app.input,
+                KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+            );
+            let completion = clipboard
+                .dispatch(
+                    request(&app, Operation::Cut(app.input.clone())),
+                    &capabilities(true, false),
+                    &mut BrokenOutput { fail_flush },
+                )
+                .unwrap();
+            assert!(matches!(
+                completion.result,
+                Err(ClipboardError::Terminal(_))
+            ));
+            complete(&mut app, completion);
+            assert_eq!(app.input, "keep me");
+            assert_eq!(app.editor.selected().as_deref(), Some("keep me"));
+            assert!(app.status.contains("check terminal output"));
+        }
+    }
+
+    #[test]
+    fn a_stopped_worker_reports_the_lost_clipboard_request() {
+        let (requests, receiver) = std::sync::mpsc::channel();
+        drop(receiver);
+        let (_sender, completions) = mpsc::unbounded_channel();
+        let clipboard = Clipboard {
+            requests,
+            completions,
+        };
+        let mut output = Vec::new();
+        let completion = clipboard
+            .dispatch(
+                request(&crate::ui::App::default(), Operation::Paste),
+                &capabilities(true, true),
+                &mut output,
+            )
+            .unwrap();
+        assert!(matches!(
+            completion.result,
+            Err(ClipboardError::WorkerStopped)
+        ));
+        assert!(output.is_empty());
     }
 
     #[tokio::test]

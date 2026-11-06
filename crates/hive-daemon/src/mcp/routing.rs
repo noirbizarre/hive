@@ -321,8 +321,13 @@ impl Aggregate {
             && params.get("cursor").is_none()
             && let Some(provider) = &self.0.workspace
         {
-            provider.capabilities(Some(cancellation)).await?;
-            let mut result = json!({"tools":[hive_protocol::workspace_tools::descriptor()]});
+            let capabilities = provider.capabilities(Some(cancellation)).await?;
+            let descriptors: Vec<_> = capabilities
+                .tools
+                .iter()
+                .map(|tool| hive_protocol::workspace_tools::tool_descriptor(&tool.name))
+                .collect();
+            let mut result = json!({"tools":descriptors});
             if !self.0.backends.is_empty() {
                 result["nextCursor"] = json!(
                     self.0
@@ -465,17 +470,18 @@ impl Aggregate {
     ) -> Result<Value, RuntimeError> {
         use hive_protocol::workspace_tools::{self as tools, ToolError};
         let provider = self.0.workspace.as_ref().ok_or(ToolError::Unsupported)?;
-        if !tools::tools()
-            .iter()
-            .any(|tool| Some(tool.name.as_str()) == params.get("name").and_then(Value::as_str))
-        {
-            return Err(ToolError::Unsupported.into());
-        }
-        tools::validate_arguments(params.get("arguments"))?;
-        let result = match provider.capabilities(Some(cancellation)).await {
-            Ok(capabilities) => {
-                let value =
-                    serde_json::to_value(capabilities).map_err(|_| RuntimeError::Response)?;
+        let name = params
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or(ToolError::Arguments)?;
+        let request = if name == tools::CAPABILITIES {
+            tools::validate_arguments(params.get("arguments"))?;
+            None
+        } else {
+            Some(tools::request(name, params.get("arguments"))?)
+        };
+        let result = match provider.execute(request, Some(cancellation)).await {
+            Ok(value) => {
                 json!({"structuredContent":value,"content":[{"type":"text","text":value.to_string()}],"isError":false})
             }
             Err(RuntimeError::WorkspaceTool(error)) => {

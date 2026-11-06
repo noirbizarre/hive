@@ -114,15 +114,15 @@ fn storage(repository: &RepositoryHandle) -> Result<Storage, Error> {
     Ok(store)
 }
 
-fn run(root: &Path, args: &[&str]) -> Result<String, Error> {
+pub(super) fn run(root: &Path, args: &[&str]) -> Result<String, Error> {
     String::from_utf8(run_bytes(root, args)?).map_err(|_| Error::Uncertain)
 }
 
-fn run_bytes(root: &Path, args: &[&str]) -> Result<Vec<u8>, Error> {
+pub(super) fn run_bytes(root: &Path, args: &[&str]) -> Result<Vec<u8>, Error> {
     run_output(root, args, false)
 }
 
-fn run_output(root: &Path, args: &[&str], digest: bool) -> Result<Vec<u8>, Error> {
+pub(super) fn run_output(root: &Path, args: &[&str], digest: bool) -> Result<Vec<u8>, Error> {
     // Never snapshot an agent's files as a side effect of inspection or repository maintenance.
     let mut argv = vec![
         "--no-pager",
@@ -254,6 +254,20 @@ fn read_marker<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, Error> 
 
 impl RepositoryBackend for Jj {
     type Error = Error;
+
+    fn supports_vcs(&self) -> bool {
+        true
+    }
+    fn vcs(
+        &self,
+        target: hive_core::workspace::backend::vcs::Target<'_>,
+        request: &hive_core::workspace::backend::vcs::Request,
+    ) -> Result<hive_core::workspace::backend::vcs::Result, hive_core::workspace::backend::vcs::Error>
+    {
+        self.validate(target.repository)
+            .map_err(|_| hive_core::workspace::backend::vcs::Error::Backend)?;
+        super::vcs::execute(target, request, true)
+    }
     fn validate(&self, repository: &RepositoryHandle) -> Result<(), Error> {
         storage(repository).map(|_| ())
     }

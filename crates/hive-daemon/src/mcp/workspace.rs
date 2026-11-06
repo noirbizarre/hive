@@ -108,6 +108,16 @@ impl Provider {
         &self,
         cancellation: Option<&McpOperationCancellation>,
     ) -> Result<Capabilities, RuntimeError> {
+        let value = self.execute(None, cancellation).await?;
+        serde_json::from_value(value).map_err(|_| RuntimeError::Response)
+    }
+
+    pub(crate) async fn execute(
+        &self,
+        request: Option<hive_core::workspace::backend::vcs::Request>,
+        cancellation: Option<&McpOperationCancellation>,
+    ) -> Result<serde_json::Value, RuntimeError> {
+        let mutation = request.as_ref().is_some_and(|r| r.mutates());
         if cancellation.is_some_and(McpOperationCancellation::is_cancelled) {
             return Err(ToolError::Cancelled.into());
         }
@@ -129,11 +139,14 @@ impl Provider {
                 match this.broker.workspace_service() {
                     Ok(service) => {
                         let authority = this.clone();
+                        #[cfg(test)]
+                        let inspected = std::sync::atomic::AtomicBool::new(false);
                         service
-                            .tool_capabilities(
+                            .tool_execute(
                                 this.session.to_string(),
                                 this.context,
                                 this.cwd.0,
+                                request,
                                 move || {
                                     if *admission_cancelled.borrow()
                                         || caller_cancelled
@@ -148,7 +161,9 @@ impl Provider {
                                         },
                                     )?;
                                     #[cfg(test)]
-                                    if let Some(hook) = &authority.before_inspect {
+                                    if !inspected.swap(true, std::sync::atomic::Ordering::AcqRel)
+                                        && let Some(hook) = &authority.before_inspect
+                                    {
                                         hook();
                                     }
                                     Ok(())
@@ -170,11 +185,28 @@ impl Provider {
             _ = async { let _ = cancelled.wait_for(|cancelled| *cancelled).await; } => None,
         };
         match result {
-            Some(result) => result.map_err(|_| ToolError::Backend)?.map_err(Into::into),
+            Some(result) => result
+                .map_err(|_| {
+                    if mutation {
+                        ToolError::Vcs(hive_core::workspace::backend::vcs::Error::Uncertain)
+                    } else {
+                        ToolError::Backend
+                    }
+                })?
+                .map_err(Into::into),
             None => {
                 drop(cancel_on_drop);
-                let _ = response.await;
-                Err(ToolError::Cancelled.into())
+                let settled = response.await;
+                // A completed mutation must not masquerade as a cancelled read that is safe to retry.
+                if mutation {
+                    settled
+                        .map_err(|_| {
+                            ToolError::Vcs(hive_core::workspace::backend::vcs::Error::Uncertain)
+                        })?
+                        .map_err(Into::into)
+                } else {
+                    Err(ToolError::Cancelled.into())
+                }
             }
         }
     }

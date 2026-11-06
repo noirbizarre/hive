@@ -174,6 +174,17 @@ impl BackendRegistry {
 /// The orchestration caller persists the handle and complete intent before invoking acquisition.
 pub trait RepositoryBackend: Send + Sync {
     type Error;
+    /// Opt in only when every advertised common operation has a callable handler.
+    fn supports_vcs(&self) -> bool {
+        false
+    }
+    fn vcs(
+        &self,
+        _target: super::vcs::Target<'_>,
+        _request: &super::vcs::Request,
+    ) -> Result<super::vcs::Result, super::vcs::Error> {
+        Err(super::vcs::Error::Unsupported)
+    }
     /// Inert codec validation must not acquire storage or contact a remote.
     fn validate(&self, _repository: &RepositoryHandle) -> Result<(), Self::Error> {
         Ok(())

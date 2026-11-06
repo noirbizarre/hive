@@ -10,6 +10,7 @@ use super::{
 use crate::identity::{NodeId, OperationId, WorkspaceId};
 
 pub mod repository;
+pub mod vcs;
 pub use repository::*;
 
 pub use super::error::{CleanupFailure, ProvisionFailure};

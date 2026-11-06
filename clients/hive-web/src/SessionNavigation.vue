@@ -3,15 +3,18 @@ import { computed, ref } from 'vue';
 import InputText from 'openvue/inputtext';
 import Button from 'openvue/button';
 import ActivityIndicator from './ActivityIndicator.vue';
+import { sessionKey } from './federation.js';
 const props = defineProps({ sessions: Array, state: Object, recent: Array, loading: Boolean, error: String, listId: { type: String, default: 'sessions' } });
 defineEmits(['open', 'refresh']);
 const search = ref('');
-const ordered = computed(() => [...props.sessions].filter(session => [session.title, session.sessionId, session.agent, session.cwd].join(' ').toLowerCase().includes(search.value.toLowerCase())).sort((a, b) => {
-  const first = props.recent.indexOf(a.sessionId), second = props.recent.indexOf(b.sessionId);
+const ordered = computed(() => [...props.sessions].filter(session => [session.title, session.sessionId, session.agent, session.cwd, session.reference?.owner, session.ownerName].join(' ').toLowerCase().includes(search.value.toLowerCase())).sort((a, b) => {
+  const first = props.recent.indexOf(sessionKey(a)), second = props.recent.indexOf(sessionKey(b));
   if (first !== -1 || second !== -1) return (first === -1 ? Infinity : first) - (second === -1 ? Infinity : second);
   return (b.lastActivityAt || 0) - (a.lastActivityAt || 0) || a.sessionId.localeCompare(b.sessionId);
 }));
 function ownership(session) {
+  if (session.availability === 'owner_unavailable') return 'Owner unavailable · cached';
+  if (!Object.hasOwn(session, 'controlOwner')) return 'Control unknown';
   if (!session.controlOwner) return 'Unclaimed';
   return session.sessionId === props.state.session?.sessionId && props.state.role === 'pilot' && props.state.connected && props.state.generation === session.generation ? 'Controlled here' : 'Controlled by another client';
 }
@@ -26,12 +29,13 @@ function ownership(session) {
     <p v-else-if="!sessions.length" class="rail-state">No sessions yet. Create a session to get started.</p>
     <p v-else-if="!ordered.length" class="rail-state">No sessions match your search.</p>
     <ul :id="listId" class="session-list">
-      <li v-for="session in ordered" :key="session.sessionId">
+      <li v-for="session in ordered" :key="sessionKey(session)">
         <button type="button" :data-session-id="session.sessionId" :aria-current="session.sessionId === state.session?.sessionId ? 'page' : undefined" @click="$emit('open', session)">
           <span class="session-title"><ActivityIndicator v-if="state.connected && state.opening && state.pendingSession === session.sessionId && !state.interaction" />{{ session.title || session.sessionId }}</span>
           <span class="session-meta">{{ session.agent || 'Unknown backend' }} <span>·</span> {{ session.lifecycle && session.lifecycle !== 'active' ? session.lifecycle : session.activity || 'unknown' }}</span>
           <span v-if="session.sessionId === state.session?.sessionId && state.interaction" class="attention">Needs attention</span>
           <span class="session-owner">{{ ownership(session) }}</span>
+          <span v-if="session.reference" class="session-owner">{{ session.ownerName ? `${session.ownerName} · ` : '' }}{{ session.reference.owner }}</span>
           <span class="session-id">{{ session.sessionId }}</span>
           <span v-if="session.recoveryReason" class="attention">{{ session.recoveryReason }}</span>
           <time v-if="session.lastActivityAt" :datetime="new Date(session.lastActivityAt).toISOString()">{{ new Date(session.lastActivityAt).toLocaleString() }}</time>

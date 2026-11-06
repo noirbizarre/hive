@@ -32,6 +32,7 @@ prompt submission, native adoption, or session deletion subcommands.
 | `--profile` | Daemon `default_profile` | Named execution setup for creation; conflicts with `--session` |
 | `--agent` | Unset | Preselect an agent in the creation picker; must belong to the selected profile |
 | `--session` | Unset | Attach to a known Hive session ID |
+| `--owner` | Receiving Hive | Execution-owner NodeId; scopes agent/profile choices and makes `--session` an owner-native ID |
 | `--cwd` | Unset | Explicit existing directory, bypassing a profile workspace policy |
 | `--project` | Profile default | Project override for workspace creation |
 | `--workspace` | Profile default | Named workspace policy |
@@ -41,6 +42,11 @@ prompt submission, native adoption, or session deletion subcommands.
 
 These work on both `hive` and `hive tui`. The TUI does not derive its address
 from `HIVE_URL` or `HIVE_LISTEN`.
+
+For remote unmanaged launches, `--cwd` must be an absolute path on the selected
+owner; no client-local existence check or path conversion occurs. A managed
+profile/workspace instead supplies the effective owner directory. The creation
+picker also offers `o` to change owner and `d` to enter its directory.
 
 ### Terminal capability overrides
 

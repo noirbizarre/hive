@@ -1,3 +1,5 @@
+import { discovery, negotiate, ownerPathIsAbsolute, sessionKey } from './federation.js';
+
 // The daemon owns lifecycle and control; this adapter projects transcript snapshots and live events.
 export function conversation() {
   const lines = [];
@@ -253,7 +255,9 @@ export function connect(url, onChange = () => {}, onDisconnect = () => true) {
   let status = 'Connecting…';
   let uncertain;
   let recoveryRequired = false;
-  let creationUncertain = store?.getItem('hive.creating') === 'true';
+  const creationStorageKey = `hive.creating.${url}`;
+  let creationUncertain = Boolean(store?.getItem(creationStorageKey)) || store?.getItem('hive.creating') === 'true';
+  function clearCreation() { store?.removeItem(creationStorageKey); store?.removeItem('hive.creating'); }
   let openQueue = Promise.resolve();
   let openVersion = 0;
   let desired;
@@ -263,6 +267,9 @@ export function connect(url, onChange = () => {}, onDisconnect = () => true) {
   let creating = false;
   let opening;
   let stopping = false;
+  let negotiated, directory;
+  const catalogs = new Set();
+  const storageId = session => sessionKey(session);
   let firstResolve;
   const initialized = new Promise(resolve => { firstResolve = resolve; });
 
@@ -399,6 +406,13 @@ export function connect(url, onChange = () => {}, onDisconnect = () => true) {
     }
   }
   function ownership(meta) {
+    if (selected && meta._meta?.hive?.session) selected.reference = meta._meta.hive.session;
+    if (selected?.reference) {
+      for (const kind of ['pending', 'recovery']) {
+        const old = `hive.${kind}.${selected.sessionId}`, key = `hive.${kind}.${storageId(selected)}`, value = store?.getItem(old);
+        if (value && !store?.getItem(key)) { store?.setItem(key, value); if (store?.getItem(key) === value) store?.removeItem(old); }
+      }
+    }
     const hive = meta?._meta?.hive;
     if (!hive || !Number.isSafeInteger(hive.generation) || !hive.role) throw new Error('Hive did not return control metadata');
     owner = hive.role === 'pilot' ? hive : { generation: hive.generation, role: 'observer' };
@@ -498,14 +512,23 @@ export function connect(url, onChange = () => {}, onDisconnect = () => true) {
       try {
         const response = await request('initialize', { protocolVersion: 2,
           info: { name: 'hive-web', version: '0.1.0' },
-          capabilities: { elicitation: { form: {}, url: {} } } });
-        if (response.protocolVersion !== 2 || !response.capabilities?.session) throw new Error('ACPv2 sessions unavailable');
+          capabilities: { elicitation: { form: {}, url: {} }, _meta: { hive: { versions: [1] } } } });
+        negotiated = negotiate(response);
+        directory = discovery(request, negotiated);
         readyNow = true;
         const waiting = readiness.size > 0;
         for (const waiter of [...readiness]) waiter.resolve();
         firstResolve(response);
-        if (desired && desired.sessionId !== selected?.sessionId && !waiting) await client.open(desired);
-        else if (selected && !waiting) await resume('observe');
+        for (const refresh of catalogs) void refresh();
+        if (desired && (!selected || sessionKey(desired) !== sessionKey(selected)) && !waiting) await client.open(desired);
+        else if (selected && !waiting) {
+          const epoch = connectionEpoch, version = openVersion, previous = selected;
+          const location = await directory.resolve(previous);
+          if (epoch !== connectionEpoch || version !== openVersion || selected !== previous) return;
+          selected = location;
+          desired = { ...selected };
+          await resume('observe');
+        }
         else {
           status = creationUncertain ? 'Session creation interrupted — select the original session from the list'
             : desired ? `Opening ${desired.sessionId}…` : 'Connected to ACPv2';
@@ -554,15 +577,19 @@ export function connect(url, onChange = () => {}, onDisconnect = () => true) {
     initialized,
     state: snapshot,
     open(session) {
-      if (!session?.sessionId || !session.cwd) throw new Error('Select a listed Hive session with a cwd');
+      if (!session?.reference && (!session?.sessionId || !session.cwd)) throw new Error('Select a listed Hive session with a cwd');
       desired = { ...session };
       const version = ++openVersion;
       opening = version;
-      status = `Opening ${session.sessionId}${readyNow ? '' : ' — waiting for ACP connection'}…`;
+      status = `Opening ${session.reference?.id || session.sessionId}${readyNow ? '' : ' — waiting for ACP connection'}…`;
       publish();
       const operation = openQueue.then(async () => {
         await ready();
         if (version !== openVersion) return;
+        const epoch = connectionEpoch;
+        session = await directory.resolve(session);
+        if (version !== openVersion || epoch !== connectionEpoch) return;
+        desired = { ...session };
         if (selected?.sessionId === session.sessionId && owner) {
           status = `${owner.role === 'pilot' ? 'Controlling' : 'Read-only'} ${session.sessionId}`;
           publish();
@@ -574,15 +601,21 @@ export function connect(url, onChange = () => {}, onDisconnect = () => true) {
             _meta: { hive: { mode: 'relinquish', generation: owner.generation, token: owner.token } } });
         }
         if (version !== openVersion) return;
-        selected = { sessionId: session.sessionId, cwd: session.cwd, agent: session.agent };
+        selected = { ...session };
         recoveryRequired = session.recovery === 'recovery_required';
         creationUncertain = false;
-        store?.removeItem('hive.creating');
+        clearCreation();
         history = conversation();
         stopping = false;
         owner = undefined;
         clearInteractions();
-        uncertain = JSON.parse(store?.getItem(`hive.pending.${selected.sessionId}`) || 'null');
+        const legacy = store?.getItem(`hive.pending.${selected.sessionId}`);
+        // Migrate only after discovery/resolution has established this route's logical identity.
+        if (legacy && selected.reference && !store?.getItem(`hive.pending.${storageId(selected)}`)) {
+          store?.setItem(`hive.pending.${storageId(selected)}`, legacy);
+          store?.removeItem(`hive.pending.${selected.sessionId}`);
+        }
+        uncertain = JSON.parse(store?.getItem(`hive.pending.${storageId(selected)}`) || 'null');
         publish();
         return resume('observe');
       });
@@ -594,13 +627,14 @@ export function connect(url, onChange = () => {}, onDisconnect = () => true) {
     async acknowledgeRecovery() {
       if (!selected || !connected || !recoveryRequired) throw new Error('Observe the recovered session before acknowledging interrupted work');
       const target = selected.sessionId, version = openVersion, epoch = connectionEpoch, key = uncertain?.key;
+      const identity = storageId(selected);
       const response = await resume('pilot', false, true);
       if (selected?.sessionId !== target || version !== openVersion || epoch !== connectionEpoch || uncertain?.key !== key
         || recoveryRequired || owner?.token !== response?._meta?.hive?.token) return response;
       // Continuing accepts the risk; it does not establish a receipt, completion or idle.
-      if (uncertain) store?.setItem(`hive.recovery.${target}`, JSON.stringify({ ...uncertain, acknowledged: true }));
+      if (uncertain) store?.setItem(`hive.recovery.${identity}`, JSON.stringify({ ...uncertain, acknowledged: true }));
       uncertain = undefined;
-      store?.removeItem(`hive.pending.${target}`);
+      store?.removeItem(`hive.pending.${identity}`);
       history.notice('[Recovery acknowledged; the earlier prompt outcome remains unresolved]');
       publish();
       return response;
@@ -615,45 +649,62 @@ export function connect(url, onChange = () => {}, onDisconnect = () => true) {
       }
       return takingControl;
     },
-    async create(agent = '', profile = '') {
+    async create(agent = '', profile = '', launch = {}) {
       await ready();
       if (creating || configuring) throw new Error('Wait for session configuration to finish');
       if (selected) throw new Error('A session is already selected');
       if (creationUncertain) throw new Error('Session creation was interrupted; choose the original session from the list before prompting');
+      const remote = launch.owner && launch.owner !== negotiated.node;
+      if (remote && !negotiated.enabled('peers')) throw new Error('Remote launch unsupported by this Hive');
+      if (remote && !agent && !profile) throw new Error('Select an agent or execution profile on the owner');
+      if (remote && launch.cwd && !ownerPathIsAbsolute(launch.cwd)) throw new Error('Working directory must be absolute on the selected owner');
+      const cwd = launch.cwd || '/';
       creating = true;
       const version = openVersion;
+      const epoch = connectionEpoch;
       try {
+        if (remote && !launch.workspace && !ownerPathIsAbsolute(launch.cwd)) {
+          const inventory = await directory.inventory(launch.owner);
+          const execution = inventory.profiles.find(entry => entry.id === profile);
+          const selectedAgent = agent || (execution ? execution.defaultAgent || (execution.agents?.includes(inventory.defaultAgent) ? inventory.defaultAgent : undefined) || (execution.agents?.length === 1 ? execution.agents[0] : undefined) : inventory.defaultAgent);
+          // Agent-level policies can provision a workspace even without a named execution profile.
+          const managed = (execution && Object.keys(execution.workspaces || {}).length) || inventory.agents.some(entry => entry.id === selectedAgent && entry.launch?.workspace === 'configured');
+          if (!managed) throw new Error('Enter an absolute working directory on the selected owner, or select a managed execution profile');
+        }
+        if (epoch !== connectionEpoch || version !== openVersion) throw new Error('Launch selection changed; review it before creating a session');
         creationUncertain = true;
-        store?.setItem('hive.creating', 'true');
+        store?.setItem(creationStorageKey, JSON.stringify({ owner: launch.owner || negotiated.node, agent, profile, cwd, workspace: launch.workspace }));
         publish();
         let created;
         try {
-          created = await request('session/new', { cwd: '/', mcpServers: [],
-            ...(agent || profile ? { _meta: { hive: { ...(agent ? { agent } : {}), ...(profile ? { profile } : {}) } } } : {}) });
+          created = await request('session/new', { cwd, mcpServers: [],
+            ...(agent || profile || remote || launch.workspace ? { _meta: { hive: { ...(agent ? { agent } : {}), ...(profile ? { profile } : {}), ...(remote ? { peer: launch.owner } : {}), ...(launch.workspace ? { workspace: launch.workspace } : {}) } } } : {}) });
         } catch (error) {
-          if (connected) { creationUncertain = false; store?.removeItem('hive.creating'); }
+          const code = error.data?.code || error.data?.hive?.code;
+          const rejected = error.code === -32602 || (code?.startsWith('hive::remote::') && !['hive::remote::launch_uncertain', 'hive::remote::provisioning_uncertain'].includes(code));
+          if (connected && epoch === connectionEpoch && rejected) { creationUncertain = false; clearCreation(); }
           throw error;
         }
         if (version !== openVersion) {
           // Selection may change while creation asks a question; don't leave an invisible pilot behind.
           const hive = created._meta?.hive;
-          if (hive?.role === 'pilot') await request('session/resume', { sessionId: created.sessionId, cwd: hive.workspace?.effectiveCwd || '/',
+          if (hive?.role === 'pilot') await request('session/resume', { sessionId: created.sessionId, cwd: hive.workspace?.effectiveCwd || cwd,
             _meta: { hive: { mode: 'relinquish', generation: hive.generation, token: hive.token } } });
           creationUncertain = false;
-          store?.removeItem('hive.creating');
+          clearCreation();
           throw new Error('Session created; select it from the session list');
         }
-        selected = { sessionId: created.sessionId, cwd: created._meta?.hive?.workspace?.effectiveCwd || '/', agent,
+        selected = { sessionId: created.sessionId, cwd: created._meta?.hive?.workspace?.effectiveCwd || cwd, agent, reference: created._meta?.hive?.session,
           workspace: created._meta?.hive?.workspace };
         desired = { ...selected };
         creationUncertain = false;
-        store?.removeItem('hive.creating');
+        clearCreation();
         history = conversation();
         const hive = ownership(created);
         history.reconcileUsage(hive.usageSnapshot, hive.usageSeq);
         history.reconcileConfig(created.configOptions || [], hive.configSeq || 0);
         return created;
-      } finally { creating = false; publish(); }
+      } finally { creating = false; publish(); for (const refresh of catalogs) void refresh(); }
     },
     async configure(configId, value) {
       await ready();
@@ -677,10 +728,10 @@ export function connect(url, onChange = () => {}, onDisconnect = () => true) {
       }
       finally { configuring = false; publish(); }
     },
-    async prompt(text, agent = '', profile = '') {
+    async prompt(text, agent = '', profile = '', launch = {}) {
       await ready();
       if (!text?.trim()) throw new Error('Enter a prompt');
-      if (!selected) await client.create(agent, profile);
+      if (!selected) await client.create(agent, profile, launch);
       if (configuring || creating) throw new Error('Wait for session configuration to finish');
       if (desired && desired.sessionId !== selected.sessionId) throw new Error('Wait for the selected session to open');
       if (owner?.role !== 'pilot') throw new Error('Start typing to take control first');
@@ -690,9 +741,10 @@ export function connect(url, onChange = () => {}, onDisconnect = () => true) {
       const key = uncertain?.key || crypto.randomUUID();
       const retrieving = Boolean(uncertain);
       const target = selected.sessionId, version = openVersion, epoch = connectionEpoch;
+      const identity = storageId(selected);
       const current = () => selected?.sessionId === target && version === openVersion && epoch === connectionEpoch && uncertain?.key === key;
       uncertain = { key, text };
-      store?.setItem(`hive.pending.${selected.sessionId}`, JSON.stringify(uncertain));
+      store?.setItem(`hive.pending.${identity}`, JSON.stringify(uncertain));
       if (!retrieving) history.running(true);
       publish();
       try {
@@ -700,7 +752,7 @@ export function connect(url, onChange = () => {}, onDisconnect = () => true) {
           _meta: { hive: { generation: owner.generation, token: owner.token, key } } });
         if (!current()) return result;
         uncertain = undefined;
-        store?.removeItem(`hive.pending.${target}`);
+        store?.removeItem(`hive.pending.${identity}`);
         publish();
         return result;
       } catch (error) {
@@ -709,14 +761,14 @@ export function connect(url, onChange = () => {}, onDisconnect = () => true) {
         if (typeof diagnostic?.recoveryRequired === 'boolean') recoveryRequired = diagnostic.recoveryRequired;
         if (diagnostic?.code === 'hive::prompt::outcome_uncertain' && diagnostic.recoveryRequired === false) {
           // The recovery action may have committed before its response was lost.
-          store?.setItem(`hive.recovery.${target}`, JSON.stringify({ ...uncertain, acknowledged: true }));
+          store?.setItem(`hive.recovery.${identity}`, JSON.stringify({ ...uncertain, acknowledged: true }));
           uncertain = undefined;
-          store?.removeItem(`hive.pending.${target}`);
+          store?.removeItem(`hive.pending.${identity}`);
           history.notice('[Recovery already acknowledged; the earlier prompt outcome remains unresolved]');
           status = error.message;
         } else if (diagnostic?.code === 'hive::prompt::not_dispatched' || error.code === -32800) {
           uncertain = undefined;
-          store?.removeItem(`hive.pending.${target}`);
+          store?.removeItem(`hive.pending.${identity}`);
           history.running(false);
           status = error.message;
         } else if (diagnostic) status = error.message;
@@ -763,6 +815,42 @@ export function connect(url, onChange = () => {}, onDisconnect = () => true) {
       return true;
     },
     close() { closed = true; clearTimeout(retryTimer); socket?.close(); },
+    catalog(onChange, onError = () => {}, onProviders, onOwners) {
+      let stopped = false, owner, revision = 0;
+      const tasks = new Map();
+      function refreshScope(kind, operation, apply, prefix = '') {
+        if (stopped || !readyNow) return Promise.resolve();
+        const epoch = connectionEpoch, selection = kind === 'inventory' ? revision : undefined;
+        const previous = tasks.get(kind);
+        if (previous?.epoch === epoch && previous.selection === selection) {
+          previous.again = true;
+          return previous.promise;
+        }
+        // A new owner or connection supersedes its old request without waiting for that owner's timeout.
+        const task = { epoch, selection, again: false };
+        tasks.set(kind, task);
+        const current = () => !stopped && readyNow && epoch === connectionEpoch && tasks.get(kind) === task;
+        task.promise = operation().then(value => { if (current()) apply(value); })
+          .catch(error => { if (current()) onError(`${prefix}${error.message}`); })
+          .finally(() => {
+            if (tasks.get(kind) !== task) return;
+            tasks.delete(kind);
+            if (task.again && currentConnection(epoch)) void refreshScope(kind, operation, apply, prefix);
+          });
+        return task.promise;
+      }
+      const currentConnection = epoch => !stopped && readyNow && epoch === connectionEpoch;
+      const refreshInventory = () => refreshScope('inventory', () => directory.inventory(owner), inventory => onProviders?.(inventory), 'Agent inventory unavailable: ');
+      const refresh = () => Promise.all([
+        refreshScope('sessions', () => directory.sessions(), page => onChange(page.sessions, page)),
+        refreshScope('owners', () => directory.owners(), owners => onOwners?.(owners)),
+        refreshInventory(),
+      ]);
+      catalogs.add(refresh);
+      const timer = setInterval(refresh, 2000);
+      void refresh();
+      return { refresh, selectOwner(value) { owner = value; revision++; void refreshInventory(); }, close() { stopped = true; clearInterval(timer); catalogs.delete(refresh); } };
+    },
   };
   return client;
 }

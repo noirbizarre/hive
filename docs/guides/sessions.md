@@ -1,6 +1,6 @@
 # Sessions and handoff
 
-A Hive session has a stable `hive-…` ID and a selected agent profile. Its lifetime
+A Hive session has a stable owner-qualified `{owner, id}` identity and a selected agent profile. Its lifetime
 is independent of any terminal tab, browser page, or ACP client connection.
 
 ## Create a session
@@ -12,6 +12,14 @@ downstream worker and records the agent's own session ID.
 The session catalog lists sessions across clients and directories. Display
 titles come from the first accepted nonempty prompt. `unknown` activity means
 the agent has not provided a trustworthy running/idle state, not that it is idle.
+
+Configured remote owners appear alongside local sessions in both built-in clients.
+Select an owner when creating a session; agent/profile IDs and working directories
+are interpreted on that owner. Gateway route IDs may differ from owner-native IDs.
+Clients retain the qualified reference and resolve the current route before
+reconnecting. Cached unavailable sessions are routing evidence, not proof of idle
+state or permission to create a replacement. See [TUI owners](tui.md#remote-execution-owners)
+and [browser owners](web.md#remote-hive-instances).
 
 ## Pilot and observers
 

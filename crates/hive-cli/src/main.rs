@@ -490,6 +490,37 @@ mod tests {
     }
 
     #[test]
+    fn owner_selection_scopes_launch_and_attachment_in_both_tui_entry_points() {
+        let owner = "node-11111111-1111-4111-8111-111111111111";
+        for prefix in [vec!["hive"], vec!["hive", "tui"]] {
+            for selector in [
+                vec!["--agent", "coder", "--cwd", "C:\\owner-only"],
+                vec!["--session", "owner-native"],
+            ] {
+                let mut args = prefix.clone();
+                args.extend(["--owner", owner]);
+                args.extend(selector);
+                let cli = Cli::try_parse_from(args).unwrap();
+                let options = match cli.command {
+                    Some(Command::Tui(options)) => options,
+                    None => cli.tui,
+                    _ => panic!("expected TUI"),
+                };
+                assert_eq!(
+                    options.owner.as_ref().map(|owner| owner.as_str()),
+                    Some(owner)
+                );
+                if options.session.is_none() {
+                    assert_eq!(options.cwd.unwrap(), PathBuf::from("C:\\owner-only"));
+                }
+            }
+            let mut invalid = prefix;
+            invalid.extend(["--owner", "workstation"]);
+            assert!(Cli::try_parse_from(invalid).is_err());
+        }
+    }
+
+    #[test]
     fn daemon_commands_and_legacy_aliases_preserve_their_options() {
         let cli = Cli::try_parse_from([
             "hive",

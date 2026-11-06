@@ -46,9 +46,34 @@ the session in the [TUI](tui.md) from your intended project directory, then sele
 it in the browser's session rail. An existing session retains its original
 directory and downstream identity.
 
-> **Cwd-only launches:** without an applicable provisioning policy, the browser
-> uses `/` and has no project-directory picker. Use a TUI-created session when
-> you need a particular existing project directory.
+> **Local cwd-only launches:** without an applicable provisioning policy, the
+> browser uses `/`. Use a TUI-created session for another local project directory.
+
+### Remote Hive instances
+
+Configure [peers](../configuration.md#remote-hive-peers) on the gateway, then select
+**Hive instance** before choosing an agent or execution profile. For unmanaged
+remote launches, enter an absolute **Working directory on owner**; the browser
+does not check its local filesystem. A managed execution profile can provision
+the workspace on the owner instead, as can an agent's owner-configured workspace
+policy without a named profile. Switching owners clears incompatible launch
+choices while preserving conversation state.
+
+Local and remote sessions share the session rail and conversation controls.
+Owner NodeIds distinguish identical agent/session names. Cached sessions remain
+visible when an owner is unavailable; unknown control/activity is not idle or
+unclaimed. Discovery refreshes over ACP; operational HTTP/SSE remains local.
+
+Links use `?owner=<NodeId>&session=<owner-session-id>`. Existing gateway-local
+`?session=<id>` links still work. Reconnect resolves the qualified reference before
+resuming observation, with the same replay, permission, plan, and cancellation
+handling as local sessions. Uncertain creation/provisioning remains blocked even
+if the gateway connection is alive; inspect the owner before creating again.
+
+The browser connects only to its gateway; remote credentials stay on that daemon.
+Use trusted private networking or explicitly configure authentication/TLS and
+browser origins as described under [private-network access](../operations.md#private-network-access).
+The built-in clients require a persistent Hive advertising ACP discovery version 1.
 
 The desktop rail is visible by default. “Hide sessions” and “Show sessions” change its
 presentation without closing the conversation. Catalog refreshes preserve focus

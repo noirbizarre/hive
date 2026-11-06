@@ -7,6 +7,13 @@ Neither starts agents until a session needs them.
 
 ## Remote Hive peers
 
+The TUI creation picker (`o` to cycle owners) and browser **Hive instance** selector
+use these registrations through the gateway's ACP discovery. Clients need only
+the gateway connection; owner credentials remain on the gateway. See the
+[TUI](guides/tui.md#remote-execution-owners) and
+[browser](guides/web.md#remote-hive-instances) guides for owner-side directories,
+managed profiles, and session attachment.
+
 Register remote execution owners in the root file or included fragments:
 
 ```toml

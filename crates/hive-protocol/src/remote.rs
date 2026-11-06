@@ -368,6 +368,7 @@ pub struct LaunchRequirements {
 }
 
 /// An initialized handle never survives reconnect and never retries creation.
+#[derive(Clone)]
 pub struct Peer {
     connection: V2ConnectionTo<Agent>,
     pub node: String,
@@ -406,6 +407,14 @@ impl Peer {
 
     pub fn can_route(&self) -> bool {
         self.location && self.selection
+    }
+
+    pub fn has_peers(&self) -> bool {
+        self.peers
+    }
+
+    pub fn has_profiles(&self) -> bool {
+        self.profiles
     }
 
     pub async fn list_peers(&self) -> Result<Value, Error> {

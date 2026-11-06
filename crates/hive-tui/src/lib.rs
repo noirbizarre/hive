@@ -19,6 +19,9 @@ mod ui;
 #[cfg(test)]
 mod interaction_tests;
 
+#[cfg(test)]
+mod federation_tests;
+
 #[cfg(all(test, unix))]
 mod terminal_tests;
 
@@ -75,6 +78,13 @@ pub struct Options {
     pub profile: Option<String>,
     #[arg(long)]
     pub session: Option<String>,
+    /// Execution owner NodeId; with --session, the session ID belongs to this owner.
+    #[arg(long, value_parser = parse_owner)]
+    pub owner: Option<hive_core::identity::NodeId>,
+}
+
+fn parse_owner(value: &str) -> Result<hive_core::identity::NodeId, String> {
+    hive_core::identity::NodeId::try_from(value.to_owned()).map_err(|error| error.to_string())
 }
 
 enum Interaction {
@@ -495,6 +505,9 @@ fn apply_resume(
         .as_ref()
         .and_then(|m| m.get("hive"))
         .ok_or_else(Error::internal_error)?;
+    if let Ok(reference) = serde_json::from_value(hive["session"].clone()) {
+        app.references.insert(id.clone(), reference);
+    }
     let conversation = app.conversations.entry(id.clone()).or_default();
     if let Some(through) = hive["snapshotThroughSeq"].as_u64() {
         // Notifications are drained after this request; marked snapshot entries bypass cursor checks.
@@ -541,6 +554,7 @@ pub struct SessionOperation {
 
 struct SessionOperationResult {
     relinquished: bool,
+    creation_uncertain: Option<bool>,
     outcome: SessionOutcome,
 }
 
@@ -626,6 +640,7 @@ fn start_resume(
         .await;
         let _ = sent.send(SessionOperationResult {
             relinquished,
+            creation_uncertain: None,
             outcome: SessionOutcome::Resume { id, response },
         });
         Ok(())
@@ -640,13 +655,81 @@ fn start_creation(cx: &V2ConnectionTo<Agent>, app: &mut App, profile: String) {
     if app.session_operation.is_some() {
         return;
     }
+    if app.creation_uncertain {
+        app.status =
+            "Creation outcome uncertain; inspect the owner catalog/workspaces, then press u to acknowledge before another launch"
+                .into();
+        return;
+    }
+    let execution_profile = app.execution_profile.clone().or_else(|| {
+        app.launch_owner
+            .as_ref()
+            .and_then(|_| app.providers["defaultProfile"].as_str().map(str::to_owned))
+    });
+    let execution = execution_profile.as_ref().and_then(|id| {
+        app.execution_profiles
+            .iter()
+            .find(|profile| &profile.id == id)
+    });
+    let managed_profile = execution.is_some_and(|profile| !profile.workspaces.is_empty());
+    let selected_agent = if profile.is_empty() {
+        execution.map_or_else(
+            || app.providers["defaultAgent"].as_str(),
+            |execution| {
+                execution
+                    .default_agent
+                    .as_deref()
+                    .or_else(|| {
+                        app.providers["defaultAgent"].as_str().filter(|default| {
+                            execution
+                                .agents
+                                .iter()
+                                .any(|agent| agent.as_str() == *default)
+                        })
+                    })
+                    .or_else(|| (execution.agents.len() == 1).then(|| execution.agents[0].as_str()))
+            },
+        )
+    } else {
+        Some(profile.as_str())
+    };
+    // Automatic owner provisioning can come from the agent rather than a named execution profile.
+    let managed_agent = selected_agent.is_some_and(|id| {
+        app.providers["agents"].as_array().is_some_and(|agents| {
+            agents
+                .iter()
+                .any(|agent| agent["id"] == id && agent["launch"]["workspace"] == "configured")
+        })
+    });
+    if app.launch_owner.is_some()
+        && !app.explicit_cwd
+        && !managed_profile
+        && !managed_agent
+        && app.workspace_launch.is_none()
+    {
+        app.status =
+            "Remote launch needs --cwd with an absolute owner path, or a managed execution profile"
+                .into();
+        return;
+    }
+    if app.launch_owner.is_some()
+        && app.explicit_cwd
+        && !hive_protocol::remote::owner_path_is_absolute(&app.cwd)
+    {
+        app.status = "Remote working directory must be absolute on the owner".into();
+        return;
+    }
     let previous = previous_pilot(app, None);
+    app.creation_target = Some((profile.clone(), app.cwd.clone()));
     let mut meta = v2::Meta::new();
     let mut hive = serde_json::json!({});
+    if let Some(owner) = &app.launch_owner {
+        hive["peer"] = owner.as_str().into();
+    }
     if !profile.is_empty() {
         hive["agent"] = profile.into();
     }
-    if let Some(profile) = &app.execution_profile {
+    if let Some(profile) = &execution_profile {
         hive["profile"] = profile.clone().into();
     }
     meta.insert("hive".into(), hive);
@@ -664,11 +747,14 @@ fn start_creation(cx: &V2ConnectionTo<Agent>, app: &mut App, profile: String) {
         label: "Creating session",
         result,
     });
+    // A dropped creation response is not proof that the owner never launched an agent.
+    app.creation_uncertain = true;
     app.page = Page::Chat;
     app.status = "Creating session…".into();
     let peer = cx.clone();
     if let Err(error) = cx.spawn(async move {
         let mut relinquished = false;
+        let mut uncertain = false;
         let response = async {
             if let Some(previous) = previous {
                 peer.send_request(previous)
@@ -677,14 +763,37 @@ fn start_creation(cx: &V2ConnectionTo<Agent>, app: &mut App, profile: String) {
                     .map_err(|error| resume_failure(&error))?;
                 relinquished = true;
             }
+            uncertain = true;
             peer.send_request(request)
                 .block_task()
                 .await
-                .map_err(|error| error.to_string())
+                .map_err(|error| {
+                    let diagnostic = serde_json::to_value(&error).unwrap_or_default();
+                    let code = diagnostic["data"]["code"].as_str();
+                    // Only an explicit pre-create rejection proves another launch is safe.
+                    if code.is_some_and(|code| {
+                        code.starts_with("hive::remote::")
+                            && !matches!(
+                                code,
+                                "hive::remote::launch_uncertain"
+                                    | "hive::remote::provisioning_uncertain"
+                            )
+                    }) || diagnostic["code"] == -32602
+                    {
+                        uncertain = false;
+                    }
+                    format!(
+                        "{error}{}",
+                        diagnostic["data"]["help"]
+                            .as_str()
+                            .map_or(String::new(), |help| format!(" — {help}"))
+                    )
+                })
         }
         .await;
         let _ = sent.send(SessionOperationResult {
             relinquished,
+            creation_uncertain: Some(uncertain),
             outcome: SessionOutcome::Create(response),
         });
         Ok(())
@@ -708,6 +817,9 @@ fn apply_session_result(
     result: SessionOperationResult,
     label: &str,
 ) -> Option<Result<v2::NewSessionResponse, String>> {
+    if let Some(uncertain) = result.creation_uncertain {
+        app.creation_uncertain = uncertain;
+    }
     if result.relinquished {
         app.owner = None;
     }
@@ -764,7 +876,16 @@ fn apply_session_result(
 fn apply_created(app: &mut App, result: Result<v2::NewSessionResponse, String>) {
     match result {
         Ok(created) => {
+            app.creation_uncertain = false;
             let id = created.session_id.to_string();
+            if let Some(reference) = created
+                .meta
+                .as_ref()
+                .and_then(|meta| meta.get("hive"))
+                .and_then(|hive| serde_json::from_value(hive["session"].clone()).ok())
+            {
+                app.references.insert(id.clone(), reference);
+            }
             let state = app.conversations.entry(id.clone()).or_default();
             state.generation = 1;
             state.pilot_present = true;
@@ -789,17 +910,25 @@ fn apply_created(app: &mut App, result: Result<v2::NewSessionResponse, String>) 
                 .and_then(|meta| meta.get("hive"))
                 .and_then(|hive| hive["workspace"]["effectiveCwd"].as_str())
                 .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| app.cwd.clone());
+                .unwrap_or_else(|| {
+                    app.creation_target
+                        .as_ref()
+                        .map_or_else(|| app.cwd.clone(), |(_, cwd)| cwd.clone())
+                });
             // Catalog refresh may already have discovered this durable pending creation.
             app.sessions.retain(|session| session.session_id != id);
             app.sessions.push(ui::SessionSummary {
                 session_id: id.clone(),
                 cwd,
-                agent: app
-                    .profiles
-                    .get(app.profile_selected)
-                    .cloned()
-                    .unwrap_or_default(),
+                agent: app.creation_target.take().map_or_else(
+                    || {
+                        app.profiles
+                            .get(app.profile_selected)
+                            .cloned()
+                            .unwrap_or_default()
+                    },
+                    |(agent, _)| agent,
+                ),
                 title: None,
                 lifecycle: "active".into(),
                 recovery: None,
@@ -856,56 +985,310 @@ fn apply_update(app: &mut App, update: v2::UpdateSessionNotification) -> bool {
     true
 }
 
-async fn refresh(client: &reqwest::Client, address: &str, app: &mut App) -> Result<(), String> {
-    let catalog = load_catalog(client, address).await?;
+async fn refresh(peer: &hive_protocol::remote::Peer, app: &mut App) -> Result<(), String> {
+    let catalog = load_catalog(peer, app.launch_owner.clone()).await?;
+    let inventory_error = catalog.providers.as_ref().err().cloned();
     apply_catalog(app, catalog);
+    inventory_error.map_or(Ok(()), Err)
+}
+
+#[derive(Debug, thiserror::Error)]
+enum InitialSelectionError {
+    #[error(
+        "Execution profile '{0}' is unavailable on the selected owner; refresh its inventory and choose a configured profile"
+    )]
+    Profile(String),
+    #[error(
+        "Agent '{0}' is unavailable in the selected owner/profile; refresh its inventory and choose a member agent"
+    )]
+    Agent(String),
+}
+
+fn apply_initial_selection(
+    app: &mut App,
+    profile: Option<&str>,
+    agent: Option<&str>,
+    attaching: bool,
+) -> Result<(), InitialSelectionError> {
+    if let Some(profile) = profile {
+        if !app
+            .execution_profiles
+            .iter()
+            .any(|entry| entry.id == profile)
+        {
+            return Err(InitialSelectionError::Profile(profile.into()));
+        }
+        select_execution_profile(app, Some(profile.into()));
+        app.page = Page::Profiles;
+    }
+    if let Some(agent) = agent {
+        app.profile_selected = app
+            .profiles
+            .iter()
+            .position(|id| id == agent)
+            .ok_or_else(|| InitialSelectionError::Agent(agent.into()))?;
+        if !attaching {
+            app.page = Page::Profiles;
+        }
+    }
     Ok(())
+}
+
+fn attachment_target(
+    app: &App,
+    session: Option<&str>,
+    owner: Option<&hive_core::identity::NodeId>,
+    reconnecting: bool,
+) -> Option<(String, Option<hive_protocol::remote::SessionReference>)> {
+    if reconnecting && let Some(id) = &app.active {
+        return Some((id.clone(), app.references.get(id).cloned()));
+    }
+    let id = session.map(str::to_owned).or_else(|| app.active.clone())?;
+    // An explicit owner scopes a native ID; a colliding gateway catalog key cannot override it.
+    let reference = owner
+        .map(|owner| hive_protocol::remote::SessionReference {
+            owner: owner.clone(),
+            id: id.clone(),
+        })
+        .or_else(|| app.references.get(&id).cloned());
+    Some((id, reference))
+}
+
+async fn restore_attachment(
+    peer: &hive_protocol::remote::Peer,
+    app: &mut App,
+    session: Option<&str>,
+    owner: Option<&hive_core::identity::NodeId>,
+    reconnecting: bool,
+) {
+    let Some((id, reference)) = attachment_target(app, session, owner, reconnecting) else {
+        return;
+    };
+    let location = if let Some(reference) = reference {
+        match peer.resolve(reference.clone()).await {
+            Ok(location) => {
+                // CLI native IDs are not route keys unless an authoritative mapping proves equality.
+                if app.references.get(&id) == Some(&reference) {
+                    app.relocate(&id, &location.session_id);
+                }
+                app.references
+                    .insert(location.session_id.clone(), location.session);
+                Some((location.session_id, location.cwd.0))
+            }
+            Err(error) => {
+                app.owner = None;
+                app.status = resume_failure(&error);
+                None
+            }
+        }
+    } else {
+        let cwd = app
+            .sessions
+            .iter()
+            .find(|session| session.session_id == id)
+            .map_or_else(|| app.cwd.clone(), |session| session.cwd.clone());
+        Some((id, cwd))
+    };
+    if let Some((id, cwd)) = location {
+        let mode = if reconnecting { "observe" } else { "pilot" };
+        if let Err(error) = resume(peer.connection(), app, id, cwd, mode).await {
+            app.status = resume_failure(&error);
+        }
+    }
+    // An owner attachment failure leaves the healthy gateway usable for navigation and other sessions.
 }
 
 struct Catalog {
     snapshot: SessionSnapshot,
-    providers: serde_json::Value,
+    providers: Result<serde_json::Value, String>,
+    owners: Vec<serde_json::Value>,
+    references: BTreeMap<String, hive_protocol::remote::SessionReference>,
+    availability: BTreeMap<String, String>,
+    owner: Option<hive_core::identity::NodeId>,
+    partial: bool,
 }
 
-async fn load_catalog(client: &reqwest::Client, address: &str) -> Result<Catalog, String> {
-    let response = client
-        .get(format!("{address}/v1/sessions"))
-        .send()
-        .await
-        .map_err(|error| error.to_string())?
-        .error_for_status()
-        .map_err(|error| error.to_string())?;
-    let snapshot: SessionSnapshot = response.json().await.map_err(|error| error.to_string())?;
-    let providers = client
-        .get(format!("{address}/v1/providers"))
-        .send()
-        .await
-        .map_err(|error| error.to_string())?
-        .error_for_status()
-        .map_err(|error| error.to_string())?
-        .json()
-        .await
-        .map_err(|error| error.to_string())?;
+async fn load_catalog(
+    peer: &hive_protocol::remote::Peer,
+    owner: Option<hive_core::identity::NodeId>,
+) -> Result<Catalog, String> {
+    let mut sessions = Vec::new();
+    let mut references = BTreeMap::new();
+    let mut availability = BTreeMap::new();
+    let mut partial = false;
+    let mut request = v2::ListSessionsRequest::new();
+    let mut cursors = std::collections::HashSet::new();
+    loop {
+        let page = peer
+            .connection()
+            .send_request(request)
+            .block_task()
+            .await
+            .map_err(|error| error.to_string())?;
+        partial |= page
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("hive"))
+            .is_some_and(|hive| hive["partial"] == true);
+        for entry in page.sessions {
+            let entry = serde_json::to_value(entry).map_err(|error| error.to_string())?;
+            let mut summary = entry["_meta"]["hive"]
+                .as_object()
+                .cloned()
+                .unwrap_or_default();
+            // Nested metadata can contain an owner's native ID; operations need the gateway alias.
+            summary.insert("sessionId".into(), entry["sessionId"].clone());
+            summary.insert("cwd".into(), entry["cwd"].clone());
+            if entry["title"].is_string() {
+                summary.insert("title".into(), entry["title"].clone());
+            }
+            let id = entry["sessionId"].as_str().unwrap_or_default().to_owned();
+            if let Ok(reference) = serde_json::from_value(entry["_meta"]["hive"]["session"].clone())
+            {
+                references.insert(id.clone(), reference);
+            }
+            if let Some(value) = entry["_meta"]["hive"]["availability"].as_str() {
+                availability.insert(id, value.to_owned());
+            }
+            sessions.push(
+                serde_json::from_value(serde_json::Value::Object(summary))
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        let Some(cursor) = page.next_cursor else {
+            break;
+        };
+        if !cursors.insert(cursor.clone()) {
+            return Err("Session inventory repeated a cursor; refresh discovery".into());
+        }
+        request = v2::ListSessionsRequest::new().cursor(cursor);
+    }
+    let owners = if peer.has_peers() {
+        peer.list_peers().await.map_err(|error| error.to_string())?["peers"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    let providers = load_inventory(peer, owner.as_ref()).await;
+    let snapshot = SessionSnapshot { sessions };
     Ok(Catalog {
         snapshot,
         providers,
+        owners,
+        references,
+        availability,
+        owner,
+        partial,
     })
 }
 
+async fn load_inventory(
+    peer: &hive_protocol::remote::Peer,
+    owner: Option<&hive_core::identity::NodeId>,
+) -> Result<serde_json::Value, String> {
+    let mut providers = serde_json::json!({"agents": [], "profiles": []});
+    let mut params = hive_protocol::remote::ListParams::default();
+    let mut cursors = std::collections::HashSet::new();
+    loop {
+        let page = match owner {
+            Some(owner) => peer.list_at(owner, params).await,
+            None => peer.list(params).await,
+        }
+        .map_err(|error| error.to_string())?;
+        providers["defaultAgent"] = serde_json::to_value(page.default_agent).unwrap_or_default();
+        providers["agents"].as_array_mut().expect("array").extend(
+            page.agents
+                .into_iter()
+                .map(|agent| serde_json::to_value(agent).expect("agent serializes")),
+        );
+        let Some(cursor) = page.next_cursor else {
+            break;
+        };
+        if !cursors.insert(cursor.clone()) {
+            return Err("Agent inventory repeated a cursor; refresh discovery".into());
+        }
+        params = hive_protocol::remote::ListParams {
+            cursor: Some(cursor),
+            limit: None,
+        };
+    }
+    if peer.has_profiles() {
+        let mut params = hive_protocol::remote::ListParams::default();
+        let mut cursors = std::collections::HashSet::new();
+        loop {
+            let page = match owner {
+                Some(owner) => peer.list_profiles_at(owner, params).await,
+                None => peer.list_profiles(params).await,
+            }
+            .map_err(|error| error.to_string())?;
+            providers["defaultProfile"] =
+                serde_json::to_value(page.default_profile).unwrap_or_default();
+            providers["profiles"].as_array_mut().expect("array").extend(
+                page.profiles
+                    .into_iter()
+                    .map(|profile| serde_json::to_value(profile).expect("profile serializes")),
+            );
+            let Some(cursor) = page.next_cursor else {
+                break;
+            };
+            if !cursors.insert(cursor.clone()) {
+                return Err("Profile inventory repeated a cursor; refresh discovery".into());
+            }
+            params = hive_protocol::remote::ListParams {
+                cursor: Some(cursor),
+                limit: None,
+            };
+        }
+    }
+    Ok(providers)
+}
+
 fn apply_catalog(app: &mut App, catalog: Catalog) {
+    if catalog.partial {
+        app.status = "Session list incomplete: some configured owners are unavailable; cached sessions remain visible".into();
+    }
+    for (route, reference) in &catalog.references {
+        if let Some(old) = app
+            .references
+            .iter()
+            .find_map(|(id, known)| (known == reference && id != route).then(|| id.clone()))
+        {
+            app.relocate(&old, route);
+        }
+    }
+    app.references.extend(catalog.references);
+    app.availability = catalog.availability.into_iter().collect();
+    app.owners = catalog.owners;
     let sessions = catalog
         .snapshot
         .sessions
         .into_iter()
         .filter(|s| {
             app.all
-                || s.cwd == app.cwd
+                || (s.cwd == app.cwd
+                    && app.references.get(&s.session_id).is_none_or(|reference| {
+                        app.launch_owner.as_ref().map_or_else(
+                            || {
+                                app.peer
+                                    .as_ref()
+                                    .is_none_or(|peer| peer.node == reference.owner.as_str())
+                            },
+                            |owner| owner == &reference.owner,
+                        )
+                    }))
                 || app.active.as_deref() == Some(s.session_id.as_str())
                 || app.recent.contains(&s.session_id)
         })
         .collect();
     app.update_sessions(sessions);
-    update_profiles(app, &catalog.providers);
+    if app.launch_owner == catalog.owner {
+        match catalog.providers {
+            Ok(providers) => update_profiles(app, &providers),
+            Err(error) => app.status = format!("Agent inventory unavailable: {error}"),
+        }
+    }
 }
 
 fn update_profiles(app: &mut App, providers: &serde_json::Value) {
@@ -1153,6 +1536,50 @@ async fn handle_key(
     _created: mpsc::UnboundedSender<Result<v2::NewSessionResponse, String>>,
 ) -> bool {
     if key.kind == KeyEventKind::Release {
+        return false;
+    }
+    if interaction.is_none()
+        && app.dialog.is_none()
+        && let Some(mut input) = app.launch_cwd_input.take()
+    {
+        match key.code {
+            KeyCode::Esc => return false,
+            KeyCode::Enter => {
+                let path = std::path::PathBuf::from(&input);
+                if app.launch_owner.is_some()
+                    && !hive_protocol::remote::owner_path_is_absolute(&path)
+                {
+                    app.status = "Enter an absolute directory on the selected owner".into();
+                    app.launch_cwd_input = Some(input);
+                } else {
+                    match if app.launch_owner.is_some() {
+                        Ok(path)
+                    } else {
+                        std::path::absolute(path)
+                    } {
+                        Ok(path) => {
+                            app.cwd = path.clone();
+                            app.explicit_cwd = true;
+                            app.workspace_launch =
+                                Some(hive_protocol::workspace::Launch::Existing {
+                                    directory: path.display().to_string(),
+                                });
+                        }
+                        Err(error) => {
+                            app.status = error.to_string();
+                            app.launch_cwd_input = Some(input);
+                        }
+                    }
+                }
+                return false;
+            }
+            KeyCode::Backspace => {
+                input.pop();
+            }
+            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => input.push(ch),
+            _ => {}
+        }
+        app.launch_cwd_input = Some(input);
         return false;
     }
     restore_draft(app);
@@ -1576,6 +2003,53 @@ async fn handle_key(
                 .map(|profile| profile.id.clone());
             select_execution_profile(app, profile);
         }
+        (KeyCode::Char('o'), _) if app.page == Page::Profiles => {
+            let next = app
+                .launch_owner
+                .as_ref()
+                .and_then(|owner| {
+                    app.owners
+                        .iter()
+                        .position(|peer| peer["owner"] == owner.as_str())
+                })
+                .map_or(0, |index| index + 1);
+            app.launch_owner = app
+                .owners
+                .get(next)
+                .and_then(|peer| peer["owner"].as_str())
+                .and_then(|owner| hive_core::identity::NodeId::try_from(owner.to_owned()).ok());
+            app.execution_profile = None;
+            app.explicit_cwd = false;
+            app.workspace_launch = None;
+            app.cwd = if app.launch_owner.is_some() {
+                "/".into()
+            } else {
+                std::env::current_dir().unwrap_or_else(|_| "/".into())
+            };
+            app.profiles.clear();
+            app.execution_profiles.clear();
+            app.providers = serde_json::Value::Null;
+            app.refresh_requested = true;
+            app.status = format!(
+                "Launch owner: {}",
+                app.launch_owner
+                    .as_ref()
+                    .map_or("Local", |owner| owner.as_str())
+            );
+        }
+        (KeyCode::Char('d'), _) if app.page == Page::Profiles => {
+            app.launch_cwd_input = Some(if app.explicit_cwd {
+                app.cwd.display().to_string()
+            } else {
+                String::new()
+            });
+        }
+        (KeyCode::Char('u'), _) if app.page == Page::Profiles && app.creation_uncertain => {
+            // This explicit acknowledgement permits new intent without claiming the prior launch failed.
+            app.creation_uncertain = false;
+            app.status =
+                "Uncertain launch acknowledged; a new launch may create another session".into();
+        }
         (KeyCode::Char('a'), _) if app.page == Page::Sessions => {
             app.all = !app.all;
             app.refresh_requested = true;
@@ -1682,6 +2156,14 @@ fn paste(app: &mut App, interaction: &Option<Interaction>, value: &str) {
             return;
         }
     };
+    if interaction.is_none()
+        && app.dialog.is_none()
+        && let Some(input) = &mut app.launch_cwd_input
+    {
+        // Pasted newlines are path data to review, never Enter presses that save or launch.
+        input.push_str(&value.replace('\n', " "));
+        return;
+    }
     if let Some(Interaction::Elicitation(request, _, draft)) = interaction {
         if FormDraft::fields(request)
             .get(draft.field)
@@ -2109,19 +2591,37 @@ async fn run_with_clipboard(
     mut clipboard: clipboard::Clipboard,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut app = App {
+        launch_owner: options.owner.clone(),
+        explicit_cwd: options.cwd.is_some(),
         terminal_capabilities: capabilities::TerminalCapabilities::detect(&options.terminal),
         cwd: options
             .cwd
             .clone()
-            .map(std::path::absolute)
+            .map(|path| {
+                if options.owner.is_some() {
+                    Ok(path)
+                } else {
+                    std::path::absolute(path)
+                }
+            })
             .transpose()?
-            .unwrap_or(std::env::current_dir()?),
+            .unwrap_or(if options.owner.is_some() {
+                "/".into()
+            } else {
+                std::env::current_dir()?
+            }),
         all: true,
         ..App::default()
     };
     app.workspace_launch = if let Some(directory) = &options.cwd {
         Some(hive_protocol::workspace::Launch::Existing {
-            directory: std::path::absolute(directory)?.display().to_string(),
+            directory: if options.owner.is_some() {
+                directory.clone()
+            } else {
+                std::path::absolute(directory)?
+            }
+            .display()
+            .to_string(),
         })
     } else if let Some(id) = &options.workspace_id {
         Some(hive_protocol::workspace::Launch::Attach {
@@ -2146,40 +2646,6 @@ async fn run_with_clipboard(
         None
     };
     let credentials = hive_protocol::transport::Credentials::native()?;
-    let http = credentials.http(Duration::from_secs(5))?;
-    let scheme = if matches!(options.transport.as_str(), "https" | "wss") {
-        "https"
-    } else {
-        "http"
-    };
-    let operational = format!("{scheme}://{}", options.address);
-    let providers: serde_json::Value = http
-        .get(format!("{operational}/v1/providers"))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    update_profiles(&mut app, &providers);
-    if let Some(profile) = &options.profile {
-        if !app
-            .execution_profiles
-            .iter()
-            .any(|entry| &entry.id == profile)
-        {
-            return Err(
-                format!("unknown execution profile '{profile}'; query GET /v1/providers").into(),
-            );
-        }
-        select_execution_profile(&mut app, Some(profile.clone()));
-        app.page = Page::Profiles;
-    }
-    if let Some(agent) = &options.agent {
-        if options.session.is_none() {
-            app.page = Page::Profiles;
-        }
-        app.profile_selected = app.profiles.iter().position(|id| id == agent).ok_or_else(|| format!("agent '{agent}' is unavailable in the selected profile; query GET /v1/providers"))?;
-    }
     let mut guard = TerminalGuard::enter()?;
     let mut terminal =
         ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))?;
@@ -2205,30 +2671,34 @@ async fn run_with_clipboard(
     let mut editor_prefix: Option<std::time::Instant> = None;
     let mut quit = false;
     let mut connected_once = false;
+    let mut selection_error = None;
     while !quit {
         let url = format!("{}://{}", options.transport, options.address);
         let (updates_tx, mut updates) = mpsc::unbounded_channel();
         let (interaction_tx, mut interactions) = mpsc::unbounded_channel();
         let (completion_tx, mut completions) = mpsc::unbounded_channel();
         let result = interaction_client(updates_tx, interaction_tx, completion_tx, credentials.acp(&url)?, async |cx| {
-                cx.send_request(v2::InitializeRequest::new(ProtocolVersion::V2,
+                 let peer = hive_protocol::remote::Peer::initialize(cx.clone(), v2::InitializeRequest::new(ProtocolVersion::V2,
                     v2::Implementation::new("hive-tui", env!("CARGO_PKG_VERSION")))
                     .capabilities(v2::ClientCapabilities::new().elicitation(v2::ElicitationCapabilities::new()
                         .form(v2::ElicitationFormCapabilities::new()).url(v2::ElicitationUrlCapabilities::new()))))
-                    .block_task().await?;
-                 let reconnecting = connected_once;
-                 connected_once = true;
-                 app.connected = true;
-                 if let Err(error) = refresh(&http, &operational, &mut app).await { app.status = error; }
-                 if !reconnecting && app.page == Page::Profiles && app.active.is_none() {
-                    app.profile_selected = options.agent.as_ref().and_then(|agent| app.profiles.iter().position(|id| id == agent)).unwrap_or(0);
-                }
-                let initial = app.active.clone().or_else(|| options.session.clone());
-                if let Some(id) = initial {
-                     let cwd = app.sessions.iter().find(|s| s.session_id == id).map_or_else(|| app.cwd.clone(), |s| s.cwd.clone());
-                     let mode = if reconnecting { "observe" } else { "pilot" };
-                     if let Err(error) = resume(&cx, &mut app, id, cwd, mode).await { app.status = resume_failure(&error); }
-                }
+                 .await?;
+                  let reconnecting = connected_once;
+                  app.connected = true;
+                  app.peer = Some(peer.clone());
+                  if app.launch_owner.as_ref().is_some_and(|owner| owner.as_str() == peer.node) { app.launch_owner = None; }
+                  if let Err(error) = refresh(&peer, &mut app).await {
+                      app.status = error.clone();
+                      // Failed discovery is retryable, but must not consume explicit startup selectors.
+                      if !reconnecting && (options.profile.is_some() || options.agent.is_some()) { return Err(Error::internal_error().data(error)); }
+                  }
+                  if !reconnecting && let Err(error) = apply_initial_selection(&mut app, options.profile.as_deref(), options.agent.as_deref(), options.session.is_some()) {
+                          let message = error.to_string();
+                          selection_error = Some(error);
+                          return Err(Error::invalid_params().data(message));
+                  }
+                  connected_once = true;
+                  restore_attachment(&peer, &mut app, options.session.as_deref(), options.owner.as_ref(), reconnecting).await;
                    let (ack_tx, mut ack_rx) = mpsc::unbounded_channel::<PromptAck>();
                   let (created_tx, mut created_rx) = mpsc::unbounded_channel::<Result<v2::NewSessionResponse, String>>();
                  // Observe after reconnect; Ctrl-L explicitly retrieves a pending receipt.
@@ -2255,10 +2725,10 @@ async fn run_with_clipboard(
                     if app.refresh_requested && !refreshing {
                         app.refresh_requested = false;
                         refreshing = true;
-                        let client = http.clone();
-                        let address = operational.clone();
+                         let client = peer.clone();
+                         let owner = app.launch_owner.clone();
                         let results = catalog_tx.clone();
-                        tokio::spawn(async move { let _ = results.send(load_catalog(&client, &address).await); });
+                         cx.spawn(async move { let _ = results.send(load_catalog(&client, owner).await); Ok(()) })?;
                     }
                     if let Some(receiver) = app.configuration.as_mut() {
                         match receiver.try_recv() {
@@ -2495,6 +2965,8 @@ async fn run_with_clipboard(
                 Ok(())
             }).await;
         app.connected = false;
+        app.peer = None;
+        app.owner = None;
         // Reconnecting the transport alone cannot make cached activity authoritative again.
         // A successful attachment clears this fence; failed resumes must not revive old work.
         for conversation in app.conversations.values_mut() {
@@ -2513,7 +2985,7 @@ async fn run_with_clipboard(
         if app.dialog.take().is_some() {
             app.input.clear();
         }
-        if quit {
+        if quit || selection_error.is_some() {
             break;
         }
         // Network failures can embed arbitrary server bodies; display only the protocol code.
@@ -2532,6 +3004,9 @@ async fn run_with_clipboard(
     }
     keys.close();
     reader.await?;
+    if let Some(error) = selection_error {
+        return Err(error.into());
+    }
     Ok(())
 }
 

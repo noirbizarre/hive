@@ -114,7 +114,8 @@ jobs:
           name: webui-dist
           path: clients/hive-web/dist/
       # Setup precedes caches so their post-save hooks run before the drive is dismounted.
-      - uses: ./.github/actions/setup-windows
+      - name: Tune Windows runner
+        uses: ./.github/actions/setup-windows
         if: runner.os == 'Windows'
 
       - uses: dtolnay/rust-toolchain@stable
@@ -149,6 +150,20 @@ jobs:
           cargo llvm-cov clean --workspace
           cargo llvm-cov nextest --profile ci --no-report
           cargo llvm-cov report --lcov --output-path lcov.info
+
+      # Keep raw inputs even when a corrupt profile prevents generating lcov.info.
+      - name: Upload coverage artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-${{ matrix.os.flag }}-${{ github.run_attempt }}
+          path: |
+            lcov.info
+            target/llvm-cov-target/*.profraw
+            target/llvm-cov-target/*.profdata
+            target/llvm-cov-target/*-profraw-list
+          retention-days: 7
+          if-no-files-found: warn
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v7

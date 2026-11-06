@@ -7,6 +7,7 @@ pub mod recovery;
 pub mod remote;
 pub mod transport;
 pub mod workspace;
+pub mod workspace_tools;
 pub use agent_client_protocol_http::{AcpHttpServer, HttpClient};
 
 /// Controlled diagnostics must never echo arbitrary provider payloads into retained session history.

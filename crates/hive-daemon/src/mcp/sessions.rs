@@ -13,12 +13,105 @@ use super::{
 
 #[derive(Default)]
 pub(crate) struct Sessions {
+    operations: Mutex<HashMap<String, SessionOperations>>,
     pub(crate) configured: Mutex<HashMap<String, super::routing::Bindings>>,
     pub(crate) pending: Arc<Mutex<HashMap<String, PendingTarget>>>,
     bindings: Mutex<HashMap<String, Vec<SessionMcpLease>>>,
     retired: Mutex<HashMap<String, Vec<watch::Receiver<bool>>>>,
     cleanup: Mutex<Vec<watch::Receiver<bool>>>,
     pub(crate) admission: tokio::sync::Mutex<()>,
+}
+
+struct Operation {
+    cancel: watch::Sender<bool>,
+    done: watch::Receiver<bool>,
+}
+
+#[derive(Default)]
+struct SessionOperations {
+    providers: Vec<Weak<std::sync::atomic::AtomicBool>>,
+    calls: Vec<Operation>,
+}
+
+impl SessionOperations {
+    fn cancel(&self) {
+        for active in self.providers.iter().filter_map(Weak::upgrade) {
+            active.store(false, std::sync::atomic::Ordering::Release);
+        }
+        for call in &self.calls {
+            call.cancel.send_replace(true);
+        }
+    }
+}
+
+/// Both subprocess and built-in requests publish work under the same close/shutdown fence.
+pub(super) fn with_authority<T>(
+    registry: &Mutex<crate::reload::Registry>,
+    sessions: &Mutex<HashMap<String, crate::Entry>>,
+    pending: &Mutex<HashMap<String, PendingTarget>>,
+    session: &str,
+    expected: Option<&Arc<Mutex<crate::Control>>>,
+    work: impl FnOnce(&crate::Control, &crate::reload::Registry) -> Result<T, RuntimeError>,
+) -> Result<T, RuntimeError> {
+    let registry = registry.lock().map_err(|_| RuntimeError::Binding)?;
+    if registry.stopping {
+        return Err(RuntimeError::Stopping);
+    }
+    let sessions = sessions.lock().map_err(|_| RuntimeError::Binding)?;
+    let pending = pending.lock().map_err(|_| RuntimeError::Binding)?;
+    let control = sessions
+        .get(session)
+        .map(|entry| &entry.control)
+        .or_else(|| pending.get(session).map(|entry| &entry.control))
+        .ok_or(RuntimeError::Binding)?;
+    if expected.is_some_and(|expected| !Arc::ptr_eq(control, expected)) {
+        return Err(RuntimeError::Binding);
+    }
+    let control = control.lock().map_err(|_| RuntimeError::Binding)?;
+    if control.closing || control.activity.session == "ended" {
+        return Err(RuntimeError::Binding);
+    }
+    work(&control, &registry)
+}
+
+/// Registration happens under the same control fence as lease requests, before work can publish.
+impl Sessions {
+    pub(crate) fn bind_provider(
+        &self,
+        session: &str,
+    ) -> Result<Arc<std::sync::atomic::AtomicBool>, RuntimeError> {
+        let mut all = self.operations.lock().map_err(|_| RuntimeError::Binding)?;
+        let operations = all.entry(session.into()).or_default();
+        operations
+            .providers
+            .retain(|provider| provider.strong_count() != 0);
+        let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        operations.providers.push(Arc::downgrade(&active));
+        Ok(active)
+    }
+
+    pub(crate) fn track_operation(
+        &self,
+        session: &str,
+        active: &std::sync::atomic::AtomicBool,
+    ) -> Result<(watch::Receiver<bool>, watch::Sender<bool>), RuntimeError> {
+        let mut all = self.operations.lock().map_err(|_| RuntimeError::Binding)?;
+        if !active.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(RuntimeError::Binding);
+        }
+        let calls = &mut all.entry(session.into()).or_default().calls;
+        calls.retain(|call| !*call.done.borrow());
+        if calls.len() >= 64 {
+            return Err(RuntimeError::Busy);
+        }
+        let (cancel, cancelled) = watch::channel(false);
+        let (done, completed) = watch::channel(false);
+        calls.push(Operation {
+            cancel,
+            done: completed,
+        });
+        Ok((cancelled, done))
+    }
 }
 
 struct Binding {
@@ -131,31 +224,24 @@ impl SessionMcpLease {
 
     pub fn request(&self, request: McpRequest) -> Result<McpCall, RuntimeError> {
         let admission = self.0.admission.upgrade().ok_or(RuntimeError::Binding)?;
-        // Match Broker admission lock order so shutdown fences bindings and calls together.
-        let admission = admission.lock().map_err(|_| RuntimeError::Binding)?;
-        if admission.stopping {
-            return Err(RuntimeError::Stopping);
-        }
         let sessions = self.0.sessions.upgrade().ok_or(RuntimeError::Binding)?;
-        let sessions = sessions.lock().map_err(|_| RuntimeError::Binding)?;
         let pending = self.0.pending.upgrade().ok_or(RuntimeError::Binding)?;
-        let pending = pending.lock().map_err(|_| RuntimeError::Binding)?;
-        let control = sessions
-            .get(&self.0.session)
-            .map(|entry| &entry.control)
-            .or_else(|| pending.get(&self.0.session).map(|target| &target.control))
-            .ok_or(RuntimeError::Binding)?;
-        let control = control.lock().map_err(|_| RuntimeError::Binding)?;
-        if control.closing || control.activity.session == "ended" {
-            return Err(RuntimeError::Binding);
-        }
-        let mut state = self.0.state.lock().map_err(|_| RuntimeError::Binding)?;
-        let lease = state.lease.as_ref().ok_or(RuntimeError::Binding)?;
-        // Register cancellation under the close fence before the spawned request can publish.
-        let call = lease.request(request);
-        state.calls.retain(|(_, done)| !*done.borrow());
-        state.calls.push((call.cancel.clone(), call.done.clone()));
-        Ok(call)
+        with_authority(
+            &admission,
+            &sessions,
+            &pending,
+            &self.0.session,
+            None,
+            |_, _| {
+                let mut state = self.0.state.lock().map_err(|_| RuntimeError::Binding)?;
+                let lease = state.lease.as_ref().ok_or(RuntimeError::Binding)?;
+                // Register cancellation under the close fence before the spawned request can publish.
+                let call = lease.request(request);
+                state.calls.retain(|(_, done)| !*done.borrow());
+                state.calls.push((call.cancel.clone(), call.done.clone()));
+                Ok(call)
+            },
+        )
     }
 }
 
@@ -346,19 +432,37 @@ impl Sessions {
     }
 
     pub(crate) fn finish(&self, session: &str) -> Vec<watch::Receiver<bool>> {
+        let builtin = self
+            .operations
+            .lock()
+            .expect("MCP operations lock poisoned")
+            .remove(session)
+            .unwrap_or_default();
+        builtin.cancel();
         self.configured
             .lock()
             .expect("MCP configured bindings lock poisoned")
             .remove(session);
         self.release(session, None);
-        self.retired
+        let mut pending = self
+            .retired
             .lock()
             .expect("MCP retired operations lock poisoned")
             .remove(session)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        pending.extend(builtin.calls.into_iter().map(|call| call.done));
+        pending
     }
 
     pub(crate) fn cancel(&self, session: &str) {
+        if let Some(operations) = self
+            .operations
+            .lock()
+            .expect("MCP operations lock poisoned")
+            .get(session)
+        {
+            operations.cancel();
+        }
         let all = self
             .bindings
             .lock()
@@ -374,6 +478,19 @@ impl Sessions {
     }
 
     pub(crate) fn clear(&self) {
+        let mut operations = self
+            .operations
+            .lock()
+            .expect("MCP operations lock poisoned");
+        let mut cleanup = self.cleanup.lock().expect("MCP cleanup lock poisoned");
+        for (_, operations) in operations.drain() {
+            operations.cancel();
+            for call in operations.calls {
+                cleanup.push(call.done);
+            }
+        }
+        drop(cleanup);
+        drop(operations);
         self.configured
             .lock()
             .expect("MCP configured bindings lock poisoned")

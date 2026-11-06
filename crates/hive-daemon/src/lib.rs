@@ -3296,9 +3296,11 @@ async fn run_agent(
                 )))
                 .block_task()
                 .await;
+            let workspace_transport;
             match initialized {
                 Ok(agent_client_protocol::InitializeOutcome::Initialized(response)) if response.protocol_version == ProtocolVersion::V2 && response.capabilities.session.is_some() => {
                     let capabilities = response.capabilities.session.as_ref().and_then(|s| s.mcp.as_ref());
+                    workspace_transport = capabilities.is_some_and(|c| c.acp.is_some());
                     let managed = selected_mcp.values().any(|s| s.managed());
                     let configured_http = selected_mcp.values().any(|s| !s.managed());
                     if (managed && capabilities.is_none_or(|c| c.acp.is_none()))
@@ -3328,12 +3330,16 @@ async fn run_agent(
                     return Ok(());
                 }
             }
-            if let Err(error) = mcp::routing::forward_http(&selected_mcp, &mut request.mcp_servers) {
+            let workspace_enabled = workspace_transport && match mcp::workspace::Provider::prepare(&mcp_broker, &hive_id) {
+                Ok(provider) => provider.is_some(),
+                Err(error) => { let _ = ready.send(Err(mcp::routing::diagnostic(error))); return Ok(()); }
+            };
+            if let Err(error) = mcp::routing::forward_http_with_builtin(&selected_mcp, &mut request.mcp_servers, workspace_enabled) {
                 let _ = ready.send(Err(mcp::routing::diagnostic(error)));
                 return Ok(());
             }
             if let Ok(mut state) = control.lock() { state.startup_phase += 1; }
-            let aggregate = match mcp::routing::Aggregate::prepare(&mcp_broker, &hive_id, selected_mcp).await {
+            let aggregate = match mcp::routing::Aggregate::prepare_with_workspace(&mcp_broker, &hive_id, selected_mcp, workspace_enabled).await {
                 Ok(aggregate) => aggregate,
                 Err(error) => { let _ = ready.send(Err(error)); return Ok(()); }
             };

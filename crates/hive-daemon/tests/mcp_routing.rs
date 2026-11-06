@@ -91,6 +91,133 @@ fn events(directory: &Path, id: &str) -> Vec<Value> {
 }
 
 #[tokio::test]
+async fn built_in_workspace_tools_work_alone_and_beside_paginated_user_tools_during_setup() {
+    for managed in [false, true] {
+        for scheme in ["ws", "http"] {
+            let temporary = tempfile::tempdir().unwrap();
+            let directory = temporary.path().canonicalize().unwrap();
+            let mut config = config(&directory, false, "routing");
+            config.projects.insert(
+                "demo".to_owned().try_into().unwrap(),
+                serde_json::from_value(json!({"name":"Demo"})).unwrap(),
+            );
+            config.workspaces.insert(
+                "task".into(),
+                serde_json::from_value(json!({"policy":"existing","directory":directory})).unwrap(),
+            );
+            let agent = config.agents.get_mut("test").unwrap();
+            agent.project = Some("demo".to_owned().try_into().unwrap());
+            agent.workspace = Some("task".into());
+            agent.env.insert("HIVE_WORKSPACE_TOOLS".into(), "1".into());
+            if !managed {
+                agent.mcp_servers.clear();
+            }
+            if managed {
+                // A user's identically named tool remains addressable through its existing alias.
+                for id in ["a", "b"] {
+                    std::fs::write(directory.join(format!("{id}.jsonl.builtin-name")), b"")
+                        .unwrap();
+                }
+            }
+            config.validate().unwrap();
+            let broker =
+                Broker::persistent(config, directory.join("state/catalog.sqlite3")).unwrap();
+            let (address, server) = serve(broker.clone()).await;
+            let opened = create(address, scheme, &directory).await.unwrap();
+            let report = report(&directory);
+            let context = &opened.meta.as_ref().unwrap()["hive"]["workspace"];
+            let capabilities = &report["workspace"]["structuredContent"];
+            assert_eq!(capabilities["workspace"], context["workspace"]);
+            assert_eq!(capabilities["owner"], context["owner"]);
+            assert_eq!(capabilities["project"], "demo");
+            assert_eq!(capabilities["repositoryBackend"], Value::Null);
+            assert_eq!(capabilities["provisioner"], "external.directory");
+            assert_eq!(capabilities["schemaVersion"], 1);
+            assert_eq!(
+                capabilities["tools"],
+                json!([{"name":"hive.workspace.capabilities","schemaVersion":1,"effect":"read_only"}])
+            );
+            assert_eq!(report["workspaceDirect"], report["workspace"]);
+            assert_eq!(report["workspace"]["resultType"], "complete");
+            let text: Value =
+                serde_json::from_str(report["workspace"]["content"][0]["text"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(&text, capabilities);
+            for key in ["workspaceArguments", "workspaceNull"] {
+                assert_eq!(
+                    report[key]["innerError"]["error"]["data"]["code"],
+                    "hive::workspace_tools::arguments"
+                );
+            }
+            assert_eq!(
+                report["workspaceUnsupported"]["innerError"]["error"]["data"]["code"],
+                "hive::workspace_tools::unsupported"
+            );
+            let tools = report["lists"]["tools"].as_array().unwrap();
+            assert_eq!(tools.len(), if managed { 7 } else { 1 });
+            assert_eq!(tools[0]["name"], "hive.workspace.capabilities");
+            assert!(
+                tools[1..]
+                    .iter()
+                    .all(|tool| tool["name"].as_str().unwrap().starts_with("hive_t_"))
+            );
+            if managed {
+                assert!(
+                    tools
+                        .iter()
+                        .any(|tool| tool["title"] == "a: hive.workspace.capabilities")
+                );
+            }
+            assert_eq!(
+                report["calls"].as_array().unwrap().len(),
+                if managed { 4 } else { 0 }
+            );
+            assert!(!report.to_string().contains("backend-private-cursor"));
+            broker.shutdown().await;
+            server.abort();
+        }
+    }
+}
+
+#[tokio::test]
+async fn automatic_workspace_tools_do_not_require_mcp_support_or_register_unmanaged_directories() {
+    for registered in [false, true] {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().canonicalize().unwrap();
+        let mut config = config(&directory, false, "routing");
+        let agent = config.agents.get_mut("test").unwrap();
+        agent.mcp_servers.clear();
+        if registered {
+            agent.env.insert("HIVE_MCP_UNSUPPORTED".into(), "1".into());
+            agent.project = Some("demo".to_owned().try_into().unwrap());
+            agent.workspace = Some("task".into());
+            config.projects.insert(
+                "demo".to_owned().try_into().unwrap(),
+                serde_json::from_value(json!({"name":"Demo"})).unwrap(),
+            );
+            config.workspaces.insert(
+                "task".into(),
+                serde_json::from_value(json!({"policy":"existing","directory":directory})).unwrap(),
+            );
+        }
+        config.validate().unwrap();
+        let broker = Broker::persistent(config, directory.join("state/catalog.sqlite3")).unwrap();
+        let (address, server) = serve(broker.clone()).await;
+        let opened = create(address, "ws", &directory).await.unwrap();
+        assert!(
+            report(&directory)["declarations"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let workspace = &opened.meta.as_ref().unwrap()["hive"]["workspace"];
+        assert_eq!(!workspace.is_null(), registered);
+        broker.shutdown().await;
+        server.abort();
+    }
+}
+
+#[tokio::test]
 async fn agents_discover_and_invoke_two_namespaced_backends_during_setup_on_both_transports() {
     for scheme in ["ws", "http"] {
         let temporary = tempfile::tempdir().unwrap();

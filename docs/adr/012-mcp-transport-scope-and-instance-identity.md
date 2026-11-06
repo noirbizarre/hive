@@ -172,6 +172,16 @@ initialization and security state Hive may not know.
 
 ### Configured aggregate routing
 
+The aggregate also hosts Hive's in-process, session-scoped
+[workspace capability provider](../workspace-tools.md). It attaches automatically
+for registered-workspace, node-local native ACPv2 sessions with negotiated ACP MCP
+support, including sessions started remotely on that owner. Built-in literal tool
+names are distinct from configured backend digest aliases. Discovery and invocation
+use the same implemented-operation catalog and revalidate durable workspace scope.
+Built-in calls share the managed request authority fence and contribute actual
+resource-job settlement evidence to close/shutdown; they do not require fake
+subprocess leases or additional transport credentials.
+
 Profiles select operator-owned TOML definitions. One native MCP-over-ACP service
 aggregates managed stdio backends; HTTP declarations remain direct agent connections.
 The aggregate presents MCP `2026-07-28` over initialized `2025-11-25` backends,

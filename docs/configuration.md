@@ -37,6 +37,13 @@ selectors. An unavailable managed server fails startup before downstream session
 setup is sent. HTTP URL/headers go directly to the agent, which handles HTTP
 availability; Hive does not start an HTTP process or proxy its connection.
 
+Registered-workspace sessions also expose the built-in
+[`hive.workspace.capabilities`](workspace-tools.md) tool through the same aggregate
+when a local native ACPv2 agent advertises `session.mcp.acp`. No server selector is
+required. This automatic provider is omitted for unsupported agents or unregistered
+directories, preserving ordinary session startup. Reserve `hive-managed-mcp` for
+this attachment even when no managed subprocess servers are selected.
+
 Managed commands must be absolute paths. `scope` is `machine`, `project` or
 `workspace`. Workspace scope requires a verified registered workspace and defaults
 cwd to its concrete root; machine/project scope requires an explicit absolute
@@ -82,7 +89,7 @@ legacy stdio backends. Discovery is fresh on request, with zero TTL and private
 cache scope. Tasks, multi-round continuations, subscriptions, sampling, elicitation,
 completion, logging configuration and push list-change notifications are unsupported.
 
-Tools/prompts receive stable bounded `hive_t_…` / `hive_p_…` aliases mapped to
+Configured tools/prompts receive stable bounded `hive_t_…` / `hive_p_…` aliases mapped to
 the exact original names, with display titles identifying backend and original title/name.
 Discover names before invoking them. Resource identifiers
 use `hive-mcp://v1-b<hex-definition-id>/<original-uri>`; preserve the entire URI
@@ -91,7 +98,8 @@ Hive also rewrites standard resource links/embedded resources in tool and prompt
 content. Arbitrary tool arguments, structured JSON, schemas and text URLs remain
 backend-native; Hive does not guess which application strings are resource IDs.
 
-Pagination visits one backend page at a time in definition-ID order. Cursors are
+Built-in tools keep their documented literal names and appear on the first tool
+page. Subsequent pagination visits one backend page at a time in definition-ID order. Cursors are
 opaque, attachment-local, method-specific and expire after 60 seconds. Restarted
 backend generations invalidate continuations; rediscover without a cursor. Bounded
 maps, cursors and frame sizes can return controlled capacity errors rather than

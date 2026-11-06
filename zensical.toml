@@ -43,6 +43,7 @@ nav = [
     { "CLI" = "reference/cli.md" },
     { "ACP compatibility matrix" = "compatibility.md" },
     { "Hive ACP extensions" = "acp-extensions.md" },
+    { "Agent workspace tools" = "workspace-tools.md" },
     { "Transports" = "transports.md" },
     { "Operational HTTP API" = "hive-api.md" },
   ] },

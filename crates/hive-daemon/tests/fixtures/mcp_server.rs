@@ -105,7 +105,8 @@ async fn main() {
             }
             "ping" => send(&mut output, id, json!({})).await,
             "tools/list" if mode == "routing" => {
-                let name = if std::path::Path::new(&format!("{log}.changed")).exists() { "changed" } else { "echo" };
+                let name = if std::path::Path::new(&format!("{log}.builtin-name")).exists() { "hive.workspace.capabilities" }
+                    else if std::path::Path::new(&format!("{log}.changed")).exists() { "changed" } else { "echo" };
                 let second = message["params"].get("cursor").is_some();
                 let mut result = json!({"tools":[{"name":if second {"error"} else {name},"description":"Fixture tool","inputSchema":{"type":"object"}}]});
                 if second { result["tools"].as_array_mut().unwrap().push(json!({"name":"hold","title":"hold","inputSchema":{"type":"object"}})); }

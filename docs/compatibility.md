@@ -181,6 +181,14 @@ servers through one native aggregate while forwarding HTTP directly. See the
 [configuration contract](configuration.md#mcp-server-declarations) for namespacing,
 explicit sharing policy and the supported legacy-backend protocol subset.
 
+Registered-workspace sessions with a local native ACPv2 agent advertising
+`session.mcp.acp` also receive the built-in
+[`hive.workspace.capabilities`](workspace-tools.md) tool. It uses the same aggregate
+without requiring configured servers. Session authority, owner-side remote
+execution, supported-only discovery, typed errors and tool schema versioning are
+covered by the MCP routing, workspace scope/lifecycle and remote owner gateway tests.
+VCS execution and workspace lifecycle tools remain separate follow-on operations.
+
 Every additional protocol gate below is disabled except end-turn usage and MCP-over-ACP.
 The `unstable` umbrella is not enabled; it would not implicitly enable protocol v2 anyway.
 

@@ -24,6 +24,9 @@ mod tests;
 /// Controlled errors intentionally omit server-supplied messages and secret-bearing inputs.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error, Diagnostic)]
 pub enum RuntimeError {
+    #[error("{0}")]
+    #[diagnostic(code(hive::mcp::workspace_tool))]
+    WorkspaceTool(#[from] hive_protocol::workspace_tools::ToolError),
     #[error(
         "unsupported MCP method; use the facade's supported discovery, tool, resource or prompt operations"
     )]

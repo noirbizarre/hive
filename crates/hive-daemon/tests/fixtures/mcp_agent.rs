@@ -34,6 +34,32 @@ async fn exercise(
             v2::McpServer::Acp(server) => {
                 let id = &server.server_id;
                 report["discovery"] = invoke(&cx, id, "server/discover", json!({})).await?;
+                if std::env::var_os("HIVE_WORKSPACE_TOOLS").is_some() {
+                    // Stable built-ins must work before discovery has populated any alias table.
+                    report["workspaceDirect"] = invoke(
+                        &cx,
+                        id,
+                        "tools/call",
+                        json!({"name":"hive.workspace.capabilities"}),
+                    )
+                    .await?;
+                    for (key, params) in [
+                        (
+                            "workspaceArguments",
+                            json!({"name":"hive.workspace.capabilities","arguments":{"workspace":"other"}}),
+                        ),
+                        (
+                            "workspaceNull",
+                            json!({"name":"hive.workspace.capabilities","arguments":null}),
+                        ),
+                        (
+                            "workspaceUnsupported",
+                            json!({"name":"hive.vcs.commit","arguments":{}}),
+                        ),
+                    ] {
+                        report[key] = invoke(&cx, id, "tools/call", params).await?;
+                    }
+                }
                 for (method, key) in [
                     ("tools/list", "tools"),
                     ("resources/list", "resources"),
@@ -60,6 +86,16 @@ async fn exercise(
                     report["lists"][key] = json!(items);
                 }
                 for tool in report["lists"]["tools"].as_array().unwrap().clone() {
+                    if tool["name"] == "hive.workspace.capabilities" {
+                        report["workspace"] = invoke(
+                            &cx,
+                            id,
+                            "tools/call",
+                            json!({"name":tool["name"],"arguments":{}}),
+                        )
+                        .await?;
+                        continue;
+                    }
                     if tool["title"]
                         .as_str()
                         .is_some_and(|title| title.ends_with(": hold"))

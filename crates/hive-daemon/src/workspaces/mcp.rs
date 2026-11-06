@@ -29,6 +29,58 @@ impl Protection {
 }
 
 impl Service {
+    pub(crate) async fn tool_capabilities(
+        &self,
+        session: String,
+        context: hive_protocol::workspace::Context,
+        cwd: PathBuf,
+        authorize: impl FnOnce() -> Result<(), hive_protocol::workspace_tools::ToolError>
+        + Send
+        + 'static,
+    ) -> Result<
+        hive_protocol::workspace_tools::Capabilities,
+        hive_protocol::workspace_tools::ToolError,
+    > {
+        use hive_protocol::workspace_tools::{self as tools, ToolError};
+        self.run(move |rt| {
+            Ok((|| {
+                // A queued job must recheck authority after acquiring the resource deletion gate.
+                authorize()?;
+                // Reject foreign identities before interpreting even a same-spelled local path.
+                if context
+                    .owner
+                    .as_ref()
+                    .is_some_and(|owner| owner != &rt.state.node)
+                {
+                    return Err(ToolError::Owner);
+                }
+                rt.mcp_scope(&session, Some(&context), &cwd, true)
+                    .map_err(|_| ToolError::Scope)?;
+                let id = rt.state.uses.get(&session).ok_or(ToolError::Scope)?;
+                let entry = rt
+                    .state
+                    .workspaces
+                    .get(id.as_str())
+                    .ok_or(ToolError::Scope)?;
+                let selection = rt.selection(entry).map_err(|_| ToolError::Scope)?;
+                Ok(tools::Capabilities {
+                    schema_version: tools::VERSION,
+                    owner: rt.state.node.to_string(),
+                    project: entry.workspace.intent().project.to_string(),
+                    workspace: id.to_string(),
+                    repository_backend: selection
+                        .repository
+                        .as_ref()
+                        .map(|repository| repository.backend.0.clone()),
+                    provisioner: selection.provisioner.0.clone(),
+                    tools: tools::tools(),
+                })
+            })())
+        })
+        .await
+        .map_err(|_| ToolError::Backend)?
+    }
+
     /// Trusted recovery boundary: call only after independently verifying termination
     /// of every process admitted under this reservation. Missing sessions are insufficient.
     pub(crate) async fn release_mcp_reservation_after_verified_termination(
@@ -152,6 +204,13 @@ impl Runtime<'_> {
             return Ok((scope, None));
         }
         let context = context.ok_or(AdmissionError::Scope)?;
+        if context
+            .owner
+            .as_ref()
+            .is_some_and(|owner| owner != &self.state.node)
+        {
+            return Err(AdmissionError::Scope);
+        }
         let id = self.state.uses.get(session).ok_or(AdmissionError::Scope)?;
         let entry = self
             .state

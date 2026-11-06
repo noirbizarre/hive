@@ -5,6 +5,195 @@ use crate::mcp::{
 };
 
 #[tokio::test]
+async fn workspace_tool_scope_is_derived_from_the_session_hold_and_rejects_foreign_owners() {
+    use hive_protocol::workspace_tools::{self as tools, ToolError};
+    let fixture = Fixture::new();
+    let entry = fixture.create(fixture.request()).await.unwrap();
+    let root = PathBuf::from(entry.workspace.location().unwrap().root.as_str());
+    fixture
+        .service
+        .attach(entry.workspace.id().clone(), "session".into())
+        .await
+        .unwrap();
+    let context = hive_protocol::workspace::Context {
+        owner: Some(entry.workspace.intent().node.clone()),
+        project: entry.workspace.intent().project.to_string(),
+        workspace: entry.workspace.id().to_string(),
+        effective_cwd: root.display().to_string(),
+    };
+    let result = fixture
+        .service
+        .tool_capabilities("session".into(), context.clone(), root.clone(), || Ok(()))
+        .await
+        .unwrap();
+    assert_eq!(result.repository_backend.as_deref(), Some("git"));
+    assert_eq!(result.provisioner, "git.worktree");
+    assert_eq!(result.tools, tools::tools());
+    assert!(matches!(
+        fixture
+            .service
+            .tool_capabilities(
+                "other-session".into(),
+                context.clone(),
+                root.clone(),
+                || Ok(())
+            )
+            .await,
+        Err(ToolError::Scope)
+    ));
+    let mut foreign = context.clone();
+    foreign.owner = Some(NodeId::new());
+    // A nonexistent path would fail inspection, so the distinct Owner error proves ordering.
+    assert!(matches!(
+        fixture
+            .service
+            .tool_capabilities("session".into(), foreign, root.join("missing"), || Ok(()))
+            .await,
+        Err(ToolError::Owner)
+    ));
+    let mut changed = context.clone();
+    changed.workspace = WorkspaceId::new().to_string();
+    assert!(matches!(
+        fixture
+            .service
+            .tool_capabilities("session".into(), changed, root.clone(), || Ok(()))
+            .await,
+        Err(ToolError::Scope)
+    ));
+    fixture.service.release("session".into()).await.unwrap();
+    assert!(matches!(
+        fixture
+            .service
+            .tool_capabilities("session".into(), context, root, || Ok(()))
+            .await,
+        Err(ToolError::Scope)
+    ));
+}
+
+#[tokio::test]
+async fn built_in_calls_retain_settlement_after_close_caller_drop_recovery_and_shutdown() {
+    use crate::mcp::{PendingTarget, StartupOwnership, workspace::Provider};
+    for action in ["close", "drop", "recovery", "shutdown"] {
+        let fixture = Fixture::new();
+        let entry = fixture.create(fixture.request()).await.unwrap();
+        let project = entry.workspace.intent().project.clone();
+        let mut config = crate::Config::default();
+        config
+            .projects
+            .insert(project.clone(), fixture.definition.clone());
+        let broker = crate::Broker::persistent(
+            config,
+            fixture
+                .service
+                .store
+                .state_directory()
+                .join("catalog.sqlite3"),
+        )
+        .unwrap();
+        let session = hive_protocol::v2::SessionId::new("built-in-session");
+        fixture
+            .service
+            .attach(entry.workspace.id().clone(), session.to_string())
+            .await
+            .unwrap();
+        let cwd = PathBuf::from(entry.workspace.location().unwrap().root.as_str());
+        let mut state = crate::control_tests::detached();
+        state.worktrunk_local = true;
+        state.workspace_context = Some(hive_protocol::workspace::Context {
+            owner: Some(entry.workspace.intent().node.clone()),
+            project: project.to_string(),
+            workspace: entry.workspace.id().to_string(),
+            effective_cwd: cwd.display().to_string(),
+        });
+        let control = Arc::new(std::sync::Mutex::new(state));
+        let mut startup = broker
+            .begin_mcp_startup(
+                session.to_string(),
+                PendingTarget {
+                    control: control.clone(),
+                    cwd: hive_protocol::v2::AbsolutePath::new(cwd),
+                },
+                StartupOwnership::Recovery,
+            )
+            .unwrap();
+        let mut provider = Provider::prepare(&broker, &session).unwrap().unwrap();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (resume, waiting) = std::sync::mpsc::channel();
+        let entered = std::sync::Mutex::new(Some(entered));
+        let waiting = std::sync::Mutex::new(waiting);
+        provider.before_inspect = Some(Arc::new(move || {
+            entered.lock().unwrap().take().unwrap().send(()).unwrap();
+            waiting.lock().unwrap().recv().unwrap();
+        }));
+        let old = provider.clone();
+        let call = tokio::spawn(async move { provider.capabilities(None).await });
+        ready.await.unwrap();
+        match action {
+            "close" => control.lock().unwrap().closing = true,
+            "drop" => call.abort(),
+            "recovery" => {
+                broker
+                    .mcp_sessions
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .get_mut(&session.to_string())
+                    .unwrap()
+                    .control = Arc::new(std::sync::Mutex::new(crate::control_tests::detached()));
+                broker.mcp_sessions.cancel(&session.to_string());
+            }
+            "shutdown" => broker.registry.lock().unwrap().stopping = true,
+            _ => unreachable!(),
+        }
+        let evidence = if action == "shutdown" {
+            broker.mcp_sessions.clear();
+            None
+        } else {
+            Some(broker.mcp_sessions.finish(&session.to_string()))
+        };
+        if let Some(pending) = &evidence {
+            assert_eq!(pending.len(), 1);
+            assert!(
+                !*pending[0].borrow(),
+                "cancellation is not resource settlement"
+            );
+        }
+        let sessions = broker.mcp_sessions.clone();
+        let mut waiter = Box::pin(async move {
+            match evidence {
+                Some(pending) => crate::mcp::settled(pending).await,
+                None => sessions.drain_cleanup().await,
+            }
+        });
+        // Poll while the resource job is blocked: an unpolled spawned task proves nothing.
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(waiter.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        resume.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .unwrap();
+        let _ = call.await;
+        assert!(old.capabilities(None).await.is_err());
+        startup.promoted = true;
+        drop(startup);
+        // Lifecycle completion still does not remove a workspace or implicitly release its hold.
+        assert!(
+            fixture
+                .service
+                .attached(session.to_string())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        fixture.service.release(session.to_string()).await.unwrap();
+        broker.shutdown().await;
+    }
+}
+
+#[tokio::test]
 async fn machine_reservations_protect_extra_resources_without_a_primary_session_and_survive_restart()
  {
     let fixture = Fixture::new();

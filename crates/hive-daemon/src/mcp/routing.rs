@@ -62,9 +62,18 @@ pub(crate) fn select(
         .collect()
 }
 
+#[cfg(test)]
 pub(crate) fn forward_http(
     selected: &Selection,
     declarations: &mut Vec<hive_protocol::v2::McpServer>,
+) -> Result<(), RuntimeError> {
+    forward_http_with_builtin(selected, declarations, false)
+}
+
+pub(crate) fn forward_http_with_builtin(
+    selected: &Selection,
+    declarations: &mut Vec<hive_protocol::v2::McpServer>,
+    builtin: bool,
 ) -> Result<(), RuntimeError> {
     // Validate collisions before mutating so a rejected setup has no partial declaration set.
     let mut names = std::collections::BTreeSet::new();
@@ -79,7 +88,7 @@ pub(crate) fn forward_http(
             return Err(RuntimeError::Declarations);
         }
     }
-    if selected.values().any(ConfiguredServer::managed) && names.contains(NAME) {
+    if (builtin || selected.values().any(ConfiguredServer::managed)) && names.contains(NAME) {
         return Err(RuntimeError::Declarations);
     }
     for (id, server) in selected {
@@ -95,17 +104,24 @@ pub(crate) fn forward_http(
 #[derive(Clone)]
 pub(crate) struct Aggregate(Arc<State>);
 struct State {
+    workspace: Option<super::workspace::Provider>,
     backends: Vec<(String, SessionMcpLease)>,
     names: Mutex<namespace::Names>,
     cursors: Mutex<Cursors>,
 }
 
 impl Aggregate {
-    pub async fn prepare(
+    pub async fn prepare_with_workspace(
         broker: &crate::Broker,
         session: &hive_protocol::v2::SessionId,
         selected: Selection,
+        workspace_enabled: bool,
     ) -> Result<Option<Self>, String> {
+        let workspace = if workspace_enabled {
+            super::workspace::Provider::prepare(broker, session).map_err(diagnostic)?
+        } else {
+            None
+        };
         let mut retained = broker
             .mcp_sessions
             .configured
@@ -143,10 +159,11 @@ impl Aggregate {
                 .get_mut(&session.to_string())
                 .ok_or_else(|| diagnostic(RuntimeError::Binding))? = retained;
         }
-        if backends.is_empty() {
+        if backends.is_empty() && workspace.is_none() {
             return Ok(None);
         }
         let aggregate = Self(Arc::new(State {
+            workspace,
             backends,
             names: Mutex::new(namespace::Names::default()),
             cursors: Mutex::new(Cursors::default()),
@@ -188,6 +205,10 @@ impl Aggregate {
         let mut result = match method {
             "server/discover" => {
                 let mut capabilities = serde_json::Map::new();
+                if let Some(provider) = &self.0.workspace {
+                    provider.capabilities(Some(cancellation)).await?;
+                    capabilities.insert("tools".into(), json!({}));
+                }
                 for (_, lease) in &self.0.backends {
                     let metadata = call(lease, McpRequest::describe(), Some(cancellation)).await?;
                     for family in ["tools", "resources", "prompts"] {
@@ -217,43 +238,52 @@ impl Aggregate {
                 self.list(method, params, cancellation).await?
             }
             "tools/call" | "prompts/get" | "resources/read" => {
-                let (backend, original) = if method == "resources/read" {
-                    namespace::unwrap(
-                        self.0.backends.iter().map(|(id, _)| id.as_str()),
-                        params
-                            .get("uri")
-                            .and_then(Value::as_str)
-                            .ok_or(RuntimeError::Request)?,
-                    )?
+                if method == "tools/call"
+                    && params
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| name.starts_with("hive."))
+                {
+                    self.workspace_call(params, cancellation).await?
                 } else {
-                    self.0
-                        .names
-                        .lock()
-                        .map_err(|_| RuntimeError::Binding)?
-                        .resolve(
-                            if method == "tools/call" { "t" } else { "p" },
+                    let (backend, original) = if method == "resources/read" {
+                        namespace::unwrap(
+                            self.0.backends.iter().map(|(id, _)| id.as_str()),
                             params
-                                .get("name")
+                                .get("uri")
                                 .and_then(Value::as_str)
                                 .ok_or(RuntimeError::Request)?,
                         )?
-                };
-                params[if method == "resources/read" {
-                    "uri"
-                } else {
-                    "name"
-                }] = json!(original);
-                let lease = &self
-                    .0
-                    .backends
-                    .iter()
-                    .find(|(id, _)| id == &backend)
-                    .ok_or(RuntimeError::Request)?
-                    .1;
-                let mut result =
-                    call(lease, McpRequest::new(method, params)?, Some(cancellation)).await?;
-                namespace::rewrite_result(&backend, method, &mut result)?;
-                result
+                    } else {
+                        self.0
+                            .names
+                            .lock()
+                            .map_err(|_| RuntimeError::Binding)?
+                            .resolve(
+                                if method == "tools/call" { "t" } else { "p" },
+                                params
+                                    .get("name")
+                                    .and_then(Value::as_str)
+                                    .ok_or(RuntimeError::Request)?,
+                            )?
+                    };
+                    params[if method == "resources/read" {
+                        "uri"
+                    } else {
+                        "name"
+                    }] = json!(original);
+                    let lease = &self
+                        .0
+                        .backends
+                        .iter()
+                        .find(|(id, _)| id == &backend)
+                        .ok_or(RuntimeError::Request)?
+                        .1;
+                    let mut result =
+                        call(lease, McpRequest::new(method, params)?, Some(cancellation)).await?;
+                    namespace::rewrite_result(&backend, method, &mut result)?;
+                    result
+                }
             }
             _ => return Err(RuntimeError::Method),
         };
@@ -287,6 +317,23 @@ impl Aggregate {
         params: Value,
         cancellation: &McpOperationCancellation,
     ) -> Result<Value, RuntimeError> {
+        if method == "tools/list"
+            && params.get("cursor").is_none()
+            && let Some(provider) = &self.0.workspace
+        {
+            provider.capabilities(Some(cancellation)).await?;
+            let mut result = json!({"tools":[hive_protocol::workspace_tools::descriptor()]});
+            if !self.0.backends.is_empty() {
+                result["nextCursor"] = json!(
+                    self.0
+                        .cursors
+                        .lock()
+                        .map_err(|_| RuntimeError::Binding)?
+                        .insert(Page::first(method))?
+                );
+            }
+            return Ok(result);
+        }
         let mut page = match params.get("cursor") {
             None => Page::first(method),
             Some(Value::String(token)) => self
@@ -410,6 +457,34 @@ impl Aggregate {
         }
         Ok(json!({key:[]}))
     }
+
+    async fn workspace_call(
+        &self,
+        params: Value,
+        cancellation: &McpOperationCancellation,
+    ) -> Result<Value, RuntimeError> {
+        use hive_protocol::workspace_tools::{self as tools, ToolError};
+        let provider = self.0.workspace.as_ref().ok_or(ToolError::Unsupported)?;
+        if !tools::tools()
+            .iter()
+            .any(|tool| Some(tool.name.as_str()) == params.get("name").and_then(Value::as_str))
+        {
+            return Err(ToolError::Unsupported.into());
+        }
+        tools::validate_arguments(params.get("arguments"))?;
+        let result = match provider.capabilities(Some(cancellation)).await {
+            Ok(capabilities) => {
+                let value =
+                    serde_json::to_value(capabilities).map_err(|_| RuntimeError::Response)?;
+                json!({"structuredContent":value,"content":[{"type":"text","text":value.to_string()}],"isError":false})
+            }
+            Err(RuntimeError::WorkspaceTool(error)) => {
+                json!({"isError":true,"content":[{"type":"text","text":error.data().to_string()}]})
+            }
+            Err(error) => return Err(error),
+        };
+        Ok(result)
+    }
 }
 
 impl McpService<Agent> for Aggregate {
@@ -422,6 +497,11 @@ impl McpService<Agent> for Aggregate {
         async move {
             match this.execute_inner(&request.method, Value::Object(request.params.unwrap_or_default()), context.operation_cancellation()).await {
                 Ok(result) => Ok(McpOutcome::Result(result)),
+                Err(RuntimeError::WorkspaceTool(error)) => {
+                    use hive_protocol::workspace_tools::ToolError;
+                    let code = if matches!(error, ToolError::Arguments | ToolError::Unsupported) { -32602 } else { -32000 };
+                    Ok(McpOutcome::Error(serde_json::from_value(json!({"code":code,"message":error.to_string(),"data":error.data()})).expect("fixed workspace tool error")))
+                },
                 Err(RuntimeError::Method) => Ok(McpOutcome::Error(serde_json::from_value(json!({"code":-32601,"message":"unsupported MCP method; use the facade's supported discovery, tool, resource or prompt operations"})).expect("fixed MCP error"))),
                 Err(RuntimeError::Request) => Ok(McpOutcome::Error(serde_json::from_value(json!({"code":-32602,"message":"unsupported MCP operation or invalid Hive identifier/cursor; discover again and check arguments"})).expect("fixed MCP error"))),
                 Err(RuntimeError::Remote { code }) => Ok(McpOutcome::Error(serde_json::from_value(json!({"code":code,"message":"MCP backend rejected the request; check arguments and inspect side effects before retrying","data":{"code":"hive::mcp::remote"}})).expect("fixed MCP error"))),
@@ -498,5 +578,21 @@ mod tests {
             Err(RuntimeError::Declarations)
         );
         assert_eq!(declarations, before);
+    }
+
+    #[test]
+    fn a_built_in_only_aggregate_reserves_its_declaration_name_atomically() {
+        let declaration = serde_json::from_value(
+            json!({"type":"http","name":NAME,"url":"https://example.test/mcp","headers":[]}),
+        )
+        .unwrap();
+        let mut declarations = vec![declaration];
+        let before = declarations.clone();
+        assert_eq!(
+            forward_http_with_builtin(&BTreeMap::new(), &mut declarations, true),
+            Err(RuntimeError::Declarations)
+        );
+        assert_eq!(declarations, before);
+        assert!(forward_http_with_builtin(&BTreeMap::new(), &mut declarations, false).is_ok());
     }
 }

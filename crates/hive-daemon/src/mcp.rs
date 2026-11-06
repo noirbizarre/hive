@@ -19,6 +19,7 @@ mod pagination;
 mod process;
 mod resolution;
 pub(crate) mod routing;
+pub(crate) mod workspace;
 pub use resolution::{AdmissionError, Sharing, StdioAdmission, StdioLaunch};
 pub mod runtime;
 mod sessions;

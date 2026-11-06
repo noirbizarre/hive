@@ -293,7 +293,8 @@ async fn remote_project_transfer_provisions_only_on_the_selected_owner_and_disti
                 assert_eq!(context["owner"], peer.node);
                 assert_eq!(meta["session"], json!({"owner":peer.node,"id":opened.session_id}));
                 let cwd = PathBuf::from(context["effectiveCwd"].as_str().unwrap());
-                assert!(cwd.starts_with(fixture.path("state")));
+                // Windows canonicalization adds a verbatim-path prefix; compare physical paths on both sides.
+                assert!(cwd.canonicalize().unwrap().starts_with(fixture.path("state").canonicalize().unwrap()));
                 assert!(cwd.join("committed.txt").is_file());
                 assert!(!initiating.path().join("absent-placeholder").exists());
                 fixture.assert_downstream_cwd(&cwd);

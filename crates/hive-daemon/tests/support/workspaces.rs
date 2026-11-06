@@ -227,13 +227,20 @@ async fn remote_project_transfer_provisions_only_on_the_selected_owner_and_disti
         (AgentVersion::V2, false),
         (AgentVersion::V2, true),
     ] {
+        // Windows can resolve `wt` to Windows Terminal rather than WorkTrunk.
+        // Successful spawning alone does not establish the optional marker capability.
         if worktrunk
-            && Command::new("wt")
+            && !Command::new("wt")
                 .args(["config", "state", "marker", "--help"])
                 .output()
-                .is_err()
+                .is_ok_and(|output| {
+                    let help = String::from_utf8_lossy(&output.stdout);
+                    output.status.success()
+                        && help.contains("--branch")
+                        && help.contains("--format")
+                })
         {
-            eprintln!("skipping remote WorkTrunk case: wt unavailable");
+            eprintln!("skipping remote WorkTrunk case: compatible wt unavailable");
             continue;
         }
         let fixture = Fixture::new(version, false);

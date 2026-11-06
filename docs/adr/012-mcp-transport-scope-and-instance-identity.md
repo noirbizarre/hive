@@ -18,7 +18,7 @@ The existing implementation already handles inline ACP declarations:
 
 | Area | Current evidence and behavior |
 | --- | --- |
-| Daemon configuration | `crates/hive-daemon/src/config.rs`: root/fragment `mcp_servers` definitions and profile selectors resolve through `mcp/configuration.rs`. Unknown fields are rejected. |
+| Daemon configuration | `crates/hive-daemon/src/config.rs`: root/fragment `mcp.servers` definitions and agent `mcp_servers` selectors resolve through `mcp/configuration.rs`. Portable Bee fields and nested Hive process controls are strictly validated; environment references are frozen before publication. |
 | Native ACPv2 creation | `Broker::create` and `run_agent` in `crates/hive-daemon/src/lib.rs` retain and forward the client's MCP declarations. |
 | Recovery | `Record::mcp_servers` in `src/persistence.rs` defaults to empty for legacy records. `Broker::recover` restores saved declarations for the downstream session. The test `recovery_keeps_workspace_roots_and_mcp_connections_alongside_the_original_identity` covers persistence. |
 | Live resume | `Broker::resume` attaches to an existing session; incoming MCP declarations are not applied as reconfiguration. |

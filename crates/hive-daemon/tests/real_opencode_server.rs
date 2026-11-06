@@ -204,7 +204,7 @@ fn encode(text: &str) -> String {
 fn config(server: &Server) -> Config {
     Config {
         peers: Default::default(),
-        mcp_servers: Default::default(),
+        mcp: Default::default(),
         default_profile: None,
         profiles: Default::default(),
         workspaces: Default::default(),
@@ -311,7 +311,7 @@ async fn a_session_started_natively_in_opencode_is_continued_through_hive_withou
     .as_array()
     .map_or(0, Vec::len);
 
-    let broker = hive_daemon::Broker::new(config(&server));
+    let broker = hive_daemon::Broker::new(config(&server)).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address: SocketAddr = listener.local_addr().unwrap();
     tokio::spawn(axum::serve(listener, hive_daemon::router(broker.clone())).into_future());

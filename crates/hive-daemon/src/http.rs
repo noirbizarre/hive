@@ -261,7 +261,7 @@ mod tests {
         .unwrap();
         policy.token_hash = Some(hash("test-secret"));
         let router = crate::router_with_policy(
-            crate::Broker::new(crate::config::Config::default()),
+            crate::Broker::new(crate::config::Config::default()).unwrap(),
             policy.clone(),
         );
         let server = tokio::spawn(async move {

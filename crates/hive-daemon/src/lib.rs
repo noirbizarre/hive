@@ -1229,10 +1229,10 @@ impl Broker {
             self.catalog.send_modify(|revision| *revision += 1);
         }
     }
-    #[must_use]
-    pub fn new(registry: Config) -> Self {
+    pub fn new(registry: Config) -> Result<Self, config::ConfigError> {
+        let registry = reload::PreparedConfig::new(registry)?;
         let (catalog, _) = watch::channel(0);
-        Self {
+        Ok(Self {
             routes: Arc::new(routing::Routes::default()),
             peer_links: Arc::new(Mutex::new(Vec::new())),
             mcp_runtime: Arc::new(tokio::sync::OnceCell::new()),
@@ -1253,7 +1253,7 @@ impl Broker {
             offline: Arc::new(Mutex::new(HashMap::new())),
             adopting: Arc::new(Mutex::new(std::collections::HashSet::new())),
             client_capabilities: Arc::new(Mutex::new(HashMap::new())),
-        }
+        })
     }
 
     /// Execution locality for trusted callers resolving managed MCP identities.
@@ -1338,7 +1338,7 @@ impl Broker {
         store.recover_prompts()?;
         // Retain interrupted keys indefinitely; only definitely non-resumable old records age out.
         store.prune(now_millis().saturating_sub(90 * 24 * 60 * 60 * 1000))?;
-        let mut broker = Self::new(registry);
+        let mut broker = Self::new(registry).map_err(projects::InitError::Config)?;
         broker
             .registry
             .lock()
@@ -2170,7 +2170,7 @@ impl Broker {
                 workspace_launch,
                 &provider,
                 selected_execution.as_ref(),
-                launch_config,
+                launch_config.raw.clone(),
                 launch_projects,
                 hive_id.to_string(),
             )
@@ -3149,7 +3149,7 @@ async fn pilot_elicitation(
 struct AgentSetup {
     recovering: Option<String>,
     broker: Broker,
-    selected_mcp: std::collections::BTreeMap<String, mcp::configuration::ConfiguredServer>,
+    selected_mcp: std::collections::BTreeMap<String, mcp::configuration::PreparedServer>,
 }
 
 async fn run_agent(
@@ -5253,7 +5253,7 @@ mod control_tests {
 
     #[tokio::test]
     async fn dropping_the_gateway_driver_releases_capabilities_without_waiting_for_eof() {
-        let broker = Broker::new(Config::default());
+        let broker = Broker::new(Config::default()).unwrap();
         let (ready, initialized) = oneshot::channel();
         let driver = tokio::spawn(Client.v2().connect_with(
             gateway_agent(broker.clone()),

@@ -276,7 +276,7 @@ async fn negotiation_rejects_malformed_offers_and_never_advertises_an_ephemeral_
         let broker = if persistent {
             hive_daemon::Broker::persistent(Config::default(), path.clone()).unwrap()
         } else {
-            hive_daemon::Broker::new(Config::default())
+            hive_daemon::Broker::new(Config::default()).unwrap()
         };
         let (address, server) = serve(broker.clone()).await;
         for hive in [

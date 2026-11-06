@@ -2,7 +2,7 @@
 
 use super::{
     SessionMcpLease,
-    configuration::ConfiguredServer,
+    configuration::PreparedServer,
     namespace,
     pagination::{Cursors, Page},
     runtime::{McpRequest, RuntimeError},
@@ -19,7 +19,7 @@ use std::{
 };
 
 pub(crate) const NAME: &str = "hive-managed-mcp";
-type Selection = BTreeMap<String, ConfiguredServer>;
+type Selection = BTreeMap<String, PreparedServer>;
 
 #[derive(Clone, Default)]
 pub(crate) struct Bindings {
@@ -37,7 +37,7 @@ impl Bindings {
 }
 
 pub(crate) fn select(
-    config: &crate::Config,
+    config: &crate::reload::PreparedConfig,
     selectors: &[String],
 ) -> Result<Selection, RuntimeError> {
     if selectors.len() > 32
@@ -53,7 +53,7 @@ pub(crate) fn select(
         .iter()
         .map(|id| {
             config
-                .mcp_servers
+                .servers
                 .get(id)
                 .cloned()
                 .map(|s| (id.clone(), s))
@@ -88,11 +88,11 @@ pub(crate) fn forward_http_with_builtin(
             return Err(RuntimeError::Declarations);
         }
     }
-    if (builtin || selected.values().any(ConfiguredServer::managed)) && names.contains(NAME) {
+    if (builtin || selected.values().any(PreparedServer::managed)) && names.contains(NAME) {
         return Err(RuntimeError::Declarations);
     }
     for (id, server) in selected {
-        if let ConfiguredServer::Http { url, headers } = server {
+        if let PreparedServer::Http { url, headers } = server {
             declarations.push(serde_json::from_value(json!({"type":"http", "name":id, "url":url,
                 "headers": headers.iter().map(|(name,value)| json!({"name":name,"value":value})).collect::<Vec<_>>()
             })).map_err(|_| RuntimeError::Request)?);
@@ -140,9 +140,8 @@ impl Aggregate {
                 continue;
             }
             let node = broker.mcp_execution_node().await.map_err(diagnostic)?;
-            let admission = server.admission(&id, node).map_err(diagnostic)?;
             let lease = broker
-                .bind_scoped_mcp(session, admission)
+                .bind_configured_mcp(session, id.clone(), server, node)
                 .await
                 .map_err(diagnostic)?;
             retained.leases.insert(id.clone(), lease.clone());
@@ -566,10 +565,11 @@ mod tests {
         let original: hive_protocol::v2::McpServer = serde_json::from_value(json!({
             "type":"http", "name":"inline", "url":"https://inline.example.test/exact?query=1", "headers":[{"name":"Authorization","value":"private-value"}]
         })).unwrap();
-        let configured: ConfiguredServer = serde_json::from_value(
-            json!({"transport":"http","url":"https://configured.example.test/mcp","headers":{}}),
+        let configured: crate::mcp::configuration::ConfiguredServer = serde_json::from_value(
+            json!({"url":"https://configured.example.test/mcp","headers":{}}),
         )
         .unwrap();
+        let configured = configured.prepare(&BTreeMap::new()).unwrap();
         let selected = BTreeMap::from([("configured".into(), configured.clone())]);
         let mut declarations = vec![original.clone()];
         forward_http(&selected, &mut declarations).unwrap();

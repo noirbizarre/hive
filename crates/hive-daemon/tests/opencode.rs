@@ -64,7 +64,7 @@ fn config(url: &str) -> Config {
 fn config_with(profile: Profile) -> Config {
     Config {
         peers: Default::default(),
-        mcp_servers: Default::default(),
+        mcp: Default::default(),
         default_profile: None,
         profiles: Default::default(),
         workspaces: Default::default(),
@@ -84,7 +84,7 @@ async fn serve(broker: hive_daemon::Broker) -> SocketAddr {
 }
 
 async fn start(config: Config) -> (hive_daemon::Broker, SocketAddr) {
-    let broker = hive_daemon::Broker::new(config);
+    let broker = hive_daemon::Broker::new(config).unwrap();
     let address = serve(broker.clone()).await;
     (broker, address)
 }

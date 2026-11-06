@@ -674,7 +674,9 @@ async fn reload_changes_new_sessions_without_interrupting_an_existing_worker() {
     )
     .unwrap();
     let source = hive_daemon::config::ConfigSource::new(Some(path.clone())).unwrap();
-    let broker = hive_daemon::Broker::new(source.load().unwrap()).with_config_source(source);
+    let broker = hive_daemon::Broker::new(source.load().unwrap())
+        .unwrap()
+        .with_config_source(source);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let router =
@@ -813,7 +815,7 @@ async fn reload_changes_new_sessions_without_interrupting_an_existing_worker() {
 async fn browser_origins_accept_localhost_on_the_listener_port_and_reject_other_origins() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let broker = hive_daemon::Broker::new(Config::default());
+    let broker = hive_daemon::Broker::new(Config::default()).unwrap();
     let origin = format!("http://{address}");
     let server = tokio::spawn(async move {
         axum::serve(
@@ -1941,7 +1943,7 @@ async fn exercise_gateway(transport: &str, version: AgentVersion) {
     } else {
         env!("CARGO_BIN_EXE_hive-test-agent").to_string()
     };
-    let broker = hive_daemon::Broker::new(config_with_agent("mock", &command, version));
+    let broker = hive_daemon::Broker::new(config_with_agent("mock", &command, version)).unwrap();
     let origin = format!("http://{address}");
     let server = tokio::spawn(async move {
         axum::serve(
@@ -2352,7 +2354,7 @@ fn config_with_agent(id: &str, command: &str, version: AgentVersion) -> Config {
     );
     Config {
         peers: Default::default(),
-        mcp_servers: Default::default(),
+        mcp: Default::default(),
         projects: Default::default(),
         default_profile: None,
         profiles: Default::default(),
@@ -2370,7 +2372,10 @@ async fn start_gateway(config: Config) -> (SocketAddr, tokio::task::JoinHandle<(
     let server = tokio::spawn(async move {
         axum::serve(
             listener,
-            hive_daemon::router_with_origin(hive_daemon::Broker::new(config), Some(&origin)),
+            hive_daemon::router_with_origin(
+                hive_daemon::Broker::new(config).unwrap(),
+                Some(&origin),
+            ),
         )
         .await
         .unwrap();

@@ -125,7 +125,7 @@ async fn gateway() -> std::net::SocketAddr {
     let address = listener.local_addr().unwrap();
     let origin = format!("http://{address}");
     let router = hive_daemon::router_with_origin(
-        hive_daemon::Broker::new(hive_daemon::config::Config::default()),
+        hive_daemon::Broker::new(hive_daemon::config::Config::default()).unwrap(),
         Some(&origin),
     );
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });

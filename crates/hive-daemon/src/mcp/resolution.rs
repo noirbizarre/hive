@@ -46,6 +46,43 @@ pub struct StdioAdmission {
     pub sharing: Sharing,
 }
 
+// Configured paths need workspace authority; trusted callers already supply absolute paths.
+pub(crate) enum AdmissionInput {
+    Trusted(Box<StdioAdmission>),
+    Configured {
+        id: String,
+        server: Box<configuration::PreparedServer>,
+        node: NodeId,
+    },
+}
+
+impl AdmissionInput {
+    pub(crate) fn scope(&self) -> Scope {
+        match self {
+            Self::Trusted(admission) => admission.definition.scope(),
+            Self::Configured { server, .. } => server.scope(),
+        }
+    }
+
+    pub(crate) fn identity(
+        self,
+        context: ScopeContext,
+        root: Option<NodePath>,
+    ) -> Result<InstanceIdentity, AdmissionError> {
+        match self {
+            Self::Trusted(admission) => admission.identity(context, root),
+            Self::Configured { id, server, node } => {
+                let admission = server.admission(
+                    &id,
+                    node,
+                    root.as_ref().map(|root| Path::new(root.as_str())),
+                )?;
+                admission.identity(context, root)
+            }
+        }
+    }
+}
+
 impl fmt::Debug for StdioLaunch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("StdioLaunch([redacted])")
@@ -65,7 +102,7 @@ pub enum AdmissionError {
     #[diagnostic(code(hive::mcp::admission_scope))]
     Scope,
     #[error(
-        "MCP launch path cannot be observed on this node; supply existing node-local executable/directories and an explicit cwd for machine/project scope"
+        "MCP launch path cannot be observed on this node; install the executable on the daemon PATH or use an existing node-local path, and supply an absolute cwd for machine/project scope"
     )]
     #[diagnostic(code(hive::mcp::admission_path))]
     Path,
@@ -201,6 +238,33 @@ impl crate::Broker {
         session: &v2::SessionId,
         admission: StdioAdmission,
     ) -> Result<SessionMcpLease, AdmissionError> {
+        self.bind_mcp_input(session, AdmissionInput::Trusted(Box::new(admission)))
+            .await
+    }
+
+    pub(crate) async fn bind_configured_mcp(
+        &self,
+        session: &v2::SessionId,
+        id: String,
+        server: configuration::PreparedServer,
+        node: NodeId,
+    ) -> Result<SessionMcpLease, AdmissionError> {
+        self.bind_mcp_input(
+            session,
+            AdmissionInput::Configured {
+                id,
+                server: Box::new(server),
+                node,
+            },
+        )
+        .await
+    }
+
+    async fn bind_mcp_input(
+        &self,
+        session: &v2::SessionId,
+        admission: AdmissionInput,
+    ) -> Result<SessionMcpLease, AdmissionError> {
         let broker = self.clone();
         let session = session.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -232,7 +296,7 @@ impl crate::Broker {
     async fn admit_scoped_mcp(
         &self,
         session: &v2::SessionId,
-        admission: StdioAdmission,
+        admission: AdmissionInput,
         cancelled: Arc<AtomicBool>,
     ) -> Result<(SessionMcpLease, bool), AdmissionError> {
         // Queued coordinators must not initialize a runtime or reserve files after shutdown.
@@ -271,7 +335,7 @@ impl crate::Broker {
                 return Err(runtime::RuntimeError::Binding.into());
             }
             // A same-spelled remote cwd is not evidence about this node's filesystem.
-            if admission.definition.scope() != Scope::Machine && !state.worktrunk_local {
+            if admission.scope() != Scope::Machine && !state.worktrunk_local {
                 return Err(AdmissionError::Scope);
             }
             (
@@ -294,7 +358,7 @@ impl crate::Broker {
                 )
                 .await
         } else {
-            if admission.definition.scope() != Scope::Machine {
+            if admission.scope() != Scope::Machine {
                 return Err(AdmissionError::Scope);
             }
             let node = runtime.node().clone();

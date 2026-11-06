@@ -2032,7 +2032,8 @@ async fn administration_rejects_unknown_resources_malformed_requests_and_missing
         503
     );
     server.abort();
-    let (url, server) = workspace_api(crate::Broker::new(crate::config::Config::default())).await;
+    let (url, server) =
+        workspace_api(crate::Broker::new(crate::config::Config::default()).unwrap()).await;
     for route in ["/v1/workspaces", "/v1/repositories"] {
         assert_eq!(
             client

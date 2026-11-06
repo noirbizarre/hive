@@ -55,6 +55,9 @@ pub struct Record {
     pub additional_directories: Vec<agent_client_protocol::schema::v2::AbsolutePath>,
     #[serde(default)]
     pub mcp_servers: Vec<agent_client_protocol::schema::v2::McpServer>,
+    // Absent legacy records must not acquire newly configured profile selections.
+    #[serde(default)]
+    pub configured_mcp_servers: Option<Vec<String>>,
     pub profile: String,
     pub version: String,
     pub created_at: u64,
@@ -787,6 +790,7 @@ mod tests {
 
     fn record(id: &str) -> Record {
         Record {
+            configured_mcp_servers: None,
             workspace_context: None,
             id: id.into(),
             downstream_id: "agent-session".into(),

@@ -2323,6 +2323,7 @@ fn config_with_agent(id: &str, command: &str, version: AgentVersion) -> Config {
     agents.insert(
         id.to_string(),
         Profile {
+            mcp_servers: vec![],
             project: None,
             workspace: None,
             name: None,
@@ -2339,6 +2340,7 @@ fn config_with_agent(id: &str, command: &str, version: AgentVersion) -> Config {
         },
     );
     Config {
+        mcp_servers: Default::default(),
         projects: Default::default(),
         workspaces: Default::default(),
         worktrunk: None,
@@ -4179,6 +4181,7 @@ async fn declared_http_and_websocket_agents_are_reached_through_the_sdk() {
         config.agents.insert(
             id.into(),
             Profile {
+                mcp_servers: vec![],
                 project: None,
                 workspace: None,
                 name: None,
@@ -4597,6 +4600,7 @@ async fn a_disconnect_and_handoff_during_generation_do_not_restart_the_prompt() 
     config.agents.insert(
         "paused".into(),
         Profile {
+            mcp_servers: vec![],
             name: None,
             command: None,
             project: None,
@@ -5084,6 +5088,7 @@ async fn permission_and_form_and_url_elicitation_reach_the_current_pilot() {
     config.agents.insert(
         "requests".into(),
         Profile {
+            mcp_servers: vec![],
             name: None,
             command: None,
             project: None,

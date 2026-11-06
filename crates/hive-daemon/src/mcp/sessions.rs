@@ -13,6 +13,8 @@ use super::{
 
 #[derive(Default)]
 pub(crate) struct Sessions {
+    pub(crate) configured: Mutex<HashMap<String, super::routing::Bindings>>,
+    pub(crate) pending: Arc<Mutex<HashMap<String, PendingTarget>>>,
     bindings: Mutex<HashMap<String, Vec<SessionMcpLease>>>,
     retired: Mutex<HashMap<String, Vec<watch::Receiver<bool>>>>,
     cleanup: Mutex<Vec<watch::Receiver<bool>>>,
@@ -20,11 +22,83 @@ pub(crate) struct Sessions {
 }
 
 struct Binding {
+    pending: Weak<Mutex<HashMap<String, PendingTarget>>>,
     id: uuid::Uuid,
     session: String,
     sessions: Weak<Mutex<HashMap<String, crate::Entry>>>,
     admission: Weak<Mutex<crate::reload::Registry>>,
     state: Mutex<BindingState>,
+}
+
+#[derive(Clone)]
+pub(crate) struct PendingTarget {
+    pub control: Arc<Mutex<crate::Control>>,
+    pub cwd: hive_protocol::v2::AbsolutePath,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum StartupOwnership {
+    New,
+    Recovery,
+}
+
+// Recovery withdraws attempt-local authority without relinquishing durable session ownership.
+pub(crate) struct PendingGuard {
+    pub sessions: Arc<Sessions>,
+    pub id: String,
+    pub promoted: bool,
+    ownership: StartupOwnership,
+}
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        let mut pending = self
+            .sessions
+            .pending
+            .lock()
+            .expect("MCP pending lock poisoned");
+        pending.remove(&self.id);
+        // Keep the identity fenced until synchronous revocation finishes. A later recovery
+        // must not publish bindings that this guard could then cancel or release by ID.
+        if !self.promoted {
+            match self.ownership {
+                StartupOwnership::New => {
+                    self.sessions.finish(&self.id);
+                }
+                StartupOwnership::Recovery => self.sessions.cancel(&self.id),
+            }
+        }
+    }
+}
+
+impl crate::Broker {
+    pub(crate) fn begin_mcp_startup(
+        &self,
+        id: String,
+        target: PendingTarget,
+        ownership: StartupOwnership,
+    ) -> Result<PendingGuard, RuntimeError> {
+        let registry = self.registry.lock().map_err(|_| RuntimeError::Binding)?;
+        if registry.stopping {
+            return Err(RuntimeError::Stopping);
+        }
+        let sessions = self.sessions.lock().map_err(|_| RuntimeError::Binding)?;
+        let mut pending = self
+            .mcp_sessions
+            .pending
+            .lock()
+            .map_err(|_| RuntimeError::Binding)?;
+        // Concurrent reconciliation must not replace another worker's pending authority.
+        if sessions.contains_key(&id) || pending.contains_key(&id) {
+            return Err(RuntimeError::Binding);
+        }
+        pending.insert(id.clone(), target);
+        Ok(PendingGuard {
+            sessions: self.mcp_sessions.clone(),
+            id,
+            promoted: false,
+            ownership,
+        })
+    }
 }
 
 struct BindingState {
@@ -51,6 +125,10 @@ impl SessionMcpLease {
         self.0.id
     }
 
+    pub(super) fn bound(&self) -> bool {
+        self.0.state.lock().is_ok_and(|state| state.lease.is_some())
+    }
+
     pub fn request(&self, request: McpRequest) -> Result<McpCall, RuntimeError> {
         let admission = self.0.admission.upgrade().ok_or(RuntimeError::Binding)?;
         // Match Broker admission lock order so shutdown fences bindings and calls together.
@@ -60,8 +138,14 @@ impl SessionMcpLease {
         }
         let sessions = self.0.sessions.upgrade().ok_or(RuntimeError::Binding)?;
         let sessions = sessions.lock().map_err(|_| RuntimeError::Binding)?;
-        let entry = sessions.get(&self.0.session).ok_or(RuntimeError::Binding)?;
-        let control = entry.control.lock().map_err(|_| RuntimeError::Binding)?;
+        let pending = self.0.pending.upgrade().ok_or(RuntimeError::Binding)?;
+        let pending = pending.lock().map_err(|_| RuntimeError::Binding)?;
+        let control = sessions
+            .get(&self.0.session)
+            .map(|entry| &entry.control)
+            .or_else(|| pending.get(&self.0.session).map(|target| &target.control))
+            .ok_or(RuntimeError::Binding)?;
+        let control = control.lock().map_err(|_| RuntimeError::Binding)?;
         if control.closing || control.activity.session == "ended" {
             return Err(RuntimeError::Binding);
         }
@@ -165,6 +249,7 @@ impl Sessions {
         }
         let consumed = protection.is_some();
         let binding = SessionMcpLease(Arc::new(Binding {
+            pending: Arc::downgrade(&self.pending),
             id: uuid::Uuid::new_v4(),
             session,
             sessions: Arc::downgrade(sessions),
@@ -261,6 +346,10 @@ impl Sessions {
     }
 
     pub(crate) fn finish(&self, session: &str) -> Vec<watch::Receiver<bool>> {
+        self.configured
+            .lock()
+            .expect("MCP configured bindings lock poisoned")
+            .remove(session);
         self.release(session, None);
         self.retired
             .lock()
@@ -285,6 +374,10 @@ impl Sessions {
     }
 
     pub(crate) fn clear(&self) {
+        self.configured
+            .lock()
+            .expect("MCP configured bindings lock poisoned")
+            .clear();
         let sessions: Vec<_> = self
             .bindings
             .lock()

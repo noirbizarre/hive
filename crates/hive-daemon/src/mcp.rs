@@ -1,4 +1,4 @@
-//! Managed MCP contracts and shared stdio runtime, not a daemon configuration registry.
+//! Managed MCP contracts, configured routing and the shared stdio runtime.
 //!
 //! Identity validation is pure; scoped Broker admission observes registered local
 //! resources while trusted callers supply effective environment and security evidence.
@@ -13,13 +13,19 @@ use hive_core::{
 use miette::Diagnostic;
 use serde::{Deserialize, Serialize};
 
+pub(crate) mod configuration;
+mod namespace;
+mod pagination;
 mod process;
 mod resolution;
+pub(crate) mod routing;
 pub use resolution::{AdmissionError, Sharing, StdioAdmission, StdioLaunch};
 pub mod runtime;
 mod sessions;
+pub(crate) use sessions::PendingTarget;
 pub use sessions::SessionMcpLease;
 pub(crate) use sessions::Sessions;
+pub(crate) use sessions::StartupOwnership;
 pub(crate) use sessions::settled;
 
 #[cfg(test)]

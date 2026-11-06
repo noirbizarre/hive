@@ -23,7 +23,7 @@ including features Hive does not implement. It is not a declaration of full ACP 
 | SDK / HTTP adapter provenance | [`305aefda6fbe88be6ae8b9088003e383f909b135`][sdk-pin], independently confirmed from both published crates' `.cargo_vcs_info.json` |
 | Additional upstream draft reviewed | [`1c0fe8dd680aa6de119b2136a7e5495075baf257`][draft-pin], 2026-10-26; not the published schema's source |
 | JSON schema artifact versions at the schema source revision | v1 **1.26.0**; v2 **2.0.0-alpha.9**; these are not Rust crate or wire versions |
-| Enabled experimental protocol features | `unstable_protocol_v2`, `unstable_end_turn_token_usage` |
+| Enabled experimental protocol features | `unstable_protocol_v2`, `unstable_end_turn_token_usage`, `unstable_mcp_over_acp` |
 
 The authoritative inventory is the pinned [v1 registry][v1-methods] and [schema][v1-schema],
 [v2 registry][v2-methods] and [schema][v2-schema], and their
@@ -176,16 +176,18 @@ Sources: [v1 tool calls][v1-tools], [v2 tool calls][v2-tools],
 MCP paths and defines the standalone transport, lifecycle and instance identity
 contract, with `machine`, `project` and `workspace` scopes. Trusted Rust embedders
 can use the shared stdio runtime and `Broker::bind_scoped_mcp` for registered
-session/resource resolution. Daemon configuration and agent routing do not select
-managed servers yet; the protocol support status below still applies.
+session/resource resolution. Daemon profile selectors now expose managed stdio
+servers through one native aggregate while forwarding HTTP directly. See the
+[configuration contract](configuration.md#mcp-server-declarations) for namespacing,
+explicit sharing policy and the supported legacy-backend protocol subset.
 
-Every additional protocol gate below is disabled except end-turn usage (listed above).
+Every additional protocol gate below is disabled except end-turn usage and MCP-over-ACP.
 The `unstable` umbrella is not enabled; it would not implicitly enable protocol v2 anyway.
 
 | Feature / specification | Status | Ingestion: v1 / v2 | Daemon / client API | TUI / Web | Evidence / gap |
 | --- | --- | --- | --- | --- | --- |
 | Session MCP declarations: v1 stdio/HTTP/SSE; v2 stdio/HTTP ([v1][v1-setup], [v2][v2-setup]) | 🟡 P | V1 rejects nonempty declarations; native v2 forwards/persists on new | Saved declarations reused for recovery; incoming upstream resume declarations **not applied**; no MCP support advertised or tool-execution guarantee; v2 removed SSE | Neither composes MCP-server declarations | [Workers/broker][daemon]; `recovery_keeps_workspace_roots_and_mcp_connections_alongside_the_original_identity` in [persistence][persistence] |
-| MCP-over-ACP, `mcp/message` request to client / notification to agent; `acp` server transport ([v1][v1-unstable], [v2][v2-unstable]) | ❌ U | `unstable_mcp_over_acp` disabled | No negotiated bridge or inner request/server routing | Neither exposes the bridge | [Workspace features][manifest] |
+| MCP-over-ACP, `mcp/message` request to client / notification to agent; `acp` server transport ([v1][v1-unstable], [v2][v2-unstable]) | 🟡 P | Native v2 agents advertising `session.mcp.acp` can use Hive's configured aggregate; v1 unsupported | Managed stdio tools/resources/prompts routed through session leases; legacy backend compatibility facade; fresh lists, no push notifications/tasks | Profile selection, no MCP configuration UI | `tests/mcp_routing.rs`; [configuration](configuration.md#mcp-server-declarations) |
 | Providers: `providers/list`, `providers/set`, `providers/disable` ([v1][v1-unstable], [v2][v2-unstable]) | ❌ U | `unstable_llm_providers` disabled | No ACP provider management; Hive's HTTP profile/provider catalog is a different surface | Neither exposes ACP provider credentials/configuration | [Workspace features][manifest]; [operational API](hive-api.md) |
 | `session/fork` ([v1][v1-unstable], [v2][v2-unstable]) | ❌ U | `unstable_session_fork` disabled | Not advertised/forwarded; no fork ownership/inheritance orchestration | No fork UI | [Workspace features][manifest]; [gateway][daemon] |
 | System prompt append/override ([v1][v1-unstable], [v2][v2-unstable]) | ❌ U | `unstable_session_system_prompt` disabled | No capability or lifecycle request orchestration; unrelated to ordinary prompt text | No system-prompt editor | [Workspace features][manifest] |
@@ -236,7 +238,7 @@ notices, compaction, boolean config, plans, or delegated filesystem/terminals.
 
 | Experimental fields ([v1][v1-unstable], [v2][v2-unstable]) | Hive handling / status |
 | --- | --- |
-| Both agent `providers`; v1 `mcpCapabilities.acp` / v2 `session.mcp.acp` | **❌ U** providers and MCP-over-ACP disabled/unadvertised. |
+| Both agent `providers`; v1 `mcpCapabilities.acp` / v2 `session.mcp.acp` | Providers and v1 native MCP are **❌ U**. V2 `session.mcp.acp` is checked for configured managed routing; Hive does not advertise an upstream general-purpose bridge. |
 | V1 `sessionCapabilities.fork` / v2 `session.fork` | **❌ U** fork disabled/unadvertised. |
 | V1 `sessionCapabilities.systemPrompt.mode.override` / v2 `session.systemPrompt.mode.override` | **❌ U** system-prompt gate disabled; parent `systemPrompt` marker for append also not advertised. |
 | V1 client `plan` | **❌ U** extended-plan reception marker not advertised; ordinary v1 `plan` adaptation is separate and supported. |

@@ -264,6 +264,28 @@ mod tests {
     }
 
     const ACP: &str = "default_agent = 'a'\n[agents.a]\ncommand = 'old-agent'\n";
+    #[tokio::test]
+    async fn mcp_reload_publishes_whole_snapshots_and_failed_selectors_preserve_the_old_revision() {
+        let fixture = Fixture::new();
+        let text = |url: &str| {
+            format!(
+                "{ACP}mcp_servers = ['docs']\n[mcp_servers.docs]\ntransport = 'http'\nurl = '{url}'\n"
+            )
+        };
+        let source = fixture.config(&text("https://old.example.test/mcp"));
+        let broker = Broker::new(source.load().unwrap()).with_config_source(source);
+        let pinned = broker.config();
+        fixture.config(&text("https://new.example.test/mcp"));
+        assert_eq!(broker.reload_config().await.unwrap(), 1);
+        let old = pinned.mcp_servers["docs"].definition().unwrap();
+        let new = broker.config().mcp_servers["docs"].definition().unwrap();
+        assert_ne!(old, new);
+        let current = broker.config();
+        fixture.config(&format!("{ACP}mcp_servers = ['missing']\n"));
+        assert!(broker.reload_config().await.is_err());
+        assert!(Arc::ptr_eq(&current, &broker.config()));
+        assert_eq!(*broker.catalog.borrow(), 1);
+    }
     fn opencode(endpoint: &str) -> String {
         format!(
             "default_agent = 'a'\n[agents.a]\nkind = 'opencode-server'\nendpoint = '{endpoint}'\n"

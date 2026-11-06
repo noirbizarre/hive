@@ -250,11 +250,21 @@ impl crate::Broker {
                 .sessions
                 .lock()
                 .map_err(|_| runtime::RuntimeError::Binding)?;
-            let entry = sessions
+            let pending = self
+                .mcp_sessions
+                .pending
+                .lock()
+                .map_err(|_| runtime::RuntimeError::Binding)?;
+            let (target_control, target_cwd) = sessions
                 .get(&session.to_string())
+                .map(|e| (&e.control, &e.cwd))
+                .or_else(|| {
+                    pending
+                        .get(&session.to_string())
+                        .map(|e| (&e.control, &e.cwd))
+                })
                 .ok_or(runtime::RuntimeError::Binding)?;
-            let state = entry
-                .control
+            let state = target_control
                 .lock()
                 .map_err(|_| runtime::RuntimeError::Binding)?;
             if state.closing || state.activity.session == "ended" {
@@ -265,9 +275,9 @@ impl crate::Broker {
                 return Err(AdmissionError::Scope);
             }
             (
-                entry.control.clone(),
+                target_control.clone(),
                 state.workspace_context.clone(),
-                entry.cwd.clone(),
+                target_cwd.clone(),
             )
         };
         if let Some(store) = &self.store {
@@ -331,16 +341,20 @@ impl crate::Broker {
             .sessions
             .lock()
             .map_err(|_| runtime::RuntimeError::Binding)?;
-        let entry = sessions
-            .get(&session.to_string())
-            .ok_or(runtime::RuntimeError::Binding)?;
-        if !std::sync::Arc::ptr_eq(&entry.control, expected) {
-            return Err(runtime::RuntimeError::Binding.into());
-        }
-        let control = entry
-            .control
+        let pending = self
+            .mcp_sessions
+            .pending
             .lock()
             .map_err(|_| runtime::RuntimeError::Binding)?;
+        let target = sessions
+            .get(&session.to_string())
+            .map(|e| &e.control)
+            .or_else(|| pending.get(&session.to_string()).map(|e| &e.control))
+            .ok_or(runtime::RuntimeError::Binding)?;
+        if !std::sync::Arc::ptr_eq(target, expected) {
+            return Err(runtime::RuntimeError::Binding.into());
+        }
+        let control = target.lock().map_err(|_| runtime::RuntimeError::Binding)?;
         if control.closing || control.activity.session == "ended" {
             return Err(runtime::RuntimeError::Binding.into());
         }

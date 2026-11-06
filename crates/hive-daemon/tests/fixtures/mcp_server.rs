@@ -100,9 +100,23 @@ async fn main() {
                 } else {
                     "2025-11-25"
                 };
-                send(&mut output, id, json!({"protocolVersion": version, "serverInfo": {"name": "fixture", "version": "1"}, "capabilities": {"tools": {}}})).await;
+                let capabilities = if mode == "routing" { json!({"tools":{"listChanged":true},"resources":{"subscribe":true},"prompts":{}}) } else { json!({"tools":{}}) };
+                send(&mut output, id, json!({"protocolVersion": version, "serverInfo": {"name": "fixture", "version": "1"}, "capabilities": capabilities})).await;
             }
             "ping" => send(&mut output, id, json!({})).await,
+            "tools/list" if mode == "routing" => {
+                let name = if std::path::Path::new(&format!("{log}.changed")).exists() { "changed" } else { "echo" };
+                let second = message["params"].get("cursor").is_some();
+                let mut result = json!({"tools":[{"name":if second {"error"} else {name},"description":"Fixture tool","inputSchema":{"type":"object"}}]});
+                if second { result["tools"].as_array_mut().unwrap().push(json!({"name":"hold","title":"hold","inputSchema":{"type":"object"}})); }
+                if !second { result["nextCursor"] = json!("backend-private-cursor"); }
+                send(&mut output, id, result).await;
+            }
+            "resources/list" if mode == "routing" => send(&mut output, id, json!({"resources":[{"name":"same","uri":"file:///same?x=%2f#part"}]})).await,
+            "resources/templates/list" if mode == "routing" => send(&mut output, id, json!({"resourceTemplates":[{"name":"template","uriTemplate":"file:///{+path}{?revision}"}]})).await,
+            "resources/read" if mode == "routing" => send(&mut output, id, json!({"contents":[{"uri":message["params"]["uri"],"text":"resource text"}]})).await,
+            "prompts/list" if mode == "routing" => send(&mut output, id, json!({"prompts":[{"name":"same","arguments":[]}]})).await,
+            "prompts/get" if mode == "routing" => send(&mut output, id, json!({"messages":[{"role":"user","content":{"type":"resource","resource":{"uri":"file:///same","text":"prompt"}}}]})).await,
             "notifications/initialized" if mode == "roots" => {
                 output.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"root-query\",\"method\":\"roots/list\",\"params\":{}}\n{\"jsonrpc\":\"2.0\",\"id\":\"sampling-query\",\"method\":\"sampling/createMessage\",\"params\":{}}\n").await.unwrap();
                 output.flush().await.unwrap();
@@ -137,6 +151,11 @@ async fn main() {
                         while let Some((id, value)) = held.pop() { send(&mut output, id, value).await; }
                         send(&mut output, id, json!({"released": true})).await;
                     }
+                    _ if mode == "routing" && std::path::Path::new(&format!("{log}.malformed")).exists() => send(&mut output, id, json!({"content":{}})).await,
+                    _ if mode == "routing" => send(&mut output, id, json!({
+                        "content":[{"type":"resource_link","name":"linked","uri":"file:///unlisted"},{"type":"text","text":"file:///opaque"}],
+                        "structuredContent":{"pid":std::process::id(),"arguments":message["params"]["arguments"],"uri":"application-native"}, "isError":false
+                    })).await,
                     _ => send(&mut output, id, json!({"pid": std::process::id(), "arguments": message["params"]["arguments"]})).await,
                 }
             }

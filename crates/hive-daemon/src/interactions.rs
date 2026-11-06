@@ -13,14 +13,18 @@ pub(super) async fn startup<T>(
 ) -> Result<T, ()> {
     tokio::pin!(ready);
     let mut deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut phase = control.lock().map_err(|_| ())?.startup_phase;
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     loop {
         tokio::select! {
             result = &mut ready => return Ok(result),
             _ = tick.tick() => {
                 // Human decisions have their own deadline; startup's watchdog measures agent silence.
-                if control.lock().is_ok_and(|state| state.pending_interactions > 0) {
-                    deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+                let state = control.lock().map_err(|_| ())?;
+                if state.pending_interactions > 0 || state.startup_phase != phase {
+                    phase = state.startup_phase;
+                    // Readiness has its own 15-second runtime budget; leave time for its diagnostic.
+                    deadline = tokio::time::Instant::now() + Duration::from_secs(if phase == 1 { 20 } else { 15 });
                 } else if tokio::time::Instant::now() >= deadline { return Err(()); }
             }
         }

@@ -230,11 +230,15 @@ pub(super) async fn run(
                 method: "notifications/initialized".into(),
                 params: json!({}),
             })?;
-            status.send_replace(Status::Ready(Ready {
+            status.send_replace(Status::Ready(std::sync::Arc::new(Ready {
                 connection: cx.clone(),
                 capabilities: response["capabilities"].clone(),
+                metadata: serde_json::json!({
+                    "capabilities": response["capabilities"], "serverInfo": response["serverInfo"],
+                    "instructions": response.get("instructions"), "generation": uuid::Uuid::new_v4().to_string(),
+                }),
                 since: tokio::time::Instant::now(),
-            }));
+            })));
             initialized.send_replace(true);
             // Clean EOF alone does not end an SDK foreground future; end it explicitly.
             cx.incoming_closed().await;

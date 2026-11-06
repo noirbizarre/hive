@@ -22,6 +22,9 @@ lockfile = true
 # from the version file; runtime selection below preserves CI's toolchain.
 idiomatic_version_file_enable_tools = []
 
+[tool_alias]
+bee = "github:noirbizarre/bee"
+
 [tools]
 # Keep the install request stable and lockable; runtime selection lives in env.
 rust = { version = "stable", components = ["rustfmt", "clippy"], mr_boxington = true }
@@ -58,6 +61,16 @@ cargo-binstall = "latest"
 uv = "latest"
 # cargo-insta is declared on the task that uses it instead of here — see the
 # note in the header.
+
+# Native workspace lifecycle tests must run on every CI platform, not silently skip.
+jj = "latest"
+
+[tools.bee]
+# Keep the external test agent on the shared install/PATH and checksum-locking path.
+version = "0.2.0"
+format = "raw"
+bin = "bee"
+platforms.windows-x64 = { bin = "bee.exe" }
 
 [env]
 # dtolnay selects a rustup default, not RUSTUP_TOOLCHAIN. Explicit selections
@@ -235,20 +248,6 @@ git tpl diff --exit-code --stat
 #
 # Artwork tasks belong here rather than in `default` or `check`: they rewrite
 # committed binaries, so a routine run would dirty the working tree every time.
-
-[tool_alias]
-bee = "github:noirbizarre/bee"
-
-[tools.bee]
-# Keep the external test agent on the shared install/PATH and checksum-locking path.
-version = "0.2.0"
-format = "raw"
-bin = "bee"
-platforms.windows-x64 = { bin = "bee.exe" }
-
-[tools.jj]
-# Native workspace lifecycle tests must run on every CI platform, not silently skip.
-version = "0.46.0"
 
 [tasks."hive:web"]
 description = "Build and test the embedded Vue browser client"

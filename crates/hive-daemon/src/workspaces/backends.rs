@@ -3,6 +3,7 @@
 use super::*;
 mod archive;
 pub(super) mod jj;
+mod vcs;
 use hive_core::workspace::backend::{
     BackendData, BackendManager, CheckpointWriter, PreparationContext, PreparedWorkspace,
     ProvisionerCapabilities, ProvisionerDescriptor, ProvisionerId, RepositoryBackend,
@@ -157,6 +158,20 @@ pub(super) struct GitRepository;
 
 impl RepositoryBackend for GitRepository {
     type Error = Error;
+
+    fn supports_vcs(&self) -> bool {
+        true
+    }
+    fn vcs(
+        &self,
+        target: hive_core::workspace::backend::vcs::Target<'_>,
+        request: &hive_core::workspace::backend::vcs::Request,
+    ) -> Result<hive_core::workspace::backend::vcs::Result, hive_core::workspace::backend::vcs::Error>
+    {
+        self.validate(target.repository)
+            .map_err(|_| hive_core::workspace::backend::vcs::Error::Backend)?;
+        vcs::execute(target, request, false)
+    }
 
     fn validate(&self, repository: &RepositoryHandle) -> Result<(), Error> {
         storage(repository).map(|_| ())
@@ -474,6 +489,8 @@ impl GitProvisioner {
         let cleanliness = match git(
             path,
             &[
+                // Scoped read tools also use this ownership observation; do not refresh its index.
+                "--no-optional-locks",
                 "status",
                 "--porcelain=v1",
                 "--untracked-files=all",

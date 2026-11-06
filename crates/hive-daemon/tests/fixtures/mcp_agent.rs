@@ -27,6 +27,7 @@ async fn exercise(
     cx: V2ConnectionTo<Client>,
     declarations: Vec<v2::McpServer>,
     phase: &str,
+    cwd: Option<std::path::PathBuf>,
 ) -> Result<(), Error> {
     let mut report = json!({"phase":phase,"declarations":declarations,"lists":{},"calls":[],"reads":[],"linkedReads":[],"templateReads":[],"prompts":[],"http":[]});
     for declaration in &declarations {
@@ -54,7 +55,7 @@ async fn exercise(
                         ),
                         (
                             "workspaceUnsupported",
-                            json!({"name":"hive.vcs.commit","arguments":{}}),
+                            json!({"name":"hive.vcs.unknown","arguments":{}}),
                         ),
                     ] {
                         report[key] = invoke(&cx, id, "tools/call", params).await?;
@@ -86,6 +87,13 @@ async fn exercise(
                     report["lists"][key] = json!(items);
                 }
                 for tool in report["lists"]["tools"].as_array().unwrap().clone() {
+                    // Discovery alone must never cause generic fixture calls to record changes.
+                    if tool["name"]
+                        .as_str()
+                        .is_some_and(|name| name.starts_with("hive.vcs."))
+                    {
+                        continue;
+                    }
                     if tool["name"] == "hive.workspace.capabilities" {
                         report["workspace"] = invoke(
                             &cx,
@@ -130,6 +138,31 @@ async fn exercise(
                         Ok(v) => v,
                         Err(e) => json!({"outerError":e}),
                     });
+                }
+                if std::env::var_os("HIVE_VCS_EXERCISE").is_some() {
+                    let root = cwd.as_ref().ok_or_else(Error::internal_error)?;
+                    std::fs::write(root.join("committed.txt"), format!("VCS tool {phase}\n"))
+                        .map_err(|_| Error::internal_error())?;
+                    std::fs::write(root.join("untracked.txt"), "must remain untracked\n")
+                        .map_err(|_| Error::internal_error())?;
+                    for (key, name, arguments) in [
+                        ("vcsStatus", "hive.vcs.status", json!({})),
+                        ("vcsDiff", "hive.vcs.diff", json!({})),
+                        (
+                            "vcsCommit",
+                            "hive.vcs.commit",
+                            json!({"message":format!("VCS tool {phase}"),"inclusion":"tracked_working_copy"}),
+                        ),
+                        ("vcsLog", "hive.vcs.log", json!({"limit":5})),
+                    ] {
+                        report[key] = invoke(
+                            &cx,
+                            id,
+                            "tools/call",
+                            json!({"name":name,"arguments":arguments}),
+                        )
+                        .await?;
+                    }
                 }
                 for resource in report["lists"]["resources"].as_array().unwrap().clone() {
                     let read =
@@ -269,7 +302,13 @@ async fn main() -> Result<(), Error> {
                 let driver = cx.clone();
                 let declarations = declarations.clone();
                 cx.spawn(async move {
-                    exercise(driver, request.mcp_servers.clone(), "new").await?;
+                    exercise(
+                        driver,
+                        request.mcp_servers.clone(),
+                        "new",
+                        Some(request.cwd.0.clone()),
+                    )
+                    .await?;
                     declarations.send_replace(request.mcp_servers);
                     if std::env::var_os("HIVE_MCP_REJECT_SETUP").is_some() {
                         return responder.respond_with_error(Error::internal_error());
@@ -292,7 +331,13 @@ async fn main() -> Result<(), Error> {
                     {
                         return responder.respond_with_error(Error::internal_error());
                     }
-                    exercise(driver.clone(), request.mcp_servers, "resume").await?;
+                    exercise(
+                        driver.clone(),
+                        request.mcp_servers,
+                        "resume",
+                        Some(request.cwd.0.clone()),
+                    )
+                    .await?;
                     driver.send_notification(v2::UpdateSessionNotification::new(
                         request.session_id,
                         v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(
@@ -318,7 +363,7 @@ async fn main() -> Result<(), Error> {
                     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
                 }
                 let declarations = snapshot.borrow().clone();
-                exercise(cx, declarations, "active").await?;
+                exercise(cx, declarations, "active", None).await?;
             }
             Ok(())
         })

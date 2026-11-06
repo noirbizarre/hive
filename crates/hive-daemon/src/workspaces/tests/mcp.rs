@@ -28,7 +28,7 @@ async fn workspace_tool_scope_is_derived_from_the_session_hold_and_rejects_forei
         .unwrap();
     assert_eq!(result.repository_backend.as_deref(), Some("git"));
     assert_eq!(result.provisioner, "git.worktree");
-    assert_eq!(result.tools, tools::tools());
+    assert_eq!(result.tools, tools::catalog(true));
     assert!(matches!(
         fixture
             .service
@@ -73,7 +73,10 @@ async fn workspace_tool_scope_is_derived_from_the_session_hold_and_rejects_forei
 #[tokio::test]
 async fn built_in_calls_retain_settlement_after_close_caller_drop_recovery_and_shutdown() {
     use crate::mcp::{PendingTarget, StartupOwnership, workspace::Provider};
-    for action in ["close", "drop", "recovery", "shutdown"] {
+    for (action, mutation) in ["close", "drop", "recovery", "shutdown"]
+        .into_iter()
+        .flat_map(|action| [(action, false), (action, true)])
+    {
         let fixture = Fixture::new();
         let entry = fixture.create(fixture.request()).await.unwrap();
         let project = entry.workspace.intent().project.clone();
@@ -97,6 +100,7 @@ async fn built_in_calls_retain_settlement_after_close_caller_drop_recovery_and_s
             .await
             .unwrap();
         let cwd = PathBuf::from(entry.workspace.location().unwrap().root.as_str());
+        std::fs::write(cwd.join("content"), "pending commit\n").unwrap();
         let mut state = crate::control_tests::detached();
         state.worktrunk_local = true;
         state.workspace_context = Some(hive_protocol::workspace::Context {
@@ -126,7 +130,16 @@ async fn built_in_calls_retain_settlement_after_close_caller_drop_recovery_and_s
             waiting.lock().unwrap().recv().unwrap();
         }));
         let old = provider.clone();
-        let call = tokio::spawn(async move { provider.capabilities(None).await });
+        let call = tokio::spawn(async move {
+            let request = mutation.then(|| hive_core::workspace::backend::vcs::Request::Commit {
+                message: "must not dispatch".into(),
+                inclusion: hive_core::workspace::backend::vcs::Inclusion::TrackedWorkingCopy,
+                untracked: vec![],
+                ignored: vec![],
+                expected_state: None,
+            });
+            provider.execute(request, None).await
+        });
         ready.await.unwrap();
         match action {
             "close" => control.lock().unwrap().closing = true,
@@ -176,6 +189,15 @@ async fn built_in_calls_retain_settlement_after_close_caller_drop_recovery_and_s
             .await
             .unwrap();
         let _ = call.await;
+        if mutation {
+            let root = Path::new(entry.workspace.location().unwrap().root.as_str());
+            assert_eq!(
+                git(root, &["log", "-1", "--format=%s"], "test")
+                    .unwrap()
+                    .trim(),
+                "initial"
+            );
+        }
         assert!(old.capabilities(None).await.is_err());
         startup.promoted = true;
         drop(startup);
@@ -375,6 +397,121 @@ async fn machine_reservations_protect_extra_resources_without_a_primary_session_
             }
         ));
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_commit_already_dispatched_retains_its_known_result_and_settlement_after_close() {
+    use crate::mcp::{PendingTarget, StartupOwnership, workspace::Provider};
+    use hive_core::workspace::backend::vcs::{Inclusion, Request};
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let entry = fixture.create(fixture.request()).await.unwrap();
+    let root = PathBuf::from(entry.workspace.location().unwrap().root.as_str());
+    std::fs::write(
+        root.join("content"),
+        "recorded despite cancelled delivery\n",
+    )
+    .unwrap();
+    let hooks = fixture._directory.path().join("blocking-hooks");
+    std::fs::create_dir(&hooks).unwrap();
+    let hook = hooks.join("pre-commit");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\ntouch hook-entered\nwhile [ ! -e hook-release ]; do sleep 0.01; done\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+    git(
+        &root,
+        &["config", "core.hooksPath", hooks.to_str().unwrap()],
+        "test",
+    )
+    .unwrap();
+    let project = entry.workspace.intent().project.clone();
+    let mut config = crate::Config::default();
+    config
+        .projects
+        .insert(project.clone(), fixture.definition.clone());
+    let broker = crate::Broker::persistent(
+        config,
+        fixture
+            .service
+            .store
+            .state_directory()
+            .join("catalog.sqlite3"),
+    )
+    .unwrap();
+    let session = hive_protocol::v2::SessionId::new("dispatched-commit-session");
+    fixture
+        .service
+        .attach(entry.workspace.id().clone(), session.to_string())
+        .await
+        .unwrap();
+    let mut state = crate::control_tests::detached();
+    state.worktrunk_local = true;
+    state.workspace_context = Some(hive_protocol::workspace::Context {
+        owner: Some(entry.workspace.intent().node.clone()),
+        project: project.to_string(),
+        workspace: entry.workspace.id().to_string(),
+        effective_cwd: root.display().to_string(),
+    });
+    let control = Arc::new(std::sync::Mutex::new(state));
+    let mut startup = broker
+        .begin_mcp_startup(
+            session.to_string(),
+            PendingTarget {
+                control: control.clone(),
+                cwd: hive_protocol::v2::AbsolutePath::new(root.clone()),
+            },
+            StartupOwnership::Recovery,
+        )
+        .unwrap();
+    let provider = Provider::prepare(&broker, &session).unwrap().unwrap();
+    let call = tokio::spawn(async move {
+        provider
+            .execute(
+                Some(Request::Commit {
+                    message: "retained native success".into(),
+                    inclusion: Inclusion::TrackedWorkingCopy,
+                    untracked: vec![],
+                    ignored: vec![],
+                    expected_state: None,
+                }),
+                None,
+            )
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !root.join("hook-entered").exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    control.lock().unwrap().closing = true;
+    broker.mcp_sessions.cancel(&session.to_string());
+    let pending = broker.mcp_sessions.finish(&session.to_string());
+    assert_eq!(pending.len(), 1);
+    assert!(
+        !*pending[0].borrow(),
+        "a running native hook retains the resource hold"
+    );
+    std::fs::write(root.join("hook-release"), "").unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(10), call)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(result["outcome"], "recorded");
+    assert_eq!(
+        result["recorded"]["identity"]["commitId"],
+        git(&root, &["rev-parse", "HEAD"], "test").unwrap().trim()
+    );
+    crate::mcp::settled(pending).await;
+    startup.promoted = true;
+    fixture.service.release(session.to_string()).await.unwrap();
+    broker.shutdown().await;
 }
 
 fn executable_path_parent(identity: &InstanceIdentity) -> &Path {

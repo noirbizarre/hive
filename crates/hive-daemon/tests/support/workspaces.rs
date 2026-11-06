@@ -60,7 +60,7 @@ impl Fixture {
         std::fs::write(
             base.join("gitconfig"),
             format!(
-                "[url {:?}]\n insteadOf = https://example.test/project\n[protocol \"file\"]\n allow = always\n[core]\n hooksPath =\n",
+                "[url {:?}]\n insteadOf = https://example.test/project\n[protocol \"file\"]\n allow = always\n[core]\n hooksPath =\n[user]\n name = Hive Test\n email = hive@example.test\n[commit]\n gpgsign = false\n",
                 reqwest::Url::from_file_path(&seed).unwrap().as_str()
             ),
         ).unwrap();
@@ -193,6 +193,71 @@ async fn workspace_gateway_host_serves_only_when_requested_by_a_parent_process()
         .unwrap();
 }
 
+fn assert_vcs_report(report: &Value, owner: &str, backend: &str) {
+    for key in ["vcsStatus", "vcsDiff", "vcsCommit", "vcsLog"] {
+        assert_eq!(report[key]["isError"], false, "{key}: {}", report[key]);
+        assert_eq!(report[key]["structuredContent"]["owner"], owner);
+        assert_eq!(
+            report[key]["structuredContent"]["repositoryBackend"],
+            backend
+        );
+    }
+    assert_eq!(
+        report["vcsStatus"]["structuredContent"]["state"]["dirty"],
+        true
+    );
+    let result = &report["vcsCommit"]["structuredContent"];
+    assert_eq!(result["outcome"], "recorded");
+    assert!(
+        result["state"]["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file["path"] == "untracked.txt" && file["untracked"] == true)
+    );
+    let recorded = result["recorded"]["identity"]["commitId"].as_str().unwrap();
+    assert!(
+        report["vcsLog"]["structuredContent"]["history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| change["identity"]["commitId"] == recorded)
+    );
+}
+
+fn assert_native_vcs_record(root: &Path, report: &Value, backend: &str) {
+    let recorded = report["vcsCommit"]["structuredContent"]["recorded"]["identity"]["commitId"]
+        .as_str()
+        .unwrap();
+    let files = if backend == "git" {
+        assert_eq!(git(root, &["rev-parse", "HEAD"]), recorded);
+        git(root, &["ls-tree", "--name-only", "-r", recorded])
+    } else {
+        let output = Command::new("jj")
+            .current_dir(root)
+            .args([
+                "--ignore-working-copy",
+                "--no-integrate-operation",
+                "file",
+                "list",
+                "-r",
+                recorded,
+                "-T",
+                "path ++ \"\\n\"",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    assert!(files.contains("committed.txt"));
+    assert!(!files.contains("untracked.txt"));
+}
+
 #[tokio::test]
 async fn remote_workspace_capability_calls_execute_on_the_owner_during_startup_and_recovery() {
     use hive_protocol::{remote::Peer, transport::Credentials};
@@ -215,7 +280,7 @@ async fn remote_workspace_capability_calls_execute_on_the_owner_during_startup_a
         }
         let fixture = Fixture::new(AgentVersion::V2, false);
         std::fs::write(fixture.path("agents.toml"), format!(
-            "[agents.coder]\ncommand = {:?}\n[agents.coder.env]\nHIVE_MCP_REPORT = {:?}\nHIVE_WORKSPACE_TOOLS = '1'\n",
+             "[agents.coder]\ncommand = {:?}\n[agents.coder.env]\nHIVE_MCP_REPORT = {:?}\nHIVE_WORKSPACE_TOOLS = '1'\nHIVE_VCS_EXERCISE = '1'\n",
             env!("CARGO_BIN_EXE_hive-test-mcp-agent"), fixture.path("report.json"))).unwrap();
         if scm == "jj" {
             std::fs::write(fixture.path("projects.toml"), "[projects.demo]\nname = 'Demo'\nscm = 'jj'\nrepository_source = 'https://example.test/project'\ndefault_revision = 'main@origin'\n").unwrap();
@@ -268,8 +333,14 @@ async fn remote_workspace_capability_calls_execute_on_the_owner_during_startup_a
                     assert_eq!(actual["project"], "demo");
                     assert_eq!(actual["repositoryBackend"], scm);
                     assert_eq!(actual["provisioner"], provisioner);
-                    assert_eq!(report["lists"]["tools"].as_array().unwrap().len(), 1);
-                    assert_eq!(actual["tools"].as_array().unwrap().len(), 1);
+                    assert_eq!(report["lists"]["tools"].as_array().unwrap().len(), 5);
+                    assert_eq!(actual["tools"].as_array().unwrap().len(), 5);
+                    assert_vcs_report(&report, &peer.node, scm);
+                    assert_native_vcs_record(
+                        Path::new(context["effectiveCwd"].as_str().unwrap()),
+                        &report,
+                        scm,
+                    );
                     assert_eq!(
                         inventory(address).await["workspaces"][0]["selection"]["provisioner"],
                         actual["provisioner"]
@@ -314,6 +385,12 @@ async fn remote_workspace_capability_calls_execute_on_the_owner_during_startup_a
                     )
                     .unwrap();
                     assert_eq!(report["phase"], "resume");
+                    assert_vcs_report(&report, context["owner"].as_str().unwrap(), scm);
+                    assert_native_vcs_record(
+                        Path::new(context["effectiveCwd"].as_str().unwrap()),
+                        &report,
+                        scm,
+                    );
                     assert_eq!(
                         report["workspace"]["structuredContent"]["owner"],
                         context["owner"]

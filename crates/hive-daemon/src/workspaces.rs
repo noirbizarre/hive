@@ -2268,6 +2268,32 @@ fn execute_output_with_timeout(
     digest: bool,
     timeout: Duration,
 ) -> Result<Vec<u8>, Error> {
+    execute_output_policy(
+        program,
+        path,
+        args,
+        worktrunk,
+        project_config,
+        digest,
+        timeout,
+        false,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "separate truncating diffs from fail-closed ownership evidence"
+)]
+fn execute_output_policy(
+    program: &str,
+    path: Option<&Path>,
+    args: &[&str],
+    worktrunk: bool,
+    project_config: Option<&Path>,
+    digest: bool,
+    timeout: Duration,
+    truncate: bool,
+) -> Result<Vec<u8>, Error> {
     #[cfg(test)]
     let replacement = TEST_GIT_CONFIG.with(|config| {
         config
@@ -2324,8 +2350,8 @@ fn execute_output_with_timeout(
     if let Some(path) = path {
         command.current_dir(path);
     }
-    let (status, output, diagnostic) = capture_output(command, timeout, worktrunk, digest)
-        .map_err(|error| {
+    let (status, output, diagnostic) =
+        capture_output_policy(command, timeout, worktrunk, digest, truncate).map_err(|error| {
             if program == "jj" && matches!(error, Error::Git(_)) {
                 Error::JjUnavailable
             } else {
@@ -2417,11 +2443,22 @@ fn capture_command(
     capture_output(command, limit, worktrunk, false)
 }
 
+#[cfg(test)]
 fn capture_output(
     command: Command,
     limit: Duration,
     worktrunk: bool,
     digest: bool,
+) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), Error> {
+    capture_output_policy(command, limit, worktrunk, digest, false)
+}
+
+fn capture_output_policy(
+    command: Command,
+    limit: Duration,
+    worktrunk: bool,
+    digest: bool,
+    truncate: bool,
 ) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>), Error> {
     use command_group::AsyncCommandGroup;
     use tokio::io::AsyncReadExt;
@@ -2448,6 +2485,7 @@ fn capture_output(
                     async fn drain(
                         mut pipe: impl tokio::io::AsyncRead + Unpin,
                         digest: bool,
+                        allow_truncation: bool,
                     ) -> std::io::Result<Vec<u8>> {
                         use sha2::{Digest, Sha256};
                         let mut hash = Sha256::new();
@@ -2461,7 +2499,7 @@ fn capture_output(
                                     return Ok(hash.finalize().to_vec());
                                 }
                                 // A truncated manifest cannot be evidence that a checkout is clean.
-                                return if truncated {
+                                return if truncated && !allow_truncation {
                                     Err(std::io::Error::other("command output limit exceeded"))
                                 } else {
                                     Ok(output)
@@ -2484,8 +2522,8 @@ fn capture_output(
                     let result = tokio::time::timeout(limit, async {
                         tokio::try_join!(
                             child.inner().wait(),
-                            drain(stdout, digest),
-                            drain(stderr, false)
+                            drain(stdout, digest, truncate),
+                            drain(stderr, false, false)
                         )
                     })
                     .await;

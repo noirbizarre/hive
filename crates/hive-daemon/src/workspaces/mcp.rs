@@ -29,19 +29,35 @@ impl Protection {
 }
 
 impl Service {
+    #[cfg(test)]
     pub(crate) async fn tool_capabilities(
         &self,
         session: String,
         context: hive_protocol::workspace::Context,
         cwd: PathBuf,
-        authorize: impl FnOnce() -> Result<(), hive_protocol::workspace_tools::ToolError>
-        + Send
-        + 'static,
+        authorize: impl Fn() -> Result<(), hive_protocol::workspace_tools::ToolError> + Send + 'static,
     ) -> Result<
         hive_protocol::workspace_tools::Capabilities,
         hive_protocol::workspace_tools::ToolError,
     > {
+        let value = self
+            .tool_execute(session, context, cwd, None, authorize)
+            .await?;
+        serde_json::from_value(value)
+            .map_err(|_| hive_protocol::workspace_tools::ToolError::Backend)
+    }
+
+    pub(crate) async fn tool_execute(
+        &self,
+        session: String,
+        context: hive_protocol::workspace::Context,
+        cwd: PathBuf,
+        request: Option<hive_core::workspace::backend::vcs::Request>,
+        authorize: impl Fn() -> Result<(), hive_protocol::workspace_tools::ToolError> + Send + 'static,
+    ) -> Result<serde_json::Value, hive_protocol::workspace_tools::ToolError> {
         use hive_protocol::workspace_tools::{self as tools, ToolError};
+        let mutation_admitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let admitted = mutation_admitted.clone();
         self.run(move |rt| {
             Ok((|| {
                 // A queued job must recheck authority after acquiring the resource deletion gate.
@@ -63,7 +79,50 @@ impl Service {
                     .get(id.as_str())
                     .ok_or(ToolError::Scope)?;
                 let selection = rt.selection(entry).map_err(|_| ToolError::Scope)?;
-                Ok(tools::Capabilities {
+                let backend = selection
+                    .repository
+                    .as_ref()
+                    .map(|repository| rt.manager.repository(repository))
+                    .transpose()
+                    .map_err(|_| ToolError::Backend)?;
+                if let Some(request) = request {
+                    let repository = selection
+                        .repository
+                        .as_ref()
+                        .ok_or(ToolError::Unsupported)?;
+                    let backend = backend.ok_or(ToolError::Unsupported)?;
+                    let location = entry.workspace.location().ok_or(ToolError::Scope)?;
+                    let fence = || {
+                        authorize()
+                            .map_err(|_| hive_core::workspace::backend::vcs::Error::Cancelled)?;
+                        // A lost blocking-job result after this fence cannot certify no effects.
+                        admitted.store(true, std::sync::atomic::Ordering::Release);
+                        Ok(())
+                    };
+                    let result = backend
+                        .vcs(
+                            hive_core::workspace::backend::vcs::Target {
+                                repository,
+                                root: &location.root,
+                                authorize_mutation: &fence,
+                            },
+                            &request,
+                        )
+                        .map_err(ToolError::Vcs)?;
+                    let mut value = serde_json::to_value(result).map_err(|_| ToolError::Backend)?;
+                    value["schemaVersion"] = serde_json::json!(tools::VERSION);
+                    value["operation"] = serde_json::to_value(&request)
+                        .map_err(|_| ToolError::Backend)?["operation"]
+                        .clone();
+                    value["owner"] = serde_json::json!(rt.state.node.to_string());
+                    value["project"] =
+                        serde_json::json!(entry.workspace.intent().project.to_string());
+                    value["workspace"] = serde_json::json!(id.to_string());
+                    value["repository"] = serde_json::json!(repository.id.to_string());
+                    value["repositoryBackend"] = serde_json::json!(repository.backend.0);
+                    return Ok(value);
+                }
+                serde_json::to_value(tools::Capabilities {
                     schema_version: tools::VERSION,
                     owner: rt.state.node.to_string(),
                     project: entry.workspace.intent().project.to_string(),
@@ -73,12 +132,19 @@ impl Service {
                         .as_ref()
                         .map(|repository| repository.backend.0.clone()),
                     provisioner: selection.provisioner.0.clone(),
-                    tools: tools::tools(),
+                    tools: tools::catalog(backend.is_some_and(|backend| backend.supports_vcs())),
                 })
+                .map_err(|_| ToolError::Backend)
             })())
         })
         .await
-        .map_err(|_| ToolError::Backend)?
+        .map_err(|_| {
+            if mutation_admitted.load(std::sync::atomic::Ordering::Acquire) {
+                ToolError::Vcs(hive_core::workspace::backend::vcs::Error::Uncertain)
+            } else {
+                ToolError::Backend
+            }
+        })?
     }
 
     /// Trusted recovery boundary: call only after independently verifying termination

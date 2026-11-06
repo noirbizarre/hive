@@ -28,6 +28,7 @@ futures = { workspace = true }
 tokio-util = { workspace = true }
 url = { workspace = true }
 glob = { workspace = true }
+ignore = { workspace = true }
 hive-core = { path = "../hive-core" }
 hive-protocol = { path = "../hive-protocol" }
 miette = { workspace = true }

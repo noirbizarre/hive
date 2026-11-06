@@ -12,6 +12,9 @@ mod mcp_tests;
 #[path = "tests/jj.rs"]
 mod jj_tests;
 
+#[path = "tests/vcs.rs"]
+mod vcs_tests;
+
 #[cfg(unix)]
 #[path = "tests/activity.rs"]
 mod activity_tests;

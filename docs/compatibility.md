@@ -346,13 +346,13 @@ remote listener and [Streamable HTTP transport](transports.md#sdk-audit-and-limi
    scope. A gap issue does not promise optional support. Remove unknown assessments
    when sufficient evidence exists, and record unassessed additions explicitly.
 5. Keep real-agent claims version/date/transport-specific. Retain probe summaries as
-    described below; deterministic mocks do not upgrade product evidence. Cross-agent
-     replay coverage for [#45](https://github.com/noirbizarre/hive/issues/45) is listed below. Programmable
-    Bee tests ([#57](https://github.com/noirbizarre/hive/issues/57)) provide independent
-    deterministic ACPv2 evidence, as described below.
+   described below; deterministic mocks do not upgrade product evidence. Cross-agent
+   replay coverage for [#45](https://github.com/noirbizarre/hive/issues/45) is listed below. Programmable
+   Bee tests ([#57](https://github.com/noirbizarre/hive/issues/57)) provide independent
+   deterministic ACPv2 evidence, as described below.
 6. Check navigation, preserved anchors, Markdown/spelling and the site build:
    `mise run lint:md`, `mise run spell`, `mise run docs:build`. Run relevant existing
-    gateway/client tests when refreshing behavioral claims; inference probes are opt-in.
+   gateway/client tests when refreshing behavioral claims; inference probes are opt-in.
 
 ### Programmable Bee evidence
 

@@ -31,7 +31,7 @@ site/
 # `mise run man`'s collected output.
 /dist
 
-# Installed by the commitlint prek hook.
+# Browser dependencies and generated assets are built locally and in CI.
 node_modules/
 clients/hive-web/dist/
 

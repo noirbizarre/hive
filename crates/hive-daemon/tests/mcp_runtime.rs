@@ -944,7 +944,7 @@ async fn broker_sessions_share_durable_bindings_across_disconnect_and_close() {
 
     let mut fixture = Fixture::new();
     let config = serde_json::from_value(json!({"default_agent": "mock", "agents": {"mock": {"command": env!("CARGO_BIN_EXE_hive-test-agent"), "versions": ["v2"]}}})).unwrap();
-    let broker = hive_daemon::Broker::new(config);
+    let broker = hive_daemon::Broker::new(config).unwrap();
     fixture.node = broker.mcp_execution_node().await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -1389,7 +1389,7 @@ async fn worker_exit_retains_only_recoverable_session_ownership_and_allows_offli
             )
             .unwrap()
         } else {
-            hive_daemon::Broker::new(config)
+            hive_daemon::Broker::new(config).unwrap()
         };
         fixture.node = broker.mcp_execution_node().await.unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

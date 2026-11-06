@@ -272,7 +272,7 @@ async fn the_broker_publisher_observes_interaction_only_waits_and_drains_on_shut
         "local".into(),
         toml::from_str("command = 'unused'").unwrap(),
     );
-    let mut broker = crate::Broker::new(config);
+    let mut broker = crate::Broker::new(config).unwrap();
     broker.store = Some(fixture.service.store.clone());
     let mut state = crate::control_tests::detached();
     state.worktrunk_local = true;
@@ -320,7 +320,7 @@ async fn the_broker_publisher_observes_interaction_only_waits_and_drains_on_shut
         let mut registry = broker.registry.lock().unwrap();
         let mut current = (*registry.current).clone();
         current.agents.clear();
-        registry.current = Arc::new(current);
+        registry.current = Arc::new(crate::reload::PreparedConfig::new(current).unwrap());
     }
     control.lock().unwrap().pending_interactions = 1;
     broker.catalog.send_modify(|revision| *revision += 1);

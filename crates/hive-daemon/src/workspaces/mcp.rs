@@ -3,7 +3,7 @@
 use super::*;
 use crate::mcp::{
     AdmissionError, InstanceIdentity, ResolvedTransport, Scope, ScopeContext, SessionMcpLease,
-    StdioAdmission, runtime,
+    runtime,
 };
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -168,21 +168,21 @@ impl Service {
         control: Arc<std::sync::Mutex<crate::Control>>,
         context: Option<hive_protocol::workspace::Context>,
         cwd: PathBuf,
-        admission: StdioAdmission,
+        admission: crate::mcp::resolution::AdmissionInput,
         cancelled: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<(SessionMcpLease, bool), AdmissionError> {
         let service = self.clone();
         // Keep inspection, reservation publication and final admission under one deletion gate.
         self.run(move |rt| {
             Ok((|| {
-                let scoped = admission.definition.scope() != Scope::Machine;
+                let scoped = admission.scope() != Scope::Machine;
                 let (scope, mut root) = rt.mcp_scope(
                     &session.to_string(),
                     scoped.then_some(context.as_ref()).flatten(),
                     &cwd,
                     scoped,
                 )?;
-                if admission.definition.scope() != Scope::Workspace {
+                if admission.scope() != Scope::Workspace {
                     root = None;
                 }
                 let identity = admission.identity(scope, root)?;

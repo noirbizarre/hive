@@ -109,7 +109,7 @@ pub(super) struct Connection {
 }
 
 pub(super) struct Snapshot {
-    config: Arc<Config>,
+    config: Arc<crate::reload::PreparedConfig>,
     cursor: String,
     position: usize,
     expires: tokio::time::Instant,
@@ -417,7 +417,7 @@ mod tests {
             json!({"agents":{"a":{"command":"unused"},"b":{"command":"unused"}}}),
         )
         .unwrap();
-        let broker = Broker::new(config);
+        let broker = Broker::new(config).unwrap();
         let mut connection = Connection {
             initialized: true,
             mode: Mode::Negotiated,
@@ -448,7 +448,7 @@ mod tests {
     #[test]
     fn profile_pages_hold_one_snapshot_and_reject_foreign_expired_and_agent_cursors() {
         let config: Config = toml::from_str("[agents.a]\ncommand = 'unused'\n[agents.b]\ncommand = 'unused'\n[profiles.first]\nagents = ['a']\n[profiles.second]\nagents = ['b']").unwrap();
-        let broker = Broker::new(config);
+        let broker = Broker::new(config).unwrap();
         let mut connection = Connection {
             initialized: true,
             mode: Mode::Negotiated,
@@ -479,7 +479,8 @@ mod tests {
                 .list_profiles(&broker, json!({"cursor":agent_cursor}))
                 .is_err()
         );
-        broker.registry.lock().unwrap().current = Arc::new(Config::default());
+        broker.registry.lock().unwrap().current =
+            Arc::new(crate::reload::PreparedConfig::new(Config::default()).unwrap());
         let next = connection
             .list_profiles(&broker, json!({"cursor":cursor}))
             .unwrap();
@@ -492,7 +493,8 @@ mod tests {
                 .is_empty()
         );
         let config: Config = toml::from_str("[profiles.a]\n[profiles.b]").unwrap();
-        broker.registry.lock().unwrap().current = Arc::new(config);
+        broker.registry.lock().unwrap().current =
+            Arc::new(crate::reload::PreparedConfig::new(config).unwrap());
         let cursor = connection
             .list_profiles(&broker, json!({"limit":1}))
             .unwrap()

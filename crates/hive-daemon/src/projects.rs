@@ -231,7 +231,7 @@ impl Broker {
                     return Err(RegistryError::Stopping);
                 }
                 ProjectSnapshot {
-                    current: registry.current.clone(),
+                    current: registry.current.raw.clone(),
                     managed_projects: registry.managed_projects.clone(),
                 }
             };

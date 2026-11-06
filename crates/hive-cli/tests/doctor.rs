@@ -85,6 +85,74 @@ fn included_profiles_and_fragment_errors_reach_both_doctor_formats() {
 }
 
 #[test]
+fn mcp_environment_references_and_validation_are_value_free_in_both_doctor_formats() {
+    let sandbox = Sandbox::new();
+    for (text, value, succeeds, code) in [
+        (
+            "[mcp.servers.docs]\nurl = 'https://example.test/mcp'\nheaders = { Authorization = { env = 'HIVE_MCP_DOCTOR_AUTH' } }",
+            Some("Bearer resolved-secret-sentinel"),
+            true,
+            "",
+        ),
+        (
+            "[mcp.servers.docs]\nurl = 'https://example.test/mcp'\nheaders = { Authorization = { env = 'HIVE_MCP_DOCTOR_AUTH' } }",
+            None,
+            false,
+            "hive::config::mcp",
+        ),
+        (
+            "[mcp.servers.docs]\nurl = 'https://example.test/mcp'\nheaders = { Authorization = { env = 'HIVE_MCP_DOCTOR_AUTH' } }",
+            Some(""),
+            false,
+            "hive::config::mcp",
+        ),
+        (
+            "[mcp.servers.docs]\nurl = 'https://example.test/mcp'\nheaders = { Authorization = { env = 'HIVE_MCP_DOCTOR_AUTH' }, Host = 'literal-secret-sentinel' }",
+            Some("Bearer resolved-secret-sentinel"),
+            false,
+            "hive::config::mcp",
+        ),
+        (
+            "[mcp.servers.docs]\nurl = 'https://example.test/mcp'\nheaders = { Authorization = { env = 'HIVE_MCP_DOCTOR_AUTH', unknown = 'literal-secret-sentinel' } }",
+            Some("Bearer resolved-secret-sentinel"),
+            false,
+            "hive::config::syntax",
+        ),
+    ] {
+        let config = sandbox.config(text);
+        for json in [false, true] {
+            let mut args = vec![
+                "doctor",
+                "--listen",
+                "127.0.0.1:0",
+                "--config",
+                config.to_str().unwrap(),
+            ];
+            if json {
+                args.push("--json");
+            }
+            let mut command = sandbox.hive(&args);
+            command.env_remove("HIVE_MCP_DOCTOR_AUTH");
+            if let Some(value) = value {
+                command.env("HIVE_MCP_DOCTOR_AUTH", value);
+            }
+            let output = run(&mut command);
+            assert_eq!(output.status.success(), succeeds);
+            let all = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(all.contains(code), "{all}");
+            assert!(!all.contains("secret-sentinel"), "{all}");
+            if json {
+                let _: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            }
+        }
+    }
+}
+
+#[test]
 fn a_broken_config_exits_non_zero_and_still_prints_valid_json() {
     let sandbox = Sandbox::new();
     let config = sandbox.config("default_agent = 'missing'\n");

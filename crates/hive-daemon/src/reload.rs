@@ -107,10 +107,54 @@ pub(crate) struct Registry {
         hive_core::identity::ProjectId,
         hive_core::project::ProjectDefinition,
     >,
-    pub current: Arc<Config>,
+    pub current: Arc<PreparedConfig>,
     pub source: Option<ConfigSource>,
     pub bindings: HashMap<String, Binding>,
     pub stopping: bool,
+}
+
+/// Raw configuration and resolved MCP inputs are published as one immutable revision.
+pub(crate) struct PreparedConfig {
+    pub raw: Arc<Config>,
+    pub servers: std::collections::BTreeMap<String, crate::mcp::configuration::PreparedServer>,
+}
+
+impl std::ops::Deref for PreparedConfig {
+    type Target = Config;
+    fn deref(&self) -> &Self::Target {
+        &self.raw
+    }
+}
+
+impl PreparedConfig {
+    pub(crate) fn new(config: Config) -> Result<Self, ConfigError> {
+        let environment = crate::mcp::configuration::environment();
+        Self::with_environment(config, &environment)
+    }
+
+    fn with_environment(
+        config: Config,
+        environment: &crate::mcp::configuration::Environment,
+    ) -> Result<Self, ConfigError> {
+        let servers = config
+            .mcp
+            .servers
+            .iter()
+            .map(|(id, server)| {
+                // Inline construction must enforce the same reserved IDs as file validation.
+                crate::mcp::configuration::validate_id(id)
+                    .map_err(|message| ConfigError::Mcp(message.into()))?;
+                server
+                    .prepare(environment)
+                    .map(|server| (id.clone(), server))
+                    .map_err(|error| ConfigError::Mcp(format!("MCP server '{id}': {error}")))
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            raw: Arc::new(config),
+            servers,
+        })
+    }
 }
 
 impl Registry {
@@ -152,7 +196,7 @@ impl Drop for Reservation {
 }
 
 impl Broker {
-    pub(crate) fn config(&self) -> Arc<Config> {
+    pub(crate) fn config(&self) -> Arc<PreparedConfig> {
         self.registry
             .lock()
             .expect("configuration lock poisoned")
@@ -179,7 +223,7 @@ impl Broker {
             }
             registry.source.clone().ok_or(ReloadError::NoSource)?
         };
-        let candidate = tokio::task::spawn_blocking(move || source.reload())
+        let candidate = tokio::task::spawn_blocking(move || PreparedConfig::new(source.reload()?))
             .await
             .map_err(|_| ReloadError::Internal)??;
         let mut registry = self.registry.lock().map_err(|_| ReloadError::Internal)?;
@@ -267,18 +311,17 @@ mod tests {
     #[tokio::test]
     async fn mcp_reload_publishes_whole_snapshots_and_failed_selectors_preserve_the_old_revision() {
         let fixture = Fixture::new();
-        let text = |url: &str| {
-            format!(
-                "{ACP}mcp_servers = ['docs']\n[mcp_servers.docs]\ntransport = 'http'\nurl = '{url}'\n"
-            )
-        };
+        let text =
+            |url: &str| format!("{ACP}mcp_servers = ['docs']\n[mcp.servers.docs]\nurl = '{url}'\n");
         let source = fixture.config(&text("https://old.example.test/mcp"));
-        let broker = Broker::new(source.load().unwrap()).with_config_source(source);
+        let broker = Broker::new(source.load().unwrap())
+            .unwrap()
+            .with_config_source(source);
         let pinned = broker.config();
         fixture.config(&text("https://new.example.test/mcp"));
         assert_eq!(broker.reload_config().await.unwrap(), 1);
-        let old = pinned.mcp_servers["docs"].definition().unwrap();
-        let new = broker.config().mcp_servers["docs"].definition().unwrap();
+        let old = pinned.servers["docs"].definition().unwrap();
+        let new = broker.config().servers["docs"].definition().unwrap();
         assert_ne!(old, new);
         let current = broker.config();
         fixture.config(&format!("{ACP}mcp_servers = ['missing']\n"));
@@ -286,6 +329,64 @@ mod tests {
         assert!(Arc::ptr_eq(&current, &broker.config()));
         assert_eq!(*broker.catalog.borrow(), 1);
     }
+    #[tokio::test]
+    async fn missing_mcp_references_preserve_the_published_revision_without_exposing_values() {
+        let fixture = Fixture::new();
+        let source = fixture.config("[mcp.servers.docs]\nurl = 'https://example.test/mcp'\nheaders = { Authorization = 'old-secret-sentinel' }");
+        let broker = Broker::new(source.load().unwrap())
+            .unwrap()
+            .with_config_source(source);
+        let pinned = broker.config();
+        // Use a UUID name so the test never depends on the developer's environment.
+        let variable = format!("HIVE_MCP_MISSING_{}", uuid::Uuid::new_v4().simple());
+        fixture.config(&format!("[mcp.servers.docs]\nurl = 'https://example.test/mcp'\nheaders = {{ Authorization = {{ env = '{variable}' }} }}"));
+        let error = broker.reload_config().await.unwrap_err().to_string();
+        assert!(error.contains(&variable) && error.contains("docs"));
+        assert!(!error.contains("old-secret-sentinel"));
+        assert!(Arc::ptr_eq(&pinned, &broker.config()));
+        assert_eq!(*broker.catalog.borrow(), 0);
+    }
+
+    #[test]
+    fn inline_brokers_reject_missing_references_and_reserved_ids_before_serving() {
+        let variable = format!("HIVE_MCP_MISSING_{}", uuid::Uuid::new_v4().simple());
+        for text in [
+            format!(
+                "[mcp.servers.docs]\nurl = 'https://example.test/mcp'\nheaders = {{ Authorization = {{ env = '{variable}' }} }}"
+            ),
+            "[mcp.servers.hive-managed-mcp]\ncommand = ['server']".into(),
+        ] {
+            let config: Config = toml::from_str(&text).unwrap();
+            assert!(matches!(Broker::new(config), Err(ConfigError::Mcp(_))));
+        }
+    }
+
+    #[test]
+    fn prepared_selections_keep_their_resolved_values_when_a_new_revision_is_prepared() {
+        let config: Config = toml::from_str("[mcp.servers.docs]\nurl = 'https://example.test/mcp'\nheaders = { Authorization = { env = 'AUTH' } }").unwrap();
+        let first = PreparedConfig::with_environment(
+            config.clone(),
+            &std::collections::BTreeMap::from([("AUTH".into(), "first-secret".into())]),
+        )
+        .unwrap();
+        let pinned = crate::mcp::routing::select(&first, &["docs".into()]).unwrap();
+        let second = PreparedConfig::with_environment(
+            config,
+            &std::collections::BTreeMap::from([("AUTH".into(), "second-secret".into())]),
+        )
+        .unwrap();
+        let refreshed = crate::mcp::routing::select(&second, &["docs".into()]).unwrap();
+        assert_eq!(
+            pinned["docs"].definition().unwrap(),
+            first.servers["docs"].definition().unwrap()
+        );
+        assert_ne!(
+            pinned["docs"].definition().unwrap(),
+            refreshed["docs"].definition().unwrap()
+        );
+        assert!(!format!("{pinned:?} {refreshed:?}").contains("secret"));
+    }
+
     fn opencode(endpoint: &str) -> String {
         format!(
             "default_agent = 'a'\n[agents.a]\nkind = 'opencode-server'\nendpoint = '{endpoint}'\n"
@@ -319,7 +420,9 @@ mod tests {
         )
         .unwrap();
         std::fs::write(&settings, "[profiles.personal]\ndefault_agent = 'a'").unwrap();
-        let broker = Broker::new(source.load().unwrap()).with_config_source(source);
+        let broker = Broker::new(source.load().unwrap())
+            .unwrap()
+            .with_config_source(source);
         let before = broker.config();
         std::fs::write(&settings, "[profiles.personal]\nname = 'Conflict'").unwrap();
         assert!(matches!(
@@ -349,7 +452,9 @@ mod tests {
         let b = fragments.join("b.toml");
         std::fs::write(&a, "[agents.a]\ncommand = 'old-agent'").unwrap();
         let source = fixture.config("include = ['conf.d/*.toml']");
-        let broker = Broker::new(source.load().unwrap()).with_config_source(source);
+        let broker = Broker::new(source.load().unwrap())
+            .unwrap()
+            .with_config_source(source);
         std::fs::write(&a, "[agents.a]\ncommand = 'edited-agent'").unwrap();
         std::fs::write(&b, "[agents.b]\ncommand = 'added-agent'").unwrap();
         assert_eq!(broker.reload_config().await.unwrap(), 1);
@@ -379,7 +484,9 @@ mod tests {
     async fn only_valid_complete_candidates_replace_the_current_registry_and_revision() {
         let fixture = Fixture::new();
         let source = fixture.config(ACP);
-        let broker = Broker::new(source.load().unwrap()).with_config_source(source);
+        let broker = Broker::new(source.load().unwrap())
+            .unwrap()
+            .with_config_source(source);
         let before = broker.config();
         for invalid in [
             "token = 'secret-must-not-leak'\n[",
@@ -423,7 +530,9 @@ mod tests {
         let fixture = Fixture::new();
         let original = opencode("http://127.0.0.1:10001");
         let source = fixture.config(&original);
-        let broker = Broker::new(source.load().unwrap()).with_config_source(source);
+        let broker = Broker::new(source.load().unwrap())
+            .unwrap()
+            .with_config_source(source);
         let profile = broker.config().agents["a"].clone();
         broker.registry.lock().unwrap().bindings.insert(
             "pending".into(),
@@ -498,7 +607,10 @@ mod tests {
     #[tokio::test]
     async fn an_in_memory_broker_reports_that_it_has_no_reload_source() {
         assert!(matches!(
-            Broker::new(Config::default()).reload_config().await,
+            Broker::new(Config::default())
+                .unwrap()
+                .reload_config()
+                .await,
             Err(ReloadError::NoSource)
         ));
     }

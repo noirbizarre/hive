@@ -17,7 +17,7 @@ pub(crate) mod configuration;
 mod namespace;
 mod pagination;
 mod process;
-mod resolution;
+pub(crate) mod resolution;
 pub(crate) mod routing;
 pub(crate) mod workspace;
 pub use resolution::{AdmissionError, Sharing, StdioAdmission, StdioLaunch};

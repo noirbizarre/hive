@@ -48,22 +48,35 @@ gateway aliases do not confer control or authority to restore the remote agent.
 
 ## MCP server declarations
 
-Define MCP servers in the root or included fragments, then select them on an
-ACPv2-only agent profile. Definitions are inert until a session selects them.
+Define MCP servers under `[mcp.servers.<id>]` in the root or included fragments,
+then select them on an ACPv2-only agent profile. Portable server fields follow
+[Bee's canonical TOML schema](https://github.com/noirbizarre/bee/blob/main/docs/mcp.md):
+copy a Bee `[servers.<id>]` definition beneath Hive's `mcp` namespace without
+changing its fields. Configuration loading validates and resolves references but
+does not launch processes or connect to endpoints.
 
 ```toml
-[mcp_servers.files]
-transport = "stdio"
-command = "/absolute/path/to/files-mcp"
-args = ["--read-only"]
-env = { EXAMPLE_MODE = "readonly" }
+[mcp]
+# Reserved for future global MCP settings; currently only servers is accepted.
+
+[mcp.servers.files]
+command = ["uvx", "example-mcp-server", "--read-only"]
+cwd = "."
+
+[mcp.servers.files.env]
+SERVICE_TOKEN = { env = "SERVICE_TOKEN" }
+MODE = "readonly"
+
+[mcp.servers.docs]
+url = "https://example.test/mcp"
+
+[mcp.servers.docs.headers]
+Authorization = { env = "DOCS_MCP_AUTHORIZATION" }
+
+# Hive-owned lifecycle/security controls are separate from portable fields.
+[mcp.servers.files.hive]
 scope = "workspace"
 idle_timeout_seconds = 60
-
-[mcp_servers.docs]
-transport = "http"
-url = "https://example.test/mcp"
-headers = {}
 
 [agents.coder]
 command = "example-acp-agent"
@@ -86,19 +99,92 @@ required. This automatic provider is omitted for unsupported agents or unregiste
 directories, preserving ordinary session startup. Reserve `hive-managed-mcp` for
 this attachment even when no managed subprocess servers are selected.
 
-Managed commands must be absolute paths. `scope` is `machine`, `project` or
-`workspace`. Workspace scope requires a verified registered workspace and defaults
-cwd to its concrete root; machine/project scope requires an explicit absolute
-`cwd`. Environment is the daemon's complete environment plus definition overrides,
-independent of the agent profile's environment. There is no shell interpolation,
-PATH search or automatic credential discovery. Backend initialization uses MCP
-`2025-11-25`, Hive client identity and empty client capabilities/options/roots.
+Specify exactly one transport: a nonempty `command` string array selects managed
+stdio, and `url` selects directly forwarded Streamable HTTP. The executable is
+the first command element; subsequent elements are literal arguments. There is
+no `transport` discriminator or separate `args`. The former declaration namespace
+is not supported. Stdio accepts `cwd` and `env`; HTTP accepts `headers`. Unknown
+fields, mixed transports and fields belonging to another transport are errors,
+including empty tables. HTTP cannot declare Hive process controls.
 
-IDs use 1–128 ASCII letters, digits, `-` or `_`; `hive-managed-mcp` is reserved.
+`hive.scope` is `machine`, `project` or `workspace`, defaulting to `workspace`.
+Workspace scope requires a verified registered concrete workspace. Omitted cwd
+defaults to its root; relative cwd and relative executable paths resolve against
+that root independently, not against the fragment directory or the configured
+cwd. This anchoring is not a filesystem sandbox. Missing workspace authority is
+an error, never an implicit switch to machine scope. Machine/project scope
+requires an explicit absolute cwd and an absolute executable or bare PATH name.
+
+Bare executable names are resolved using the captured **daemon** PATH (and
+PATHEXT on Windows) before instance identity is computed. A server's explicit
+`env.PATH` changes its child environment, not this initial lookup. Relative or
+empty PATH entries are anchored to the verified workspace root for workspace
+scope and skipped for other scopes. Paths are canonicalized and must exist at
+admission; executable candidates must be executable files. There is no shell,
+tilde, dotenv or command-substitution expansion.
+
+Children inherit only explicitly configured environment entries plus this
+platform baseline when present: `PATH`, `HOME`, `USERPROFILE`, `TMPDIR`, `TMP`,
+`TEMP`, `SystemRoot`, `WINDIR`, `COMSPEC` and `PATHEXT`. Explicit entries override
+the baseline. Other daemon/provider credentials are not automatically forwarded;
+the agent profile's environment is independent. Child stderr is discarded.
+
+Environment and header values are literal strings or whole-value
+`{ env = "NAME" }` references. Export the complete header value, such as
+`Bearer ...`; `${NAME}` inside a string is not interpolated. References read the
+daemon environment, not the child overlay. Missing, empty or non-Unicode values
+fail validation with value-free diagnostics. Resolved inputs are frozen at
+configuration publication and pinned with session selections; they are not read
+again at process launch. Reload uses the running daemon's environment, so changing
+an invoking shell's exports cannot update it. Resolved credentials are neither
+logged nor included in public configuration/discovery or durable session records.
+
+HTTP endpoints require HTTPS, or HTTP on localhost/a loopback IP, without URL
+userinfo or fragments. Header names are case-insensitive; duplicates, invalid
+values and protocol/routing overrides are rejected. Reserved names include
+`host`, `accept`, `content-type`, `content-length`, `connection`,
+`transfer-encoding`, `mcp-session-id`, `mcp-protocol-version` and `last-event-id`.
+Resolved headers are sent to the selected downstream agent, which owns HTTP
+connections, redirect/credential handling, TLS/proxy settings, retries and consent.
+Accepting Bee's portable syntax does not give Hive Bee's direct-client guarantees:
+Hive uses trusted daemon configuration rather than Bee's untrusted project-file
+discovery and launch approval. Hive does not discover `.agents/mcp.toml` or require
+a separate MCP file. Backend initialization uses MCP `2025-11-25`, Hive client
+identity and empty client capabilities/options/roots.
+
+IDs use 1–128 ASCII letters, digits, `.`, `-` or `_`; `hive-managed-mcp` is reserved.
 Definitions and profile selectors must be unique. A profile can select at most
 32 servers. Inline native ACPv2 declarations retain their existing forwarding
 and persistence behavior; configured declarations cannot collide with their names.
 Bundled clients need no MCP composer to use profile selections.
+
+Definitions compose through the ordinary `include` mechanism, with references
+resolved after composition. For example:
+
+```toml
+# config.toml
+include = ["conf.d/*.toml"]
+```
+
+```toml
+# conf.d/work.toml
+[mcp.servers.work-docs]
+url = "https://work.example.test/mcp"
+
+[agents.work-coder]
+command = "example-acp-agent"
+mcp_servers = ["work-docs"]
+
+[profiles.work]
+agents = ["work-coder"]
+```
+
+An agent can also select a server in another fragment, regardless of include
+order. Server IDs must be unique across all files; duplicate definitions name
+both sources and fail instead of overriding or extending one another. Empty
+`[mcp]` tables are allowed in multiple files; unsupported global keys are errors
+in every source. Named execution profiles select reusable agents; MCP selectors
+belong on those agents.
 
 ### Explicit process sharing
 
@@ -106,7 +192,7 @@ Private session instances are the default. Scope alone never authorizes sharing.
 To opt in, the daemon operator supplies a complete trusted sharing assertion:
 
 ```toml
-[mcp_servers.files.sharing]
+[mcp.servers.files.hive.sharing]
 mode = "shared"
 principal = "local-operator"
 partition = "trusted-team"
@@ -149,7 +235,7 @@ silently returning incomplete catalogs. Backend failures are sanitized; publishe
 calls are never replayed automatically. Cancellation does not imply that a tool
 had no side effects, and cleanup waits for actual backend settlement.
 
-Live sessions pin selected definitions across reload. Saved sessions retain their
+Live sessions pin selected definitions and resolved values across reload. Saved sessions retain their
 original selector IDs; daemon restart resolves those IDs against current definitions
 and re-admits them. Missing definitions fail recovery. Legacy saved sessions do not
 gain newly added profile selectors. Generated ACP IDs, effective environments and
@@ -157,7 +243,9 @@ sharing snapshots are not persisted.
 
 ### Trusted embedding APIs
 
-Trusted Rust embedders can use `Broker::bind_scoped_mcp` with a `StdioAdmission`
+`Broker::new` is fallible: inline/programmatic configuration uses the same trusted
+MCP preparation boundary as file-backed startup and reload. Trusted Rust embedders
+can use `Broker::bind_scoped_mcp` with a `StdioAdmission`
 to resolve scope from registered session resources. Workspace scope defaults to
 the canonical concrete root; machine/project scope requires an explicit launch
 cwd. Embedders still supply the resolved executable, complete effective
@@ -215,7 +303,7 @@ default_agent = "claude"
 command = "claude-agent-acp"
 ```
 
-Each fragment can contain `[profiles.<id>]`, `[agents.<id>]`, `[mcp_servers.<id>]`,
+Each fragment can contain `[profiles.<id>]`, `[agents.<id>]`, `[mcp.servers.<id>]`,
 `[projects.<id>]`, `[workspaces.<id>]`
 and global `[worktrunk]` tables with the
 same fields as the root. `include`, `default_agent` and `default_profile` are
@@ -280,7 +368,7 @@ and tracing settings require restart.
 | `default_profile` | String | Unset | Root-only named execution profile for new sessions |
 | `profiles` | Table keyed by stable IDs | Empty | Named execution setups, composed across fragments |
 | `agents` | Table of profiles | Empty | Available downstream agents |
-| `mcp_servers` | Table keyed by server IDs | Empty | Managed stdio or directly forwarded HTTP definitions |
+| `mcp` | MCP settings table | Empty | Reserved global namespace; `mcp.servers` holds managed stdio or forwarded HTTP definitions |
 | `projects` | Table keyed by project IDs | Empty | Portable configured definitions |
 | `workspaces` | Table keyed by policy names | Empty | Workspace policy templates |
 | `worktrunk` | Global integration table | Auto-detect | Optional WorkTrunk lifecycle selection |

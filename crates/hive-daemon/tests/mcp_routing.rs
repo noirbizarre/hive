@@ -14,17 +14,17 @@ fn config(directory: &Path, shared: bool, mode: &str) -> Config {
         "default_agent":"test", "agents":{"test":{
             "command":env!("CARGO_BIN_EXE_hive-test-mcp-agent"),
             "env":{"HIVE_MCP_REPORT":directory.join("report.json")},"mcp_servers":["a","b"]
-        }}, "mcp_servers":{}
+        }}, "mcp":{"servers":{}}
     }))
     .unwrap();
     for id in ["a", "b"] {
-        let mut definition = json!({"transport":"stdio","command":env!("CARGO_BIN_EXE_hive-test-mcp"),
-            "args":[directory.join(format!("{id}.jsonl")),mode],"scope":"machine","cwd":directory,"idle_timeout_seconds":0});
+        let mut definition = json!({"command":[env!("CARGO_BIN_EXE_hive-test-mcp"),directory.join(format!("{id}.jsonl")),mode],"cwd":directory,"hive":{"scope":"machine","idle_timeout_seconds":0}});
         if shared {
-            definition["sharing"] = json!({"mode":"shared","principal":"operator","partition":"test","policy_generation":"1","external_generations":{}});
+            definition["hive"]["sharing"] = json!({"mode":"shared","principal":"operator","partition":"test","policy_generation":"1","external_generations":{}});
         }
         config
-            .mcp_servers
+            .mcp
+            .servers
             .insert(id.into(), serde_json::from_value(definition).unwrap());
     }
     config.validate().unwrap();
@@ -115,6 +115,11 @@ async fn built_in_workspace_tools_work_alone_and_beside_paginated_user_tools_dur
             if managed {
                 // A user's identically named tool remains addressable through its existing alias.
                 for id in ["a", "b"] {
+                    // Relative log arguments prove the copied declaration runs at the verified root.
+                    config.mcp.servers.insert(id.into(), serde_json::from_value(json!({
+                        "command":[env!("CARGO_BIN_EXE_hive-test-mcp"), format!("{id}.jsonl"), "routing"],
+                        "cwd":".", "hive":{"idle_timeout_seconds":0}
+                    })).unwrap());
                     std::fs::write(directory.join(format!("{id}.jsonl.builtin-name")), b"")
                         .unwrap();
                 }
@@ -228,7 +233,7 @@ async fn agents_discover_and_invoke_two_namespaced_backends_during_setup_on_both
             "HIVE_MCP_REFRESH_TRIGGER".into(),
             refresh.display().to_string(),
         );
-        let broker = Broker::new(config);
+        let broker = Broker::new(config).unwrap();
         let (address, server) = serve(broker.clone()).await;
         create(address, scheme, &directory).await.unwrap();
         let first = report(&directory);
@@ -344,7 +349,7 @@ async fn only_explicitly_compatible_operator_assertions_share_configured_process
     for shared in [false, true] {
         let temporary = tempfile::tempdir().unwrap();
         let directory = temporary.path().canonicalize().unwrap();
-        let broker = Broker::new(config(&directory, shared, "routing"));
+        let broker = Broker::new(config(&directory, shared, "routing")).unwrap();
         let (address, server) = serve(broker.clone()).await;
         create(address, "ws", &directory).await.unwrap();
         create(address, "ws", &directory).await.unwrap();
@@ -394,7 +399,7 @@ async fn unsupported_agents_start_no_backends_and_failed_initialization_publishe
                 .env
                 .insert("HIVE_MCP_REJECT_SETUP".into(), "1".into());
         }
-        let broker = Broker::new(config);
+        let broker = Broker::new(config).unwrap();
         let (address, server) = serve(broker.clone()).await;
         let error = create(address, "ws", &directory).await.unwrap_err();
         if failure != "reject" {
@@ -433,8 +438,10 @@ async fn forwarded_http_remains_direct_alongside_the_managed_aggregate() {
     let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}/mcp", listener.local_addr().unwrap());
+    let reference_value = std::env::var("PATH").unwrap();
     let http = axum::Router::new().route("/mcp", post(async |State(seen): State<std::sync::Arc<std::sync::Mutex<Vec<Value>>>>, headers: HeaderMap, Json(request): Json<Value>| {
         assert_eq!(headers["x-fixture"], "direct-secret");
+        assert_eq!(headers["x-reference"], std::env::var("PATH").unwrap());
         seen.lock().unwrap().push(request.clone());
         Json(json!({"jsonrpc":"2.0","id":request["id"],"result":if request["method"] == "tools/list" {json!({"tools":[{"name":"remote","inputSchema":{"type":"object"}}]})} else {json!({"content":[{"type":"text","text":"remote called"}]})}}))
     })).with_state(seen.clone());
@@ -444,12 +451,10 @@ async fn forwarded_http_remains_direct_alongside_the_managed_aggregate() {
     let temporary = tempfile::tempdir().unwrap();
     let directory = temporary.path().canonicalize().unwrap();
     let mut config = config(&directory, true, "routing");
-    config.mcp_servers.insert(
+    config.mcp.servers.insert(
         "remote".into(),
-        serde_json::from_value(
-            json!({"transport":"http","url":endpoint,"headers":{"x-fixture":"direct-secret"}}),
-        )
-        .unwrap(),
+        serde_json::from_value(json!({"url":endpoint,"headers":{"x-fixture":"direct-secret", "x-reference":{"env":"PATH"}}}))
+            .unwrap(),
     );
     config
         .agents
@@ -457,7 +462,8 @@ async fn forwarded_http_remains_direct_alongside_the_managed_aggregate() {
         .unwrap()
         .mcp_servers
         .push("remote".into());
-    let broker = Broker::new(config);
+    let database = directory.join("state/catalog.sqlite3");
+    let broker = Broker::persistent(config, database.clone()).unwrap();
     let (address, server) = serve(broker.clone()).await;
     create(address, "http", &directory).await.unwrap();
     let report = report(&directory);
@@ -465,13 +471,19 @@ async fn forwarded_http_remains_direct_alongside_the_managed_aggregate() {
     assert_eq!(report["declarations"][0]["url"], endpoint);
     assert_eq!(
         report["declarations"][0]["headers"],
-        json!([{"name":"x-fixture","value":"direct-secret"}])
+        json!([{"name":"x-fixture","value":"direct-secret"}, {"name":"x-reference","value":reference_value}])
     );
     assert_eq!(
         report["http"][0]["result"]["content"][0]["text"],
         "remote called"
     );
     assert_eq!(seen.lock().unwrap().len(), 2);
+    let db = rusqlite::Connection::open(&database).unwrap();
+    let record: String = db
+        .query_row("SELECT record FROM sessions", [], |row| row.get(0))
+        .unwrap();
+    assert!(!record.contains("direct-secret"));
+    assert!(!record.contains("x-reference"));
     broker.shutdown().await;
     server.abort();
     http_server.abort();
@@ -498,7 +510,7 @@ async fn recovery_regenerates_the_aggregate_and_preserves_saved_configured_selec
         .mcp_servers
         .clear();
     let mut missing = changed_profile.clone();
-    missing.mcp_servers.clear();
+    missing.mcp.servers.clear();
     let recovered = Broker::persistent(changed_profile, path.clone()).unwrap();
     tokio::join!(recovered.reconcile(), recovered.reconcile());
     let report = report(&directory);
@@ -545,7 +557,7 @@ async fn native_cancellation_keeps_setup_cleanup_owned_until_the_backend_settles
         "HIVE_MCP_CANCEL_LOG".into(),
         directory.join("a.jsonl").display().to_string(),
     );
-    let broker = Broker::new(config);
+    let broker = Broker::new(config).unwrap();
     let (address, server) = serve(broker.clone()).await;
     let task_directory = directory.clone();
     let creation = tokio::spawn(async move { create(address, "ws", &task_directory).await });
@@ -653,7 +665,7 @@ async fn malformed_backend_results_become_controlled_failures_without_replaying_
     let temporary = tempfile::tempdir().unwrap();
     let directory = temporary.path().canonicalize().unwrap();
     std::fs::write(directory.join("a.jsonl.malformed"), b"").unwrap();
-    let broker = Broker::new(config(&directory, true, "routing"));
+    let broker = Broker::new(config(&directory, true, "routing")).unwrap();
     let (address, server) = serve(broker.clone()).await;
     create(address, "ws", &directory).await.unwrap();
     let report = report(&directory);

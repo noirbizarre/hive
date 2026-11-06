@@ -1040,7 +1040,7 @@ mod tests {
 
     #[test]
     fn identical_owner_local_ids_never_share_a_gateway_alias() {
-        let broker = Broker::new(Config::default());
+        let broker = Broker::new(Config::default()).unwrap();
         let first = SessionReference {
             owner: NodeId::new(),
             id: "opaque-native-looking-id".into(),

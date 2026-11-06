@@ -23,7 +23,7 @@ async fn peer_endpoints_keep_their_exact_path_instead_of_appending_another_acp_s
     );
     let router = axum::Router::new().nest(
         "/private/gateway",
-        hive_daemon::router(hive_daemon::Broker::new(Config::default())),
+        hive_daemon::router(hive_daemon::Broker::new(Config::default()).unwrap()),
     );
     let server = tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
@@ -164,7 +164,7 @@ async fn peer_transport_loss_and_explicit_disconnect_preserve_the_owner_session(
             env!("CARGO_BIN_EXE_hive-test-agent"),
             AgentVersion::V2,
         );
-        let broker = hive_daemon::Broker::new(config);
+        let broker = hive_daemon::Broker::new(config).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let owner = listener.local_addr().unwrap();
         let policy = hive_daemon::http::ServeOptions::default()

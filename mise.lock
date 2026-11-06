@@ -135,27 +135,26 @@ url = "https://github.com/orhun/git-cliff/releases/download/v2.14.2/git-cliff-2.
 url_api = "https://api.github.com/repos/orhun/git-cliff/releases/assets/573487227"
 
 [[tools.jj]]
-version = "0.46.0"
+version = "0.47.1"
 backend = "aqua:jj-vcs/jj"
-specifiers = ["0.46.0"]
+specifiers = ["latest"]
 
 [tools.jj."platforms.linux-x64"]
-checksum = "sha256:fce0271158e665ceb82dc66c5eb95b1728649094e9133074f3b5baece345fc08"
-checksum_source = "mise-versions"
-url = "https://github.com/jj-vcs/jj/releases/download/v0.46.0/jj-v0.46.0-x86_64-unknown-linux-musl.tar.gz"
-url_api = "https://api.github.com/repos/jj-vcs/jj/releases/assets/619869961"
+checksum = "sha256:d4b657f622ee50929c8916466dfa3d6a6c17a0a32b50e7b2c793707ec9ebcad7"
+url = "https://github.com/jj-vcs/jj/releases/download/v0.47.1/jj-v0.47.1-x86_64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/jj-vcs/jj/releases/assets/711489795"
 
 [tools.jj."platforms.macos-arm64"]
-checksum = "sha256:43daa37ce0f9716cdf6fb65a29cbcae74a3160aef048cf3cb3d166d41cb4ab58"
+checksum = "sha256:50129b527f7cd6aef82aebd4bb2b670bb56766adc509ef3279c4327aa3592255"
 checksum_source = "mise-versions"
-url = "https://github.com/jj-vcs/jj/releases/download/v0.46.0/jj-v0.46.0-aarch64-apple-darwin.tar.gz"
-url_api = "https://api.github.com/repos/jj-vcs/jj/releases/assets/619877551"
+url = "https://github.com/jj-vcs/jj/releases/download/v0.47.1/jj-v0.47.1-aarch64-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/jj-vcs/jj/releases/assets/711488052"
 
 [tools.jj."platforms.windows-x64"]
-checksum = "sha256:c42316b10df04611bc65029a18bcb2d92636edddb6871d511f7bb4233e999b83"
+checksum = "sha256:72f9f80bc99d07a7f48d5f219cf5bab91f7e906e4b53f6c827948e646cd1152f"
 checksum_source = "mise-versions"
-url = "https://github.com/jj-vcs/jj/releases/download/v0.46.0/jj-v0.46.0-x86_64-pc-windows-msvc.zip"
-url_api = "https://api.github.com/repos/jj-vcs/jj/releases/assets/619879226"
+url = "https://github.com/jj-vcs/jj/releases/download/v0.47.1/jj-v0.47.1-x86_64-pc-windows-msvc.zip"
+url_api = "https://api.github.com/repos/jj-vcs/jj/releases/assets/711497973"
 
 [[tools.mr-boxington]]
 version = "1.29.2"

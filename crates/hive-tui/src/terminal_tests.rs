@@ -30,7 +30,8 @@ struct Fixture {
 fn owner(seq: u64) -> v2::Meta {
     v2::Meta::from_iter([(
         "hive".into(),
-        json!({"role":"pilot", "token":"fixture", "generation":1, "pilot":true, "nextSeq":seq + 1, "snapshotThroughSeq":seq}),
+        json!({"role":"pilot", "token":"fixture", "generation":1, "pilot":true, "nextSeq":seq + 1, "snapshotThroughSeq":seq,
+            "activitySnapshot":{"version":1,"seq":seq,"foreground":"idle"}}),
     )])
 }
 
@@ -75,6 +76,16 @@ async fn report(State(state): State<Arc<Fixture>>) -> Json<Value> {
 
 async fn action(State(state): State<Arc<Fixture>>, Path(action): Path<String>) -> Json<Value> {
     match action.as_str() {
+        "running" | "blocked" | "done" | "error" | "cancelled" => {
+            let value = match action.as_str() {
+                "running" => json!({"sessionUpdate":"state_update","state":"running"}),
+                "blocked" => json!({"sessionUpdate":"state_update","state":"requires_action"}),
+                "done" => json!({"sessionUpdate":"state_update","state":"idle","stopReason":"end_turn"}),
+                "error" => json!({"sessionUpdate":"state_update","state":"idle","stopReason":"error","error":{"message":"fixture failure"}}),
+                _ => json!({"sessionUpdate":"state_update","state":"idle","stopReason":"cancelled"}),
+            };
+            state.update(serde_json::from_value(value).unwrap());
+        }
         "update" => state.update(v2::SessionUpdate::AgentMessageChunk(v2::ContentChunk::new(
             (0..40)
                 .map(|index| format!("History row {index}\n"))
@@ -138,7 +149,13 @@ async fn runtime_fixture() {
                 sessions.stalled.store(true, Ordering::SeqCst);
                 released.await;
             }
-            Json(json!({"sessions":[{"sessionId":"hive-fixture", "cwd":std::env::current_dir().unwrap(), "agent":"fixture", "lifecycle":"active", "activity":"idle", "generation":1}]}))
+            let mut entries = vec![json!({"sessionId":"hive-fixture", "cwd":std::env::current_dir().unwrap(), "agent":"fixture", "lifecycle":"active", "activity":"idle", "generation":1})];
+            if std::env::var("HIVE_RUNTIME_STATUS").is_ok_and(|value| matches!(value.as_str(), "status" | "status-subset" | "status-on")) {
+                let mut second = entries[0].clone();
+                second["sessionId"] = "hive-second".into();
+                entries.push(second);
+            }
+            Json(json!({"sessions":entries}))
         }))
         .route("/v1/providers", get(async move || {
             providers.catalogs.fetch_add(1, Ordering::SeqCst);
@@ -219,6 +236,11 @@ async fn runtime_fixture() {
                     capabilities::CapabilityOverride::Off
                 },
                 osc52_read: capabilities::CapabilityOverride::On,
+                osc7501: match std::env::var("HIVE_RUNTIME_STATUS").as_deref() {
+                    Ok("status-off") => capabilities::CapabilityOverride::Off,
+                    Ok("status-on") => capabilities::CapabilityOverride::On,
+                    _ => capabilities::CapabilityOverride::Auto,
+                },
                 ..Default::default()
             },
             cwd: None,
@@ -242,7 +264,16 @@ async fn runtime_fixture() {
 
 #[test]
 fn the_real_event_loop_keeps_paste_and_external_edits_unsent_until_enter() {
-    for scenario in ["resume", "create", "osc52", "rich"] {
+    for scenario in [
+        "resume",
+        "create",
+        "osc52",
+        "rich",
+        "status",
+        "status-subset",
+        "status-off",
+        "status-on",
+    ] {
         // Reuse this instrumented executable so child-process execution contributes to coverage too.
         let output = std::process::Command::new("python3")
             .arg("-B")

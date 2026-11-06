@@ -10,6 +10,7 @@ pub mod images;
 mod input;
 mod osc5522;
 mod picker;
+mod program_status;
 mod state;
 mod theme;
 mod transcript;
@@ -220,6 +221,7 @@ struct TerminalGuard {
     // Retry cleanup only for a mode we actually used; disabled/unavailable transports emit none.
     rich_mode_used: bool,
     images: images::KittyRenderer,
+    program_status: program_status::Reporter,
 }
 impl Interaction {
     fn url_id(&self) -> Option<String> {
@@ -282,6 +284,7 @@ impl TerminalGuard {
             active: false,
             rich_mode_used: false,
             images: images::KittyRenderer::default(),
+            program_status: program_status::Reporter::default(),
         };
         guard.resume()?;
         Ok(guard)
@@ -352,6 +355,7 @@ impl TerminalGuard {
         }
         // Images belong to this alternate screen, never to the shell or editor.
         let images = self.images.cleanup(&mut std::io::stdout());
+        let status = self.program_status.clear(&mut std::io::stdout());
         self.images.invalidate();
         // Attempt all restorations even if terminal output fails.
         let screen = execute!(
@@ -368,13 +372,14 @@ impl TerminalGuard {
         );
         let raw = disable_raw_mode();
         self.active = false;
-        images.and(screen).and(raw)
+        images.and(status).and(screen).and(raw)
     }
 }
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         // Retry all cleanup even after a partially failed suspend or resume.
         let _ = self.images.cleanup(&mut std::io::stdout());
+        let _ = self.program_status.clear(&mut std::io::stdout());
         let _ = execute!(
             std::io::stdout(),
             DisableMouseCapture,
@@ -2099,6 +2104,9 @@ async fn run_with_clipboard(
     let (reader_control, controls) = std::sync::mpsc::channel();
     let reader =
         tokio::task::spawn_blocking(move || terminal_reader(keys_tx, replies_tx, controls));
+    guard
+        .program_status
+        .start(app.terminal_capabilities.osc7501, terminal.backend_mut());
     let rich_paste = cfg!(unix)
         && app.terminal_capabilities.osc5522_read.source
             != capabilities::CapabilitySource::UnavailableTransport
@@ -2152,7 +2160,14 @@ async fn run_with_clipboard(
                    let mut staged_updates = Vec::new();
                   let (catalog_tx, mut catalog_rx) = mpsc::unbounded_channel();
                   let mut refreshing = false;
-                 loop {
+                  loop {
+                    if editing.is_none() {
+                        let kind = interaction.as_ref().filter(|request| request.available(&app) && !request.expired() && !request.request_scoped()).map(|request| match request {
+                            Interaction::Permission(..) => program_status::Kind::Permission,
+                            Interaction::Elicitation(..) => program_status::Kind::Question,
+                        });
+                        guard.program_status.sync(program_status::project(&app, kind), terminal.backend_mut());
+                    }
                     if app.refresh_requested && !refreshing {
                         app.refresh_requested = false;
                         refreshing = true;
@@ -2221,7 +2236,8 @@ async fn run_with_clipboard(
                               if let Some(completion) = clipboard.finish(completion, terminal.backend_mut()) { clipboard::complete(&mut app, completion); }
                           },
                           Some(reply) = replies.recv(), if editing.is_none() => {
-                              match reply {
+                               match reply {
+                                   input::Reply::ProgramStatus(features, received) => guard.program_status.receive(features, received, &mut app.terminal_capabilities.osc7501),
                                   input::Reply::PasteMode(status) if rich_paste && matches!(status, 1..=3) => {
                                       use std::io::Write;
                                       // Mark before writing so partial output failures still attempt restoration.
@@ -2252,7 +2268,9 @@ async fn run_with_clipboard(
                               refreshing = false;
                               match result { Ok(catalog) => apply_catalog(&mut app, catalog), Err(error) => app.status = format!("Session list unavailable: {error}") }
                           }
-                           _ = interaction_tick.tick() => {
+                            _ = interaction_tick.tick() => {
+                                // Replies may already be queued after a slow ACP initialization.
+                                if replies.is_empty() { guard.program_status.tick(&mut app.terminal_capabilities.osc7501); }
                                if editing.is_none() && let Some(completion) = clipboard.protocol.borrow_mut().tick(terminal.backend_mut()) { clipboard::complete(&mut app, completion); }
                                let phase = (animation_clock.elapsed().as_millis() / 100) as usize;
                                let animated = editing.is_none() && app.animation_visible && phase != app.animation_phase;
@@ -2393,6 +2411,14 @@ async fn run_with_clipboard(
                 Ok(())
             }).await;
         app.connected = false;
+        // Reconnecting the transport alone cannot make cached activity authoritative again.
+        // A successful attachment clears this fence; failed resumes must not revive old work.
+        for conversation in app.conversations.values_mut() {
+            conversation.gap = true;
+        }
+        if editing.is_none() {
+            let _ = guard.program_status.clear(terminal.backend_mut());
+        }
         app.session_operation = None;
         app.configuration = None;
         app.submitting.clear();

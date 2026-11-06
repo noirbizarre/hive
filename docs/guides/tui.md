@@ -243,7 +243,8 @@ the TUI. See [CLI reference](../reference/cli.md).
 
 The Sessions heading shows a compact **Terminal caps** diagnostic, initialized
 when the local TUI starts and shared by TUI components. Rich clipboard negotiation
-can subsequently establish write support. `graphics` means Kitty
+can subsequently establish write support, and program status negotiation can
+establish OSC 7501 support. `graphics` means Kitty
 graphics, `OSC52` is the text clipboard protocol, `OSC5522` is the rich clipboard
 protocol, and `OSC7501` is program status reporting. Clipboard entries distinguish
 `w` (write) and `r` (read).
@@ -258,7 +259,7 @@ protocol, and `OSC7501` is program status reporting. Clipboard entries distingui
 The line clips in compact layouts. It reports permission to attempt an operation,
 not guaranteed terminal acceptance. ACP message images use the PNG Kitty backend.
 OSC 52 writes and OSC 5522 image operations use the shared clipboard service.
-Programmatic OSC 52 reads and program status reporting remain follow-up work.
+Programmatic OSC 52 reads remain follow-up work.
 Existing text rendering, native clipboard operations, and terminal-native paste
 remain usable without any positive capability decision.
 
@@ -271,7 +272,8 @@ private mode 5522 to negotiate user-triggered rich paste (unless rich reads are 
 | `TMUX`, `STY`, or `ZELLIJ` present (even empty), or `TERM` starting with `screen`/`tmux` | All optional protocol support unknown |
 | Missing, empty, generic, or unrecognized terminal identity | All optional protocol support unknown |
 | Supporting response to the mode 5522 query | Native rich paste and OSC 5522 writes supported |
-| OSC 7501 on any terminal | Unknown without an override |
+| Supporting response to the OSC 7501 query (Unix) | Program status supported, respecting advertised states and kinds |
+| No OSC 7501 response within 500 ms (Unix) | Program status unsupported |
 | Clipboard reads on any terminal | Unknown without explicit read opt-in |
 
 Environment variables are hints, not negotiation: SSH may omit them or forward
@@ -279,6 +281,32 @@ stale values, multiplexers may block protocols, and terminal versions and user
 settings vary. Kitty-specific incidental variables do not establish support for
 newer protocols. Overrides assert support but neither implement multiplexer
 passthrough nor guarantee that the terminal will accept an operation.
+
+#### Agent program status
+
+Hive reports the attached session's foreground agent state through
+[OSC 7501 Program Status](https://www.superlogical.com/rex/docs/build/program-status).
+The terminal chooses how to present it. Running work reports `working`, and
+action-required work reports `blocked`; session permissions and questions include
+the corresponding blocked kind. Explicit successful completion reports `done`,
+failures report `error`, and cancellation or idle without a known outcome reports
+`idle`. Background tools/tasks do not reopen completed foreground work, and no
+percentage is inferred from their counts.
+
+Reports include the session identifier and a short description. Switching sessions
+replaces the report; merely highlighting another session does not. Done/error
+persists until another authoritative state or session switch, rather than ordinary
+typing; freshly attaching to an idle session does not resurrect old outcomes.
+Disconnects, unknown/ended state, history gaps, editor handoff, and exit clear only
+Hive's own record. Returning from the editor restores the current state.
+
+In `auto`, Unix clients query once without blocking input. Unsupported terminals
+continue normally. Terminals advertising only some states receive conservative
+fallbacks: blocked to working, and done/error to idle with outcome context, where
+supported; otherwise Hive clears its record. Unsupported blocked kinds are omitted.
+`--terminal-osc7501 on` asserts baseline write support without negotiation; `off`
+disables queries and reports. Non-Unix clients do not negotiate automatically but
+can use write-only reporting with `on` on an available terminal transport.
 
 Clipboard write support never grants arbitrary read permission. Rich read `on`
 opts into explicit OSC 5522 reads. Negotiated native paste handles user-triggered

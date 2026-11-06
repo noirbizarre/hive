@@ -6,6 +6,7 @@ use crossterm::event::Event;
 #[derive(Debug)]
 #[cfg_attr(not(unix), allow(dead_code))]
 pub enum Reply {
+    ProgramStatus(crate::program_status::Features, std::time::Instant),
     Clipboard(Vec<u8>),
     PasteMode(u8),
     Error(String),
@@ -57,6 +58,14 @@ impl Decoder {
                 if !self.discard && self.bytes.starts_with(b"\x1b]5522;") {
                     let end = self.bytes.len() - if byte == 7 { 1 } else { 2 };
                     reply(Reply::Clipboard(self.bytes[7..end].to_vec()));
+                }
+                if !self.discard && self.bytes.starts_with(b"\x1b]7501;") {
+                    let end = self.bytes.len() - if byte == 7 { 1 } else { 2 };
+                    if let Some(features) =
+                        crate::program_status::Features::parse(&self.bytes[7..end])
+                    {
+                        reply(Reply::ProgramStatus(features, std::time::Instant::now()));
+                    }
                 }
                 *self = Self::default();
             }
@@ -362,6 +371,40 @@ mod tests {
             vec![Event::Key(crossterm::event::KeyCode::Char('x').into())]
         );
         assert!(matches!(&replies[..], [Reply::Error(_)]));
+    }
+
+    #[test]
+    fn program_status_replies_are_demultiplexed_without_consuming_neighboring_input() {
+        for end in ["\x07", "\x1b\\"] {
+            let bytes = format!("a\x1b]7501;?:states=idle,working:kinds=permission{end}\x1b]5522;type=read:status=OK\x1b\\b").into_bytes();
+            for split in 0..bytes.len() {
+                let mut decoder = Decoder::default();
+                let (mut events, mut replies) = (Vec::new(), Vec::new());
+                for chunk in [&bytes[..split], &bytes[split..]] {
+                    for byte in chunk {
+                        decoder.feed(*byte, &mut |e| events.push(e), &mut |r| replies.push(r));
+                    }
+                }
+                assert_eq!(
+                    events,
+                    vec![
+                        Event::Key(crossterm::event::KeyCode::Char('a').into()),
+                        Event::Key(crossterm::event::KeyCode::Char('b').into())
+                    ]
+                );
+                assert!(matches!(
+                    &replies[..],
+                    [Reply::ProgramStatus(_, _), Reply::Clipboard(_)]
+                ));
+            }
+        }
+        let mut decoder = Decoder::default();
+        let (mut events, mut replies) = (Vec::new(), Vec::new());
+        for byte in b"\x1b]7501;state=working\x07\x1b[200~\x1b]7501;?\x07\x1b[201~" {
+            decoder.feed(*byte, &mut |e| events.push(e), &mut |r| replies.push(r));
+        }
+        assert!(replies.is_empty());
+        assert_eq!(events, vec![Event::Paste("\x1b]7501;?\x07".into())]);
     }
 
     #[test]

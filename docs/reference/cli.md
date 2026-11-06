@@ -79,7 +79,15 @@ establishes automatic OSC 5522 image-write support; write `off` still disables i
 Terminal permission denial does not silently fall back to a different clipboard.
 On non-Unix, OSC 5522 is unavailable even with `on`; native image clipboard support
 is independent. See [image paste](../guides/tui.md#paste-and-copy-images) for limits,
-agent requirements, and copy controls. Program status remains follow-up work.
+agent requirements, and copy controls.
+
+OSC 7501 `auto` queries support on Unix without blocking input, falling back if no
+reply arrives within 500 ms. Reports follow the attached session, including
+working, blocked, completion, failure, and idle states. `on` asserts baseline
+write support without querying, including on non-Unix clients; `off` emits no
+queries or reports. Hive clears its own record on disconnect, editor handoff,
+and exit. See [agent program status](../guides/tui.md#agent-program-status) for
+outcome lifetime and negotiated fallback behavior.
 See [terminal capabilities](../guides/tui.md#terminal-capabilities) for detection
 limitations and the TUI diagnostic legend.
 

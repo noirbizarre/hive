@@ -219,6 +219,14 @@ impl App {
     }
 
     pub fn select_session(&mut self, id: String) {
+        if self.active.as_ref() != Some(&id) {
+            // Revisiting a session must not resurrect a completion already left behind.
+            for session in self.active.iter().chain(std::iter::once(&id)) {
+                if let Some(conversation) = self.conversations.get_mut(session) {
+                    conversation.outcome = None;
+                }
+            }
+        }
         self.draft_revision = self.draft_revision.wrapping_add(1);
         if self.active.as_ref() != Some(&id)
             && let Some(draft) = self.suspended_draft.take()

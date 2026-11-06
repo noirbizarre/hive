@@ -40,6 +40,8 @@ def main():
         create = sys.argv[2] == "create"
         osc52 = sys.argv[2] == "osc52"
         rich = sys.argv[2] == "rich"
+        status_scenario = sys.argv[2].startswith("status")
+        status_subset = sys.argv[2] == "status-subset"
         editor.write_text(
             "from pathlib import Path\nimport sys, time\n"
             "root = Path(__file__).parent\n"
@@ -63,6 +65,7 @@ def main():
             env["XDG_RUNTIME_DIR"] = str(directory)
             env.pop("HIVE_RUNTIME_OSC52", None)
             env.pop("HIVE_RUNTIME_RICH", None)
+            env["HIVE_RUNTIME_STATUS"] = sys.argv[2]
             if rich:
                 env["HIVE_RUNTIME_RICH"] = "1"
             if osc52:
@@ -82,6 +85,7 @@ def main():
         address = None
         cursor_queries = 0
         mode_queries = 0
+        status_queries = 0
         packet_offset = 0
         clipboard_reads = []
         clipboard_writes = []
@@ -112,7 +116,7 @@ def main():
         http = ThreadPoolExecutor(max_workers=1)
 
         def pump():
-            nonlocal address, cursor_queries, mode_queries, packet_offset
+            nonlocal address, cursor_queries, mode_queries, packet_offset, status_queries
             if not select.select([master], [], [], .02)[0]:
                 return
             try:
@@ -123,6 +127,11 @@ def main():
                 raise
             output.extend(chunk)
             screen.feed(chunk)
+            while output.count(b"\x1b]7501;?\x1b\\") > status_queries:
+                if status_scenario:
+                    features = b"?:states=idle,working:kinds=" if status_subset else b"?"
+                    os.write(master, b"\x1b]7501;" + features + b"\x1b\\")
+                status_queries += 1
             if rich:
                 while output.count(b"\x1b[?5522$p") > mode_queries:
                     os.write(master, b"\x1b[?5522;2$y")
@@ -178,6 +187,10 @@ def main():
         def send(value):
             os.write(master, value)
 
+        def statuses():
+            return [dict(field.split("=", 1) for field in match[1].decode().split(":"))
+                    for match in re.finditer(rb"\x1b\]7501;(state=[^\x1b]*)\x1b\\", output)]
+
         try:
             print(f"PTY scenario: {sys.argv[2]}", file=sys.stderr, flush=True)
             wait(lambda: address is not None)
@@ -187,6 +200,78 @@ def main():
                 wait(lambda: state()["creations"] == 1 and b"\x1b[?25h" in output)
             else:
                 wait(lambda: state()["resumes"] == 1 and b"\x1b[?25h" in output)
+            if status_scenario and sys.argv[2] != "status-off":
+                wait(lambda: statuses() and statuses()[-1]["state"] == "idle")
+                for action_name, expected in [("running", "working"), ("blocked", "working" if status_subset else "blocked"),
+                                              ("running", "working"), ("done", "idle" if status_subset else "done"),
+                                              ("error", "idle" if status_subset else "error"), ("cancelled", "idle")]:
+                    before = len(statuses())
+                    action(action_name)
+                    wait(lambda: len(statuses()) > before and statuses()[-1]["state"] == expected)
+                action("running")
+                wait(lambda: statuses()[-1]["state"] == "working")
+                action("permission")
+                wait(lambda: screen.contains("PTY approval"))
+                wait(lambda: statuses()[-1]["state"] == ("working" if status_subset else "blocked"))
+                assert statuses()[-1].get("kind") == (None if status_subset else "permission")
+                send(b"1\r")
+                wait(lambda: state()["permissions"] == 1)
+                wait(lambda: statuses()[-1]["state"] == "working")
+                send(b"draft\x18\x05")
+                wait(ready.exists)
+                wait(lambda: statuses()[-1]["state"] == "clear")
+                assert ready.read_text() == "draft", "detection reply leaked into the composer"
+                editor_output_start = len(output)
+                action("done")
+                release.touch()
+                wait(lambda: screen.contains("Editor changes loaded"))
+                wait(lambda: statuses()[-1]["state"] == ("idle" if status_subset else "done"))
+                # Inspect the complete handoff interval after output has crossed the resume barrier.
+                editor_output_end = output.index(b"\x1b[?1049h", editor_output_start)
+                assert b"\x1b]7501;state=" not in output[editor_output_start:editor_output_end], "status emitted while editor owned terminal"
+                before = len(statuses())
+                action("update")
+                wait(lambda: screen.contains("History row"))
+                send(b"typed")
+                # Rendering the resulting composer is an ordered barrier for processing the keys.
+                wait(lambda: screen.contains("secondtyped"))
+                assert len(statuses()) == before, "typing/background output acknowledged completion"
+                send(b"\t")
+                wait(lambda: screen.contains("Sessions"))
+                send(b"\x1b[B\r")
+                wait(lambda: base64.b64decode(statuses()[-1].get("title", "")) == b"hive-second")
+                assert statuses()[-1]["state"] == "idle"
+                send(b"\t")
+                wait(lambda: screen.contains("Sessions"))
+                send(b"\x1b[A\r")
+                wait(lambda: base64.b64decode(statuses()[-1].get("title", "")) == b"hive-fixture")
+                assert statuses()[-1]["state"] == "idle", "session switch resurrected completion"
+                action("running")
+                wait(lambda: statuses()[-1]["state"] == "working")
+                before = len(statuses())
+                resumes = state()["resumes"]
+                action("gap")
+                wait(lambda: state()["resumes"] > resumes)
+                wait(lambda: [report["state"] for report in statuses()[before:]] == ["clear", "idle"])
+                # Reattach after a gap, then exercise exit cleanup on a live report.
+                send(b"\x11")
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    pump()
+                    exited, code = os.waitpid(pid, os.WNOHANG)
+                    if exited:
+                        pid = None
+                        assert os.waitstatus_to_exitcode(code) == 0
+                        break
+                else:
+                    raise AssertionError("status fixture did not stop")
+                reports = statuses()
+                assert reports[-1]["state"] == "clear"
+                assert len({report["id"] for report in reports}) == 1
+                assert all(report.get("app") == "hive" for report in reports if report["state"] != "clear")
+                assert status_queries == (0 if sys.argv[2] == "status-on" else 1)
+                assert settings(master) == original
+                return
             if rich:
                 wait(lambda: b"\x1b[?5522h" in output)
                 # Terminal-native offer authorizes exactly the follow-up representation read.
@@ -349,8 +434,10 @@ def main():
                 raise AssertionError("TUI failed to shut down")
             assert settings(master) == original, "terminal modes were not restored"
             # Detection must not inject capability queries into the terminal's input conversation.
-            for protocol in (b"\x1b_G", b"\x1b]5522;", b"\x1b]7501;", b"\x1b]52;c;?"):
+            for protocol in (b"\x1b_G", b"\x1b]5522;", b"\x1b]52;c;?"):
                 assert protocol not in output, "capability detection emitted a protocol sequence"
+            assert status_queries == (0 if create or sys.argv[2] == "status-off" else 1)
+            assert not statuses(), "unsupported or disabled terminal received a status report"
             assert output.count(b"\x1b]52;") == (2 if osc52 else 0)
         except BaseException:
             sys.stderr.write(output.decode(errors="replace"))

@@ -40,7 +40,14 @@ pub struct ConversationLine {
     pub revision: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TurnOutcome {
+    Done,
+    Error,
+}
+
 pub struct Conversation {
+    pub outcome: Option<TurnOutcome>,
     pub transcript_epoch: u64,
     pub lines_revision: u64,
     pub lines: Vec<ConversationLine>,
@@ -70,6 +77,7 @@ pub struct Conversation {
 impl Default for Conversation {
     fn default() -> Self {
         Self {
+            outcome: None,
             transcript_epoch: 0,
             lines_revision: 0,
             lines: Vec::new(),
@@ -100,6 +108,7 @@ impl Default for Conversation {
 
 impl Conversation {
     fn foreground(&mut self, state: &str) {
+        self.outcome = None;
         self.foreground = match state {
             "running" | "requires_action" | "idle" => state,
             _ => "unknown",
@@ -108,6 +117,20 @@ impl Conversation {
         // Busy includes blocked work, whereas execution animation uses the exact foreground.
         self.running = matches!(self.foreground.as_str(), "running" | "requires_action");
         self.activity["foreground"] = serde_json::json!(self.foreground);
+    }
+
+    fn foreground_update(&mut self, value: &serde_json::Value) {
+        self.foreground(value["state"].as_str().unwrap_or("unknown"));
+        if self.foreground == "idle" {
+            // A reasonless idle (notably OpenCode) is not evidence of successful completion.
+            self.outcome = match value["stopReason"].as_str() {
+                Some("end_turn") => Some(TurnOutcome::Done),
+                Some("error" | "refusal" | "_v1_error" | "_opencode_error") => {
+                    Some(TurnOutcome::Error)
+                }
+                _ => None,
+            };
+        }
     }
 
     pub fn transcript_snapshot(&mut self, value: &serde_json::Value, seq: u64) {
@@ -427,7 +450,10 @@ impl Conversation {
             v2::SessionUpdate::StateUpdate(status) if seq >= self.activity_seq => {
                 let was_running = self.running;
                 let value = serde_json::to_value(&status).unwrap_or_default();
-                self.foreground(value["state"].as_str().unwrap_or("unknown"));
+                self.foreground_update(&value);
+                if snapshot {
+                    self.outcome = None;
+                }
                 self.activity_seq = seq;
                 if let v2::StateUpdate::Idle(idle) = status {
                     self.active_thought = None;
@@ -470,7 +496,10 @@ impl Conversation {
                 if seq > self.activity_seq {
                     let kind = value["kind"].as_str().unwrap_or_default();
                     if kind == "foreground" {
-                        self.foreground(value["state"]["state"].as_str().unwrap_or("unknown"));
+                        self.foreground_update(&value["state"]);
+                        if snapshot {
+                            self.outcome = None;
+                        }
                     }
                     if kind == "session" {
                         self.activity["session"] = value["status"].clone();
@@ -551,6 +580,141 @@ mod tests {
         let mut meta = v2::Meta::new();
         meta.insert("hive".into(), serde_json::json!({"seq": seq}));
         v2::UpdateSessionNotification::new(v2::SessionId::new("hive-test"), update).meta(meta)
+    }
+
+    #[test]
+    fn foreground_outcomes_survive_companions_but_not_new_work_or_resume() {
+        use serde_json::json;
+        for (reason, expected) in [
+            (Some(v2::StopReason::EndTurn), Some(TurnOutcome::Done)),
+            (Some(v2::StopReason::Refusal), Some(TurnOutcome::Error)),
+            (Some(v2::StopReason::Cancelled), None),
+            (Some(v2::StopReason::MaxTokens), None),
+            (None, None),
+            (
+                Some(v2::StopReason::Other(v2::OtherStopReason::new(
+                    "_v1_error",
+                    Default::default(),
+                ))),
+                Some(TurnOutcome::Error),
+            ),
+            (
+                Some(v2::StopReason::Other(v2::OtherStopReason::new(
+                    "_opencode_error",
+                    Default::default(),
+                ))),
+                Some(TurnOutcome::Error),
+            ),
+        ] {
+            let mut conversation = Conversation::default();
+            let idle = v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(
+                v2::IdleStateUpdate::new().stop_reason(reason),
+            ));
+            let value = serde_json::to_value(&idle).unwrap();
+            assert!(
+                conversation.apply(event(
+                    1,
+                    serde_json::from_value(
+                        json!({"sessionUpdate":"state_update","state":"running"})
+                    )
+                    .unwrap()
+                ))
+            );
+            assert!(conversation.apply(event(2, idle)));
+            assert_eq!(conversation.outcome, expected, "{value}");
+            let mut state = value;
+            state.as_object_mut().unwrap().remove("sessionUpdate");
+            assert!(
+                conversation.apply(event(
+                    3,
+                    serde_json::from_value(
+                        json!({"sessionUpdate":"_hive_activity","kind":"foreground","state":state})
+                    )
+                    .unwrap()
+                ))
+            );
+            assert_eq!(conversation.outcome, expected);
+            assert!(conversation.apply(event(4, serde_json::from_value(json!({"sessionUpdate":"_hive_activity","kind":"task","taskId":"late","task":{"status":"running"}})).unwrap())));
+            assert_eq!(conversation.outcome, expected);
+            conversation.snapshot(&json!({"version":1,"seq":4,"foreground":"idle"}));
+            assert_eq!(conversation.outcome, None);
+            assert!(!conversation.apply(event(2, serde_json::from_value(json!({"sessionUpdate":"state_update","state":"idle","stopReason":"end_turn"})).unwrap())));
+            assert_eq!(conversation.outcome, None);
+        }
+    }
+
+    #[test]
+    fn translated_failures_wait_for_idle_and_survive_their_activity_companions() {
+        use serde_json::json;
+        for (extension, reason) in [
+            ("_hive_error", "_v1_error"),
+            ("_hive_opencode_error", "_opencode_error"),
+        ] {
+            let mut conversation = Conversation::default();
+            for (seq, value) in [
+                (1, json!({"sessionUpdate":"state_update","state":"running"})),
+                (
+                    2,
+                    json!({"sessionUpdate":extension,"message":"failed","help":"Check logs"}),
+                ),
+            ] {
+                assert!(conversation.apply(event(seq, serde_json::from_value(value).unwrap())));
+            }
+            // Diagnostics are transcript content; the authoritative idle ends foreground execution.
+            assert_eq!(conversation.foreground, "running");
+            assert_eq!(conversation.outcome, None);
+            for (seq, value) in [
+                (
+                    3,
+                    json!({"sessionUpdate":"state_update","state":"idle","stopReason":reason}),
+                ),
+                (
+                    4,
+                    json!({"sessionUpdate":"_hive_activity","kind":"foreground","state":{"state":"idle","stopReason":reason}}),
+                ),
+            ] {
+                assert!(conversation.apply(event(seq, serde_json::from_value(value).unwrap())));
+                assert_eq!(conversation.outcome, Some(TurnOutcome::Error));
+            }
+        }
+    }
+
+    #[test]
+    fn historical_failures_do_not_change_the_current_turn_outcome() {
+        use serde_json::json;
+        let mut conversation = Conversation::default();
+        conversation.begin_transcript(10);
+        conversation.snapshot(&json!({"version":1,"seq":10,"foreground":"running"}));
+        let mut historical = event(
+            10,
+            serde_json::from_value(
+                json!({"sessionUpdate":"_hive_error","message":"old","help":"Check logs"}),
+            )
+            .unwrap(),
+        );
+        historical.meta.as_mut().unwrap().get_mut("hive").unwrap()["snapshot"] = true.into();
+        assert!(conversation.apply(historical));
+        assert_eq!(conversation.outcome, None);
+        assert_eq!(conversation.foreground, "running");
+        for (seq, value) in [
+            (
+                11,
+                json!({"sessionUpdate":"state_update","state":"idle","stopReason":"error","error":{"message":"failed"}}),
+            ),
+            (
+                12,
+                json!({"sessionUpdate":"_hive_error","message":"failed","help":"Check logs"}),
+            ),
+        ] {
+            assert!(conversation.apply(event(seq, serde_json::from_value(value).unwrap())));
+        }
+        assert_eq!(conversation.outcome, Some(TurnOutcome::Error));
+        conversation.apply(event(
+            13,
+            serde_json::from_value(json!({"sessionUpdate":"state_update","state":"running"}))
+                .unwrap(),
+        ));
+        assert_eq!(conversation.outcome, None);
     }
 
     #[test]

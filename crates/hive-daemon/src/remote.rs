@@ -419,6 +419,8 @@ mod tests {
 
     #[test]
     fn malformed_profile_selectors_cannot_fall_back_to_default_admission() {
+        // A Unix root alone is not absolute on Windows; keep cwd validation out of this test.
+        let cwd = std::env::current_dir().unwrap();
         let connection = Connection {
             initialized: true,
             mode: Mode::Negotiated,
@@ -427,7 +429,7 @@ mod tests {
         for profile in [json!(null), json!(""), json!(false), json!({})] {
             assert!(
                 launch(
-                    json!({"cwd":"/", "mcpServers":[], "_meta":{"hive":{"profile":profile}}}),
+                    json!({"cwd":cwd, "mcpServers":[], "_meta":{"hive":{"profile":profile}}}),
                     &connection
                 )
                 .is_err()
@@ -435,7 +437,7 @@ mod tests {
         }
         assert!(
             launch(
-                json!({"cwd":"/", "mcpServers":[], "_meta":{"hive":{"profile":"personal"}}}),
+                json!({"cwd":cwd, "mcpServers":[], "_meta":{"hive":{"profile":"personal"}}}),
                 &connection
             )
             .is_ok()

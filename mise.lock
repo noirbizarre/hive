@@ -107,7 +107,7 @@ backend = "cargo:cargo-nextest"
 specifiers = ["latest"]
 
 [[tools."cargo:git-tpl"]]
-version = "0.14.3"
+version = "0.16.0"
 backend = "cargo:git-tpl"
 specifiers = ["latest"]
 

@@ -78,6 +78,17 @@ jobs:
       - name: Lint Rust
         run: mise run lint
 
+      # Check the release configuration and its workflows before release day.
+      - name: Install gh-ship
+        run: gh extension install noirbizarre/gh-ship
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate the release setup
+        run: gh ship validate
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   test:
     name: 🧪 Tests (${{ matrix.os.name }})
     needs: webui
@@ -136,7 +147,10 @@ jobs:
 
       - name: Run tests (with coverage)
         run: |
-          cargo llvm-cov nextest --profile ci
+          # --no-report also disables automatic cleaning: discard cached workspace artifacts
+          # and profiles explicitly so earlier runs cannot contaminate this run's coverage.
+          cargo llvm-cov clean --workspace
+          cargo llvm-cov nextest --profile ci --no-report
           cargo llvm-cov report --lcov --output-path lcov.info
 
       - name: Upload coverage to Codecov
@@ -176,23 +190,6 @@ jobs:
           path: clients/hive-web/dist/
           if-no-files-found: error
           retention-days: 1
-
-  # gh-ship runs the release. Its configuration and the workflows it names must
-  # satisfy the contract it enforces, and finding out otherwise mid-release is
-  # the worst possible moment — so it is checked on every pull request instead.
-  ship:
-    name: 🚢 Ship setup
-    runs-on: ubuntu-latest
-    env:
-      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install gh-ship
-        run: gh extension install noirbizarre/gh-ship
-
-      - name: Validate the release setup
-        run: gh ship validate
 
   # `rust-version` in Cargo.toml is a promise. Without a job that keeps it, it
   # drifts the first time anyone uses a newer language feature — and the

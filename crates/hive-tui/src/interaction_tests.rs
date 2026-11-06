@@ -164,6 +164,19 @@ fn a_receipt_lookup_can_retire_an_already_acknowledged_recovery_after_its_respon
 }
 
 async fn connected(body: impl AsyncFnOnce(V2ConnectionTo<Agent>) -> Result<(), Error>) {
+    connected_with_resume(None, body).await;
+}
+
+#[derive(Default)]
+struct ResumeGate {
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+async fn connected_with_resume(
+    gate: Option<std::sync::Arc<ResumeGate>>,
+    body: impl AsyncFnOnce(V2ConnectionTo<Agent>) -> Result<(), Error>,
+) {
     let agent = Agent
         .v2()
         .on_receive_request(
@@ -194,8 +207,12 @@ async fn connected(body: impl AsyncFnOnce(V2ConnectionTo<Agent>) -> Result<(), E
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
-            async |_: v2::ResumeSessionRequest, responder: agent_client_protocol::Responder<v2::ResumeSessionResponse>, _: V2ConnectionTo<Client>| {
-                tokio::time::sleep(Duration::from_millis(100)).await;
+            async move |_: v2::ResumeSessionRequest, responder: agent_client_protocol::Responder<v2::ResumeSessionResponse>, _: V2ConnectionTo<Client>| {
+                if let Some(gate) = &gate {
+                    // Hold the operation until the test has exercised input and drawing under load.
+                    gate.entered.notify_one();
+                    gate.release.notified().await;
+                }
                 responder.respond(v2::ResumeSessionResponse::new().meta(v2::Meta::from_iter([("hive".into(), json!({
                     "generation":1,"role":"pilot","pilot":true,"token":"test","running":false,
                     "activitySnapshot":{"version":1,"seq":0,"session":"active","foreground":"idle"}
@@ -348,11 +365,13 @@ async fn erase(cx: &V2ConnectionTo<Agent>, app: &mut App, pending: &mut Option<I
 
 #[tokio::test]
 async fn delayed_control_actions_keep_frames_and_input_responses_responsive() {
-    connected(async |cx| {
+    let gate = std::sync::Arc::new(ResumeGate::default());
+    connected_with_resume(Some(gate.clone()), async |cx| {
         use ratatui::{Terminal, backend::TestBackend};
         let mut app = App { connected: true, ..App::default() };
         app.select_session("hive-test".into());
-        tokio::time::timeout(Duration::from_millis(20), key(&cx, &mut app, &mut None, KeyCode::Char('t'), KeyModifiers::CONTROL)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), key(&cx, &mut app, &mut None, KeyCode::Char('t'), KeyModifiers::CONTROL)).await.unwrap();
+        gate.entered.notified().await;
         assert!(app.session_operation.is_some());
         text(&cx, &mut app, &mut None, "draft during takeover").await;
         assert_eq!(app.input, "draft during takeover");
@@ -374,6 +393,7 @@ async fn delayed_control_actions_keep_frames_and_input_responses_responsive() {
         assert!(pending.is_none());
         assert_eq!(app.input, "draft during takeover");
         assert!(app.session_operation.is_some());
+        gate.release.notify_one();
         let result = operation_completion(&mut app.session_operation).await.unwrap();
         app.session_operation = None;
         assert!(!result.relinquished);

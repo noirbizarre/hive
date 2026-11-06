@@ -24,7 +24,15 @@ use hive_protocol::AgentVersion;
 use serde_json::{Value, json};
 use tokio::{sync::mpsc, time::timeout};
 
-type Updates = mpsc::UnboundedReceiver<v2::UpdateSessionNotification>;
+enum Event {
+    Update(Box<v2::UpdateSessionNotification>),
+    Boundary,
+}
+
+struct Updates {
+    receiver: mpsc::UnboundedReceiver<Event>,
+    boundary: mpsc::UnboundedSender<Event>,
+}
 
 fn cwd() -> String {
     std::env::current_dir().unwrap().display().to_string()
@@ -153,6 +161,7 @@ async fn connect<T>(
     body: impl AsyncFnOnce(V2ConnectionTo<Agent>, Updates) -> agent_client_protocol::Result<T>,
 ) -> T {
     let (tx, rx) = mpsc::unbounded_channel();
+    let boundary = tx.clone();
     let permissions = pilot.clone();
     let forms = pilot.clone();
     timeout(
@@ -161,7 +170,8 @@ async fn connect<T>(
             .v2()
             .on_receive_notification(
                 async move |update: v2::UpdateSessionNotification, _: V2ConnectionTo<Agent>| {
-                    tx.send(update).map_err(Error::into_internal_error)
+                    tx.send(Event::Update(Box::new(update)))
+                        .map_err(Error::into_internal_error)
                 },
                 agent_client_protocol::on_receive_notification!(),
             )
@@ -222,7 +232,14 @@ async fn connect<T>(
                     )
                     .block_task()
                     .await?;
-                    body(cx, rx).await
+                    body(
+                        cx,
+                        Updates {
+                            receiver: rx,
+                            boundary,
+                        },
+                    )
+                    .await
                 },
             ),
     )
@@ -262,7 +279,7 @@ async fn until(
 ) -> Vec<v2::SessionUpdate> {
     let mut seen = Vec::new();
     timeout(Duration::from_secs(15), async {
-        while let Some(update) = updates.recv().await {
+        while let Some(Event::Update(update)) = updates.receiver.recv().await {
             if &update.session_id != id {
                 continue;
             }
@@ -322,24 +339,35 @@ fn user_texts(updates: &[v2::SessionUpdate]) -> Vec<String> {
         .collect()
 }
 
-/// Drains whatever replay currently holds for `id`.
+/// Collects replay through its ordered response boundary, regardless of notification latency.
 async fn replay(address: SocketAddr, id: &v2::SessionId) -> Vec<v2::SessionUpdate> {
     let id = id.clone();
     connect(address, Pilot::default(), async move |cx, mut updates| {
         let mut meta = v2::Meta::new();
         meta.insert("hive".into(), json!({"mode": "observe"}));
-        cx.send_request(
+        let boundary = updates.boundary.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        cx.prepare_request(
             v2::ResumeSessionRequest::new(id.clone(), std::env::current_dir().unwrap())
                 .replay_from(v2::ReplayFrom::Start(v2::ReplayFromStart::new()))
                 .meta(meta),
         )
-        .block_task()
-        .await?;
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        .on_receiving_result(async move |result| {
+            // This hook runs in wire order; adding a marker after .await would race notifications.
+            boundary
+                .send(Event::Boundary)
+                .map_err(Error::into_internal_error)?;
+            let _ = tx.send(result);
+            Ok(())
+        })?;
+        rx.await.map_err(Error::into_internal_error)??;
         let mut seen = Vec::new();
-        while let Ok(update) = updates.try_recv() {
-            if update.session_id == id {
-                seen.push(update.update);
+        loop {
+            match updates.receiver.recv().await {
+                Some(Event::Boundary) => break,
+                Some(Event::Update(update)) if update.session_id == id => seen.push(update.update),
+                Some(Event::Update(_)) => {}
+                None => panic!("replay connection closed before its response boundary"),
             }
         }
         Ok(seen)
@@ -764,7 +792,7 @@ async fn active_close_waits_for_final_events_and_detaches_without_deleting_nativ
             .block_task()
             .await?;
         let mut final_events = Vec::new();
-        while let Ok(event) = updates.try_recv() {
+        while let Ok(Event::Update(event)) = updates.receiver.try_recv() {
             final_events.push(event.update);
         }
         assert_eq!(agent_text(&final_events), "final-before-close");
@@ -818,7 +846,7 @@ async fn preview_active_close_confirms_idle_after_terminal_events_and_preserves_
             .block_task()
             .await?;
         let mut final_events = Vec::new();
-        while let Ok(event) = updates.try_recv() {
+        while let Ok(Event::Update(event)) = updates.receiver.try_recv() {
             final_events.push(event.update);
         }
         assert_eq!(agent_text(&final_events), "final-before-close");
@@ -854,7 +882,7 @@ async fn stale_idle_queued_before_the_current_turn_cannot_complete_its_close() {
             .block_task()
             .await?;
         let mut final_events = Vec::new();
-        while let Ok(event) = updates.try_recv() {
+        while let Ok(Event::Update(event)) = updates.receiver.try_recv() {
             final_events.push(event.update);
         }
         assert_eq!(agent_text(&final_events), "final-before-close");

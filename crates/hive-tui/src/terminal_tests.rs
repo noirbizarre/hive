@@ -263,33 +263,62 @@ async fn runtime_fixture() {
     server.abort();
 }
 
+fn run_terminal_scenario(scenario: &str) {
+    // Reuse this instrumented executable so child-process execution contributes to coverage too.
+    let output = std::process::Command::new("python3")
+        .arg("-B")
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/runtime.py"))
+        .arg(std::env::current_exe().unwrap())
+        .arg(scenario)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// Each process owns its PTY, so independent scenarios need not share one timeout or execution slot.
 #[test]
-fn the_real_event_loop_keeps_paste_and_external_edits_unsent_until_enter() {
-    for scenario in [
-        "resume",
-        "create",
-        "osc52",
-        "rich",
-        "status",
-        "status-subset",
-        "status-off",
-        "status-on",
-    ] {
-        // Reuse this instrumented executable so child-process execution contributes to coverage too.
-        let output = std::process::Command::new("python3")
-            .arg("-B")
-            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/runtime.py"))
-            .arg(std::env::current_exe().unwrap())
-            .arg(scenario)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+fn a_resumed_session_keeps_terminal_edits_unsent_until_enter() {
+    run_terminal_scenario("resume");
+}
+
+#[test]
+fn a_created_session_keeps_terminal_edits_unsent_until_enter() {
+    run_terminal_scenario("create");
+}
+
+#[test]
+fn osc52_clipboard_fallback_keeps_terminal_edits_unsent_until_enter() {
+    run_terminal_scenario("osc52");
+}
+
+#[test]
+fn rich_clipboard_content_keeps_terminal_edits_unsent_until_enter() {
+    run_terminal_scenario("rich");
+}
+
+#[test]
+fn terminal_status_negotiation_preserves_interactive_editing() {
+    run_terminal_scenario("status");
+}
+
+#[test]
+fn partial_terminal_status_support_preserves_interactive_editing() {
+    run_terminal_scenario("status-subset");
+}
+
+#[test]
+fn disabled_terminal_status_preserves_interactive_editing() {
+    run_terminal_scenario("status-off");
+}
+
+#[test]
+fn enabled_terminal_status_preserves_interactive_editing() {
+    run_terminal_scenario("status-on");
 }
 
 #[test]

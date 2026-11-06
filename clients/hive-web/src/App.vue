@@ -6,7 +6,7 @@ import Textarea from 'openvue/textarea';
 import Tag from 'openvue/tag';
 import Message from 'openvue/message';
 import Drawer from 'openvue/drawer';
-import { catalog } from './client.js';
+import { sessionKey } from './federation.js';
 import SessionNavigation from './SessionNavigation.vue';
 import TranscriptView from './TranscriptView.vue';
 import InteractionCard from './InteractionCard.vue';
@@ -16,15 +16,20 @@ const props = defineProps({ client: { type: Object, required: true }, state: { t
 const state = computed(() => unref(props.state));
 const sessions = ref([]), recent = ref([]), agents = ref([]);
 const executionProfiles = ref([]), executionProfile = ref(''), defaultExecutionProfile = ref('');
+const owners = ref([]), launchOwner = ref(''), launchCwd = ref('');
+const launch = () => ({ owner: launchOwner.value, cwd: launchCwd.value });
+const launchProfile = computed(() => executionProfile.value || (launchOwner.value && !owners.value.find(owner => owner.owner === launchOwner.value)?.local ? defaultExecutionProfile.value : ''));
 const selectedProfile = computed(() => executionProfiles.value.find(profile => profile.id === (executionProfile.value || defaultExecutionProfile.value)));
 const availableAgents = computed(() => selectedProfile.value
   ? agents.value.filter(agent => selectedProfile.value.agents.includes(agent.id)) : agents.value);
 const loading = ref(true), listError = ref(''), providerError = ref(''), error = ref('');
+const listWarning = ref('');
 const drawer = ref(false), navigation = ref(true), text = ref(''), backend = ref(''), sending = ref(false);
 const mobileMenu = ref();
 const configFailures = ref({});
 let feed;
 let deepLink = new URLSearchParams(location.search).get('session');
+const deepOwner = new URLSearchParams(location.search).get('owner');
 const pilot = computed(() => state.value.role === 'pilot' && state.value.connected && !state.value.gap);
 const selected = computed(() => sessions.value.find(item => item.sessionId === state.value.session?.sessionId));
 const busy = computed(() => state.value.opening || state.value.configuring || state.value.creating || state.value.takingControl || sending.value);
@@ -74,6 +79,10 @@ function providers({ agents: inventory, defaultAgent, profiles = [], defaultProf
   if (!availableAgents.value.some(agent => agent.id === backend.value)) backend.value = selectedProfile.value ? '' : defaultAgent || inventory[0]?.id || '';
 }
 watch(executionProfile, () => { backend.value = ''; });
+watch(launchOwner, owner => {
+  backend.value = ''; executionProfile.value = ''; defaultExecutionProfile.value = ''; agents.value = []; executionProfiles.value = []; launchCwd.value = '';
+  feed?.selectOwner?.(owner);
+});
 function typing() { if (text.value && state.value.session && !pilot.value && !state.value.recoveryRequired && !busy.value) action(() => props.client.takeControl()); }
 async function send(retry = false) {
   if (sending.value || (!retry && (blocked.value || !text.value.trim()))) return;
@@ -81,32 +90,35 @@ async function send(retry = false) {
   const target = state.value.session?.sessionId;
   const draft = text.value;
   await action(async () => {
-    await props.client.prompt(retry ? state.value.uncertain.text : draft, backend.value, executionProfile.value);
+    await props.client.prompt(retry ? state.value.uncertain.text : draft, backend.value, launchProfile.value, launch());
     // A delayed acknowledgement must not erase a newer draft or another session's input.
     if (!retry && state.value.session?.sessionId === target && text.value === draft) text.value = '';
   });
   sending.value = false;
 }
-watch(() => state.value.session?.sessionId, id => {
+watch(() => sessionKey(state.value.session), () => {
+  const id = state.value.session?.sessionId;
   if (!id) return;
-  recent.value = [id, ...recent.value.filter(item => item !== id)];
-  history.replaceState(null, '', `?${new URLSearchParams({ session: id })}`);
+  const key = sessionKey(state.value.session), reference = state.value.session.reference;
+  recent.value = [key, ...recent.value.filter(item => item !== key && item !== id)];
+  history.replaceState(null, '', `?${new URLSearchParams(reference ? { owner: reference.owner, session: reference.id } : { session: id })}`);
   backend.value = state.value.session.agent || '';
   error.value = '';
 });
 onMounted(() => {
-  feed = catalog(items => {
+  feed = props.client.catalog((items, metadata) => {
     sessions.value = items; loading.value = false; listError.value = '';
+    listWarning.value = metadata?.partial ? `Session list incomplete — unavailable owners: ${(metadata.unavailableOwners || []).join(', ')}` : '';
     if (deepLink) {
-      const found = items.find(item => item.sessionId === deepLink);
-      if (found) open(found);
+      const found = items.find(item => deepOwner ? item.reference?.owner === deepOwner && item.reference.id === deepLink : item.sessionId === deepLink);
+      if (found || deepOwner) open(found || { reference: { owner: deepOwner, id: deepLink } });
       else error.value = `Hive session ${deepLink} not found; choose a listed session`;
       deepLink = null;
     }
   }, message => {
     if (message.startsWith('Agent inventory unavailable')) providerError.value = message;
     else { loading.value = false; listError.value = message; }
-  }, providers);
+   }, providers, items => { owners.value = items; });
 });
 onBeforeUnmount(() => { feed?.close(); props.client.close(); });
 </script>
@@ -131,9 +143,11 @@ onBeforeUnmount(() => { feed?.close(); props.client.close(); });
         <Button v-if="state.session" as="a" href="/ui" label="New session" size="small" severity="secondary" outlined />
       </header>
       <section class="configuration-bar" aria-label="Session configuration">
+        <label v-if="!state.session && owners.length" class="config-field" for="owner">Hive instance<Select v-model="launchOwner" input-id="owner" :options="owners.map(owner => ({ ...owner, label: owner.name || owner.alias || owner.owner }))" option-label="label" option-value="owner" placeholder="Local" :disabled="busy" /></label>
+        <label v-if="!state.session && launchOwner && !owners.find(owner => owner.owner === launchOwner)?.local" class="config-field" for="owner-cwd">Working directory on owner<input id="owner-cwd" v-model="launchCwd" placeholder="Absolute owner path (or managed profile)" :disabled="busy"></label>
         <label v-if="executionProfiles.length && !state.session" class="config-field" for="profile">Execution profile<Select v-model="executionProfile" input-id="profile" :options="[{ id: '', name: 'Daemon default' }, ...executionProfiles]" option-label="name" option-value="id" :disabled="busy" /></label>
         <label class="config-field" for="agent">Hive backend<Select :model-value="state.session ? selected?.agent || state.session.agent || backend : backend" input-id="agent" placeholder="Default backend" :options="[{ id: '', name: 'Default backend' }, ...(state.session ? agents : availableAgents)]" option-label="name" option-value="id" :disabled="Boolean(state.session) || busy" @update:model-value="value => backend = value" /></label>
-        <Button v-if="!state.session" id="create" label="Create session" :loading="state.connected && state.creating && !state.interaction" :disabled="!state.connected || busy || Boolean(providerError)" @click="action(() => client.create(backend, executionProfile))" />
+        <Button v-if="!state.session" id="create" label="Create session" :loading="state.connected && state.creating && !state.interaction" :disabled="!state.connected || busy || Boolean(providerError)" @click="action(() => client.create(backend, launchProfile, launch()))" />
         <label v-for="option in configOptions" :key="option.configId" class="config-field" :for="`config-${option.configId}`">{{ option.category === 'model' ? 'Provider / Model' : option.name }}
           <Select :key="configFailures[option.configId] || 0" :input-id="`config-${option.configId}`" :model-value="option.currentValue" :aria-label="currentLabel(option)" :placeholder="String(option.currentValue ?? 'Unavailable')" :title="option.description" :options="groups(option)" option-group-label="name" option-group-children="items" option-label="name" option-value="value" :disabled="configDisabled || !hasChoices(option)" @update:model-value="value => configure(option, value)">
             <template #value><ActivityIndicator v-if="state.connected && state.configuring && !state.interaction" />{{ currentLabel(option) }}</template>
@@ -143,6 +157,7 @@ onBeforeUnmount(() => { feed?.close(); props.client.close(); });
         <Button v-if="state.session && !pilot" id="control" label="Take control" severity="secondary" outlined :loading="state.connected && state.takingControl && !state.interaction" :disabled="!state.connected || state.recoveryRequired || busy || state.gap" @click="action(() => client.takeControl())" />
       </section>
       <div class="notices">
+        <Message v-if="listWarning" severity="warn" :closable="false" role="status">{{ listWarning }}</Message>
         <!-- Coverage survives transient transport messages and never blocks available content. -->
         <Message v-if="state.session" id="history-status" severity="warn" :closable="false" role="status">
           {{ state.transcript?.completeness === 'partial' ? 'History: partial' : 'History: retention coverage unknown' }}

@@ -1656,6 +1656,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "crossterm",
+ "hive-core",
  "hive-protocol",
  "image",
  "nucleo-matcher",

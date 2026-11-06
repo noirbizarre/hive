@@ -68,3 +68,13 @@ cookies protect both surfaces. There are no per-user roles. The ACP/operational
 protocol separation and owner-side session supervision remain unchanged.
 See [current deployment guidance](../operations.md#private-network-access) and
 [SDK validation/limitations](../transports.md#sdk-audit-and-limits).
+
+## Built-in federated discovery — 2026-11-06
+
+[#81](https://github.com/noirbizarre/hive/issues/81) moves TUI and browser session
+and launch discovery onto their negotiated ACP connections. Both present local
+and configured remote owners in one session interface, retaining qualified
+references for resolution before reconnect. Operational HTTP/SSE remains a local
+administration/integration surface, not a federated catalog subscription or a
+second conversation protocol. Client refresh polling is independent of ordered
+ACP conversation updates.

@@ -16,15 +16,23 @@ use crate::{picker::Picker, state::Conversation, theme::Theme, transcript::Trans
 pub struct SessionSummary {
     pub session_id: String,
     pub cwd: std::path::PathBuf,
+    #[serde(default)]
     pub agent: String,
     pub title: Option<String>,
+    #[serde(default = "unknown_state")]
     pub lifecycle: String,
     pub recovery: Option<String>,
     pub recovery_reason: Option<String>,
+    #[serde(default = "unknown_state")]
     pub activity: String,
     pub last_activity_at: Option<u64>,
     pub control_owner: Option<String>,
+    #[serde(default)]
     pub generation: u64,
+}
+
+fn unknown_state() -> String {
+    "unknown".into()
 }
 
 #[derive(Deserialize)]
@@ -42,6 +50,15 @@ pub enum Page {
 
 #[derive(Default)]
 pub struct App {
+    pub peer: Option<hive_protocol::remote::Peer>,
+    pub launch_owner: Option<hive_core::identity::NodeId>,
+    pub owners: Vec<serde_json::Value>,
+    pub references: HashMap<String, hive_protocol::remote::SessionReference>,
+    pub availability: HashMap<String, String>,
+    pub explicit_cwd: bool,
+    pub creation_uncertain: bool,
+    pub launch_cwd_input: Option<String>,
+    pub creation_target: Option<(String, std::path::PathBuf)>,
     pub terminal_capabilities: crate::capabilities::TerminalCapabilities,
     pub workspace_launch: Option<hive_protocol::workspace::Launch>,
     pub page: Page,
@@ -98,6 +115,48 @@ pub struct App {
 }
 
 impl App {
+    fn owner_label(&self, owner: &str) -> String {
+        if self.peer.as_ref().is_some_and(|peer| peer.node == owner) {
+            return format!("Local · {owner}");
+        }
+        self.owners
+            .iter()
+            .find(|peer| peer["owner"] == owner)
+            .and_then(|peer| peer["name"].as_str().or(peer["alias"].as_str()))
+            .map_or_else(|| owner.to_owned(), |label| format!("{label} · {owner}"))
+    }
+    pub fn relocate(&mut self, old: &str, new: &str) {
+        if old == new {
+            return;
+        }
+        // Rebind every route-keyed view together so alias changes cannot split one conversation.
+        macro_rules! move_entry { ($($field:ident),*) => { $(if let Some(value) = self.$field.remove(old) { self.$field.insert(new.to_owned(), value); })* }; }
+        move_entry!(
+            conversations,
+            transcripts,
+            drafts,
+            draft_editors,
+            draft_images,
+            pending,
+            rejected,
+            references,
+            availability
+        );
+        if self.submitting.remove(old) {
+            self.submitting.insert(new.to_owned());
+        }
+        for id in &mut self.recent {
+            if id == old {
+                *id = new.to_owned();
+            }
+        }
+        if self.active.as_deref() == Some(old) {
+            self.active = Some(new.to_owned());
+        }
+        if self.stopping.as_deref() == Some(old) {
+            self.stopping = Some(new.to_owned());
+        }
+    }
     fn activity_live(&self) -> bool {
         self.connected
             && !self
@@ -506,7 +565,20 @@ impl App {
                 Span::styled(title, theme.text()),
             ]),
             Line::styled(
-                if self.page == Page::Sessions {
+                if self.page == Page::Profiles {
+                    if let Some(input) = &self.launch_cwd_input {
+                        format!("  Owner directory: {input}▏ · Enter save · Esc cancel")
+                    } else {
+                        format!(
+                            "  Owner: {} · {} · o owner · d directory · p profile",
+                            self.launch_owner.as_ref().map_or_else(
+                                || "Local".into(),
+                                |owner| self.owner_label(owner.as_str())
+                            ),
+                            self.cwd.display()
+                        )
+                    }
+                } else if self.page == Page::Sessions {
                     self.terminal_capability_summary()
                 } else {
                     format!(
@@ -593,7 +665,15 @@ impl App {
             return;
         }
         let entries = self.sessions.iter().map(|info| {
-            let owner = if info.control_owner.is_none() {
+            let owner = if self
+                .availability
+                .get(&info.session_id)
+                .is_some_and(|value| value == "owner_unavailable")
+            {
+                "owner unavailable · cached"
+            } else if info.lifecycle == "unknown" {
+                "control unknown"
+            } else if info.control_owner.is_none() {
                 "unclaimed"
             } else if self.active.as_deref() == Some(&info.session_id)
                 && self.pilot()
@@ -630,6 +710,14 @@ impl App {
                     theme.text(),
                 ),
                 Span::styled(format!("{}  ", info.agent), theme.muted()),
+                Span::styled(
+                    self.references
+                        .get(&info.session_id)
+                        .map_or(String::new(), |reference| {
+                            format!("{}  ", self.owner_label(reference.owner.as_str()))
+                        }),
+                    theme.muted(),
+                ),
                 Span::styled(
                     format!(
                         "{} / {}{}{}  ",
@@ -671,7 +759,7 @@ impl App {
                 Paragraph::new(vec![
                     Line::styled("No agents configured", theme.text()),
                     Line::styled(
-                        "Add an [agents.<id>] definition to the daemon configuration, then run hive daemon reload.",
+                        if self.owners.is_empty() { "Add an [agents.<id>] definition to the daemon configuration, then run hive daemon reload." } else { "Press o to select a configured remote owner, or add local agents and reload the daemon." },
                         theme.muted(),
                     ),
                 ])
@@ -889,8 +977,15 @@ impl App {
             Page::Sessions => {
                 "↑↓ select  Enter pilot  o observe  Tab chat  a all  Ctrl-N new  Esc quit"
             }
-            Page::Profiles if self.profiles.is_empty() => "Tab sessions  Esc quit",
-            Page::Profiles => "↑↓ agent  p profile  Enter create  Tab sessions  Esc quit",
+            Page::Profiles if self.creation_uncertain => {
+                "Inspect owner state · u acknowledge uncertain launch · Tab sessions · Esc quit"
+            }
+            Page::Profiles if self.profiles.is_empty() => {
+                "o owner  d directory  Tab sessions  Esc quit"
+            }
+            Page::Profiles => {
+                "↑↓ agent  o owner  d directory  p profile  Enter create  Tab sessions  Esc quit"
+            }
             Page::Chat if self.dialog.is_some() => "Enter confirm  Esc decline",
             Page::Chat if history => {
                 "History · PgUp/PgDn or wheel scroll · End live · Ctrl-↑↓ tool · Ctrl-O details"

@@ -2,6 +2,175 @@ import { afterEach, beforeEach, test } from 'node:test';
 import { strict as assert } from 'node:assert';
 import { readFileSync } from 'node:fs';
 import { catalog, connect, conversation, validateContent } from './src/client.js';
+import { discovery, negotiate, ownerPathIsAbsolute, sessionKey } from './src/federation.js';
+
+const localOwner = 'node-11111111-1111-4111-8111-111111111111';
+const remoteOwner = 'node-22222222-2222-4222-8222-222222222222';
+
+test('federated discovery keeps colliding owner identities and sparse unavailable routes distinct', async () => {
+  const calls = [];
+  const directory = discovery(async (method, params) => {
+    calls.push([method, params]);
+    if (method === 'session/list') return { sessions: [
+      { sessionId: 'local-route', cwd: '/work', _meta: { hive: { agent: 'coder', session: { owner: localOwner, id: 'same' } } } },
+      { sessionId: 'remote-route', cwd: 'C:\\work', _meta: { hive: { sessionId: 'same', session: { owner: remoteOwner, id: 'same' }, cached: true, availability: 'owner_unavailable' } } },
+    ], _meta: { hive: { partial: true, unavailableOwners: [remoteOwner] } } };
+    if (method === '_hive/peers/list') return { peers: [{ owner: remoteOwner, alias: 'workstation', name: 'Workstation' }] };
+    if (method === '_hive/agents/list') return params.cursor ? { agents: [{ id: 'second' }] } : { agents: [{ id: 'coder' }], nextCursor: 'next' };
+    if (method === '_hive/profiles/list') return { profiles: [{ id: 'personal' }] };
+  }, { node: localOwner, enabled: () => true });
+  const page = await directory.sessions();
+  assert.equal(page.sessions[1].sessionId, 'remote-route');
+  assert.notEqual(sessionKey(page.sessions[0]), sessionKey(page.sessions[1]));
+  assert.equal(page.sessions[1].activity, undefined);
+  assert.equal(Object.hasOwn(page.sessions[1], 'controlOwner'), false);
+  assert.equal(page.partial, true);
+  assert.equal((await directory.owners())[1].alias, 'workstation');
+  assert.deepEqual((await directory.inventory(remoteOwner)).agents.map(agent => agent.id), ['coder', 'second']);
+  assert.ok(calls.filter(([method]) => method.includes('agents') || method.includes('profiles')).every(([, params]) => params.peer === remoteOwner));
+  assert.ok(['/work', 'C:\\work', '\\\\host\\share'].every(ownerPathIsAbsolute));
+  assert.equal(ownerPathIsAbsolute('relative'), false);
+});
+
+test('invalid Hive negotiation and repeated inventory cursors fail without local fallback', async () => {
+  assert.throws(() => negotiate({ protocolVersion: 2, capabilities: { session: {} } }), /persistent Hive/);
+  assert.throws(() => negotiate({ protocolVersion: 2, capabilities: { session: {}, _meta: { hive: { version: 1, node: localOwner, features: { peers: {} } } } } }), /Inconsistent/);
+  const directory = discovery(async () => ({ agents: [], nextCursor: 'same' }), { node: localOwner, enabled: () => true });
+  await assert.rejects(directory.inventory(remoteOwner), /repeated/);
+});
+
+test('late owner inventory cannot replace a newer selection or hide usable session discovery', async () => {
+  let delayed;
+  const sockets = transport((socket, message) => {
+    if (message.method === 'session/list') return { sessions: [{ sessionId: 'route', cwd: '/work' }] };
+    if (message.method === '_hive/peers/list') return { peers: [{ owner: remoteOwner, alias: 'remote' }] };
+    if (message.method === '_hive/profiles/list') return { profiles: [] };
+    if (message.method === '_hive/agents/list') {
+      if (message.params.peer === remoteOwner) { delayed = message; return false; }
+      return { agents: [{ id: 'local' }] };
+    }
+  });
+  const client = connect('ws://localhost/acp');
+  await client.initialized;
+  const inventories = [], sessions = [], errors = [];
+  const feed = client.catalog(items => sessions.push(items), error => errors.push(error), inventory => inventories.push(inventory));
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    feed.selectOwner(remoteOwner);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.ok(delayed);
+    feed.selectOwner(localOwner);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(inventories.at(-1).agents[0].id, 'local', 'new owner discovery must not wait for the stalled owner');
+    assert.equal(sockets[0].sent.filter(message => message.method === '_hive/agents/list' && !message.params.peer).length, 2);
+    sockets[0].receive({ jsonrpc: '2.0', id: delayed.id, error: { code: -32060, message: 'Old owner unavailable' } });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(inventories.at(-1).agents[0].id, 'local');
+    assert.equal(errors.length, 0);
+    assert.equal(sessions.at(-1)[0].sessionId, 'route');
+  } finally { feed.close(); client.close(); }
+});
+
+test('owner configured agent workspaces do not require an invented directory or a profile workspace override', async () => {
+  for (const profile of ['', 'personal', 'global-default']) {
+    const sockets = transport((socket, message) => {
+      if (message.method === '_hive/agents/list') return { agents: [{ id: 'coder', launch: { workspace: 'configured' } }], defaultAgent: 'coder' };
+      if (message.method === '_hive/profiles/list') return { profiles: [{ id: 'personal', agents: ['coder'], defaultAgent: 'coder', workspaces: {} }, { id: 'global-default', agents: ['coder', 'other'], workspaces: {} }] };
+    });
+    const client = connect('ws://localhost/acp');
+    try {
+      await client.create(profile ? '' : 'coder', profile, { owner: remoteOwner });
+      const created = sockets[0].sent.find(message => message.method === 'session/new');
+      assert.equal(created.params._meta.hive.peer, remoteOwner);
+      assert.equal(created.params.cwd, '/');
+      if (profile) assert.equal(created.params._meta.hive.profile, profile);
+    } finally { client.close(); }
+  }
+});
+
+test('an unresolved qualified deep link is opened after reconnect without creating another session', async () => {
+  const reference = { owner: remoteOwner, id: 'deep-link' };
+  let resolving = false;
+  const sockets = transport((socket, message) => {
+    if (message.method === '_hive/sessions/resolve') {
+      if (sockets.length === 1) { resolving = true; return false; }
+      return { session: reference, sessionId: 'resolved-route', cwd: '/owner-only' };
+    }
+  });
+  const client = connect('ws://localhost/acp');
+  const opening = client.open({ reference }).catch(error => error);
+  try {
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(resolving, true);
+    sockets[0].close();
+    assert.match((await opening).message, /disconnected/);
+    await new Promise(resolve => setTimeout(resolve, 800));
+    assert.equal(client.state().session.sessionId, 'resolved-route');
+    assert.deepEqual(sockets[1].sent.map(message => message.method), ['initialize', '_hive/sessions/resolve', 'session/resume']);
+  } finally { client.close(); }
+});
+
+test('remote browser sessions stream plans and questions then cancel and resolve before reconnect resume', async () => {
+  const reference = { owner: remoteOwner, id: 'native-session' };
+  const plan = { sessionUpdate: 'plan_update', plan: { type: 'items', planId: 'steps', entries: [{ content: 'Remote task', status: 'in_progress', priority: 'high' }] } };
+  const sockets = transport((socket, message, result) => {
+    if (message.method === 'session/new') return { ...result, sessionId: 'route-one', _meta: { hive: { ...result._meta.hive, session: reference } } };
+    if (message.method === 'session/prompt') {
+      queueMicrotask(() => {
+        socket.receive(update(1, { sessionUpdate: 'agent_message', messageId: 'remote', content: [{ type: 'text', text: 'Remote output' }] }, 'route-one'));
+        socket.receive(update(2, plan, 'route-one'));
+        socket.receive(update(3, { sessionUpdate: 'state_update', state: 'requires_action' }, 'route-one'));
+        socket.receive({ jsonrpc: '2.0', id: 'remote-permission', method: 'session/request_permission', params: { sessionId: 'route-one', title: 'Approve', options: [{ optionId: 'allow', name: 'Allow', kind: 'allow_once' }] } });
+      });
+    }
+    if (message.method === '_hive/sessions/resolve') return { session: reference, sessionId: 'route-two', cwd: '/owner/moved' };
+    if (message.method === 'session/resume') return { _meta: { hive: { ...result._meta.hive, session: reference, planSnapshot: { version: 1, seq: 2, plans: { steps: plan } } } } };
+  });
+  const client = connect('ws://localhost/acp');
+  await client.create('coder', '', { owner: remoteOwner, cwd: '/owner/only' });
+  const created = sockets[0].sent.find(message => message.method === 'session/new');
+  assert.equal(created.params._meta.hive.peer, remoteOwner);
+  assert.equal(created.params.cwd, '/owner/only');
+  await client.prompt('work');
+  assert.ok(JSON.stringify(client.state().lines).includes('Remote output'));
+  assert.deepEqual(client.state().planSnapshot.plans.steps, plan);
+  assert.equal(client.state().running, true);
+  assert.equal(client.respond({ outcome: { outcome: 'selected', optionId: 'allow' } }, 'remote-permission'), true);
+  assert.equal(client.cancel(), true);
+  assert.equal(sockets[0].sent.find(message => message.method === 'session/cancel').params.sessionId, 'route-one');
+  sockets[0].receive(update(4, { sessionUpdate: 'state_update', state: 'idle', stopReason: 'cancelled' }, 'route-one'));
+  assert.equal(client.state().running, false);
+  sockets[0].close();
+  try {
+    await new Promise(resolve => setTimeout(resolve, 800));
+    assert.equal(sockets.length, 2);
+    const sent = sockets[1].sent;
+    assert.deepEqual(sent.map(message => message.method), ['initialize', '_hive/sessions/resolve', 'session/resume']);
+    assert.equal(sent[2].params.sessionId, 'route-two');
+    assert.equal(sent[2].params.cwd, '/owner/moved');
+    assert.equal(sent[2].params._meta.hive.mode, 'observe');
+    assert.deepEqual(sent[2].params.replayFrom, { type: '_hive_seq', seq: 5 });
+    assert.equal(client.state().session.reference.owner, remoteOwner);
+  } finally { client.close(); }
+});
+
+test('connected uncertain remote creation remains fenced and invalid owner paths never dispatch', async () => {
+  const sockets = transport((socket, message) => {
+    if (message.method === 'session/new') {
+      queueMicrotask(() => socket.receive({ jsonrpc: '2.0', id: message.id, error: { code: -32000, message: 'Uncertain', data: { code: 'hive::remote::launch_uncertain', help: 'Inspect owner sessions' } } }));
+      return false;
+    }
+  });
+  const client = connect('ws://localhost/acp');
+  try {
+    await assert.rejects(client.create('coder', '', { owner: remoteOwner, cwd: 'relative' }), /absolute/);
+    assert.equal(sockets[0].sent.some(message => message.method === 'session/new'), false);
+    await assert.rejects(client.create('coder', '', { owner: remoteOwner, cwd: 'C:\\owner-only' }), /Uncertain/);
+    await assert.rejects(client.create('coder', '', { owner: remoteOwner, cwd: '/other' }), /interrupted/);
+    assert.equal(sockets[0].sent.filter(message => message.method === 'session/new').length, 1);
+    assert.equal(JSON.parse(localStorage.getItem('hive.creating.ws://localhost/acp')).owner, remoteOwner);
+  } finally { client.close(); }
+});
 
 const session = { sessionId: 'hive-tui', cwd: '/workspace', agent: 'pi', title: 'Review parser',
   activity: 'idle', controlOwner: 'tui-connection', lastActivityAt: 1791754566280 };
@@ -280,7 +449,7 @@ function transport(respond = () => {}) {
       this.sent.push(message);
       if (message.id == null) return;
       let result;
-      if (message.method === 'initialize') result = { protocolVersion: 2, capabilities: { session: {} } };
+      if (message.method === 'initialize') result = { protocolVersion: 2, capabilities: { session: {}, _meta: { hive: { version: 1, node: 'node-11111111-1111-4111-8111-111111111111', features: { agents: {}, selection: {}, control: {}, location: {}, peers: {}, profiles: {}, workspaces: {} } } } } };
       else if (message.method === 'session/new') result = { sessionId: 'hive-new', _meta: { hive: { generation: 1,
         token: 'new-token', role: 'pilot', nextSeq: 1, running: false } } };
       else if (message.method === 'session/resume') result = { _meta: { hive: {

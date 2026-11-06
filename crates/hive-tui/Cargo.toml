@@ -14,6 +14,7 @@ serde = { workspace = true }
 agent-client-protocol = { workspace = true }
 clap = { workspace = true }
 hive-protocol = { path = "../hive-protocol" }
+hive-core = { path = "../hive-core" }
 tokio = { workspace = true }
 uuid = { workspace = true }
 ratatui = { workspace = true }

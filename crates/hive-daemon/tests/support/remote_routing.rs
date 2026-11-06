@@ -43,6 +43,179 @@ fn code(error: Error) -> Value {
 }
 
 #[tokio::test]
+async fn a_discovered_remote_session_streams_plans_cancels_and_resumes_after_client_disconnect() {
+    let temporary = tempfile::tempdir().unwrap();
+    let owner = hive_daemon::Broker::persistent(
+        config_with_agent(
+            "mock",
+            env!("CARGO_BIN_EXE_hive-test-agent"),
+            AgentVersion::V2,
+        ),
+        temporary.path().join("owner/catalog.sqlite3"),
+    )
+    .unwrap();
+    let node = owner.mcp_execution_node().await.unwrap();
+    let (owner_address, owner_server) = serve(owner.clone()).await;
+    let mut config = Config::default();
+    config.peers.insert(
+        "workstation".into(),
+        registration(node.clone(), owner_address),
+    );
+    let gateway =
+        hive_daemon::Broker::persistent(config, temporary.path().join("gateway/catalog.sqlite3"))
+            .unwrap();
+    let (address, server) = serve(gateway.clone()).await;
+    let (events, mut updates) = mpsc::unbounded_channel();
+    let (retained, mut receive) = mpsc::unbounded_channel();
+    timeout(
+        Duration::from_secs(20),
+        Client
+            .v2()
+            .on_receive_notification(
+                async move |update: v2::UpdateSessionNotification, _: V2ConnectionTo<Agent>| {
+                    let _ = events.send(update);
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(
+                HttpClient::new(format!("ws://{address}")).unwrap(),
+                async move |cx| {
+                    let peer = initialize(cx.clone()).await?;
+                    assert!(peer.list(Default::default()).await?.agents.is_empty());
+                    assert_eq!(peer.list_peers().await?["peers"][0]["owner"], node.as_str());
+                    assert_eq!(
+                        peer.list_at(&node, Default::default()).await?.agents[0].id,
+                        "mock"
+                    );
+                    let created = peer
+                        .start_at(
+                            &node,
+                            "mock",
+                            v2::NewSessionRequest::new(std::env::current_dir().unwrap()),
+                        )
+                        .await?;
+                    let reference: SessionReference = serde_json::from_value(
+                        created.meta.as_ref().unwrap()["hive"]["session"].clone(),
+                    )
+                    .unwrap();
+                    let listing = cx
+                        .prepare_request(v2::ListSessionsRequest::new())
+                        .block_task()
+                        .await?;
+                    assert_eq!(listing.sessions.len(), 1);
+                    assert_eq!(listing.sessions[0].session_id, created.session_id);
+                    let mut last = 0;
+                    for (text, key) in [("plan-sequence", "plans"), ("close-running", "cancel")] {
+                        cx.prepare_request(
+                            v2::PromptRequest::new(created.session_id.clone(), vec![text.into()])
+                                .meta(controlled(&created.meta, key)),
+                        )
+                        .block_task()
+                        .await?;
+                        if key == "cancel" {
+                            cx.send_notification(
+                                v2::CancelSessionNotification::new(created.session_id.clone())
+                                    .meta(created.meta.clone()),
+                            )?;
+                        }
+                        let mut streamed = false;
+                        let mut planned = false;
+                        loop {
+                            let update = updates.recv().await.unwrap();
+                            assert_eq!(update.session_id, created.session_id);
+                            let seq = update.meta.as_ref().unwrap()["hive"]["seq"]
+                                .as_u64()
+                                .unwrap();
+                            assert!(seq > last);
+                            last = seq;
+                            streamed |=
+                                matches!(update.update, v2::SessionUpdate::AgentMessageChunk(_));
+                            planned |= matches!(update.update, v2::SessionUpdate::PlanUpdate(_));
+                            if let v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(idle)) =
+                                update.update
+                            {
+                                // Initial setup idle is not the terminal state of either submitted prompt.
+                                if key == "plans" && !streamed {
+                                    continue;
+                                }
+                                if key == "cancel"
+                                    && idle.stop_reason != Some(v2::StopReason::Cancelled)
+                                {
+                                    continue;
+                                }
+                                if key == "plans" {
+                                    assert!(planned);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    retained.send((reference, last)).unwrap();
+                    Ok(())
+                },
+            ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let (reference, seq) = receive.recv().await.unwrap();
+    timeout(
+        Duration::from_secs(15),
+        Client.v2().connect_with(
+            HttpClient::new(format!("http://{address}")).unwrap(),
+            async move |cx| {
+                let peer = initialize(cx.clone()).await?;
+                let location = peer.resolve(reference.clone()).await?;
+                let resumed = cx
+                    .prepare_request(
+                        v2::ResumeSessionRequest::new(
+                            v2::SessionId::new(location.session_id),
+                            location.cwd,
+                        )
+                        .meta(v2::Meta::from_iter([(
+                            "hive".into(),
+                            json!({"mode":"observe"}),
+                        )]))
+                        .replay_from(v2::ReplayFrom::Other(
+                            v2::OtherReplayFrom::new(
+                                "_hive_seq",
+                                BTreeMap::from([("seq".into(), json!(seq + 1))]),
+                            ),
+                        )),
+                    )
+                    .block_task()
+                    .await?;
+                let hive = &resumed.meta.as_ref().unwrap()["hive"];
+                assert_eq!(hive["session"], serde_json::to_value(reference).unwrap());
+                assert_eq!(hive["role"], "observer");
+                assert!(hive.get("token").is_none());
+                assert_eq!(hive["activitySnapshot"]["foreground"], "idle");
+                assert_eq!(
+                    hive["planSnapshot"]["plans"]["steps"]["plan"]["entries"][0]["status"],
+                    "cancelled"
+                );
+                Ok(())
+            },
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        summaries(owner_address).await["sessions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    gateway.shutdown().await;
+    owner.shutdown().await;
+    server.abort();
+    owner_server.abort();
+}
+
+#[tokio::test]
 async fn lost_creation_and_prompt_responses_never_redispatch_work_when_the_gateway_restarts() {
     for method in ["session/new", "session/prompt"] {
         let temporary = tempfile::tempdir().unwrap();

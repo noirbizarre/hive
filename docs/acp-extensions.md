@@ -52,8 +52,9 @@ uses the original ACP connection and returned attachment metadata. Reconnect
 requires initialization, `resolve(SessionReference)`, then explicit standard resume.
 For gateways, `list_peers`, `list_at`, `list_profiles_at`, `start_at` and
 `start_profile_at` use explicit owner NodeIds. Prepared creation APIs allow bridges
-to install parent-ID mappings before publishing requests. Built-in UI migration
-remains #81.
+to install parent-ID mappings before publishing requests. Both built-in clients
+use negotiated ACP discovery, owner-scoped launch selection, and qualified
+reference resolution while sharing their existing session reducers and controls.
 
 ## Baseline and minimal extension surface
 
@@ -602,7 +603,8 @@ Tests must prove discovery/resolve have no execution or control side effects and
 that gateway aliases cannot change owner identity. #78 must validate the nested
 resolver payload's connection scope over the pinned HTTP adapter. Remote workspace
 provisioning evidence for [#88][workspace] lives in the workspace gateway tests;
-UI integration remains #81.
+Built-in client coverage includes owner selection, unavailable catalogs, remote
+launch paths, streamed plans/interactions, cancellation, and qualified reconnect.
 
 Implemented #79 evidence lives in `crates/hive-daemon/tests/support/remote_discovery.rs`,
 the `remote::tests` modules, and

@@ -206,7 +206,8 @@ def main():
             if create:
                 wait(lambda: screen.contains("fixture"))
                 send(b"\x0e\r")
-                wait(lambda: state()["creations"] == 1 and b"\x1b[?25h" in output)
+                # Server creation can precede the attachment response; edits need the client's session binding.
+                wait(lambda: state()["creations"] == 1 and screen.contains("Session created") and b"\x1b[?25h" in output)
             else:
                 wait(lambda: state()["resumes"] == 1 and b"\x1b[?25h" in output)
             if status_scenario and sys.argv[2] != "status-off":
@@ -389,7 +390,7 @@ def main():
             ready.unlink()
             release.unlink()
             send(b"responsive\x18\x05")
-            # Less than the HTTP timeout: progress must happen before a stalled refresh can fail.
+            # Progress must happen while the ACP catalog request is still stalled.
             wait(ready.exists, timeout=4)
             assert ready.read_text() == "responsive", "catalog fetch blocked prompt editing"
             print("PTY: editing progressed during stalled catalog", file=sys.stderr, flush=True)

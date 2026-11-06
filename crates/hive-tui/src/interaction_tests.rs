@@ -108,6 +108,7 @@ fn recovery_acknowledgement_retires_pending_intent_without_stopping_work_or_skip
         &mut app,
         SessionOperationResult {
             relinquished: false,
+            creation_uncertain: None,
             outcome: SessionOutcome::Resume {
                 id: "original".into(),
                 response: Ok(response),
@@ -463,6 +464,7 @@ fn failed_history_attachment_keeps_the_target_available_for_explicit_live_only_r
     app.select_session("previous".into());
     app.input = "old draft".into();
     let result = SessionOperationResult {
+        creation_uncertain: None,
         relinquished: true,
         outcome: SessionOutcome::Resume {
             id: "target".into(),

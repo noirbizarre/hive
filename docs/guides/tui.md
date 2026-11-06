@@ -18,6 +18,35 @@ reports ambiguous selection rather than choosing the first member.
 To attach to a known
 session, use `hive tui --session hive-…`.
 
+## Remote execution owners
+
+Configure [peers](../configuration.md#remote-hive-peers) on the receiving daemon,
+then press `o` in the creation picker to cycle Local and configured owners.
+Agent and execution-profile choices belong to the selected owner. Press `d` to
+enter an existing absolute directory **on that owner**, or choose a profile with
+a managed workspace policy. Owner-configured agent workspace policies can also
+provision automatically without a named profile. Switching owners resets launch choices, not the
+attached conversation or its draft.
+
+```sh
+hive tui --owner node-11111111-1111-4111-8111-111111111111 --agent opencode --cwd /srv/project
+hive tui --owner node-11111111-1111-4111-8111-111111111111 --session hive-owner-session
+```
+
+With `--owner`, `--session` is that owner's native Hive session ID. Without it,
+`--session` retains its gateway-local meaning. Remote paths are passed unchanged;
+they need not exist on the terminal machine. Windows drive and UNC paths are
+accepted independently of the terminal OS. The owner checks actual availability.
+
+The unified overview includes owner NodeIds and cached unavailable sessions.
+Reconnect resolves the qualified owner/session reference before resuming as an
+observer; it never creates a replacement session or resends a prompt. If creation
+or provisioning is uncertain, inspect the owner's catalog and workspace operations,
+then press `u` in the creation picker to explicitly acknowledge the unresolved
+outcome before another launch. Resuming another session does not clear this fence.
+Both built-in clients require persistent Hive ACP discovery
+version 1. See [private-network access](../operations.md#private-network-access).
+
 ## Session navigation
 
 The TUI opens with the session overview visible. It lists all directories by
@@ -28,6 +57,8 @@ so the same sessions are available in the Web UI and other ACP clients.
 | --- | --- |
 | `Ctrl-N` | Open the agent picker to create a session |
 | `p` in creation picker | Cycle named execution profiles |
+| `o` / `d` in creation picker | Cycle execution owners / set owner-side directory |
+| `u` in creation picker | Acknowledge an uncertain launch after inspecting owner state |
 | Arrows, Enter | Select an agent or session |
 | `Tab` | Show/hide the session overview while chatting |
 | `a` in overview | Toggle all directories / current directory |

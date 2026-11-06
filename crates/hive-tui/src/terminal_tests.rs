@@ -135,32 +135,10 @@ async fn action(State(state): State<Arc<Fixture>>, Path(action): Path<String>) -
 #[ignore = "child fixture for tests/runtime.py; requires a controlling PTY"]
 async fn runtime_fixture() {
     let state = Arc::new(Fixture::default());
-    let sessions = state.clone();
-    let providers = state.clone();
     let agents = state.clone();
     let router = Router::new()
         .route("/fixture", get(report))
         .route("/fixture/{action}", post(action))
-        .route("/v1/sessions", get(async move || {
-            sessions.catalogs.fetch_add(1, Ordering::SeqCst);
-            if sessions.stall.load(Ordering::SeqCst) {
-                // Register before publishing readiness so the test cannot lose a wake-up.
-                let released = sessions.release.notified();
-                sessions.stalled.store(true, Ordering::SeqCst);
-                released.await;
-            }
-            let mut entries = vec![json!({"sessionId":"hive-fixture", "cwd":std::env::current_dir().unwrap(), "agent":"fixture", "lifecycle":"active", "activity":"idle", "generation":1})];
-            if std::env::var("HIVE_RUNTIME_STATUS").is_ok_and(|value| matches!(value.as_str(), "status" | "status-subset" | "status-on")) {
-                let mut second = entries[0].clone();
-                second["sessionId"] = "hive-second".into();
-                entries.push(second);
-            }
-            Json(json!({"sessions":entries}))
-        }))
-        .route("/v1/providers", get(async move || {
-            providers.catalogs.fetch_add(1, Ordering::SeqCst);
-            Json(json!({"agents":[{"id":"fixture"}]}))
-        }))
         .with_state(state)
         .merge(hive_protocol::AcpHttpServer::new(move || {
             let initialize = agents.clone();
@@ -168,10 +146,33 @@ async fn runtime_fixture() {
             let prompt = agents.clone();
             let configuration = agents.clone();
             let create = agents.clone();
+            let catalog = agents.clone();
             Agent.v2()
-                .on_receive_request(async move |request: v2::InitializeRequest, responder: agent_client_protocol::Responder<v2::InitializeResponse>, cx: V2ConnectionTo<Client>| {
-                    *initialize.peer.lock().unwrap() = Some(cx);
-                    responder.respond(v2::InitializeResponse::new(request.protocol_version, v2::Implementation::new("pty-fixture", "1")))
+                .on_receive_request(async move |_: hive_protocol::remote::Initialize, responder: agent_client_protocol::Responder<serde_json::Value>, cx: V2ConnectionTo<Client>| {
+                     *initialize.peer.lock().unwrap() = Some(cx);
+                     responder.respond(json!({"protocolVersion":2,"info":{"name":"pty-fixture","version":"1"},"capabilities":{"session":{},"_meta":{"hive":{"version":1,"node":"node-11111111-1111-4111-8111-111111111111","features":{"agents":{},"selection":{},"control":{},"location":{},"peers":{},"profiles":{}}}}}}))
+                 }, agent_client_protocol::on_receive_request!())
+                .on_receive_request(async move |_: v2::ListSessionsRequest, responder: agent_client_protocol::Responder<v2::ListSessionsResponse>, _: V2ConnectionTo<Client>| {
+                    catalog.catalogs.fetch_add(1, Ordering::SeqCst);
+                    if catalog.stall.load(Ordering::SeqCst) {
+                        let released = catalog.release.notified();
+                        catalog.stalled.store(true, Ordering::SeqCst);
+                        released.await;
+                    }
+                    let entry = |id: &str| json!({"sessionId":id,"cwd":std::env::current_dir().unwrap(),"_meta":{"hive":{"agent":"fixture","lifecycle":"active","activity":"idle","generation":1,"session":{"owner":"node-11111111-1111-4111-8111-111111111111","id":id}}}});
+                    let mut sessions = vec![entry("hive-fixture")];
+                    if std::env::var("HIVE_RUNTIME_STATUS").is_ok_and(|value| matches!(value.as_str(), "status" | "status-subset" | "status-on")) { sessions.push(entry("hive-second")); }
+                    responder.respond(serde_json::from_value(json!({"sessions":sessions})).unwrap())
+                }, agent_client_protocol::on_receive_request!())
+                .on_receive_request(async |_: hive_protocol::remote::ListAgents, responder: agent_client_protocol::Responder<hive_protocol::remote::AgentsPage>, _: V2ConnectionTo<Client>| {
+                    responder.respond(serde_json::from_value(json!({"agents":[{"id":"fixture","name":"Fixture","kind":"acp","transport":"stdio","versions":[],"isDefault":true,"capabilities":{},"launch":{"cwd":"required","workspace":"optional"}}],"defaultAgent":"fixture"})).unwrap())
+                }, agent_client_protocol::on_receive_request!())
+                .on_receive_request(async |_: hive_protocol::remote::ListProfiles, responder: agent_client_protocol::Responder<hive_protocol::remote::ProfilesPage>, _: V2ConnectionTo<Client>| {
+                    responder.respond(hive_protocol::remote::ProfilesPage { profiles: Vec::new(), default_profile: None, next_cursor: None })
+                }, agent_client_protocol::on_receive_request!())
+                .on_receive_request(async |_: hive_protocol::remote::ListPeers, responder: agent_client_protocol::Responder<serde_json::Value>, _: V2ConnectionTo<Client>| { responder.respond(json!({"peers":[]})) }, agent_client_protocol::on_receive_request!())
+                .on_receive_request(async |request: hive_protocol::remote::ResolveSession, responder: agent_client_protocol::Responder<hive_protocol::remote::SessionLocation>, _: V2ConnectionTo<Client>| {
+                    responder.respond(serde_json::from_value(json!({"session":request.0["session"],"sessionId":request.0["session"]["id"],"cwd":std::env::current_dir().unwrap()})).unwrap())
                 }, agent_client_protocol::on_receive_request!())
                 .on_receive_request(async move |request: v2::ResumeSessionRequest, responder: agent_client_protocol::Responder<v2::ResumeSessionResponse>, _: V2ConnectionTo<Client>| {
                     resume.resumes.fetch_add(1, Ordering::SeqCst);
@@ -218,6 +219,7 @@ async fn runtime_fixture() {
     });
     run_with_clipboard(
         Options {
+            owner: None,
             profile: None,
             terminal: capabilities::TerminalOptions {
                 kitty_graphics: if std::env::var_os("HIVE_RUNTIME_RICH").is_some() {

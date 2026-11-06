@@ -8,7 +8,7 @@ import App from './App.vue';
 import InteractionCard from './InteractionCard.vue';
 import TranscriptView from './TranscriptView.vue';
 import SessionNavigation from './SessionNavigation.vue';
-import { conversation } from './client.js';
+import { catalog, conversation } from './client.js';
 
 const session = { sessionId: 'hive-tui', cwd: '/workspace', agent: 'pi', title: 'Review parser', activity: 'idle', controlOwner: 'other', generation: 3 };
 const options = [{ configId: 'model', name: 'Model', category: 'model', type: 'select', currentValue: 'fast', options: [{ name: 'Provider', options: [{ value: 'fast', name: 'Fast' }, { value: 'careful', name: 'Careful' }] }] }];
@@ -27,6 +27,8 @@ function application(initial = {}) {
     configure: vi.fn(async (_, value) => publish({ configOptions: [{ ...options[0], currentValue: value }] })),
     prompt: vi.fn(async () => {}), cancel: vi.fn(), respond: vi.fn(() => true), close: vi.fn(),
     attachWithoutHistory: vi.fn(), acknowledgeRecovery: vi.fn(),
+    // Existing component cases inject deterministic snapshots; ACP discovery is tested by the real adapter suite.
+    catalog,
   };
   render(App, { state, client });
   return { state, client, publish };
@@ -43,6 +45,41 @@ beforeEach(() => {
   });
 });
 afterEach(() => { wrapper?.unmount(); document.body.innerHTML = ''; vi.unstubAllGlobals(); });
+
+test('owner selection scopes colliding backend choices and sends the owner directory without HTTP discovery', async () => {
+  const owner = 'node-22222222-2222-4222-8222-222222222222';
+  const state = shallowRef({ connected: true, role: 'observer', lines: [], configOptions: [] });
+  const selectOwner = vi.fn();
+  const client = { close: vi.fn(), create: vi.fn(), catalog: vi.fn((sessions, error, providers, owners) => {
+    owners([{ owner: 'node-11111111-1111-4111-8111-111111111111', name: 'Local', local: true }, { owner, name: 'Workstation' }]);
+    sessions([]); providers({ agents: [{ id: 'coder', name: 'Local coder' }] });
+    selectOwner.mockImplementation(() => providers({ agents: [{ id: 'coder', name: 'Remote coder' }] }));
+    return { selectOwner, refresh: vi.fn(), close: vi.fn() };
+  }) };
+  render(App, { client, state });
+  await flushPromises();
+  const selector = id => wrapper.findAllComponents(Select).find(select => select.props('inputId') === id);
+  selector('owner').vm.$emit('update:modelValue', owner);
+  await nextTick();
+  expect(selectOwner).toHaveBeenCalledWith(owner);
+  expect(selector('agent').props('options').map(option => option.name)).toContain('Remote coder');
+  await wrapper.get('#owner-cwd').setValue('/remote/only');
+  await wrapper.get('#create').trigger('click');
+  await flushPromises();
+  expect(client.create).toHaveBeenCalledWith('coder', '', { owner, cwd: '/remote/only' });
+  expect(fetch).not.toHaveBeenCalled();
+});
+
+test('cached remote session navigation shows unknown authority and searches owner identity', async () => {
+  const owner = 'node-22222222-2222-4222-8222-222222222222';
+  const remote = { sessionId: 'gateway-route', cwd: '/owner', reference: { owner, id: 'native' }, cached: true, availability: 'owner_unavailable' };
+  render(SessionNavigation, { sessions: [remote], recent: [], state: {}, loading: false });
+  expect(wrapper.text()).toContain('Owner unavailable');
+  expect(wrapper.text()).not.toContain('Unclaimed');
+  expect(wrapper.text()).toContain(owner);
+  await wrapper.get('input').setValue(owner);
+  expect(wrapper.find('[data-session-id="gateway-route"]').exists()).toBe(true);
+});
 
 test('named profile selection filters agents and survives inventory refresh independently of sessions', async () => {
   let inventory = { agents: [{ id: 'pi', name: 'Pi' }, { id: 'bee', name: 'Bee' }], defaultProfile: 'personal', profiles: [
@@ -64,7 +101,7 @@ test('named profile selection filters agents and survives inventory refresh inde
   expect(selector('profile').props('modelValue')).toBe('work');
   await wrapper.get('#create').trigger('click');
   await flushPromises();
-  expect(client.create).toHaveBeenCalledWith('', 'work');
+  expect(client.create).toHaveBeenCalledWith('', 'work', { owner: '', cwd: '' });
   expect(wrapper.find('#profile').exists()).toBe(false);
 });
 
@@ -89,7 +126,7 @@ test('implicit profile selection follows changed daemon defaults without pinning
   expect(selector('agent').props('options').map(option => option.id)).toEqual(['', 'pi']);
   await wrapper.get('#create').trigger('click');
   await flushPromises();
-  expect(client.create).toHaveBeenCalledWith('', '');
+  expect(client.create).toHaveBeenCalledWith('', '', { owner: '', cwd: '' });
 });
 
 test('cleared message and tool patches remove previously displayed content', async () => {
@@ -215,7 +252,7 @@ test('session selection observes the original session and typing requests contro
   expect(wrapper.get('#send').element.disabled).toBe(false);
   await wrapper.get('#prompt').trigger('submit');
   await flushPromises();
-  expect(client.prompt).toHaveBeenCalledWith('follow up', 'pi', '');
+  expect(client.prompt).toHaveBeenCalledWith('follow up', 'pi', '', { owner: '', cwd: '' });
   expect(wrapper.get('#composer').element.value).toBe('');
 });
 
@@ -434,7 +471,7 @@ test('reconnect recovery and expired history actions never silently send a promp
   expect(wrapper.get('#send').element.disabled).toBe(true);
   publish({ connected: true, role: 'pilot' }); await nextTick();
   await wrapper.findAll('button').find(button => button.text() === 'Retrieve original receipt').trigger('click');
-  await flushPromises(); expect(client.prompt).toHaveBeenCalledWith('original', 'pi', '');
+  await flushPromises(); expect(client.prompt).toHaveBeenCalledWith('original', 'pi', '', { owner: '', cwd: '' });
   publish({ gap: true, uncertain: undefined }); await nextTick();
   await wrapper.findAll('button').find(button => button.text() === 'Attach without earlier history').trigger('click');
   expect(client.attachWithoutHistory).toHaveBeenCalledOnce();

@@ -52,134 +52,156 @@ async fn workspace_crash_subprocess_host() {
 }
 
 #[tokio::test]
-async fn process_death_preserves_creation_and_sweep_boundaries_without_resuming_deletion() {
+async fn process_death_preserves_provisioned_clones() {
+    check_crash_boundary("provisioned", "clone").await;
+}
+
+#[tokio::test]
+async fn process_death_preserves_provisioned_worktrees() {
+    check_crash_boundary("provisioned", "worktree").await;
+}
+
+#[tokio::test]
+async fn process_death_preserves_sweep_plans_without_resuming_deletion() {
+    check_crash_boundary("planned", "clone").await;
+}
+
+#[tokio::test]
+async fn process_death_settles_removed_clones() {
+    check_crash_boundary("removed", "clone").await;
+}
+
+#[tokio::test]
+async fn process_death_settles_removed_worktrees() {
+    check_crash_boundary("removed", "worktree").await;
+}
+
+#[tokio::test]
+async fn process_death_settles_deleted_clones() {
+    check_crash_boundary("deleted", "clone").await;
+}
+
+#[tokio::test]
+async fn process_death_settles_deleted_worktrees() {
+    check_crash_boundary("deleted", "worktree").await;
+}
+
+async fn check_crash_boundary(phase: &str, backing: &str) {
     use tokio::io::{AsyncBufReadExt, BufReader};
-    for (phase, backing) in [
-        ("provisioned", "clone"),
-        ("provisioned", "worktree"),
-        ("planned", "clone"),
-        ("removed", "clone"),
-        ("removed", "worktree"),
-        ("deleted", "clone"),
-        ("deleted", "worktree"),
-    ] {
-        let fixture = Fixture::new();
-        let entry = if phase == "provisioned" {
-            None
-        } else {
-            Some(expired(&fixture, backing).await)
-        };
-        let sweep = if matches!(phase, "removed" | "deleted") {
-            Some(plan(&fixture.service, None).await)
-        } else {
-            None
-        };
-        let mut request = fixture.request();
-        request.policy = WorkspaceTemplate::Ephemeral {
-            backing: backing.into(),
-            base_ref: None,
-            retention: Retention::Until { expires_at: 1 },
-        };
-        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
-        command
-            .args([
-                "--exact",
-                "workspaces::tests::recovery_tests::workspace_crash_subprocess_host",
-                "--nocapture",
-            ])
-            .env(
-                "HIVE_WORKSPACE_CRASH_DATABASE",
-                fixture
-                    .service
-                    .store
-                    .state_directory()
-                    .join("catalog.sqlite3"),
-            )
-            .env("HIVE_WORKSPACE_CRASH_PHASE", phase)
-            .env(
-                "HIVE_WORKSPACE_CRASH_REQUEST",
-                serde_json::to_string(&request).unwrap(),
-            )
-            .env(
-                "HIVE_WORKSPACE_CRASH_DEFINITION",
-                serde_json::to_string(&fixture.definition).unwrap(),
-            )
-            .env(
-                "LLVM_PROFILE_FILE",
-                if cfg!(windows) { "NUL" } else { "/dev/null" },
-            )
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true);
-        if let Some(sweep) = &sweep {
-            command.env(
-                "HIVE_WORKSPACE_CRASH_SWEEP",
-                sweep["request"]["operation"].as_str().unwrap(),
-            );
-        }
-        let mut child = command.spawn().unwrap();
-        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
-        tokio::time::timeout(Duration::from_secs(30), async {
-            loop {
-                let line = lines
-                    .next_line()
-                    .await
-                    .unwrap()
-                    .expect("child exited before crash boundary");
-                if line == "HIVE_WORKSPACE_CRASH_READY" {
-                    break;
-                }
+    let fixture = Fixture::new();
+    let entry = if phase == "provisioned" {
+        None
+    } else {
+        Some(expired(&fixture, backing).await)
+    };
+    let sweep = if matches!(phase, "removed" | "deleted") {
+        Some(plan(&fixture.service, None).await)
+    } else {
+        None
+    };
+    let mut request = fixture.request();
+    request.policy = WorkspaceTemplate::Ephemeral {
+        backing: backing.into(),
+        base_ref: None,
+        retention: Retention::Until { expires_at: 1 },
+    };
+    let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            "workspaces::tests::recovery_tests::workspace_crash_subprocess_host",
+            "--nocapture",
+        ])
+        .env(
+            "HIVE_WORKSPACE_CRASH_DATABASE",
+            fixture
+                .service
+                .store
+                .state_directory()
+                .join("catalog.sqlite3"),
+        )
+        .env("HIVE_WORKSPACE_CRASH_PHASE", phase)
+        .env(
+            "HIVE_WORKSPACE_CRASH_REQUEST",
+            serde_json::to_string(&request).unwrap(),
+        )
+        .env(
+            "HIVE_WORKSPACE_CRASH_DEFINITION",
+            serde_json::to_string(&fixture.definition).unwrap(),
+        )
+        .env(
+            "LLVM_PROFILE_FILE",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true);
+    if let Some(sweep) = &sweep {
+        command.env(
+            "HIVE_WORKSPACE_CRASH_SWEEP",
+            sweep["request"]["operation"].as_str().unwrap(),
+        );
+    }
+    let mut child = command.spawn().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let line = lines
+                .next_line()
+                .await
+                .unwrap()
+                .expect("child exited before crash boundary");
+            if line == "HIVE_WORKSPACE_CRASH_READY" {
+                break;
             }
-        })
-        .await
-        .unwrap();
-        child.kill().await.unwrap();
-        child.wait().await.unwrap();
-        let restarted = Service::new(fixture.service.store.clone());
-        if phase == "deleted" {
-            // This distinct boundary proves startup settles Cleaning, not merely a stale batch result.
-            let interrupted = restarted.list().await.unwrap();
-            assert_eq!(interrupted[0].workspace.state(), WorkspaceState::Cleaning);
-            assert!(
-                !Path::new(interrupted[0].workspace.location().unwrap().root.as_str()).exists()
-            );
         }
-        restarted.run(|rt| rt.recover_resources()).await.unwrap();
-        restarted.run(|rt| rt.recover_resources()).await.unwrap();
-        let records = restarted.list().await.unwrap();
-        assert_eq!(records.len(), 1);
-        let record = &records[0];
-        if matches!(phase, "removed" | "deleted") {
-            assert_eq!(record.workspace.state(), WorkspaceState::Removed);
-            let result = apply(&restarted, sweep.as_ref().unwrap()).await;
-            assert_eq!(result["items"][0]["status"], "already_removed");
+    })
+    .await
+    .unwrap();
+    child.kill().await.unwrap();
+    child.wait().await.unwrap();
+    let restarted = Service::new(fixture.service.store.clone());
+    if phase == "deleted" {
+        // This distinct boundary proves startup settles Cleaning, not merely a stale batch result.
+        let interrupted = restarted.list().await.unwrap();
+        assert_eq!(interrupted[0].workspace.state(), WorkspaceState::Cleaning);
+        assert!(!Path::new(interrupted[0].workspace.location().unwrap().root.as_str()).exists());
+    }
+    restarted.run(|rt| rt.recover_resources()).await.unwrap();
+    restarted.run(|rt| rt.recover_resources()).await.unwrap();
+    let records = restarted.list().await.unwrap();
+    assert_eq!(records.len(), 1);
+    let record = &records[0];
+    if matches!(phase, "removed" | "deleted") {
+        assert_eq!(record.workspace.state(), WorkspaceState::Removed);
+        let result = apply(&restarted, sweep.as_ref().unwrap()).await;
+        assert_eq!(result["items"][0]["status"], "already_removed");
+        assert_eq!(
+            result["items"][0]["cleanup"],
+            sweep.as_ref().unwrap()["items"][0]["cleanup"]
+        );
+    } else {
+        assert_eq!(record.workspace.state(), WorkspaceState::Ready);
+        assert!(Path::new(record.workspace.location().unwrap().root.as_str()).exists());
+        if phase == "planned" {
+            let stored: serde_json::Value = restarted.store.resource("node").unwrap().unwrap();
+            let sweep = stored["sweeps"]
+                .as_object()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap();
+            assert_eq!(sweep["items"][0]["status"], "planned");
             assert_eq!(
-                result["items"][0]["cleanup"],
-                sweep.as_ref().unwrap()["items"][0]["cleanup"]
+                record.workspace.id(),
+                entry.as_ref().unwrap().workspace.id()
+            );
+            assert_eq!(
+                apply(&restarted, sweep).await["items"][0]["status"],
+                "removed"
             );
         } else {
-            assert_eq!(record.workspace.state(), WorkspaceState::Ready);
-            assert!(Path::new(record.workspace.location().unwrap().root.as_str()).exists());
-            if phase == "planned" {
-                let stored: serde_json::Value = restarted.store.resource("node").unwrap().unwrap();
-                let sweep = stored["sweeps"]
-                    .as_object()
-                    .unwrap()
-                    .values()
-                    .next()
-                    .unwrap();
-                assert_eq!(sweep["items"][0]["status"], "planned");
-                assert_eq!(
-                    record.workspace.id(),
-                    entry.as_ref().unwrap().workspace.id()
-                );
-                assert_eq!(
-                    apply(&restarted, sweep).await["items"][0]["status"],
-                    "removed"
-                );
-            } else {
-                assert_eq!(record.workspace.operation(), Some(&request.operation));
-            }
+            assert_eq!(record.workspace.operation(), Some(&request.operation));
         }
     }
 }

@@ -20,6 +20,11 @@ def settings(fd):
     return values
 
 
+def interrupted(signum, _frame):
+    # Raise through the supervisor so nextest termination still kills and reaps the PTY child.
+    raise RuntimeError(f"terminal supervisor interrupted by signal {signum}")
+
+
 def main():
     pid, master = pty.fork()
     if pid == 0:
@@ -35,7 +40,10 @@ def main():
     pasted = False
     resized = False
     cursor_queries = 0
-    deadline = time.monotonic() + 600
+    # Leave time for diagnostics and reaping before nextest's outer 120-second deadline.
+    deadline = time.monotonic() + 60
+    previous = signal.signal(signal.SIGTERM, interrupted)
+    reaped = False
     try:
         while time.monotonic() < deadline:
             if not select.select([master], [], [], 0.1)[0]:
@@ -61,9 +69,16 @@ def main():
                 os.write(master, b"\x1b[200~one\ntwo\x1b[201~")
                 pasted = True
         else:
-            os.killpg(pid, signal.SIGKILL)
             raise RuntimeError("terminal test timed out")
-        _, status = os.waitpid(pid, 0)
+        # PTY EOF can precede process exit; never replace one bounded wait with an unbounded one.
+        while True:
+            exited, status = os.waitpid(pid, os.WNOHANG)
+            if exited:
+                reaped = True
+                break
+            if time.monotonic() >= deadline:
+                raise RuntimeError("terminal child did not exit after PTY EOF")
+            time.sleep(.01)
         assert os.waitstatus_to_exitcode(status) == 0, "terminal lifecycle test failed"
         assert pasted, "test never requested bracketed paste"
         assert resized, "test never requested image reflow"
@@ -98,7 +113,17 @@ def main():
         sys.stderr.write(output.decode(errors="replace"))
         raise
     finally:
+        # Kill descendants even when their leader exited; inherited pipes can keep nextest alive.
+        # Once reaped, the leader PID can be reused; only its still-owned group needs cleanup.
+        for kill in ((os.killpg,) if reaped else (os.killpg, os.kill)):
+            try:
+                kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if not reaped:
+            os.waitpid(pid, 0)
         os.close(master)
+        signal.signal(signal.SIGTERM, previous)
     print("PTY smoke test passed: images, cursor, paste, editor handoff, and terminal restoration")
 
 

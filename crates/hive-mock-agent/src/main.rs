@@ -43,6 +43,21 @@ fn load() -> State {
         .unwrap_or_default()
 }
 
+async fn wait_for_config_release(path: std::ffi::OsString) -> Result<(), Error> {
+    // Cross-process admission tests must hold dispatch until takeover, regardless of host speed.
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        while !std::path::Path::new(&path)
+            .try_exists()
+            .map_err(Error::into_internal_error)?
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| Error::internal_error().data("configuration release file was never created"))?
+}
+
 fn model_options(current: &str) -> Vec<v2::SessionConfigOption> {
     // Deliberately opaque values catch clients that try to derive provider identity from IDs.
     serde_json::from_value(serde_json::json!([{
@@ -412,7 +427,7 @@ async fn main() -> agent_client_protocol::Result<()> {
                             responder.respond_with_error(Error::request_cancelled())
                         });
                     }
-                    if std::env::var_os("HIVE_MOCK_PAUSE_CONFIG").is_some() {
+                    if let Some(release) = std::env::var_os("HIVE_MOCK_CONFIG_RELEASE") {
                         notify(
                             &cx,
                             &request.session_id,
@@ -421,8 +436,7 @@ async fn main() -> agent_client_protocol::Result<()> {
                                 Default::default(),
                             )),
                         )?;
-                        // Announce dispatch before delaying so race tests synchronize on an event, not a guessed admission time.
-                        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                        wait_for_config_release(release).await?;
                     }
                     if value.to_string() == "careful" {
                         notify(
@@ -980,7 +994,7 @@ async fn serve_v1() -> agent_client_protocol::Result<()> {
                             responder.respond_with_error(Error::request_cancelled())
                         });
                     }
-                    if std::env::var_os("HIVE_MOCK_PAUSE_CONFIG").is_some() {
+                    if let Some(release) = std::env::var_os("HIVE_MOCK_CONFIG_RELEASE") {
                         // A standard update crosses the compatibility adapter without requiring a test-only gateway extension.
                         cx.send_notification(v1::SessionNotification::new(
                             request.session_id.clone(),
@@ -988,7 +1002,7 @@ async fn serve_v1() -> agent_client_protocol::Result<()> {
                                 options.clone(),
                             )),
                         ))?;
-                        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                        wait_for_config_release(release).await?;
                     }
                     if value.to_string() == "careful" {
                         cx.send_notification(v1::SessionNotification::new(

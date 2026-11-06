@@ -1739,6 +1739,8 @@ async fn model_choices_survive_translation_setters_rejection_and_observer_attach
 async fn configuration_reserves_admission_and_a_takeover_after_dispatch_keeps_the_authoritative_result()
  {
     for version in [AgentVersion::V1, AgentVersion::V2] {
+        let directory = tempfile::tempdir().unwrap();
+        let release = directory.path().join("release-config");
         let command = format!(
             "{}{}",
             env!("CARGO_BIN_EXE_hive-test-agent"),
@@ -1749,12 +1751,10 @@ async fn configuration_reserves_admission_and_a_takeover_after_dispatch_keeps_th
             }
         );
         let mut config = config_with_agent("mock", &command, version);
-        config
-            .agents
-            .get_mut("mock")
-            .unwrap()
-            .env
-            .insert("HIVE_MOCK_PAUSE_CONFIG".into(), "1".into());
+        config.agents.get_mut("mock").unwrap().env.insert(
+            "HIVE_MOCK_CONFIG_RELEASE".into(),
+            release.to_str().unwrap().into(),
+        );
         let (address, server) = start_gateway(config).await;
         let (tx, mut rx) = mpsc::unbounded_channel();
         timeout(Duration::from_secs(10), Client.v2().on_receive_notification(
@@ -1774,6 +1774,7 @@ async fn configuration_reserves_admission_and_a_takeover_after_dispatch_keeps_th
             assert!(cx.send_request(v2::PromptRequest::new(id.clone(), vec!["must not dispatch".into()]).meta(controlled(&created.meta, "during-config"))).block_task().await.is_err());
             assert!(cx.send_request(v2::SetSessionConfigOptionRequest::new(id.clone(), v2::SessionConfigId::new("model"), v2::SessionConfigOptionValue::Id { value: v2::SessionConfigValueId::new("fast") }).meta(created.meta.clone())).block_task().await.is_err());
             let pilot = cx.send_request(v2::ResumeSessionRequest::new(id.clone(), cwd.clone())).block_task().await?;
+            std::fs::write(release, b"release").map_err(Error::into_internal_error)?;
             received.await.map_err(Error::into_internal_error)??;
             let resumed = cx.send_request(v2::ResumeSessionRequest::new(id, cwd).meta({ let mut meta = v2::Meta::new(); meta.insert("hive".into(), serde_json::json!({"mode":"observe"})); meta })).block_task().await?;
             assert_eq!(serde_json::to_value(resumed.config_options).unwrap()[0]["currentValue"], "careful");

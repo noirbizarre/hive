@@ -641,12 +641,29 @@ async fn named_profiles_provision_inline_and_referenced_policies_across_transpor
 }
 
 #[tokio::test]
-async fn workspace_worktrees_reach_both_acp_adapters_from_composed_config_in_either_order() {
-    for version in [AgentVersion::V1, AgentVersion::V2] {
-        for reverse in [false, true] {
-            let fixture = Fixture::new(version, reverse);
-            let (address, mut host) = fixture.start().await;
-            timeout(Duration::from_secs(30), Client.v2().connect_with(
+async fn workspace_worktrees_reach_v1_from_composed_config() {
+    check_composed_worktrees(AgentVersion::V1, false).await;
+}
+
+#[tokio::test]
+async fn workspace_worktrees_reach_v1_from_reversed_composed_config() {
+    check_composed_worktrees(AgentVersion::V1, true).await;
+}
+
+#[tokio::test]
+async fn workspace_worktrees_reach_v2_from_composed_config() {
+    check_composed_worktrees(AgentVersion::V2, false).await;
+}
+
+#[tokio::test]
+async fn workspace_worktrees_reach_v2_from_reversed_composed_config() {
+    check_composed_worktrees(AgentVersion::V2, true).await;
+}
+
+async fn check_composed_worktrees(version: AgentVersion, reverse: bool) {
+    let fixture = Fixture::new(version, reverse);
+    let (address, mut host) = fixture.start().await;
+    timeout(Duration::from_secs(30), Client.v2().connect_with(
                 HttpClient::new(format!("ws://{address}")).unwrap(), async |cx| {
                     cx.send_request(v2::InitializeRequest::new(ProtocolVersion::V2, v2::Implementation::new("workspace-test", "1"))).block_task().await?;
                     let mut paths = Vec::new();
@@ -700,10 +717,8 @@ async fn workspace_worktrees_reach_both_acp_adapters_from_composed_config_in_eit
                     Ok(())
                 },
             )).await.unwrap().unwrap();
-            host.kill().await.unwrap();
-            host.wait().await.unwrap();
-        }
-    }
+    host.kill().await.unwrap();
+    host.wait().await.unwrap();
 }
 
 #[tokio::test]

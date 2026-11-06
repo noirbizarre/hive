@@ -1,5 +1,46 @@
 use super::*;
 
+#[tokio::test]
+async fn an_unpolled_call_releases_admission_before_publishing_settlement() {
+    let (mut instance, _) = idle_instance(60);
+    Arc::get_mut(&mut instance).unwrap().slots = Arc::new(Semaphore::new(1));
+    instance.leases.store(1, Ordering::Release);
+    let lease = Lease {
+        instance: instance.clone(),
+    };
+    // A separate current-thread runtime lets shutdown destroy the task before its first poll.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let call = {
+        let _entered = runtime.enter();
+        lease.request(McpRequest::new("ping", serde_json::json!({})).unwrap())
+    };
+    let settled = call.settlement();
+    assert_eq!(instance.slots.available_permits(), 0);
+    // Fence settlement publication so the assertion observes destructor order, not thread speed.
+    let fence = instance.state.lock().unwrap();
+    let shutdown = std::thread::spawn(move || runtime.shutdown_timeout(Duration::from_secs(5)));
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while instance.operations.load(Ordering::Acquire) != 0 && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let retiring = instance.operations.load(Ordering::Acquire) == 0;
+    let released = instance.slots.available_permits() == 1;
+    let published = *settled.borrow();
+    // Always unblock and join cleanup before reporting an assertion failure.
+    drop(fence);
+    shutdown.join().unwrap();
+    assert!(retiring, "runtime shutdown never retired the unpolled call");
+    assert!(
+        released,
+        "operation retirement still owns its admission slot"
+    );
+    assert!(!published, "settlement crossed the cleanup fence");
+    assert!(*settled.borrow(), "shutdown did not publish settlement");
+}
+
 #[tokio::test(start_paused = true)]
 async fn resource_protection_outlives_idle_timeout_and_waits_for_confirmed_process_exit() {
     let (instance, stopping) = idle_instance(60);
@@ -65,7 +106,11 @@ async fn resource_waiters_cover_reacquisition_operations_and_replacement_generat
         instance.settle_resources(&state);
         assert!(!*done.borrow(), "operations can outlive their lease");
     }
-    drop(Operation(instance, watch::channel(false).0));
+    drop(Operation {
+        instance,
+        settled: watch::channel(false).0,
+        permit: None,
+    });
     assert!(*done.borrow());
 }
 

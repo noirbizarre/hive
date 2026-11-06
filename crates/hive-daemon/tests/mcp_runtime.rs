@@ -80,8 +80,9 @@ impl Fixture {
         Self::with_policy(RuntimePolicy {
             // Successful native startup needs the production budget on loaded CI hosts.
             startup_timeout: Duration::from_secs(15),
-            shutdown_grace: Duration::from_millis(50),
-            exit_grace: Duration::from_millis(100),
+            // These are upper bounds, not sleeps: loaded Windows hosts still need time to reap.
+            shutdown_grace: Duration::from_secs(2),
+            exit_grace: Duration::from_secs(2),
             restart_backoff: Duration::from_millis(10),
             ..Default::default()
         })
@@ -796,18 +797,23 @@ async fn conflicting_response_arms_fail_the_connection_and_clean_up_the_live_ser
 
 #[tokio::test]
 async fn crashed_calls_are_not_replayed_and_later_work_lazily_restarts() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::with_policy(RuntimePolicy {
+        // One slot makes any retry before settlement observable instead of relying on load.
+        max_concurrent_calls: 1,
+        restart_backoff: Duration::from_millis(10),
+        ..Default::default()
+    });
     let lease = fixture
         .runtime
         .acquire(fixture.identity("normal", 0))
         .unwrap();
-    assert!(
-        lease
-            .request(tool("crash", json!({})))
-            .result()
-            .await
-            .is_err()
-    );
+    let crashed = lease.request(tool("crash", json!({})));
+    let settled = crashed.settlement();
+    assert!(matches!(
+        crashed.result().await,
+        Err(RuntimeError::Connection)
+    ));
+    wait_for_settlement(settled).await;
     fixture
         .observed(|events| {
             events
@@ -818,11 +824,16 @@ async fn crashed_calls_are_not_replayed_and_later_work_lazily_restarts() {
     // The policy's explicit backoff is observed rather than guessing process startup timing.
     let result = tokio::time::timeout(Duration::from_secs(20), async {
         loop {
-            match lease.request(tool("echo", json!({}))).result().await {
+            let call = lease.request(tool("echo", json!({})));
+            let settled = call.settlement();
+            let result = call.result().await;
+            // Failure delivery does not release admission; yielding can accumulate pending cleanup.
+            wait_for_settlement(settled).await;
+            match result {
                 Err(RuntimeError::Backoff { retry_after_ms }) => {
                     tokio::time::sleep(Duration::from_millis(retry_after_ms.max(1))).await
                 }
-                Err(RuntimeError::Connection) => tokio::task::yield_now().await,
+                Err(RuntimeError::Connection) => continue,
                 result => break result,
             }
         }
@@ -848,6 +859,19 @@ async fn crashed_calls_are_not_replayed_and_later_work_lazily_restarts() {
         1
     );
     fixture.runtime.shutdown().await;
+}
+
+async fn wait_for_settlement(mut settled: tokio::sync::watch::Receiver<bool>) {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !*settled.borrow_and_update() {
+            settled
+                .changed()
+                .await
+                .expect("operation ended without settlement");
+        }
+    })
+    .await
+    .expect("MCP operation did not release its admission slot");
 }
 
 #[tokio::test]
@@ -884,7 +908,11 @@ async fn initialization_failures_and_stderr_floods_do_not_hang_the_runtime() {
 
 #[tokio::test]
 async fn shutdown_settles_ignored_cancellation_and_rejects_future_admission() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::with_policy(RuntimePolicy {
+        // Deliberately unresponsive work should hit a short grace, not spend the production delay.
+        shutdown_grace: Duration::from_millis(50),
+        ..Default::default()
+    });
     let identity = fixture.identity("normal", 0);
     let lease = fixture.runtime.acquire(identity.clone()).unwrap();
     let call = lease.request(tool("hold", json!({})));

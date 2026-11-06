@@ -2582,27 +2582,35 @@ mod tests {
                 images::fixture_scene(frame, images, &source);
             })
             .unwrap();
-        eprintln!("HIVE_PTY_IMAGE_RESIZE_READY");
-        // The parent changes the actual PTY size before acknowledging with `r`.
-        // Ignore a queued resize notification; draw must also notice geometry itself.
-        loop {
-            if matches!(event::read().unwrap(), Event::Key(key) if key.code == KeyCode::Char('r')) {
-                break;
-            }
-        }
-        guard
-            .draw(&mut terminal, &capabilities, |frame, images| {
-                images::fixture_scene(frame, images, &source);
-            })
-            .unwrap();
         let (sender, mut keys) = mpsc::unbounded_channel();
         let (control, controls) = std::sync::mpsc::channel();
         let (replies, _received) = mpsc::channel(32);
         let reader =
             tokio::task::spawn_blocking(move || terminal_reader(sender, replies, controls));
+        eprintln!("HIVE_PTY_IMAGE_RESIZE_READY");
+        // The parent changes the actual PTY size before acknowledging with `r`.
+        // Ignore a queued resize notification; draw must also notice geometry itself.
+        // A second input parser can buffer bytes that the application's reader will never see.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if matches!(keys.recv().await.unwrap(), Event::Key(key) if key.code == KeyCode::Char('r')) {
+                    break;
+                }
+            }
+        }).await.expect("PTY parent did not acknowledge resize");
+        eprintln!("HIVE_PTY_RESIZE_ACKNOWLEDGED");
+        guard
+            .draw(&mut terminal, &capabilities, |frame, images| {
+                images::fixture_scene(frame, images, &source);
+            })
+            .unwrap();
         let (sent, paused) = oneshot::channel();
         control.send(ReaderControl::Pause(sent)).unwrap();
-        paused.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), paused)
+            .await
+            .expect("terminal reader did not pause")
+            .unwrap();
+        eprintln!("HIVE_PTY_READER_PAUSED");
         guard.suspend().unwrap();
         assert!(!crossterm::terminal::is_raw_mode_enabled().unwrap());
         let child = std::process::Command::new("stty")
@@ -2628,6 +2636,7 @@ mod tests {
                 .unwrap()
                 .success()
         );
+        eprintln!("HIVE_PTY_EDITOR_EXITED");
         guard.resume().unwrap();
         guard.clear(&mut terminal).unwrap();
         guard
@@ -2654,8 +2663,13 @@ mod tests {
             matches!(pasted, Event::Paste(ref value) if value == "one\ntwo"),
             "unexpected event: {pasted:?}"
         );
+        eprintln!("HIVE_PTY_PASTE_RECEIVED");
         keys.close();
-        reader.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), reader)
+            .await
+            .expect("terminal reader did not exit")
+            .unwrap();
+        eprintln!("HIVE_PTY_READER_EXITED");
         guard.suspend().unwrap();
         assert!(!crossterm::terminal::is_raw_mode_enabled().unwrap());
     }

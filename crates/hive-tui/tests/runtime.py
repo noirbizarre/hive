@@ -22,6 +22,12 @@ import zlib
 from terminal_screen import Screen
 
 
+def interrupted(signum, _frame):
+    # Unlike faulthandler's exit=True, raising runs the process-group cleanup below.
+    faulthandler.dump_traceback()
+    raise RuntimeError(f"terminal supervisor interrupted by signal {signum}")
+
+
 def settings(fd):
     values = termios.tcgetattr(fd)
     # BSD may mark input for reprocessing after tcsetattr; PENDIN is not an application mode.
@@ -78,7 +84,9 @@ def main():
         fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
         os.set_blocking(master, False)
         # A stalled kernel/HTTP call must leave a useful trace before the outer test timeout.
-        faulthandler.dump_traceback_later(45, exit=True)
+        previous_alarm = signal.signal(signal.SIGALRM, interrupted)
+        previous_term = signal.signal(signal.SIGTERM, interrupted)
+        signal.alarm(45)
         original = settings(master)
         output = bytearray()
         screen = Screen()
@@ -156,7 +164,8 @@ def main():
             while output.count(b"\x1b[6n") > cursor_queries:
                 os.write(master, b"\x1b[3;3R")
                 cursor_queries += 1
-            match = re.search(rb"HIVE_RUNTIME_READY (http://[^\s]+)", output)
+            # PTY reads can split the address anywhere; only publish a complete readiness record.
+            match = re.search(rb"HIVE_RUNTIME_READY (http://[^\s]+)[\r\n]", output)
             if match:
                 address = match[1].decode()
 
@@ -443,6 +452,7 @@ def main():
             sys.stderr.write(output.decode(errors="replace"))
             raise
         finally:
+            signal.alarm(0)
             if pid is not None:
                 for kill in (os.killpg, os.kill):
                     try:
@@ -453,7 +463,8 @@ def main():
             if pid is not None:
                 os.waitpid(pid, 0)
             http.shutdown(wait=True)
-            faulthandler.cancel_dump_traceback_later()
+            signal.signal(signal.SIGALRM, previous_alarm)
+            signal.signal(signal.SIGTERM, previous_term)
 
 
 if __name__ == "__main__":

@@ -163,76 +163,99 @@ async fn jj_workspaces_share_storage_but_keep_independent_changes_and_survive_re
 }
 
 #[tokio::test]
-async fn jj_cleanup_protects_unsnapshotted_snapshotted_untracked_and_ignored_data() {
+async fn jj_cleanup_protects_unsnapshotted_data() {
+    check_jj_cleanup("modified").await;
+}
+
+#[tokio::test]
+async fn jj_cleanup_protects_snapshotted_data() {
+    check_jj_cleanup("snapshotted").await;
+}
+
+#[tokio::test]
+async fn jj_cleanup_protects_untracked_data() {
+    check_jj_cleanup("untracked").await;
+}
+
+#[tokio::test]
+async fn jj_cleanup_protects_ignored_data() {
+    check_jj_cleanup("ignored").await;
+}
+
+#[tokio::test]
+async fn jj_cleanup_protects_deleted_data() {
+    check_jj_cleanup("deleted").await;
+}
+
+// Independent repositories let nextest schedule these expensive native scenarios separately.
+async fn check_jj_cleanup(kind: &str) {
     let fixture = Fixture::jj();
-    for kind in ["modified", "snapshotted", "untracked", "ignored", "deleted"] {
-        let entry = fixture.create(fixture.jj_request()).await.unwrap();
-        let root = root(&entry);
-        match kind {
-            "modified" | "snapshotted" => {
-                std::fs::write(root.join("content"), "valuable work\n").unwrap()
-            }
-            "untracked" => std::fs::write(root.join("untracked"), "valuable data").unwrap(),
-            "ignored" => {
-                std::fs::write(root.join(".gitignore"), "valuable\n").unwrap();
-                command(&root, &["status"]);
-                command(&root, &["new"]);
-                std::fs::write(root.join("valuable"), "ignored data").unwrap();
-            }
-            "deleted" => std::fs::remove_file(root.join("content")).unwrap(),
-            _ => unreachable!(),
+    let entry = fixture.create(fixture.jj_request()).await.unwrap();
+    let root = root(&entry);
+    match kind {
+        "modified" | "snapshotted" => {
+            std::fs::write(root.join("content"), "valuable work\n").unwrap()
         }
-        if kind == "snapshotted" {
+        "untracked" => std::fs::write(root.join("untracked"), "valuable data").unwrap(),
+        "ignored" => {
+            std::fs::write(root.join(".gitignore"), "valuable\n").unwrap();
             command(&root, &["status"]);
+            command(&root, &["new"]);
+            std::fs::write(root.join("valuable"), "ignored data").unwrap();
         }
-        let before = command(
-            &root,
-            &[
-                "--ignore-working-copy",
-                "op",
-                "log",
-                "--limit",
-                "1",
-                "--no-graph",
-                "-T",
-                "id",
-            ],
-        );
-        assert_eq!(
-            cleanliness(&fixture.service, &entry).await,
-            Cleanliness::Dirty,
-            "{kind}"
-        );
-        let after = command(
-            &root,
-            &[
-                "--ignore-working-copy",
-                "op",
-                "log",
-                "--limit",
-                "1",
-                "--no-graph",
-                "-T",
-                "id",
-            ],
-        );
-        assert_eq!(before, after, "inspection must not snapshot {kind}");
-        assert!(
-            fixture
-                .service
-                .remove(entry.workspace.id().clone(), OperationId::new(), false)
-                .await
-                .is_err(),
-            "{kind}"
-        );
-        assert!(root.exists());
+        "deleted" => std::fs::remove_file(root.join("content")).unwrap(),
+        _ => unreachable!(),
+    }
+    if kind == "snapshotted" {
+        command(&root, &["status"]);
+    }
+    let before = command(
+        &root,
+        &[
+            "--ignore-working-copy",
+            "op",
+            "log",
+            "--limit",
+            "1",
+            "--no-graph",
+            "-T",
+            "id",
+        ],
+    );
+    assert_eq!(
+        cleanliness(&fixture.service, &entry).await,
+        Cleanliness::Dirty,
+        "{kind}"
+    );
+    let after = command(
+        &root,
+        &[
+            "--ignore-working-copy",
+            "op",
+            "log",
+            "--limit",
+            "1",
+            "--no-graph",
+            "-T",
+            "id",
+        ],
+    );
+    assert_eq!(before, after, "inspection must not snapshot {kind}");
+    assert!(
         fixture
             .service
-            .remove(entry.workspace.id().clone(), OperationId::new(), true)
+            .remove(entry.workspace.id().clone(), OperationId::new(), false)
             .await
-            .unwrap();
-        assert!(!root.exists());
-    }
+            .is_err(),
+        "{kind}"
+    );
+    assert!(root.exists());
+    fixture
+        .service
+        .remove(entry.workspace.id().clone(), OperationId::new(), true)
+        .await
+        .unwrap();
+    assert!(!root.exists());
 }
 
 #[tokio::test]

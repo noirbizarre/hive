@@ -588,14 +588,20 @@ impl Drop for Lease {
     }
 }
 
-struct Operation(Arc<Instance>, watch::Sender<bool>);
+struct Operation {
+    instance: Arc<Instance>,
+    settled: watch::Sender<bool>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
 impl Drop for Operation {
     fn drop(&mut self) {
-        self.0.operations.fetch_sub(1, Ordering::AcqRel);
-        self.0.idle();
-        let state = self.0.state.lock().expect("MCP state lock poisoned");
-        self.0.settle_resources(&state);
-        self.1.send_replace(true);
+        // A task can be dropped before its first poll, before local guard drop order is established.
+        drop(self.permit.take());
+        self.instance.operations.fetch_sub(1, Ordering::AcqRel);
+        self.instance.idle();
+        let state = self.instance.state.lock().expect("MCP state lock poisoned");
+        self.instance.settle_resources(&state);
+        self.settled.send_replace(true);
     }
 }
 
@@ -637,10 +643,13 @@ impl Lease {
             instance.operations.fetch_add(1, Ordering::AcqRel);
             instance.cancel_idle();
         }
-        let operation = Operation(instance.clone(), settled);
+        let operation = Operation {
+            instance: instance.clone(),
+            settled,
+            permit: Some(permit.expect("admission checked before spawning")),
+        };
         tokio::spawn(async move {
             let _operation = operation;
-            let _permit = permit.expect("admission checked before spawning");
             let mut reply = Some(reply);
             let ready = async {
                 let mut status = instance.connection()?;
@@ -814,6 +823,14 @@ pub struct McpCall {
     pub(super) done: watch::Receiver<bool>,
 }
 impl McpCall {
+    /// Observe terminal operation settlement before consuming the caller-visible result.
+    ///
+    /// A connection error or cancellation can arrive while cleanup still owns an admission slot.
+    /// `true` means that slot has been released; closure while false is not confirmed settlement.
+    pub fn settlement(&self) -> watch::Receiver<bool> {
+        self.done.clone()
+    }
+
     pub fn cancel(&self) {
         self.cancel.send_replace(true);
     }

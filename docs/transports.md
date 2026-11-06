@@ -5,6 +5,7 @@
 | Client to Hive | v2 | WebSocket `/acp` | Integration-tested SDK client through mock agent |
 | Client to Hive | v2 | HTTP POST + SSE GET `/acp` | Integration-tested SDK client through same broker |
 | Hive-side peer client to owner Hive | v2 | Streamable HTTP `/acp` | Standard requests, configuration, streamed updates, disconnect and explicit live reattachment tested against a real owner broker and stdio agent |
+| Initiating Hive to owner Hive | v2 | Streamable HTTP `/acp` | Configured owner identity verification, remote creation, listing, resolution, control and reconnect tested with two brokers |
 | Hive to agent | v2 | stdio | Integration-tested with deterministic mock |
 | Hive to agent | v1 | stdio | Integration-tested text prompt compatibility adapter |
 | Hive to agent | v2/v1 | WebSocket, HTTP/SSE | SDK client transport; v2 HTTP/SSE and WS integration-tested with mock |
@@ -19,8 +20,8 @@ session ID and routing. No transport `Last-Event-ID` resumption is claimed.
 
 The [Hive ACP extension specification](acp-extensions.md) defines versioned agent
 discovery, selection and qualified session location through standard ACP transport.
-Persistent owners implement negotiated discovery and selected startup; qualified
-session location/routing remains #80. See the [current extension implementation](acp-extensions.md#current-implementation).
+Persistent owners implement negotiated discovery, selected startup, qualified
+session location and gateway routing. See the [current extension implementation](acp-extensions.md#current-implementation).
 
 Production startup defaults to loopback. Explicit `--allow-remote` permits the
 shared listener on a private interface, with optional bearer authentication.
@@ -42,7 +43,7 @@ interchangeability with MCP Streamable HTTP or full draft-protocol conformance.
   Open the session stream before expecting session-scoped replies or updates.
 - Top-level `params.sessionId` determines transport session scope. The specified
   resolver's nested `session: {owner, id}` remains connection-scoped; a test
-  receives its current method-not-found response without any session attachment.
+  receives its negotiation error without any session attachment.
 - POST bodies have a **16 MiB** SDK limit. Invalid content type is rejected;
   malformed frames without a connection ID fail at the HTTP boundary. With an
   established connection, JSON-RPC errors may instead arrive on SSE.
@@ -78,7 +79,12 @@ implements the SDK's `ConnectTo<Client>` and can be passed to `Client.v2().conne
 It creates no catalog record or session. The reusable `hive_protocol::remote::Peer`
 negotiates extensions, lists safe profiles, and explicitly starts a selected agent
 through standard `session/new`. Neither helper retries startup after a lost response.
-There is no `[peers]` TOML routing registry; cross-Hive session routing remains #80.
+The daemon's [peer registry](configuration.md#remote-hive-peers) uses these helpers
+for dynamic inventories and separate per-session attachments. Owner drivers are
+supervised independently so one owner failure cannot terminate unrelated clients.
+Gateway disconnect/shutdown ends attachments without sending `session/close`.
+Retain qualified references, resolve after reconnect, then explicitly resume;
+owner-side control, replay sequence and prompt keys remain authoritative.
 
 [sdk-http]: https://github.com/agentclientprotocol/rust-sdk/blob/305aefda6fbe88be6ae8b9088003e383f909b135/md/http-transport.md
 [sdk-source]: https://github.com/agentclientprotocol/rust-sdk/tree/305aefda6fbe88be6ae8b9088003e383f909b135/src/agent-client-protocol-http/src

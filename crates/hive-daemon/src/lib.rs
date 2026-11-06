@@ -43,6 +43,7 @@ pub mod http;
 mod interactions;
 pub mod mcp;
 mod opencode;
+mod peers;
 mod persistence;
 mod plans;
 mod pricing;
@@ -50,6 +51,7 @@ pub mod projects;
 mod prompt_journal;
 pub mod reload;
 mod remote;
+mod routing;
 mod session_config;
 mod transcript;
 mod usage;
@@ -145,6 +147,8 @@ fn transport(profile: &Profile) -> Result<Downstream, String> {
 
 #[derive(Clone)]
 pub struct Broker {
+    routes: Arc<routing::Routes>,
+    peer_links: Arc<Mutex<Vec<std::sync::Weak<peers::Link>>>>,
     mcp_runtime: Arc<tokio::sync::OnceCell<mcp::runtime::Runtime>>,
     mcp_sessions: Arc<mcp::Sessions>,
     mcp_ephemeral_node: hive_core::identity::NodeId,
@@ -1229,6 +1233,8 @@ impl Broker {
     pub fn new(registry: Config) -> Self {
         let (catalog, _) = watch::channel(0);
         Self {
+            routes: Arc::new(routing::Routes::default()),
+            peer_links: Arc::new(Mutex::new(Vec::new())),
             mcp_runtime: Arc::new(tokio::sync::OnceCell::new()),
             mcp_sessions: Arc::new(mcp::Sessions::default()),
             mcp_ephemeral_node: hive_core::identity::NodeId::new(),
@@ -1381,6 +1387,7 @@ impl Broker {
                 );
             }
         }
+        broker.routes = Arc::new(routing::Routes::load(&store)?);
         broker.store = Some(store);
         Ok(broker)
     }
@@ -1949,6 +1956,11 @@ impl Broker {
             let _writer = self.reloading.lock().await;
             if let Ok(mut registry) = self.registry.lock() {
                 registry.stopping = true;
+            }
+        }
+        if let Ok(mut links) = self.peer_links.lock() {
+            for link in links.drain(..).filter_map(|link| link.upgrade()) {
+                link.disconnect();
             }
         }
         // Finish any resource admission before retiring bindings and stopping their runtime.
@@ -4295,6 +4307,7 @@ fn watch_attachment(
 fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client> {
     let client_id = uuid::Uuid::new_v4().to_string();
     let remote = Arc::new(Mutex::new(remote::Connection::default()));
+    let routes = Arc::new(routing::ClientRoutes::default());
     Agent
         .v2()
         .name("hive")
@@ -4304,6 +4317,7 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
                 let remote = remote.clone();
                 let capabilities = broker.client_capabilities.clone();
                 let client_id = client_id.clone();
+                let routes = routes.clone();
                 async move |raw: hive_protocol::remote::Initialize,
                             responder: Responder<serde_json::Value>,
                             cx: V2ConnectionTo<Client>| {
@@ -4313,6 +4327,7 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
                     let remote = remote.clone();
                     let capabilities = capabilities.clone();
                     let client_id = client_id.clone();
+                    let routes = routes.clone();
                     let connection = cx.clone();
                     cx.spawn(async move {
                     let mut response = serde_json::to_value(v2::InitializeResponse::new(request.protocol_version,
@@ -4342,6 +4357,7 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
                     // A connection-scoped task is dropped before termination is published.
                     tokio::spawn(async move {
                         upstream_ended(&connection).await;
+                        routes.detach().await;
                         if let Ok(mut capabilities) = capabilities.lock() {
                             capabilities.remove(&client_id);
                         }
@@ -4355,7 +4371,15 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
         .on_receive_request({
             let broker = broker.clone();
             let remote = remote.clone();
-            async move |request: hive_protocol::remote::ListAgents, responder: Responder<hive_protocol::remote::AgentsPage>, _: V2ConnectionTo<Client>| {
+            let routes = routes.clone();
+            async move |mut request: hive_protocol::remote::ListAgents, responder: Responder<hive_protocol::remote::AgentsPage>, cx: V2ConnectionTo<Client>| {
+                if let Some(owner) = remote::peer_selector(&mut request.0, &remote)? {
+                    let broker = broker.clone(); let routes = routes.clone();
+                    return cx.spawn(async move {
+                        let result = routes.discovery.inventory(&broker, owner, false, request.0).await.and_then(|value| serde_json::from_value(value).map_err(Error::into_internal_error));
+                        let _ = responder.respond_with_result(result); Ok(())
+                    });
+                }
                 let result = remote.lock().map_err(|_| Error::internal_error())?.list(&broker, request.0);
                 responder.respond_with_result(result)
             }
@@ -4363,7 +4387,15 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
         .on_receive_request({
             let broker = broker.clone();
             let remote = remote.clone();
-            async move |request: hive_protocol::remote::ListProfiles, responder: Responder<hive_protocol::remote::ProfilesPage>, _: V2ConnectionTo<Client>| {
+            let routes = routes.clone();
+            async move |mut request: hive_protocol::remote::ListProfiles, responder: Responder<hive_protocol::remote::ProfilesPage>, cx: V2ConnectionTo<Client>| {
+                if let Some(owner) = remote::peer_selector(&mut request.0, &remote)? {
+                    let broker = broker.clone(); let routes = routes.clone();
+                    return cx.spawn(async move {
+                        let result = routes.discovery.inventory(&broker, owner, true, request.0).await.and_then(|value| serde_json::from_value(value).map_err(Error::into_internal_error));
+                        let _ = responder.respond_with_result(result); Ok(())
+                    });
+                }
                 let result = remote.lock().map_err(|_| Error::internal_error())?.list_profiles(&broker, request.0);
                 responder.respond_with_result(result)
             }
@@ -4373,9 +4405,15 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
                 let broker = broker.clone();
                 let client_id = client_id.clone();
                 let remote = remote.clone();
+                let routes = routes.clone();
                 async move |raw: hive_protocol::remote::NewSession,
                             responder: Responder<v2::NewSessionResponse>,
-                            cx: V2ConnectionTo<Client>| {
+                             cx: V2ConnectionTo<Client>| {
+                    if raw.0.pointer("/_meta/hive/peer").is_some() {
+                        remote::negotiated(&remote)?;
+                        let broker = broker.clone(); let client_id = client_id.clone(); let routes = routes.clone(); let upstream = cx.clone();
+                        return cx.spawn(async move { routes.create(&broker, &client_id, upstream, raw.0, responder).await });
+                    }
                     let (request, negotiated) = remote::launch(raw.0, &*remote.lock().map_err(|_| Error::internal_error())?)?;
                     let broker = broker.clone();
                     let client_id = client_id.clone();
@@ -4392,6 +4430,14 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
                     cx.spawn(async move {
                         let _end = end;
                         let result = broker.create(request, negotiated, client_id, connection, parent).await;
+                        let result = match result {
+                            Ok(mut response) if negotiated => {
+                                let node = broker.owner_node().await?;
+                                response.meta.get_or_insert_default().entry("hive").or_insert_with(|| serde_json::json!({}))["session"] = serde_json::json!({"owner": node, "id": response.session_id});
+                                Ok(response)
+                            },
+                            result => result,
+                        };
                         let result = if negotiated { result.map_err(|error| hive_protocol::remote::RemoteError::sanitized(error, hive_protocol::remote::RemoteError::LaunchUncertain)) } else { result };
                         let _ = responder.respond_with_result(result);
                         Ok(())
@@ -4404,9 +4450,17 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
             {
                 let broker = broker.clone();
                 let client_id = client_id.clone();
+                let routes = routes.clone();
+                let remote = remote.clone();
                 async move |request: v2::PromptRequest,
                             responder: Responder<v2::PromptResponse>,
-                            cx: V2ConnectionTo<Client>| {
+                             cx: V2ConnectionTo<Client>| {
+                    if routing::routed(&request.session_id) {
+                        remote::negotiated(&remote)?;
+                        let broker = broker.clone(); let client_id = client_id.clone(); let routes = routes.clone(); let upstream = cx.clone();
+                        return cx.spawn(async move { routes.forward(&broker, &client_id, upstream, request, responder).await });
+                    }
+                    remote::available(&broker, &request.session_id, &remote)?;
                     let capabilities = broker
                         .client_capabilities
                         .lock()
@@ -4438,28 +4492,13 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
         .on_receive_request(
             {
                 let broker = broker.clone();
+                let remote = remote.clone();
                 async move |request: v2::ListSessionsRequest,
-                            responder: Responder<v2::ListSessionsResponse>,
-                            _cx: V2ConnectionTo<Client>| {
-                    let snapshot = broker.snapshot(request.cwd.as_ref())?;
-                    let entries = snapshot
-                        .sessions
-                        .into_iter()
-                        .map(|summary| {
-                            let mut meta = v2::Meta::new();
-                            let mut hive = serde_json::to_value(&summary)
-                                .map_err(Error::into_internal_error)?;
-                            hive["running"] = serde_json::json!(matches!(summary.activity, "running" | "requires_action"));
-                            hive["pilot"] = serde_json::json!(summary.control_owner.is_some());
-                            meta.insert("hive".into(), hive);
-                            Ok(v2::SessionInfo::new(
-                                v2::SessionId::new(summary.session_id),
-                                summary.cwd,
-                            )
-                            .meta(meta))
-                        })
-                        .collect::<agent_client_protocol::Result<Vec<_>>>()?;
-                    responder.respond(v2::ListSessionsResponse::new(entries))
+                             responder: Responder<v2::ListSessionsResponse>,
+                             cx: V2ConnectionTo<Client>| {
+                    let negotiated = remote.lock().map_err(|_| Error::internal_error())?.mode == remote::Mode::Negotiated;
+                    let broker = broker.clone();
+                    cx.spawn(async move { let result = broker.listed(request, negotiated).await; let _ = responder.respond_with_result(result); Ok(()) })
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -4468,11 +4507,26 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
             {
                 let broker = broker.clone();
                 let client_id = client_id.clone();
+                let remote = remote.clone();
+                let routes = routes.clone();
                 async move |request: v2::ResumeSessionRequest,
                             responder: Responder<v2::ResumeSessionResponse>,
-                            cx: V2ConnectionTo<Client>| {
+                             cx: V2ConnectionTo<Client>| {
+                    if routing::routed(&request.session_id) {
+                        remote::negotiated(&remote)?;
+                        let broker = broker.clone(); let client_id = client_id.clone(); let routes = routes.clone(); let upstream = cx.clone();
+                        return cx.spawn(async move { routes.forward(&broker, &client_id, upstream, request, responder).await });
+                    }
+                    remote::available(&broker, &request.session_id, &remote)?;
+                    let id = request.session_id.clone();
                     match broker.resume(request, &client_id, cx) {
-                        Ok(response) => responder.respond(response),
+                        Ok(mut response) => {
+                            if remote.lock().map_err(|_| Error::internal_error())?.mode == remote::Mode::Negotiated {
+                                let node = broker.owner_node().await?;
+                                response.meta.get_or_insert_default().entry("hive").or_insert_with(|| serde_json::json!({}))["session"] = serde_json::json!({"owner": node, "id": id});
+                            }
+                            responder.respond(response)
+                        },
                         Err(error) => responder.respond_with_error(error),
                     }
                 }
@@ -4483,9 +4537,17 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
             {
                 let broker = broker.clone();
                 let client_id = client_id.clone();
+                let routes = routes.clone();
+                let remote = remote.clone();
                 async move |mut request: v2::SetSessionConfigOptionRequest,
                             responder: Responder<v2::SetSessionConfigOptionResponse>,
-                            cx: V2ConnectionTo<Client>| {
+                             cx: V2ConnectionTo<Client>| {
+                    if routing::routed(&request.session_id) {
+                        remote::negotiated(&remote)?;
+                        let broker = broker.clone(); let client_id = client_id.clone(); let routes = routes.clone(); let upstream = cx.clone();
+                        return cx.spawn(async move { routes.forward(&broker, &client_id, upstream, request, responder).await });
+                    }
+                    remote::available(&broker, &request.session_id, &remote)?;
                     let entry = broker.entry(&request.session_id)?;
                     let (reply, received) = oneshot::channel();
                     let mut state = entry.control.lock().map_err(|_| Error::internal_error())?;
@@ -4517,9 +4579,17 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
             {
                 let broker = broker.clone();
                 let client_id = client_id.clone();
+                let routes = routes.clone();
+                let remote = remote.clone();
                 async move |request: v2::CloseSessionRequest,
                             responder: Responder<v2::CloseSessionResponse>,
-                            cx: V2ConnectionTo<Client>| {
+                             cx: V2ConnectionTo<Client>| {
+                    if routing::routed(&request.session_id) {
+                        remote::negotiated(&remote)?;
+                        let broker = broker.clone(); let client_id = client_id.clone(); let routes = routes.clone(); let upstream = cx.clone();
+                        return cx.spawn(async move { routes.forward(&broker, &client_id, upstream, request, responder).await });
+                    }
+                    remote::available(&broker, &request.session_id, &remote)?;
                     let entry = broker.entry(&request.session_id)?;
                     let (reply, received) = oneshot::channel();
                     {
@@ -4601,8 +4671,30 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
             },
             agent_client_protocol::on_receive_request!(),
         )
+        .on_receive_request({
+            let broker = broker.clone(); let remote = remote.clone();
+            async move |request: hive_protocol::remote::ResolveSession, responder: Responder<hive_protocol::remote::SessionLocation>, cx: V2ConnectionTo<Client>| {
+                remote::negotiated(&remote)?;
+                let params: hive_protocol::remote::ResolveParams = serde_json::from_value(request.0).map_err(|_| hive_protocol::remote::RemoteError::InvalidParams.wire())?;
+                let broker = broker.clone();
+                cx.spawn(async move { let result = broker.location(params.session).await; let _ = responder.respond_with_result(result); Ok(()) })
+            }
+        }, agent_client_protocol::on_receive_request!())
+        .on_receive_request({
+            let broker = broker.clone(); let remote = remote.clone();
+            async move |request: hive_protocol::remote::ListPeers, responder: Responder<serde_json::Value>, _: V2ConnectionTo<Client>| {
+                remote::negotiated(&remote)?;
+                if request.0.as_object().is_none_or(|object| !object.is_empty()) { return responder.respond_with_error(hive_protocol::remote::RemoteError::InvalidParams.wire()); }
+                let peers = broker.config().peers.iter().map(|(alias, peer)| serde_json::json!({"owner":peer.owner,"alias":alias,"name":peer.name})).collect::<Vec<_>>();
+                responder.respond(serde_json::json!({"peers":peers}))
+            }
+        }, agent_client_protocol::on_receive_request!())
         .on_receive_notification(
             async move |request: v2::CancelSessionNotification, _cx: V2ConnectionTo<Client>| {
+                if routing::routed(&request.session_id) {
+                    if remote::negotiated(&remote).is_ok() { let _ = routes.cancel(&broker, request).await; }
+                    return Ok(());
+                }
                 let entry = broker.entry(&request.session_id)?;
                 let state = entry.control.lock().map_err(|_| Error::internal_error())?;
                 if state.owner(&client_id, request.meta.as_ref()).is_err() {

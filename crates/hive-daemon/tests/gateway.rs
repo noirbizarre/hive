@@ -20,6 +20,8 @@ mod recovery;
 mod remote_discovery;
 #[path = "support/remote_http.rs"]
 mod remote_http;
+#[path = "support/remote_routing.rs"]
+mod remote_routing;
 #[path = "support/workspaces.rs"]
 mod workspaces;
 
@@ -2348,6 +2350,7 @@ fn config_with_agent(id: &str, command: &str, version: AgentVersion) -> Config {
         },
     );
     Config {
+        peers: Default::default(),
         mcp_servers: Default::default(),
         projects: Default::default(),
         default_profile: None,

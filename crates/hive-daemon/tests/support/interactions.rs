@@ -10,6 +10,29 @@ async fn fixture(
     tokio::task::JoinHandle<()>,
     mpsc::UnboundedReceiver<serde_json::Value>,
 ) {
+    fixture_inner(mode, false).await
+}
+
+pub(super) async fn owner_fixture(
+    mode: &'static str,
+) -> (
+    SocketAddr,
+    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<()>,
+    mpsc::UnboundedReceiver<serde_json::Value>,
+) {
+    fixture_inner(mode, true).await
+}
+
+async fn fixture_inner(
+    mode: &'static str,
+    persistent: bool,
+) -> (
+    SocketAddr,
+    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<()>,
+    mpsc::UnboundedReceiver<serde_json::Value>,
+) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let downstream = listener.local_addr().unwrap();
     let (report, reports) = mpsc::unbounded_channel();
@@ -99,7 +122,7 @@ async fn fixture(
     )
     .unwrap();
     config.agents.insert("interactions".into(), profile);
-    let (address, gateway) = if mode == "stalled-permission" {
+    let (address, gateway) = if persistent || mode == "stalled-permission" {
         let directory = tempfile::tempdir().unwrap();
         let broker =
             hive_daemon::Broker::persistent(config, directory.path().join("hive/sessions.sqlite3"))

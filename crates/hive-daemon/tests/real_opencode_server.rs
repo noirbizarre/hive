@@ -203,6 +203,7 @@ fn encode(text: &str) -> String {
 
 fn config(server: &Server) -> Config {
     Config {
+        peers: Default::default(),
         mcp_servers: Default::default(),
         default_profile: None,
         profiles: Default::default(),

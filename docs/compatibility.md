@@ -314,18 +314,19 @@ infer it merely from negotiating protocol v2.
 | `_hive_error`, `_hive_opencode_error` | ✅ S | Controlled failure diagnostics rendered by both clients, not standard `notice` support | [Protocol boundary](#protocol-boundary), [OpenCode diagnostics](#opencode-diagnostics) |
 | HTTP catalog, provider/native-session discovery, invalidation feed | ✅ S | Operational API alongside ACP; no implication of standard ACP providers/auth or arbitrary native ACP session adoption | [Operational API](hive-api.md), [OpenCode adapter](#opencode-server-adapter) |
 | Versioned `capabilities._meta.hive` negotiation and `_hive/agents/list` | ✅ S | Persistent owners advertise agents/selection/control; safe snapshot pagination and strict owner-side startup admission. Built-in clients retain legacy discovery | [Hive ACP extensions](acp-extensions.md#current-implementation); `remote_discovery` gateway tests and negotiated remote Bee test |
-| Qualified `_meta.hive.session` references and `_hive/sessions/resolve` | ❌ U | Specified owner-qualified identity and gateway route lookup; no remote routing or resume claim | [Session location contract](acp-extensions.md#session-identity-catalog-and-location); implementation [#80](https://github.com/noirbizarre/hive/issues/80) |
+| Qualified `_meta.hive.session` references and `_hive/sessions/resolve` | ✅ S | Owner-qualified references, verified configured peers, durable gateway aliases and standard routed lifecycle; UI integration remains #81 | [Session location contract](acp-extensions.md#session-identity-catalog-and-location); `remote_routing` gateway tests |
+| `_hive/peers/list`, peer-scoped inventories and `_meta.hive.peer` | ✅ S | Static owner-pinned registration, dynamic owner-scoped inventories and explicit remote agent/profile selection | [Peer contract](acp-extensions.md#configured-peers-and-explicit-selection); [configuration](configuration.md#remote-hive-peers) |
 
 ### Federation specification boundary
 
 The [version 1 extension specification](acp-extensions.md) reuses standard ACP
 `initialize`, `session/new`, `session/list`, `session/resume`, mutations and
 `session/update`. Only profile discovery and qualified session resolution add
-methods. Profile selection, ownership fencing, prompt keys and replay metadata
+methods, along with safe configured-peer enumeration. Profile selection, ownership fencing, prompt keys and replay metadata
 are Hive-specific even when carried on standard ACP methods.
 
 Negotiated discovery/selection and the existing selector/control contracts are
-implemented. Cross-Hive location/routing remains #80. Clients must check the
+implemented alongside qualified location and cross-Hive routing. Clients must check the
 advertisement rather than infer support from ACPv2 or the operational HTTP catalog.
 Negotiated launch errors distinguish confirmed failure from uncertain downstream
 creation; the peer helper never retries startup. Deployment uses the optional-auth

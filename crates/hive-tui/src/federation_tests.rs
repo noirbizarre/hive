@@ -6,6 +6,205 @@ const LOCAL: &str = "node-11111111-1111-4111-8111-111111111111";
 const REMOTE: &str = "node-22222222-2222-4222-8222-222222222222";
 
 #[tokio::test]
+async fn owner_directory_edits_and_owner_changes_preserve_the_conversation_and_reject_stale_inventory()
+ {
+    interaction_tests::connected(async |cx| {
+        let mut app = App { page: Page::Profiles, input: "unsent conversation".into(), cwd: "/local".into(), explicit_cwd: true, owners: vec![json!({"owner":REMOTE,"alias":"workstation"})], ..App::default() };
+        let (acks, _) = mpsc::unbounded_channel();
+        let (created, _) = mpsc::unbounded_channel();
+        let mut interaction = None;
+        let mut key = async |app: &mut App, code| {
+            assert!(!handle_key(&cx, "", app, event::KeyEvent::new(code, KeyModifiers::NONE), &mut interaction, acks.clone(), created.clone()).await);
+        };
+        key(&mut app, KeyCode::Char('o')).await;
+        assert_eq!(app.launch_owner.as_ref().unwrap().as_str(), REMOTE);
+        assert!(!app.explicit_cwd);
+        key(&mut app, KeyCode::Char('d')).await;
+        paste(&mut app, &None, "C:\\owner-only");
+        key(&mut app, KeyCode::Enter).await;
+        assert_eq!(app.cwd, std::path::Path::new("C:\\owner-only"));
+        assert!(app.explicit_cwd);
+        assert!(matches!(&app.workspace_launch, Some(hive_protocol::workspace::Launch::Existing { directory }) if directory == "C:\\owner-only"));
+        assert_eq!(app.input, "unsent conversation");
+        app.launch_cwd_input = Some("relative".into());
+        key(&mut app, KeyCode::Enter).await;
+        assert_eq!(app.launch_cwd_input.as_deref(), Some("relative"));
+        assert_eq!(app.cwd, std::path::Path::new("C:\\owner-only"));
+        key(&mut app, KeyCode::Backspace).await;
+        key(&mut app, KeyCode::Char('x')).await;
+        key(&mut app, KeyCode::Esc).await;
+        assert!(app.launch_cwd_input.is_none());
+        key(&mut app, KeyCode::Char('o')).await;
+        assert!(app.launch_owner.is_none());
+        assert!(app.workspace_launch.is_none());
+        assert!(!app.explicit_cwd);
+        update_profiles(&mut app, &json!({"agents":[{"id":"local-agent"}]}));
+        let owners = app.owners.clone();
+        apply_catalog(&mut app, Catalog { snapshot: SessionSnapshot { sessions: Vec::new() }, providers: Ok(json!({"agents":[{"id":"stale-remote-agent"}]})), owners, references: BTreeMap::new(), availability: BTreeMap::new(), owner: Some(hive_core::identity::NodeId::try_from(REMOTE.to_owned()).unwrap()), partial: false });
+        assert_eq!(app.profiles, ["local-agent"]);
+        assert_eq!(app.input, "unsent conversation");
+        assert!(app.session_operation.is_none());
+        Ok(())
+    }).await;
+}
+
+#[tokio::test]
+async fn paginated_owner_inventories_are_complete_and_repeated_cursors_cannot_loop_forever() {
+    let agent = Agent.v2()
+        .on_receive_request(async |_: hive_protocol::remote::Initialize, responder: agent_client_protocol::Responder<serde_json::Value>, _: V2ConnectionTo<Client>| {
+            responder.respond(json!({"protocolVersion":2,"info":{"name":"fixture","version":"1"},"capabilities":{"session":{},"_meta":{"hive":{"version":1,"node":LOCAL,"features":{"agents":{},"selection":{},"control":{},"location":{},"peers":{},"profiles":{}}}}}}))
+        }, agent_client_protocol::on_receive_request!())
+        .on_receive_request(async |request: hive_protocol::remote::ListAgents, responder: agent_client_protocol::Responder<hive_protocol::remote::AgentsPage>, _: V2ConnectionTo<Client>| {
+            let repeated = request.0["peer"] == "node-33333333-3333-4333-8333-333333333333";
+            let id = if request.0["cursor"].is_string() { "second" } else { "first" };
+            responder.respond(serde_json::from_value(json!({"agents":[{"id":id,"name":id,"kind":"acp","transport":"stdio","versions":[],"isDefault":false,"capabilities":{},"launch":{"cwd":"required","workspace":"optional"}}],"defaultAgent":"first","nextCursor":if repeated || id == "first" { Some("agents-next") } else { None }})).unwrap())
+        }, agent_client_protocol::on_receive_request!())
+        .on_receive_request(async |request: hive_protocol::remote::ListProfiles, responder: agent_client_protocol::Responder<hive_protocol::remote::ProfilesPage>, _: V2ConnectionTo<Client>| {
+            let id = if request.0["cursor"].is_string() { "second" } else { "first" };
+            responder.respond(serde_json::from_value(json!({"profiles":[{"id":id,"name":id,"agents":[id],"projects":[],"defaultAgent":id,"defaultProject":null,"isDefault":false,"workspaces":{}}],"defaultProfile":"first","nextCursor":if id == "first" { Some("profiles-next") } else { None }})).unwrap())
+        }, agent_client_protocol::on_receive_request!())
+        .on_receive_request(async |_: hive_protocol::remote::ListPeers, responder: agent_client_protocol::Responder<serde_json::Value>, _: V2ConnectionTo<Client>| { responder.respond(json!({"peers":[{"owner":REMOTE,"alias":"workstation"}]})) }, agent_client_protocol::on_receive_request!())
+        .on_receive_request(async |request: v2::ListSessionsRequest, responder: agent_client_protocol::Responder<v2::ListSessionsResponse>, _: V2ConnectionTo<Client>| {
+            let second = request.cursor.is_some();
+            let owner = if second { REMOTE } else { LOCAL };
+            let id = if second { "remote-route" } else { "local-route" };
+            responder.respond(serde_json::from_value(json!({"sessions":[{"sessionId":id,"cwd":"/same-directory","_meta":{"hive":{"title":"Retained title","session":{"owner":owner,"id":"native"}}}}],"nextCursor":if second { None } else { Some("sessions-next") },"_meta":{"hive":{"partial":!second,"unavailableOwners":[REMOTE]}}})).unwrap())
+        }, agent_client_protocol::on_receive_request!());
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        Client.v2().connect_with(agent, async |cx| {
+            let peer = hive_protocol::remote::Peer::initialize(
+                cx,
+                v2::InitializeRequest::new(
+                    ProtocolVersion::V2,
+                    v2::Implementation::new("test", "1"),
+                ),
+            )
+            .await?;
+            for owner in [
+                None,
+                Some(hive_core::identity::NodeId::try_from(REMOTE.to_owned()).unwrap()),
+            ] {
+                let catalog = load_catalog(&peer, owner.clone()).await.unwrap();
+                assert_eq!(catalog.snapshot.sessions.len(), 2);
+                let providers = catalog.providers.as_ref().unwrap();
+                assert_eq!(providers["agents"].as_array().unwrap().len(), 2);
+                assert_eq!(providers["profiles"].as_array().unwrap().len(), 2);
+                assert_eq!(providers["defaultAgent"], "first");
+                assert!(catalog.partial);
+                let mut app = App {
+                    peer: Some(peer.clone()),
+                    launch_owner: owner,
+                    cwd: "/same-directory".into(),
+                    ..App::default()
+                };
+                apply_catalog(&mut app, catalog);
+                assert_eq!(
+                    app.sessions.len(),
+                    1,
+                    "identical paths on different owners must not merge directory scope"
+                );
+                assert!(app.status.contains("incomplete"));
+            }
+            let repeated = hive_core::identity::NodeId::try_from(
+                "node-33333333-3333-4333-8333-333333333333".to_owned(),
+            )
+            .unwrap();
+            assert!(
+                load_inventory(&peer, Some(&repeated))
+                    .await
+                    .unwrap_err()
+                    .contains("repeated a cursor")
+            );
+            Ok(())
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+}
+
+#[tokio::test]
+async fn typed_launch_failures_distinguish_safe_rejection_from_uncertain_owner_execution() {
+    let agent = Agent
+        .v2()
+        .on_receive_request(
+            async |request: v2::InitializeRequest,
+                   responder: agent_client_protocol::Responder<v2::InitializeResponse>,
+                   _: V2ConnectionTo<Client>| {
+                responder.respond(v2::InitializeResponse::new(
+                    request.protocol_version,
+                    v2::Implementation::new("fixture", "1"),
+                ))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            async |request: v2::NewSessionRequest,
+                   responder: agent_client_protocol::Responder<v2::NewSessionResponse>,
+                   _: V2ConnectionTo<Client>| {
+                let path = request.cwd.0.to_string_lossy();
+                let error = match path.as_ref() {
+                    "/uncertain" => hive_protocol::remote::RemoteError::LaunchUncertain,
+                    "/provisioning" => hive_protocol::remote::RemoteError::ProvisioningUncertain,
+                    _ => hive_protocol::remote::RemoteError::LaunchFailed,
+                };
+                responder.respond_with_error(error.wire())
+            },
+            agent_client_protocol::on_receive_request!(),
+        );
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        Client.v2().connect_with(agent, async |cx| {
+            cx.send_request(v2::InitializeRequest::new(
+                ProtocolVersion::V2,
+                v2::Implementation::new("test", "1"),
+            ))
+            .block_task()
+            .await?;
+            for (path, uncertain) in [
+                ("/uncertain", true),
+                ("/provisioning", true),
+                ("/failed", false),
+            ] {
+                let mut app = App {
+                    cwd: path.into(),
+                    launch_owner: Some(
+                        hive_core::identity::NodeId::try_from(REMOTE.to_owned()).unwrap(),
+                    ),
+                    explicit_cwd: true,
+                    ..App::default()
+                };
+                start_creation(&cx, &mut app, "coder".into());
+                let result = operation_completion(&mut app.session_operation)
+                    .await
+                    .unwrap();
+                app.session_operation = None;
+                let created = apply_session_result(&mut app, result, "Creating session").unwrap();
+                apply_created(&mut app, created);
+                assert_eq!(app.creation_uncertain, uncertain);
+                assert!(app.status.contains("Could not start session"));
+                assert!(
+                    app.status
+                        .contains(if uncertain { "Inspect" } else { "Check" })
+                );
+                if uncertain {
+                    start_creation(&cx, &mut app, "coder".into());
+                    assert!(
+                        app.session_operation.is_none(),
+                        "uncertainty must prevent a duplicate dispatch"
+                    );
+                }
+            }
+            Ok(())
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+}
+
+#[tokio::test]
 async fn explicit_owner_attachment_cannot_capture_colliding_state_and_an_unavailable_owner_keeps_navigation_usable()
  {
     let agent = Agent.v2()

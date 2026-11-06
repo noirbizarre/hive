@@ -1258,6 +1258,53 @@ mod tests {
     }
 
     #[test]
+    fn remote_catalog_rows_show_owner_labels_and_unavailable_authority_without_inventing_idle() {
+        let owner = hive_core::identity::NodeId::try_from(
+            "node-22222222-2222-4222-8222-222222222222".to_owned(),
+        )
+        .unwrap();
+        let mut app = App {
+            all: true,
+            owners: vec![serde_json::json!({"owner":owner,"alias":"workstation"})],
+            ..App::default()
+        };
+        app.references.insert(
+            "route".into(),
+            hive_protocol::remote::SessionReference {
+                owner: owner.clone(),
+                id: "native".into(),
+            },
+        );
+        app.availability
+            .insert("route".into(), "owner_unavailable".into());
+        app.sessions.push(
+            serde_json::from_value(serde_json::json!({"sessionId":"route","cwd":"/owner-only"}))
+                .unwrap(),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(200, 20)).unwrap();
+        terminal.draw(|frame| app.show(frame)).unwrap();
+        let rendered = screen(&terminal);
+        assert!(rendered.contains("workstation"));
+        assert!(rendered.contains("owner unavailable · cached"));
+        assert!(rendered.contains("unknown / unknown"));
+        assert!(!rendered.contains("unclaimed"));
+        app.availability.clear();
+        terminal.draw(|frame| app.show(frame)).unwrap();
+        assert!(screen(&terminal).contains("control unknown"));
+        app.page = Page::Profiles;
+        app.launch_owner = Some(owner);
+        app.launch_cwd_input = Some("C:\\owner-only".into());
+        app.creation_uncertain = true;
+        terminal.draw(|frame| app.show(frame)).unwrap();
+        let rendered = screen(&terminal);
+        assert!(rendered.contains("Owner directory: C:\\owner-only"));
+        assert!(rendered.contains("u acknowledge uncertain launch"));
+        app.launch_cwd_input = None;
+        terminal.draw(|frame| app.show(frame)).unwrap();
+        assert!(screen(&terminal).contains("workstation"));
+    }
+
+    #[test]
     fn an_empty_session_overview_explains_how_to_create_a_session() {
         let mut app = App {
             all: true,

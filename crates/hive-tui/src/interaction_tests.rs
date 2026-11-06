@@ -164,7 +164,7 @@ fn a_receipt_lookup_can_retire_an_already_acknowledged_recovery_after_its_respon
     assert!(!app.conversations["original"].running);
 }
 
-async fn connected(body: impl AsyncFnOnce(V2ConnectionTo<Agent>) -> Result<(), Error>) {
+pub(super) async fn connected(body: impl AsyncFnOnce(V2ConnectionTo<Agent>) -> Result<(), Error>) {
     connected_with_resume(None, body).await;
 }
 

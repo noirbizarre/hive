@@ -70,10 +70,16 @@ HIVE_TERMINAL_OSC52_WRITE=on hive --terminal-osc52-write auto
 OSC 52 writes are preferred for copy/cut when permitted; otherwise Hive uses the
 native clipboard. Terminal writes have a 64 KiB UTF-8 text limit and no acceptance
 acknowledgement. Native clipboard operations remain independent of these options.
-Programmatic OSC 52 reads are not implemented: the input backend cannot receive
-clipboard replies, so even read `on` never sends a query. Paste uses the native
-clipboard or terminal-native bracketed paste. Rich clipboard and program status
-backends remain follow-up work.
+Programmatic OSC 52 reads are not implemented, even with read `on`.
+On Unix, OSC 5522 read `on` routes explicit paste shortcuts to the terminal's rich
+clipboard. With `auto`, Hive negotiates mode 5522 for terminal-native paste offers
+without initiating arbitrary content reads; explicit paste uses the native clipboard.
+Read `off` disables rich offers and terminal reads. Successful negotiation also
+establishes automatic OSC 5522 image-write support; write `off` still disables it.
+Terminal permission denial does not silently fall back to a different clipboard.
+On non-Unix, OSC 5522 is unavailable even with `on`; native image clipboard support
+is independent. See [image paste](../guides/tui.md#paste-and-copy-images) for limits,
+agent requirements, and copy controls. Program status remains follow-up work.
 See [terminal capabilities](../guides/tui.md#terminal-capabilities) for detection
 limitations and the TUI diagnostic legend.
 

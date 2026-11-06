@@ -19,8 +19,8 @@ use crate::capabilities::TerminalCapabilities;
 
 // Bound both transfer cost and terminal-side allocations before accepting a source.
 const MAX_BYTES: usize = 16 * 1024 * 1024;
-const MAX_PIXELS: u64 = 40_000_000;
-const MAX_DIMENSION: u32 = 16_384;
+pub(crate) const MAX_PIXELS: u64 = 40_000_000;
+pub(crate) const MAX_DIMENSION: u32 = 16_384;
 const CHUNK_BYTES: usize = 4096;
 
 /// Encoded message data stays independent of terminal capabilities and survives reflow.
@@ -56,6 +56,14 @@ pub enum PrepareError {
 }
 
 impl EncodedImage {
+    pub(crate) fn attachment(
+        &self,
+    ) -> Result<Arc<crate::draft::Attachment>, crate::draft::DraftError> {
+        if self.data.len() > crate::draft::MAX_IMAGE_BYTES.div_ceil(3) * 4 {
+            return Err(crate::draft::DraftError::Limit);
+        }
+        crate::draft::Attachment::new(self.mime_type.clone(), self.bytes()?)
+    }
     pub fn new(data: String, mime_type: String, uri: Option<String>) -> Self {
         Self {
             data,

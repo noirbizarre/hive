@@ -114,6 +114,7 @@ async fn action(State(state): State<Arc<Fixture>>, Path(action): Path<String>) -
                 state.permissions.fetch_add(1, Ordering::SeqCst);
             });
         }
+        "image" => state.update(serde_json::from_value(json!({"sessionUpdate":"agent_message", "messageId":"clipboard-image", "content":[crate::images::fixture_block()]})).unwrap()),
         _ => panic!("unknown fixture action"),
     }
     Json(json!({"ok":true}))
@@ -186,15 +187,31 @@ async fn runtime_fixture() {
     eprintln!("HIVE_RUNTIME_READY http://{address}");
     let create = std::env::var_os("HIVE_RUNTIME_CREATE").is_some();
     let clipboard = clipboard::Clipboard::worker(|| {
-        |_: &clipboard::Operation| {
-            Err(clipboard::ClipboardError::Backend(
+        |operation: &clipboard::Operation| match operation {
+            clipboard::Operation::PrepareImage(mime, bytes) => Ok(Some(clipboard::Value::Image(
+                draft::Attachment::new(mime.clone(), bytes.clone())?,
+            ))),
+            clipboard::Operation::ExportImage(image) => {
+                Ok(Some(clipboard::Value::Image(image.attachment()?)))
+            }
+            _ => Err(clipboard::ClipboardError::Backend(
                 "fixture clipboard unavailable".into(),
-            ))
+            )),
         }
     });
     run_with_clipboard(
         Options {
             terminal: capabilities::TerminalOptions {
+                kitty_graphics: if std::env::var_os("HIVE_RUNTIME_RICH").is_some() {
+                    capabilities::CapabilityOverride::Off
+                } else {
+                    capabilities::CapabilityOverride::Auto
+                },
+                osc5522_read: if std::env::var_os("HIVE_RUNTIME_RICH").is_some() {
+                    capabilities::CapabilityOverride::On
+                } else {
+                    capabilities::CapabilityOverride::Auto
+                },
                 // Keep headless failure tests independent of the host's terminal and overrides.
                 osc52_write: if std::env::var_os("HIVE_RUNTIME_OSC52").is_some() {
                     capabilities::CapabilityOverride::On
@@ -225,7 +242,7 @@ async fn runtime_fixture() {
 
 #[test]
 fn the_real_event_loop_keeps_paste_and_external_edits_unsent_until_enter() {
-    for scenario in ["resume", "create", "osc52"] {
+    for scenario in ["resume", "create", "osc52", "rich"] {
         // Reuse this instrumented executable so child-process execution contributes to coverage too.
         let output = std::process::Command::new("python3")
             .arg("-B")

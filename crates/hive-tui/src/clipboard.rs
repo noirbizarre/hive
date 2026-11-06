@@ -10,6 +10,26 @@ pub enum Operation {
     Copy(String),
     Cut(String),
     Paste,
+    PasteText,
+    CopyImage(std::sync::Arc<crate::images::EncodedImage>),
+    ExportImage(std::sync::Arc<crate::images::EncodedImage>),
+    PrepareImage(String, Vec<u8>),
+}
+
+#[derive(Clone)]
+pub enum Value {
+    Text(String),
+    Image(std::sync::Arc<crate::draft::Attachment>),
+}
+impl From<&str> for Value {
+    fn from(text: &str) -> Self {
+        Self::Text(text.into())
+    }
+}
+impl From<String> for Value {
+    fn from(text: String) -> Self {
+        Self::Text(text)
+    }
 }
 
 pub struct Request {
@@ -18,6 +38,7 @@ pub struct Request {
     pub original: String,
     pub editor: crate::editor::PromptEditor,
     pub target: Target,
+    pub revision: u64,
 }
 
 pub enum Target {
@@ -28,11 +49,15 @@ pub enum Target {
 
 pub struct Completion {
     pub request: Request,
-    pub result: Result<Option<String>, ClipboardError>,
+    pub result: Result<Option<Value>, ClipboardError>,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClipboardError {
+    #[error(transparent)]
+    Protocol(#[from] crate::osc5522::ProtocolError),
+    #[error(transparent)]
+    Draft(#[from] crate::draft::DraftError),
     #[error(
         "Clipboard unavailable: {0}; check your desktop clipboard service or use terminal copy/paste"
     )]
@@ -41,7 +66,7 @@ pub enum ClipboardError {
         "Selection is {bytes} bytes; terminal clipboard copies are limited to {MAX_OSC52_BYTES} bytes; select less text or disable OSC 52 writes to use the native clipboard"
     )]
     TooLarge { bytes: usize },
-    #[error("Could not send text to the terminal clipboard: {0}; check terminal output and retry")]
+    #[error("Could not send data to the terminal clipboard: {0}; check terminal output and retry")]
     Terminal(#[source] std::io::Error),
     #[error("Clipboard worker stopped; restart Hive or use terminal copy/paste")]
     WorkerStopped,
@@ -50,8 +75,9 @@ pub enum ClipboardError {
 }
 
 pub struct Clipboard {
-    requests: std::sync::mpsc::Sender<Request>,
-    pub completions: mpsc::UnboundedReceiver<Completion>,
+    requests: std::sync::mpsc::SyncSender<Request>,
+    pub completions: mpsc::Receiver<Completion>,
+    pub protocol: std::cell::RefCell<crate::osc5522::Protocol>,
 }
 
 impl Clipboard {
@@ -61,6 +87,19 @@ impl Clipboard {
         capabilities: &crate::capabilities::TerminalCapabilities,
         output: &mut impl std::io::Write,
     ) -> Option<Completion> {
+        if cfg!(unix)
+            && capabilities.osc5522_read.is_usable()
+            && matches!(request.operation, Operation::Paste | Operation::PasteText)
+        {
+            return self.protocol.borrow_mut().read(request, output);
+        }
+        let mut request = request;
+        if cfg!(unix)
+            && capabilities.osc5522_write.is_usable()
+            && let Operation::CopyImage(image) = &request.operation
+        {
+            request.operation = Operation::ExportImage(image.clone());
+        }
         // Prefer the user's terminal over a remote desktop clipboard when running through SSH.
         if capabilities.osc52_write.is_usable()
             && let Operation::Copy(text) | Operation::Cut(text) = &request.operation
@@ -68,46 +107,84 @@ impl Clipboard {
             let result = write_osc52(output, text).map(|()| None);
             return Some(Completion { request, result });
         }
-        // Crossterm cannot expose OSC replies: even explicit read consent must not emit a query.
-        self.requests.send(request).err().map(|error| Completion {
-            request: error.0,
-            result: Err(ClipboardError::WorkerStopped),
-        })
+        self.enqueue(request)
     }
 
     pub fn new() -> Self {
         Self::worker(|| {
             let mut clipboard = None;
             move |operation: &Operation| {
-                (|| {
+                (|| -> Result<Option<Value>, ClipboardError> {
+                    match operation {
+                        Operation::PrepareImage(mime, bytes) => {
+                            return Ok(Some(Value::Image(crate::draft::Attachment::new(
+                                mime.clone(),
+                                bytes.clone(),
+                            )?)));
+                        }
+                        Operation::ExportImage(image) => {
+                            return Ok(Some(Value::Image(image.attachment()?)));
+                        }
+                        _ => {}
+                    }
                     if clipboard.is_none() {
-                        clipboard = Some(arboard::Clipboard::new()?);
+                        clipboard = Some(
+                            arboard::Clipboard::new()
+                                .map_err(|e| ClipboardError::Backend(e.to_string()))?,
+                        );
                     }
                     let clipboard = clipboard.as_mut().expect("clipboard initialized");
                     match operation {
-                        Operation::Copy(text) | Operation::Cut(text) => {
-                            clipboard.set_text(text.clone()).map(|()| None)
+                        Operation::Copy(text) | Operation::Cut(text) => clipboard
+                            .set_text(text.clone())
+                            .map(|()| None)
+                            .map_err(|e| ClipboardError::Backend(e.to_string())),
+                        Operation::Paste => match clipboard.get_image() {
+                            Ok(image) => Ok(Some(Value::Image(
+                                crate::draft::Attachment::from_native(image)?,
+                            ))),
+                            Err(
+                                arboard::Error::ContentNotAvailable
+                                | arboard::Error::ClipboardNotSupported,
+                            ) => clipboard
+                                .get_text()
+                                .map(|text| Some(text.into()))
+                                .map_err(|e| ClipboardError::Backend(e.to_string())),
+                            Err(error) => Err(ClipboardError::Backend(error.to_string())),
+                        },
+                        Operation::PasteText => clipboard
+                            .get_text()
+                            .map(|text| Some(text.into()))
+                            .map_err(|error| ClipboardError::Backend(error.to_string())),
+                        Operation::CopyImage(image) => clipboard
+                            .set_image(image.attachment()?.native()?)
+                            .map(|()| None)
+                            .map_err(|e| ClipboardError::Backend(e.to_string())),
+                        Operation::ExportImage(_) | Operation::PrepareImage(_, _) => {
+                            unreachable!("handled before native clipboard access")
                         }
-                        Operation::Paste => clipboard.get_text().map(Some),
                     }
                 })()
-                .map_err(|error: arboard::Error| ClipboardError::Backend(error.to_string()))
             }
         })
     }
 
     pub(crate) fn worker<F>(make: impl FnOnce() -> F + Send + 'static) -> Self
     where
-        F: FnMut(&Operation) -> Result<Option<String>, ClipboardError>,
+        F: FnMut(&Operation) -> Result<Option<Value>, ClipboardError>,
     {
-        let (requests, receiver) = std::sync::mpsc::channel::<Request>();
-        let (sender, completions) = mpsc::unbounded_channel();
+        // Bound queued image payloads and prepared completions while the UI is suspended.
+        let (requests, receiver) = std::sync::mpsc::sync_channel::<Request>(4);
+        let (sender, completions) = mpsc::channel(4);
         std::thread::spawn(move || {
             // Initialize inside the owner thread; native handles need not be transferable between threads.
             let mut apply = make();
             while let Ok(request) = receiver.recv() {
                 let result = apply(&request.operation);
-                if sender.send(Completion { request, result }).is_err() {
+                if sender
+                    .blocking_send(Completion { request, result })
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -115,6 +192,56 @@ impl Clipboard {
         Self {
             requests,
             completions,
+            protocol: Default::default(),
+        }
+    }
+
+    pub fn prepare_image(
+        &self,
+        mut request: Request,
+        mime: String,
+        bytes: Vec<u8>,
+    ) -> Option<Completion> {
+        request.operation = Operation::PrepareImage(mime, bytes);
+        self.enqueue(request)
+    }
+
+    fn enqueue(&self, request: Request) -> Option<Completion> {
+        use std::sync::mpsc::TrySendError;
+        self.requests
+            .try_send(request)
+            .err()
+            .map(|error| match error {
+                TrySendError::Full(request) => Completion {
+                    request,
+                    result: Err(crate::osc5522::ProtocolError("worker is busy".into()).into()),
+                },
+                TrySendError::Disconnected(request) => Completion {
+                    request,
+                    result: Err(ClipboardError::WorkerStopped),
+                },
+            })
+    }
+
+    pub fn finish(
+        &self,
+        completion: Completion,
+        output: &mut impl std::io::Write,
+    ) -> Option<Completion> {
+        if matches!(completion.request.operation, Operation::ExportImage(_)) {
+            match completion.result {
+                Ok(Some(Value::Image(image))) => {
+                    self.protocol
+                        .borrow_mut()
+                        .write(completion.request, image, output)
+                }
+                result => Some(Completion {
+                    request: completion.request,
+                    result,
+                }),
+            }
+        } else {
+            Some(completion)
         }
     }
 }
@@ -144,27 +271,49 @@ pub fn command(key: crossterm::event::KeyEvent) -> Option<char> {
 }
 
 pub fn complete(app: &mut crate::ui::App, completion: Completion) {
-    let result = completion.result.and_then(|value| {
-        value
-            .map(|text| crate::editor::import(&text))
-            .transpose()
-            .map_err(ClipboardError::Import)
+    let mut image = None;
+    let result = completion.result.and_then(|value| match value {
+        Some(Value::Text(text)) => crate::editor::import(&text)
+            .map(Some)
+            .map_err(ClipboardError::Import),
+        Some(Value::Image(value)) => {
+            image = Some(value);
+            Ok(None)
+        }
+        None => Ok(None),
     });
     match result {
         Err(error) => {
             app.status = error.to_string();
-            if matches!(completion.request.operation, Operation::Paste)
+            if matches!(error, ClipboardError::Backend(_))
+                && matches!(
+                    completion.request.operation,
+                    Operation::Paste | Operation::PasteText
+                )
                 && app.terminal_capabilities.osc52_read.is_usable()
             {
                 app.status.push_str(
-                    "; terminal clipboard reads are not implemented; use terminal-native paste",
+                    "; OSC 52 reads are not implemented; enable OSC 5522 reads or use terminal-native paste",
                 );
             }
         }
         Ok(value) => {
             let request = completion.request;
-            if matches!(request.operation, Operation::Copy(_)) {
+            if matches!(
+                request.operation,
+                Operation::Copy(_) | Operation::CopyImage(_) | Operation::ExportImage(_)
+            ) {
                 app.status = "Selection copied".into();
+                return;
+            }
+            if app.draft_revision != request.revision {
+                app.status =
+                    "Clipboard destination changed; retry paste in the intended field".into();
+                return;
+            }
+            if image.is_some() && !matches!(request.target, Target::Chat) {
+                app.status =
+                    "Images belong in a chat draft; paste plain text into this field".into();
                 return;
             }
             match request.target {
@@ -176,6 +325,7 @@ pub fn complete(app: &mut crate::ui::App, completion: Completion) {
                     if let Some(value) = value {
                         app.input
                             .push_str(&crate::editor::normalize(&value).replace('\n', " "));
+                        app.draft_revision = app.draft_revision.wrapping_add(1);
                     }
                     return;
                 }
@@ -197,6 +347,7 @@ pub fn complete(app: &mut crate::ui::App, completion: Completion) {
                     if let Some(picker) = app.picker.as_mut() {
                         picker.refresh(choices);
                     }
+                    app.draft_revision = app.draft_revision.wrapping_add(1);
                     return;
                 }
                 Target::Chat => {}
@@ -208,6 +359,7 @@ pub fn complete(app: &mut crate::ui::App, completion: Completion) {
             }
             // A late desktop response must not overwrite a new session, modal, caret, or draft.
             if app.active != request.session
+                || app.draft_revision != request.revision
                 || app.input != request.original
                 || app.dialog.is_some()
                 || app.picker.is_some()
@@ -218,11 +370,28 @@ pub fn complete(app: &mut crate::ui::App, completion: Completion) {
                     "Draft changed while clipboard was busy; retry the clipboard action".into();
                 return;
             }
-            if let Some(value) = value {
+            if let Some(image) = image {
+                let bytes = app
+                    .attachments
+                    .iter()
+                    .map(|image| image.bytes.len())
+                    .sum::<usize>();
+                if app.attachments.len() >= crate::draft::MAX_IMAGES
+                    || image.bytes.len() > crate::draft::MAX_IMAGE_BYTES.saturating_sub(bytes)
+                {
+                    app.status = crate::draft::DraftError::Limit.to_string();
+                    return;
+                }
+                app.attachments.push(image);
+                app.status = "Image attached · Alt-Backspace removes the last image".into();
+                app.draft_revision = app.draft_revision.wrapping_add(1);
+            } else if let Some(value) = value {
                 app.editor
                     .insert(&mut app.input, &crate::editor::normalize(&value));
+                app.draft_revision = app.draft_revision.wrapping_add(1);
             } else if matches!(request.operation, Operation::Cut(_)) {
                 app.editor.insert(&mut app.input, "");
+                app.draft_revision = app.draft_revision.wrapping_add(1);
             }
         }
     }
@@ -240,6 +409,7 @@ mod tests {
             original: app.input.clone(),
             editor: app.editor.clone(),
             target: Target::Chat,
+            revision: app.draft_revision,
         }
     }
 
@@ -262,6 +432,75 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn image_completions_attach_only_to_the_unchanged_chat_destination() {
+        let image = crate::draft::Attachment::from_native(arboard::ImageData {
+            width: 1,
+            height: 1,
+            bytes: vec![0; 4].into(),
+        })
+        .unwrap();
+        let mut app = crate::ui::App {
+            active: Some("one".into()),
+            ..Default::default()
+        };
+        let original = request(&app, Operation::Paste);
+        app.draft_revision += 1;
+        complete(
+            &mut app,
+            Completion {
+                request: original,
+                result: Ok(Some(Value::Image(image.clone()))),
+            },
+        );
+        assert!(app.attachments.is_empty());
+        let mut modal = request(&app, Operation::Paste);
+        modal.target = Target::Picker(String::new());
+        complete(
+            &mut app,
+            Completion {
+                request: modal,
+                result: Ok(Some(Value::Image(image.clone()))),
+            },
+        );
+        assert!(app.attachments.is_empty());
+        let original = request(&app, Operation::Paste);
+        complete(
+            &mut app,
+            Completion {
+                request: original,
+                result: Ok(Some(Value::Image(image))),
+            },
+        );
+        assert_eq!(app.attachments.len(), 1);
+        assert!(app.input.is_empty());
+        assert!(app.pending.is_empty());
+    }
+
+    #[test]
+    fn a_fifth_image_is_rejected_without_losing_existing_attachments() {
+        let image = crate::draft::Attachment::from_native(arboard::ImageData {
+            width: 1,
+            height: 1,
+            bytes: vec![0; 4].into(),
+        })
+        .unwrap();
+        let mut app = crate::ui::App::default();
+        for _ in 0..5 {
+            let request = request(&app, Operation::Paste);
+            complete(
+                &mut app,
+                Completion {
+                    request,
+                    result: Ok(Some(Value::Image(image.clone()))),
+                },
+            );
+        }
+        assert_eq!(app.attachments.len(), 4);
+        assert!(app.status.contains("four images"));
+        assert!(app.pending.is_empty());
     }
 
     #[test]
@@ -359,7 +598,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_opt_in_never_emits_queries_and_native_paste_failures_explain_the_limitation() {
+    async fn osc52_read_opt_in_never_emits_queries_and_native_paste_failures_explain_the_limitation()
+     {
         let mut clipboard = Clipboard::worker(|| {
             let mut first = true;
             move |operation: &Operation| {
@@ -389,10 +629,7 @@ mod tests {
             complete(&mut app, clipboard.completions.recv().await.unwrap());
         }
         assert_eq!(app.input, "native paste");
-        assert!(
-            app.status
-                .contains("terminal clipboard reads are not implemented")
-        );
+        assert!(app.status.contains("OSC 52 reads are not implemented"));
         assert!(output.is_empty());
     }
 
@@ -445,12 +682,13 @@ mod tests {
 
     #[test]
     fn a_stopped_worker_reports_the_lost_clipboard_request() {
-        let (requests, receiver) = std::sync::mpsc::channel();
+        let (requests, receiver) = std::sync::mpsc::sync_channel(4);
         drop(receiver);
-        let (_sender, completions) = mpsc::unbounded_channel();
+        let (_sender, completions) = mpsc::channel(4);
         let clipboard = Clipboard {
             requests,
             completions,
+            protocol: Default::default(),
         };
         let mut output = Vec::new();
         let completion = clipboard
@@ -496,7 +734,7 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        assert_eq!(pasted.result.unwrap().as_deref(), Some(text));
+        assert!(matches!(pasted.result.unwrap(), Some(Value::Text(value)) if value == text));
     }
 
     #[test]
@@ -527,7 +765,8 @@ mod tests {
                     stored = Some(text.clone());
                     Ok(None)
                 }
-                Operation::Paste => Ok(stored.clone()),
+                Operation::Paste | Operation::PasteText => Ok(stored.clone().map(Value::Text)),
+                _ => panic!("text clipboard test received an image operation"),
             }
         });
         let mut app = crate::ui::App {

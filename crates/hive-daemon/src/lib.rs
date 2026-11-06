@@ -187,6 +187,8 @@ struct Entry {
 type NativeInterruption = watch::Sender<Option<tokio::time::Instant>>;
 
 struct Control {
+    // Capability belongs to this live adapter, not the heterogeneous gateway as a whole.
+    prompt_images: bool,
     // Cleanup protection is not proof of dispatch; classify startup from worker publication evidence.
     startup: Arc<Mutex<remote::Startup>>,
     worktrunk_terminal: Option<(u64, worktrunk::Status)>,
@@ -349,6 +351,7 @@ impl Control {
         }
         Self {
             generation: record.generation,
+            prompt_images: false,
             worktrunk_terminal: None,
             worktrunk_restore: true,
             worktrunk_local: false,
@@ -419,6 +422,7 @@ impl Control {
         }
         Self {
             generation: 1,
+            prompt_images: false,
             worktrunk_terminal: None,
             worktrunk_restore: false,
             worktrunk_local: false,
@@ -484,6 +488,7 @@ impl Control {
         activity["seq"] = self.next_seq.saturating_sub(1).into();
         let mut hive = serde_json::json!({
             "workspace": self.workspace_context,
+            "promptImages": self.prompt_images,
             "generation": self.generation, "nextSeq": self.next_seq,
             "running": self.busy(), "pilot": self.pilot.is_some(),
             "activitySnapshot": activity,
@@ -1532,6 +1537,20 @@ impl Broker {
         }
         if state.recovery_required {
             return Err(hive_protocol::recovery::RecoveryError::Required.wire(true));
+        }
+        // Receipt lookup above remains valid even if a replacement agent has different capabilities.
+        if !state.prompt_images
+            && request
+                .prompt
+                .iter()
+                .any(|block| matches!(block, v2::ContentBlock::Image(_)))
+        {
+            return Err(Error::invalid_params().data(serde_json::json!({"hive": {
+                "code": "hive::prompt::not_dispatched",
+                "message": "This session's agent adapter does not support image prompts",
+                "help": "Use an ACPv2 agent advertising image input, or remove the image attachments",
+                "recoveryRequired": false
+            }})));
         }
         if state.external_activity {
             // Say *why* it is busy: the generic message would send users hunting for a Hive prompt.
@@ -3103,7 +3122,10 @@ async fn run_agent(
             match initialized {
                 Ok(agent_client_protocol::InitializeOutcome::Initialized(response)) if response.protocol_version == ProtocolVersion::V2 && response.capabilities.session.is_some() => {
                     tracing::info!(protocol = "v2", session = true, "agent capabilities negotiated");
-                    if let Ok(mut state) = control.lock() { state.history_status.restoration = Restoration::Supported; }
+                    if let Ok(mut state) = control.lock() {
+                        state.history_status.restoration = Restoration::Supported;
+                        state.prompt_images = response.capabilities.session.as_ref().and_then(|session| session.prompt.as_ref()).is_some_and(|prompt| prompt.image.is_some());
+                    }
                 }
                 Ok(agent_client_protocol::InitializeOutcome::LowerVersion(_)) => {
                     // The configured adapter stays authoritative even when the peer offers v1.
@@ -4732,6 +4754,7 @@ mod control_tests {
             urls: HashMap::new(),
             early_completions: HashMap::new(),
             token: "first".into(),
+            prompt_images: false,
             pilot: Some("test".into()),
             subscribers: HashMap::new(),
             changed,

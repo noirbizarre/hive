@@ -17,12 +17,12 @@ class Screen:
         self.pending += self.decoder.decode(chunk)
         while self.pending:
             if self.pending.startswith("\x1b["):
-                match = re.match(r"\x1b\[([0-9;?]*)([@-~])", self.pending)
+                match = re.match(r"\x1b\[([0-9;?]*)([ -/]*)([@-~])", self.pending)
                 if match is None:
                     return
-                parameters, command = match.groups()
+                parameters, intermediates, command = match.groups()
                 self.pending = self.pending[match.end():]
-                if parameters.startswith("?"):
+                if parameters.startswith("?") or intermediates:
                     if parameters == "?1049" and command == "h":
                         self.cells.clear()
                     continue
@@ -41,6 +41,13 @@ class Screen:
                 elif command == "K":
                     self.cells = {position: text for position, text in self.cells.items()
                                   if position[0] != self.row or position[1] < self.column}
+                continue
+            if self.pending.startswith("\x1b]"):
+                # Clipboard packets are terminal commands, not visible screen characters.
+                match = re.search(r"\x07|\x1b\\", self.pending)
+                if match is None:
+                    return
+                self.pending = self.pending[match.end():]
                 continue
             if self.pending == "\x1b":
                 return

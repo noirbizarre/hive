@@ -218,6 +218,7 @@ async fn runtime_fixture() {
     });
     run_with_clipboard(
         Options {
+            profile: None,
             terminal: capabilities::TerminalOptions {
                 kitty_graphics: if std::env::var_os("HIVE_RUNTIME_RICH").is_some() {
                     capabilities::CapabilityOverride::Off

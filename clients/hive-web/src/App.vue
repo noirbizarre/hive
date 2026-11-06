@@ -15,6 +15,10 @@ import ActivityIndicator from './ActivityIndicator.vue';
 const props = defineProps({ client: { type: Object, required: true }, state: { type: Object, required: true } });
 const state = computed(() => unref(props.state));
 const sessions = ref([]), recent = ref([]), agents = ref([]);
+const executionProfiles = ref([]), executionProfile = ref(''), defaultExecutionProfile = ref('');
+const selectedProfile = computed(() => executionProfiles.value.find(profile => profile.id === (executionProfile.value || defaultExecutionProfile.value)));
+const availableAgents = computed(() => selectedProfile.value
+  ? agents.value.filter(agent => selectedProfile.value.agents.includes(agent.id)) : agents.value);
 const loading = ref(true), listError = ref(''), providerError = ref(''), error = ref('');
 const drawer = ref(false), navigation = ref(true), text = ref(''), backend = ref(''), sending = ref(false);
 const mobileMenu = ref();
@@ -59,12 +63,17 @@ async function configure(option, value) {
   });
 }
 async function open(session) { drawer.value = false; await action(() => props.client.open(session)); }
-function providers({ agents: inventory, defaultAgent }) {
+function providers({ agents: inventory, defaultAgent, profiles = [], defaultProfile }) {
   providerError.value = '';
   agents.value = inventory;
+  executionProfiles.value = profiles;
+  defaultExecutionProfile.value = defaultProfile || '';
+  // Empty means follow the daemon, not pin today's default profile across reloads.
+  if (executionProfile.value && !profiles.some(profile => profile.id === executionProfile.value)) executionProfile.value = '';
   // A configuration reload updates choices without changing the attached session or draft.
-  if (!inventory.some(agent => agent.id === backend.value)) backend.value = defaultAgent || inventory[0]?.id || '';
+  if (!availableAgents.value.some(agent => agent.id === backend.value)) backend.value = selectedProfile.value ? '' : defaultAgent || inventory[0]?.id || '';
 }
+watch(executionProfile, () => { backend.value = ''; });
 function typing() { if (text.value && state.value.session && !pilot.value && !state.value.recoveryRequired && !busy.value) action(() => props.client.takeControl()); }
 async function send(retry = false) {
   if (sending.value || (!retry && (blocked.value || !text.value.trim()))) return;
@@ -72,7 +81,7 @@ async function send(retry = false) {
   const target = state.value.session?.sessionId;
   const draft = text.value;
   await action(async () => {
-    await props.client.prompt(retry ? state.value.uncertain.text : draft, backend.value);
+    await props.client.prompt(retry ? state.value.uncertain.text : draft, backend.value, executionProfile.value);
     // A delayed acknowledgement must not erase a newer draft or another session's input.
     if (!retry && state.value.session?.sessionId === target && text.value === draft) text.value = '';
   });
@@ -122,8 +131,9 @@ onBeforeUnmount(() => { feed?.close(); props.client.close(); });
         <Button v-if="state.session" as="a" href="/ui" label="New session" size="small" severity="secondary" outlined />
       </header>
       <section class="configuration-bar" aria-label="Session configuration">
-        <label class="config-field" for="agent">Hive backend<Select :model-value="state.session ? selected?.agent || state.session.agent || backend : backend" input-id="agent" placeholder="Default backend" :options="[{ id: '', name: 'Default backend' }, ...agents]" option-label="name" option-value="id" :disabled="Boolean(state.session) || busy" @update:model-value="value => backend = value" /></label>
-        <Button v-if="!state.session" id="create" label="Create session" :loading="state.connected && state.creating && !state.interaction" :disabled="!state.connected || busy || Boolean(providerError)" @click="action(() => client.create(backend))" />
+        <label v-if="executionProfiles.length && !state.session" class="config-field" for="profile">Execution profile<Select v-model="executionProfile" input-id="profile" :options="[{ id: '', name: 'Daemon default' }, ...executionProfiles]" option-label="name" option-value="id" :disabled="busy" /></label>
+        <label class="config-field" for="agent">Hive backend<Select :model-value="state.session ? selected?.agent || state.session.agent || backend : backend" input-id="agent" placeholder="Default backend" :options="[{ id: '', name: 'Default backend' }, ...(state.session ? agents : availableAgents)]" option-label="name" option-value="id" :disabled="Boolean(state.session) || busy" @update:model-value="value => backend = value" /></label>
+        <Button v-if="!state.session" id="create" label="Create session" :loading="state.connected && state.creating && !state.interaction" :disabled="!state.connected || busy || Boolean(providerError)" @click="action(() => client.create(backend, executionProfile))" />
         <label v-for="option in configOptions" :key="option.configId" class="config-field" :for="`config-${option.configId}`">{{ option.category === 'model' ? 'Provider / Model' : option.name }}
           <Select :key="configFailures[option.configId] || 0" :input-id="`config-${option.configId}`" :model-value="option.currentValue" :aria-label="currentLabel(option)" :placeholder="String(option.currentValue ?? 'Unavailable')" :title="option.description" :options="groups(option)" option-group-label="name" option-group-children="items" option-label="name" option-value="value" :disabled="configDisabled || !hasChoices(option)" @update:model-value="value => configure(option, value)">
             <template #value><ActivityIndicator v-if="state.connected && state.configuring && !state.interaction" />{{ currentLabel(option) }}</template>

@@ -716,6 +716,136 @@ async fn profile_policy_provisions_at_admission_and_explicit_existing_launch_byp
 }
 
 #[tokio::test]
+async fn named_workspace_defaults_override_agents_but_requests_and_membership_remain_authoritative()
+{
+    use hive_protocol::{v2::NewSessionRequest, workspace::Launch};
+    let fixture = Fixture::new();
+    let config: crate::config::Config = serde_json::from_value(serde_json::json!({
+        "projects":{"project":fixture.definition},
+        "workspaces":{"task":{"policy":"worktree"}}, "worktrunk":{"enabled":false},
+        "agents":{"coder":{"command":"unstarted-agent", "project":"project", "workspace":"task"}},
+        "profiles":{
+            "personal":{"agents":["coder"],"projects":["project"],"workspaces":{"project":{"policy":"clone"}}},
+            "restricted":{"agents":["coder"]}
+        }
+    })).unwrap();
+    config.validate().unwrap();
+    let broker = crate::Broker::persistent(
+        config.clone(),
+        fixture
+            .service
+            .store
+            .state_directory()
+            .join("catalog.sqlite3"),
+    )
+    .unwrap();
+    let provider = &config.agents["coder"];
+    let personal = Some(&config.profiles["personal"]);
+    let mut automatic = NewSessionRequest::new(fixture.seed.clone());
+    let created = broker
+        .launch_execution_workspace(
+            &mut automatic,
+            None,
+            provider,
+            personal,
+            Arc::new(config.clone()),
+            BTreeMap::new(),
+            "automatic".into(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        automatic.cwd.0.join(".git").is_dir(),
+        "profile clone must override agent worktree"
+    );
+    let mut explicit = NewSessionRequest::new(fixture.seed.clone());
+    broker
+        .launch_execution_workspace(
+            &mut explicit,
+            Some(Launch::New {
+                project: None,
+                definition: None,
+                policy: Some("task".into()),
+                base_ref: None,
+                revision: None,
+                branch: None,
+            }),
+            provider,
+            personal,
+            Arc::new(config.clone()),
+            BTreeMap::new(),
+            "explicit".into(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        explicit.cwd.0.join(".git").is_file(),
+        "request worktree must override profile clone"
+    );
+    let mut existing = NewSessionRequest::new(fixture.seed.clone());
+    broker
+        .launch_execution_workspace(
+            &mut existing,
+            Some(Launch::Existing {
+                directory: fixture.seed.display().to_string(),
+            }),
+            provider,
+            personal,
+            Arc::new(config.clone()),
+            BTreeMap::new(),
+            "existing".into(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(existing.cwd.0, fixture.seed);
+    let mut blocked = NewSessionRequest::new(fixture.seed.clone());
+    let error = broker
+        .launch_execution_workspace(
+            &mut blocked,
+            Some(Launch::Attach {
+                id: created.workspace.clone(),
+                owner: None,
+            }),
+            provider,
+            Some(&config.profiles["restricted"]),
+            Arc::new(config.clone()),
+            BTreeMap::new(),
+            "blocked".into(),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Profile(_)));
+    assert!(
+        broker
+            .workspace_service()
+            .unwrap()
+            .attached("blocked".into())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let attached = broker
+        .launch_execution_workspace(
+            &mut blocked,
+            Some(Launch::Attach {
+                id: created.workspace,
+                owner: None,
+            }),
+            provider,
+            personal,
+            Arc::new(config.clone()),
+            BTreeMap::new(),
+            "allowed".into(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(attached.effective_cwd, created.effective_cwd);
+    assert_eq!(fixture.service.list().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
 async fn the_core_backend_boundary_replays_durable_intent_and_preserves_cleanup_request_identity() {
     use hive_core::workspace::backend::{
         CleanupOutcome, ProvisionOutcome, ProvisionRequest, WorkspaceBackend,

@@ -12,7 +12,8 @@ this contract. Location requirements remain future work as qualified below.
 
 ## Current implementation
 
-Persistent brokers advertise `agents`, `selection` and `control` after a compatible
+Persistent brokers advertise `agents`, `selection`, `control`, `workspaces` and
+`profiles` after a compatible
 offer. They reuse their stored execution-node ID across restart. In-memory embedded
 brokers omit the Hive advertisement. A missing/null offer retains legacy metadata
 behavior; an incompatible offer disables extension operations/selectors while
@@ -24,7 +25,7 @@ transport share one administrative principal and the same inventory/launch acces
 there is no per-user resource policy. Explicit private-network trust or shared-token
 authentication is the deployment's access boundary.
 
-Pagination retains one immutable configuration snapshot per connection for five
+Pagination retains one immutable configuration snapshot per inventory kind and connection for five
 minutes. A new listing replaces it; each continuation rotates its opaque token.
 Completed, expired, superseded and foreign cursors fail rather than restart.
 Configuration reload does not mix pages, but discovery never reserves an agent.
@@ -102,6 +103,7 @@ unsuccessful. An unknown offered version is not malformed.
 | `agents` | `_hive/agents/list` is implemented |
 | `selection` | `_meta.hive.agent` is consumed by `session/new`; requires `agents` and `control` |
 | `workspaces` | Workspace intent and portable project transfer are consumed by `session/new`; requires `selection` |
+| `profiles` | `_hive/profiles/list` and `_meta.hive.profile` selection are implemented; requires `selection` |
 | `location` | Qualified session metadata and `_hive/sessions/resolve` are implemented; requires `control` |
 | `control` | Existing Hive controller, prompt-key and replay contracts linked below are implemented |
 
@@ -149,6 +151,28 @@ In that case Hive discovery/selection/location are disabled: the client can
 offer standard ACP behavior, but MUST NOT strip a requested selector and launch
 the peer's default agent instead. Existing local clients using legacy Hive
 metadata are outside this new negotiation guarantee.
+
+## Named execution profiles: `_hive/profiles/list`
+
+With the `profiles` feature, list named execution setups using the same `cursor`
+and `limit` contract as agent discovery. Results contain `profiles`, nullable
+`defaultProfile`, and optional `nextCursor`. Each profile has `id`, `name`, member
+ID arrays `agents` and `projects`, nullable `defaultAgent` and `defaultProject`,
+`isDefault`, and a `workspaces` map keyed by project ID. Workspace summaries expose
+only `{ "template": "name" }` or `{ "policy": "kind" }`, never private directories
+or policy settings. Profile and agent cursors are independent and not interchangeable.
+
+Send `_meta.hive.profile` as a nonempty string in `session/new`, optionally with
+`agent` and `workspace`. Profile-only requests resolve owner-side defaults against
+one admission snapshot. Unknown profiles, nonmember selections and ambiguous
+defaults return `hive::remote::invalid_profile`. The [configuration rules](configuration.md#selection-and-overrides)
+define precedence and workspace behavior. Selectors are consumed by Hive.
+
+The Rust `Peer` offers `list_profiles(ListParams)` and
+`start_profile(profile_id, optional_agent_id, request)`. Both require the advertised
+feature; unsupported owners never receive a silently downgraded launch. Existing
+`list` and `start` continue to operate on concrete agent IDs. A configured
+`default_profile` also applies when no profile selector is supplied.
 
 ## Agent discovery: `_hive/agents/list`
 

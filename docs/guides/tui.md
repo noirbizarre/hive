@@ -1,13 +1,21 @@
 # Terminal client
 
 Run `hive` or `hive tui` after starting the daemon. Start it in your project
-directory: new sessions use the terminal's current working directory.
+directory: cwd-only sessions use the terminal's current working directory.
+An applicable profile workspace policy instead provisions a checkout and uses
+its effective directory.
 
 ```sh
 hive tui --agent opencode
 ```
 
-`--agent` preselects a profile in the new-session picker. To attach to a known
+`--agent` preselects an agent in the new-session picker. Use
+`hive tui --profile personal` to choose a named execution setup. In the picker,
+press `p` to cycle execution profiles and implicit daemon selection; agent choices
+follow their membership. Implicit selection follows the daemon's current default.
+The **Profile default** entry lets the daemon resolve configured defaults and
+reports ambiguous selection rather than choosing the first member.
+To attach to a known
 session, use `hive tui --session hive-…`.
 
 ## Session navigation
@@ -18,8 +26,9 @@ so the same sessions are available in the Web UI and other ACP clients.
 
 | Key | Action |
 | --- | --- |
-| `Ctrl-N` | Open the profile picker to create a session |
-| Arrows, Enter | Select a profile or session |
+| `Ctrl-N` | Open the agent picker to create a session |
+| `p` in creation picker | Cycle named execution profiles |
+| Arrows, Enter | Select an agent or session |
 | `Tab` | Show/hide the session overview while chatting |
 | `a` in overview | Toggle all directories / current directory |
 | Enter in overview | Attach as pilot |

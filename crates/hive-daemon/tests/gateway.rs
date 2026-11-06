@@ -668,7 +668,7 @@ async fn reload_changes_new_sessions_without_interrupting_an_existing_worker() {
     let command = env!("CARGO_BIN_EXE_hive-test-agent");
     std::fs::write(
         &path,
-        format!("default_agent = 'old'\n[agents.old]\ncommand = {command:?}\n"),
+        format!("default_profile = 'personal'\n[profiles.personal]\nagents = ['old']\n[agents.old]\ncommand = {command:?}\n"),
     )
     .unwrap();
     let source = hive_daemon::config::ConfigSource::new(Some(path.clone())).unwrap();
@@ -749,6 +749,14 @@ async fn reload_changes_new_sessions_without_interrupting_an_existing_worker() {
                     .iter()
                     .any(|s| s["agent"] == "new")
             );
+            // Removing the execution profile and its agent cannot retarget the retained subprocess.
+            let resumed = cx
+                .send_request(v2::ResumeSessionRequest::new(
+                    original.session_id.clone(),
+                    cwd.clone(),
+                ))
+                .block_task()
+                .await?;
             // Both model setting and prompting exercise the retained original subprocess after removal.
             cx.send_request(
                 v2::SetSessionConfigOptionRequest::new(
@@ -758,13 +766,13 @@ async fn reload_changes_new_sessions_without_interrupting_an_existing_worker() {
                         value: v2::SessionConfigValueId::new("careful"),
                     },
                 )
-                .meta(original.meta.clone()),
+                .meta(resumed.meta.clone()),
             )
             .block_task()
             .await?;
             cx.send_request(
                 v2::PromptRequest::new(original.session_id.clone(), vec!["still alive".into()])
-                    .meta(controlled(&original.meta, "after-reload")),
+                    .meta(controlled(&resumed.meta, "after-reload")),
             )
             .block_task()
             .await?;
@@ -2342,6 +2350,8 @@ fn config_with_agent(id: &str, command: &str, version: AgentVersion) -> Config {
     Config {
         mcp_servers: Default::default(),
         projects: Default::default(),
+        default_profile: None,
+        profiles: Default::default(),
         workspaces: Default::default(),
         worktrunk: None,
         default_agent: Some(id.to_string()),
@@ -3995,6 +4005,49 @@ async fn restore_plans(forget: bool) {
         // The runner removes this unique directory after those handles have been released.
         let _ = std::fs::remove_dir_all(base);
     }
+}
+
+#[tokio::test]
+async fn default_named_profiles_select_concrete_agents_without_changing_legacy_agent_identity() {
+    let mut config =
+        config_with_agent("a", env!("CARGO_BIN_EXE_hive-test-agent"), AgentVersion::V2);
+    config.agents.insert("b".into(), config.agents["a"].clone());
+    config.profiles =
+        toml::from_str::<Config>("[profiles.personal]\nagents = ['a','b']\ndefault_agent = 'b'")
+            .unwrap()
+            .profiles;
+    config.default_profile = Some("personal".into());
+    let (address, server) = start_gateway(config).await;
+    for transport in ["ws", "http"] {
+        create_and_prompt(
+            &format!("{transport}://{address}"),
+            None,
+            "named",
+            "Echo: named",
+        )
+        .await;
+    }
+    let status: serde_json::Value = reqwest::get(format!("http://{address}/v1/status"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status["activeByAgent"]["b"], 2);
+    assert!(status["activeByAgent"].get("personal").is_none());
+    let providers: serde_json::Value = reqwest::get(format!("http://{address}/v1/providers"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(providers["defaultProfile"], "personal");
+    assert_eq!(providers["agents"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        providers["profiles"][0]["agents"],
+        serde_json::json!(["a", "b"])
+    );
+    server.abort();
 }
 
 #[tokio::test]

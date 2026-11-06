@@ -40,12 +40,15 @@ credentials and the browser cookie are separate from session controller tokens.
 
 ## Open a project session
 
-Create the session in the [TUI](tui.md) from your intended project directory,
-then select it in the browser's session rail. The existing session retains its
-original directory and downstream identity.
+Choose an execution profile with an applicable workspace policy to create a
+managed project checkout directly from the browser. For cwd-only work, create
+the session in the [TUI](tui.md) from your intended project directory, then select
+it in the browser's session rail. An existing session retains its original
+directory and downstream identity.
 
-> **New-session working directory:** the browser currently uses `/` and has no
-> project-directory picker. Use a TUI-created session for project work.
+> **Cwd-only launches:** without an applicable provisioning policy, the browser
+> uses `/` and has no project-directory picker. Use a TUI-created session when
+> you need a particular existing project directory.
 
 The desktop rail is visible by default. “Hide sessions” and “Show sessions” change its
 presentation without closing the conversation. Catalog refreshes preserve focus
@@ -67,6 +70,13 @@ discovers the agent's configuration without sending a prompt. Choose its
 **Provider / Model** before sending the first message or between later turns. Provider names and model
 choices come from the agent; the Hive backend selects the agent process or
 server, not its model provider.
+
+When named profiles are configured, first choose an **Execution profile**. It
+filters backend choices and applies that setup's projects and workspace defaults.
+**Default backend** leaves agent resolution to the daemon, including ambiguity
+diagnostics. **Daemon default** uses the configured default execution profile.
+Inventory refresh preserves selection by ID; opening an existing session does
+not reinterpret its agent ID as an execution profile.
 
 Existing sessions show the current configuration. Use **Take control**
 before editing a read-only session. Controls are unavailable during an

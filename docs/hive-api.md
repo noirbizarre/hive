@@ -184,9 +184,15 @@ startup. `project` alone leaves ordinary ACP cwd behavior intact. Optional
 ```
 
 `new` may also supply `branch`; omitted project/policy use profile defaults.
+An optional portable `definition` requires an explicit `project` ID. The execution
+node registers an absent definition, reuses an identical definition, or rejects a
+conflict without replacing it. Registration persists even if provisioning fails.
+For negotiated peer launches this requires the `workspaces` feature; see
+[owner-side provisioning](acp-extensions.md#provisioning-on-the-selected-owner).
 For JJ, use `revision` instead of Git's `baseRef`/`branch`. The returned stable
 workspace context has the same shape for either SCM.
 `{"kind":"attach","id":"workspace-…"}` attaches a ready resource.
+Attach may also include `owner`; a foreign node identity is rejected locally.
 `{"kind":"existing","directory":"/absolute/path"}` bypasses managed creation.
 A selector can omit `agent` when a default profile exists. Hive consumes selectors
 instead of forwarding them downstream. Native adoption cannot use them; resume
@@ -205,11 +211,14 @@ return invalid params with code `hive::workspace::selector`; resolution and
 provisioning failures use stable `hive::workspace::*` / `hive::repository::*` codes.
 Diagnostics do not echo rejected selector values or Git subprocess output.
 
-Creation/resume metadata includes `_meta.hive.workspace` with `project`, `workspace`
+Creation/resume metadata includes `_meta.hive.workspace` with `owner`, `project`, `workspace`
 and `effectiveCwd`, or null for an unmanaged cwd. Session summaries expose the same
 context. Clients must retain the returned/listed cwd for resume and relinquish,
 rather than reusing their launch placeholder. Confirmed close releases use while
 retaining the workspace.
+`owner` is the persistent execution node identity; `effectiveCwd` belongs to that
+node and must not be inspected as an initiating-Hub path. Legacy stored contexts
+may omit `owner`.
 
 ## Project registry
 

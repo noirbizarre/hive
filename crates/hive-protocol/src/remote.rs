@@ -20,6 +20,12 @@ pub enum RemoteError {
     Forbidden,
     #[error("The owner rejected the requested workspace")]
     InvalidWorkspace,
+    #[error("The project definition conflicts with the execution node")]
+    ProjectConflict,
+    #[error("The execution node could not provision the workspace")]
+    ProvisioningFailed,
+    #[error("The execution node's workspace provisioning outcome is uncertain")]
+    ProvisioningUncertain,
     #[error("The agent failed before session creation")]
     LaunchFailed,
     #[error("The agent startup outcome is uncertain")]
@@ -34,6 +40,9 @@ impl RemoteError {
             Self::UnknownAgent => "hive::remote::unknown_agent",
             Self::Forbidden => "hive::remote::forbidden",
             Self::InvalidWorkspace => "hive::remote::invalid_workspace",
+            Self::ProjectConflict => "hive::remote::project_conflict",
+            Self::ProvisioningFailed => "hive::remote::provisioning_failed",
+            Self::ProvisioningUncertain => "hive::remote::provisioning_uncertain",
             Self::LaunchFailed => "hive::remote::launch_failed",
             Self::LaunchUncertain => "hive::remote::launch_uncertain",
         }
@@ -51,8 +60,17 @@ impl RemoteError {
                 "Refresh the owner inventory and select an available agent explicitly."
             }
             Self::Forbidden => "Request access from the owner administrator.",
+            Self::ProjectConflict => {
+                "Select another project ID or explicitly update the definition on the execution node."
+            }
+            Self::ProvisioningFailed => {
+                "Check the execution node's project, workspace policy, Git credentials and backend configuration; inspect its workspace operations before retrying."
+            }
+            Self::ProvisioningUncertain => {
+                "Inspect and reconcile workspace operations on the execution node before an explicit retry; do not automatically provision another workspace."
+            }
             Self::InvalidWorkspace => {
-                "Select an existing absolute directory or permitted configured workspace on the owner."
+                "Select an owner-registered or transferred project with a compatible owner policy, or an existing absolute directory on the owner."
             }
             Self::LaunchFailed => {
                 "Check the owner agent configuration and sanitized diagnostics before retrying."
@@ -85,6 +103,9 @@ impl RemoteError {
             Self::UnknownAgent,
             Self::Forbidden,
             Self::InvalidWorkspace,
+            Self::ProjectConflict,
+            Self::ProvisioningFailed,
+            Self::ProvisioningUncertain,
             Self::LaunchFailed,
             Self::LaunchUncertain,
         ]
@@ -131,7 +152,7 @@ pub fn offered_versions(params: &Value) -> Result<Option<Vec<u64>>, Error> {
 }
 
 pub fn advertisement(node: &str) -> Value {
-    json!({"version": 1, "node": node, "features": {"agents": {}, "selection": {}, "control": {}}})
+    json!({"version": 1, "node": node, "features": {"agents": {}, "selection": {}, "control": {}, "workspaces": {}}})
 }
 
 /// Retain raw values and redact Debug: malformed selectors must not become a default launch.
@@ -239,6 +260,7 @@ pub struct Peer {
     pub node: String,
     selection: bool,
     agents: bool,
+    workspaces: bool,
 }
 
 impl Peer {
@@ -256,11 +278,14 @@ impl Peer {
             .await
             .map_err(|error| RemoteError::sanitized(error, RemoteError::Unsupported))?;
         let (node, selection, agents) = Self::validate(&response)?;
+        let workspaces =
+            response["capabilities"]["_meta"]["hive"]["features"]["workspaces"].is_object();
         Ok(Self {
             connection,
             node,
             selection,
             agents,
+            workspaces,
         })
     }
 
@@ -281,7 +306,7 @@ impl Peer {
         let features = hive["features"]
             .as_object()
             .ok_or_else(|| RemoteError::InvalidParams.wire())?;
-        for key in ["agents", "selection", "control", "location"] {
+        for key in ["agents", "selection", "control", "location", "workspaces"] {
             if features.get(key).is_some_and(|value| {
                 !value.is_null() && value.as_object().is_none_or(|object| !object.is_empty())
             }) {
@@ -290,6 +315,7 @@ impl Peer {
         }
         let enabled = |key| features.get(key).is_some_and(Value::is_object);
         if (enabled("selection") && (!enabled("agents") || !enabled("control")))
+            || (enabled("workspaces") && !enabled("selection"))
             || (enabled("location") && !enabled("control"))
             || (["selection", "location", "control"]
                 .iter()
@@ -325,6 +351,15 @@ impl Peer {
         }
         if agent.is_empty() {
             return Err(RemoteError::InvalidParams.wire());
+        }
+        if request
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("hive"))
+            .is_some_and(|hive| hive.get("workspace").is_some())
+            && !self.workspaces
+        {
+            return Err(RemoteError::Unsupported.wire());
         }
         let hive = request
             .meta
@@ -382,6 +417,18 @@ mod tests {
             !format!("{:?}", NewSession(json!({"_meta":"PRIVATE_SENTINEL"})))
                 .contains("PRIVATE_SENTINEL")
         );
+        for kind in [
+            RemoteError::ProjectConflict,
+            RemoteError::ProvisioningFailed,
+            RemoteError::ProvisioningUncertain,
+        ] {
+            let error = Error::new(-32060, "PRIVATE_SENTINEL")
+                .data(json!({"code":kind.code(),"stderr":"PRIVATE_SENTINEL"}));
+            let controlled = RemoteError::sanitized(error, RemoteError::LaunchUncertain);
+            let value = serde_json::to_value(controlled).unwrap();
+            assert_eq!(value["data"]["code"], kind.code());
+            assert!(!value.to_string().contains("PRIVATE_SENTINEL"));
+        }
     }
 
     #[test]
@@ -396,6 +443,8 @@ mod tests {
                 json!("http://PRIVATE_SENTINEL"),
             ),
             ("/capabilities/_meta/hive/features/agents", json!(true)),
+            ("/capabilities/_meta/hive/features/workspaces", json!(true)),
+            ("/capabilities/_meta/hive/features/selection", Value::Null),
             ("/capabilities/_meta/hive/features/control", Value::Null),
             ("/capabilities/_meta/hive/features/agents", Value::Null),
             ("/capabilities/session", Value::Null),

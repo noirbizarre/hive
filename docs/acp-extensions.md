@@ -32,8 +32,9 @@ Configuration reload does not mix pages, but discovery never reserves an agent.
 Negotiated launches reject malformed Hive metadata, unknown operational fields,
 and nonempty additional-directory/MCP declarations before execution. Unmanaged cwd
 must be an existing absolute owner-side directory. Configured workspace selection
-keeps its existing placeholder-cwd and effective-directory behavior; it does not
-add remote project orchestration. Owner-configured processes use existing adapters
+keeps its existing placeholder-cwd and effective-directory behavior. The negotiated
+`workspaces` feature also accepts portable project definitions and provisions them
+on the selected owner. Owner-configured processes use existing adapters
 and remain owner-supervised after disconnect.
 
 Confirmed pre-create startup failures return `launch_failed`. Once downstream
@@ -100,6 +101,7 @@ unsuccessful. An unknown offered version is not malformed.
 | --- | --- |
 | `agents` | `_hive/agents/list` is implemented |
 | `selection` | `_meta.hive.agent` is consumed by `session/new`; requires `agents` and `control` |
+| `workspaces` | Workspace intent and portable project transfer are consumed by `session/new`; requires `selection` |
 | `location` | Qualified session metadata and `_hive/sessions/resolve` are implemented; requires `control` |
 | `control` | Existing Hive controller, prompt-key and replay contracts linked below are implemented |
 
@@ -239,9 +241,45 @@ Hive attachment metadata. If `location` is enabled, it also returns the qualifie
 reference specified below. No separate process lifecycle method is introduced.
 
 Existing [workspace selectors](hive-api.md#session-launch-selectors) and native
-adoption retain their contracts. Neither is implied by `selection`; remote
-workspace integration is tracked in [#88][workspace]. Version 1 adds no arbitrary
-command, environment, credential or profile-configuration launch parameters.
+adoption retain their contracts. Neither is implied by `selection`.
+
+### Provisioning on the selected owner
+
+With `workspaces` advertised, `session/new` can carry a `new` selector with an
+explicit project ID and optional portable `definition`:
+
+```json
+{"cwd":"/","_meta":{"hive":{"agent":"coder","workspace":{
+  "kind":"new","project":"demo","policy":"task",
+  "definition":{"name":"Demo","repository_source":"https://example.test/demo.git"}
+}}}}
+```
+
+The receiving owner resolves the named policy, provisions through its local
+workspace service, and supplies the observed cwd to its agent. Neither client nor
+initiating Hub needs a checkout or may inspect the returned cwd locally. Without
+this capability the peer helper rejects workspace intent instead of dropping it.
+
+An absent project definition is registered under the exact supplied ID. Equal
+configured or managed definitions are reused; different definitions fail with
+`project_conflict`, never overwrite or allocate a suffixed identity. Without a
+definition, the owner resolves its existing project. Registration survives later
+provisioning or agent startup failure. Policies, filesystem overrides, Git
+credentials and WorkTrunk configuration remain on the owner. Project preparation
+argv is stored metadata, not a new command-execution facility; owner-approved
+WorkTrunk hooks retain their normal lifecycle.
+
+Workspace context includes `owner`, `project`, `workspace`, and `effectiveCwd`.
+An attach selector may include `owner`; a foreign owner is rejected before local
+resource inspection. Successful managed launches and resumes also include
+`_meta.hive.session: {"owner": NodeId, "id": SessionId}`. These additive references
+do not advertise `location` or implement #80 routing: retain the selected peer for
+ordinary control and explicit resume. Old contexts without `owner` remain readable.
+
+Acquisition/backend failures return `provisioning_failed`, interrupted effects
+return `provisioning_uncertain`, and invalid owner project/policy inputs return
+`invalid_workspace`. These are distinct from downstream agent startup failures.
+WorkTrunk lifecycle commands and activity markers run only on the execution owner.
 
 `session/new` is not made idempotent by prompt keys. If a response is lost after
 process creation, the caller MUST report uncertain startup and inspect the owner
@@ -408,6 +446,9 @@ string. `error.message` describes the specific failure without private inputs.
 | `-32602` | `hive::remote::invalid_workspace` | Owner rejected cwd, roots or workspace inputs; select permitted owner-side workspace |
 | `-32060` | `hive::remote::launch_failed` | Confirmed launch failure; inspect sanitized owner diagnostics before retry |
 | `-32060` | `hive::remote::launch_uncertain` | Launch outcome unresolved; inspect catalog before explicit retry |
+| `-32060` | `hive::remote::project_conflict` | Supplied definition differs; explicitly update the owner or select another ID |
+| `-32060` | `hive::remote::provisioning_failed` | Inspect owner project, credentials, backend and workspace operations |
+| `-32060` | `hive::remote::provisioning_uncertain` | Reconcile owner workspace effects before an explicit retry |
 | `-32060` | `hive::remote::session_not_found` | Authorized authoritative lookup found no session; refresh owner catalog |
 | `-32060` | `hive::remote::owner_unavailable` | No verified configured owner connection; restore connectivity/configuration |
 | `-32060` | `hive::remote::stale_route` | Mapping no longer valid; resolve qualified reference again |
@@ -481,8 +522,8 @@ fencing, prompt deduplication, and reconnect without duplicate execution.
 Tests must prove discovery/resolve have no execution or control side effects and
 that gateway aliases cannot change owner identity. #78 must validate the nested
 resolver payload's connection scope over the pinned HTTP adapter. Remote workspace
-provisioning and UI integration remain #88 and #81. These are implementation
-obligations for the relevant implementation.
+provisioning evidence for [#88][workspace] lives in the workspace gateway tests;
+UI integration remains #81.
 
 Implemented #79 evidence lives in `crates/hive-daemon/tests/support/remote_discovery.rs`,
 the `remote::tests` modules, and
@@ -490,7 +531,7 @@ the `remote::tests` modules, and
 in `crates/hive-daemon/tests/bee.rs`. It covers negotiation, safe inventory/pagination,
 reload, strict launch admission, v1/v2 selection, launch failure/uncertainty,
 owner-side cwd, standard control and explicit reattachment without duplicate creation.
-The resolver, qualified references, gateway aliases and cross-Hive routing checks
+The resolver, general session location, gateway aliases and cross-Hive routing checks
 remain obligations for #80.
 
 [issue]: https://github.com/noirbizarre/hive/issues/77

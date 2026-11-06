@@ -303,8 +303,9 @@ and idle usage are verified. Cleanup retains the current change/history under a
 workspace root, and forgets its native registration. Review retained bookmarks
 before deleting them manually. Other workspaces and repository history are retained.
 
-All operations run on the owning daemon. Cross-node provisioning/startup is tracked
-separately in [#88](https://github.com/noirbizarre/hive/issues/88).
+All operations run on the owning daemon. Negotiated peers can transfer portable
+project definitions and request [owner-side provisioning](acp-extensions.md#provisioning-on-the-selected-owner).
+The selected node resolves its own workspace policies, credentials and overrides.
 
 ### Global WorkTrunk integration
 

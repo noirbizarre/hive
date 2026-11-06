@@ -44,6 +44,54 @@ beforeEach(() => {
 });
 afterEach(() => { wrapper?.unmount(); document.body.innerHTML = ''; vi.unstubAllGlobals(); });
 
+test('named profile selection filters agents and survives inventory refresh independently of sessions', async () => {
+  let inventory = { agents: [{ id: 'pi', name: 'Pi' }, { id: 'bee', name: 'Bee' }], defaultProfile: 'personal', profiles: [
+    { id: 'personal', name: 'Personal', agents: ['bee'] }, { id: 'work', name: 'Work', agents: ['pi'] },
+  ] };
+  vi.stubGlobal('fetch', vi.fn(async url => ({ ok: true, json: async () => url.includes('providers') ? inventory : { revision, sessions: items } })));
+  const { client } = application();
+  await flushPromises();
+  const selector = id => wrapper.findAllComponents(Select).find(select => select.props('inputId') === id);
+  expect(selector('profile').props('modelValue')).toBe('');
+  expect(selector('agent').props('options').map(option => option.id)).toEqual(['', 'bee']);
+  selector('profile').vm.$emit('update:modelValue', 'work');
+  await nextTick();
+  expect(selector('agent').props('options').map(option => option.id)).toEqual(['', 'pi']);
+  inventory = { ...inventory, profiles: [...inventory.profiles].reverse() };
+  source.revision({ data: String(++revision) });
+  await flushPromises();
+  expect(selector('profile').props('options').map(option => option.id)).toEqual(['', 'work', 'personal']);
+  expect(selector('profile').props('modelValue')).toBe('work');
+  await wrapper.get('#create').trigger('click');
+  await flushPromises();
+  expect(client.create).toHaveBeenCalledWith('', 'work');
+  expect(wrapper.find('#profile').exists()).toBe(false);
+});
+
+test('implicit profile selection follows changed daemon defaults without pinning a named profile', async () => {
+  let inventory = { agents: [{ id: 'pi', name: 'Pi' }, { id: 'bee', name: 'Bee' }], defaultProfile: 'personal', profiles: [
+    { id: 'personal', name: 'Personal', agents: ['bee'] }, { id: 'work', name: 'Work', agents: ['pi'] },
+  ] };
+  vi.stubGlobal('fetch', vi.fn(async url => ({ ok: true, json: async () => url.includes('providers') ? inventory : { revision, sessions: items } })));
+  const { client } = application();
+  await flushPromises();
+  const selector = id => wrapper.findAllComponents(Select).find(select => select.props('inputId') === id);
+  expect(selector('profile').props('modelValue')).toBe('');
+  expect(selector('agent').props('options').map(option => option.id)).toEqual(['', 'bee']);
+  selector('profile').vm.$emit('update:modelValue', 'personal');
+  await nextTick();
+  selector('profile').vm.$emit('update:modelValue', '');
+  await nextTick();
+  inventory = { ...inventory, defaultProfile: 'work' };
+  source.revision({ data: String(++revision) });
+  await flushPromises();
+  expect(selector('profile').props('modelValue')).toBe('');
+  expect(selector('agent').props('options').map(option => option.id)).toEqual(['', 'pi']);
+  await wrapper.get('#create').trigger('click');
+  await flushPromises();
+  expect(client.create).toHaveBeenCalledWith('', '');
+});
+
 test('cleared message and tool patches remove previously displayed content', async () => {
   const view = conversation();
   let seq = 0;
@@ -167,7 +215,7 @@ test('session selection observes the original session and typing requests contro
   expect(wrapper.get('#send').element.disabled).toBe(false);
   await wrapper.get('#prompt').trigger('submit');
   await flushPromises();
-  expect(client.prompt).toHaveBeenCalledWith('follow up', 'pi');
+  expect(client.prompt).toHaveBeenCalledWith('follow up', 'pi', '');
   expect(wrapper.get('#composer').element.value).toBe('');
 });
 
@@ -386,7 +434,7 @@ test('reconnect recovery and expired history actions never silently send a promp
   expect(wrapper.get('#send').element.disabled).toBe(true);
   publish({ connected: true, role: 'pilot' }); await nextTick();
   await wrapper.findAll('button').find(button => button.text() === 'Retrieve original receipt').trigger('click');
-  await flushPromises(); expect(client.prompt).toHaveBeenCalledWith('original', 'pi');
+  await flushPromises(); expect(client.prompt).toHaveBeenCalledWith('original', 'pi', '');
   publish({ gap: true, uncertain: undefined }); await nextTick();
   await wrapper.findAll('button').find(button => button.text() === 'Attach without earlier history').trigger('click');
   expect(client.attachWithoutHistory).toHaveBeenCalledOnce();

@@ -98,6 +98,24 @@ async fn a_peer_without_workspace_capability_never_receives_a_workspace_launch()
                     "unsupported",
                 );
                 assert_eq!(observed.load(Ordering::SeqCst), 0);
+                diagnostic(
+                    peer.start_profile(
+                        "personal",
+                        None,
+                        v2::NewSessionRequest::new(std::env::current_dir().unwrap()),
+                    )
+                    .await
+                    .unwrap_err(),
+                    "unsupported",
+                );
+                let request = v2::NewSessionRequest::new(std::env::current_dir().unwrap()).meta(
+                    v2::Meta::from_iter([("hive".into(), json!({"profile":"personal"}))]),
+                );
+                diagnostic(
+                    peer.start("coder", request).await.unwrap_err(),
+                    "unsupported",
+                );
+                assert_eq!(observed.load(Ordering::SeqCst), 0);
                 peer.start(
                     "coder",
                     v2::NewSessionRequest::new(std::env::current_dir().unwrap()),

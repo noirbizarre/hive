@@ -1939,7 +1939,7 @@ impl Broker {
 
     fn provider_info(&self) -> serde_json::Value {
         let registry = self.config();
-        serde_json::json!({ "defaultAgent": registry.default_agent, "agents": registry.public_profiles() })
+        serde_json::json!({ "defaultAgent": registry.default_agent, "agents": registry.public_profiles(), "defaultProfile": registry.default_profile, "profiles": registry.public_execution_profiles() })
     }
 
     /// Close every downstream worker when an embedded gateway stops serving requests.
@@ -1987,8 +1987,13 @@ impl Broker {
         let requested = request.meta.as_mut().and_then(|meta| meta.get_mut("hive"));
         let mut adopt: Option<String> = None;
         let mut workspace_launch: Option<hive_protocol::workspace::Launch> = None;
+        let mut execution_profile = None;
         let chosen = match requested {
             Some(serde_json::Value::Object(hive)) => {
+                if let Some(value) = hive.remove("profile") {
+                    execution_profile = Some(value.as_str().filter(|id| !id.is_empty()).map(str::to_owned)
+                        .ok_or_else(|| Error::invalid_params().data("_meta.hive.profile must be a nonempty named profile ID; see GET /v1/providers"))?);
+                }
                 if let Some(value) = hive.remove("workspace") {
                     workspace_launch = Some(serde_json::from_value(value).map_err(|_| {
                         // Parser errors can echo private selector values; expose only the public contract.
@@ -2014,7 +2019,7 @@ impl Broker {
                 let id =
                     match hive.remove("agent") {
                         Some(serde_json::Value::String(id)) if !id.is_empty() => Some(id),
-                        None if workspace_launch.is_some() => None,
+                        None if workspace_launch.is_some() || execution_profile.is_some() => None,
                         _ => return Err(Error::invalid_params().data(
                             "_meta.hive.agent must be a nonempty profile ID; see GET /v1/providers",
                         )),
@@ -2036,14 +2041,27 @@ impl Broker {
             None => None,
         };
         let hive_id = v2::SessionId::new(SessionId::new().as_str());
-        let (chosen, provider, launch_config, launch_projects, mut reservation) = {
+        let (chosen, provider, selected_execution, launch_config, launch_projects, mut reservation) = {
             // Selection and binding publication are one admission boundary with reload.
             let mut registry = self.registry.lock().map_err(|_| Error::internal_error())?;
             if registry.stopping {
                 return Err(Error::invalid_request().data("Hive is shutting down"));
             }
-            let chosen = chosen.or_else(|| registry.current.default_agent.clone());
-            let chosen = chosen.ok_or_else(|| if negotiated { hive_protocol::remote::RemoteError::UnknownAgent.wire() } else { Error::invalid_params().data("no default agent configured; set default_agent in Hive config or pass _meta.hive.agent in session/new") })?;
+            let (chosen, selected_execution) = registry
+                .current
+                .select_execution(execution_profile.as_deref(), chosen)
+                .map_err(|error| {
+                    if negotiated {
+                        if matches!(error, config::ConfigError::DefaultAgent(_)) {
+                            hive_protocol::remote::RemoteError::UnknownAgent.wire()
+                        } else {
+                            hive_protocol::remote::RemoteError::InvalidProfile.wire()
+                        }
+                    } else {
+                        Error::invalid_params().data(error.to_string())
+                    }
+                })?;
+            let selected_execution = selected_execution.cloned();
             let provider = registry
                 .current
                 .agents
@@ -2071,6 +2089,7 @@ impl Broker {
             (
                 chosen,
                 provider,
+                selected_execution,
                 registry.current.clone(),
                 registry.managed_projects.clone(),
                 reload::Reservation {
@@ -2083,8 +2102,25 @@ impl Broker {
         let kind = provider.kind;
         let selected_mcp = mcp::routing::select(&launch_config, &provider.mcp_servers)
             .map_err(|error| startup_error(mcp::routing::diagnostic(error)))?;
+        // Resolve ambiguity before cwd validation so a placeholder cannot hide a profile error.
+        let automatic_policy = if adopt.is_none() && workspace_launch.is_none() {
+            match &selected_execution {
+                Some(profile) => profile
+                    .automatic_workspace(provider.project.clone(), provider.workspace.is_some())
+                    .map_err(|error| {
+                        if negotiated {
+                            hive_protocol::remote::RemoteError::InvalidProfile.wire()
+                        } else {
+                            Error::invalid_params().data(error.to_string())
+                        }
+                    })?,
+                None => provider.workspace.is_some(),
+            }
+        } else {
+            false
+        };
         if negotiated
-            && (adopt.is_some() || (workspace_launch.is_none() && provider.workspace.is_none()))
+            && (adopt.is_some() || (workspace_launch.is_none() && !automatic_policy))
             && !request.cwd.0.is_dir()
         {
             return Err(hive_protocol::remote::RemoteError::InvalidWorkspace.wire());
@@ -2117,10 +2153,11 @@ impl Broker {
         };
         let worktrunk_config = launch_config.worktrunk.unwrap_or_default();
         let workspace_context = if adopt.is_none() {
-            self.launch_workspace(
+            self.launch_execution_workspace(
                 &mut request,
                 workspace_launch,
                 &provider,
+                selected_execution.as_ref(),
                 launch_config,
                 launch_projects,
                 hive_id.to_string(),
@@ -4314,6 +4351,14 @@ fn gateway_agent(broker: Broker) -> impl agent_client_protocol::ConnectTo<Client
             let remote = remote.clone();
             async move |request: hive_protocol::remote::ListAgents, responder: Responder<hive_protocol::remote::AgentsPage>, _: V2ConnectionTo<Client>| {
                 let result = remote.lock().map_err(|_| Error::internal_error())?.list(&broker, request.0);
+                responder.respond_with_result(result)
+            }
+        }, agent_client_protocol::on_receive_request!())
+        .on_receive_request({
+            let broker = broker.clone();
+            let remote = remote.clone();
+            async move |request: hive_protocol::remote::ListProfiles, responder: Responder<hive_protocol::remote::ProfilesPage>, _: V2ConnectionTo<Client>| {
+                let result = remote.lock().map_err(|_| Error::internal_error())?.list_profiles(&broker, request.0);
                 responder.respond_with_result(result)
             }
         }, agent_client_protocol::on_receive_request!())

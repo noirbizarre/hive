@@ -16,6 +16,8 @@ pub enum RemoteError {
     Unsupported,
     #[error("The requested agent or configured default is unavailable")]
     UnknownAgent,
+    #[error("The requested execution profile or its selection is unavailable")]
+    InvalidProfile,
     #[error("The operation is not authorized by the owner")]
     Forbidden,
     #[error("The owner rejected the requested workspace")]
@@ -38,6 +40,7 @@ impl RemoteError {
             Self::InvalidParams => "hive::remote::invalid_params",
             Self::Unsupported => "hive::remote::unsupported",
             Self::UnknownAgent => "hive::remote::unknown_agent",
+            Self::InvalidProfile => "hive::remote::invalid_profile",
             Self::Forbidden => "hive::remote::forbidden",
             Self::InvalidWorkspace => "hive::remote::invalid_workspace",
             Self::ProjectConflict => "hive::remote::project_conflict",
@@ -58,6 +61,9 @@ impl RemoteError {
             }
             Self::UnknownAgent => {
                 "Refresh the owner inventory and select an available agent explicitly."
+            }
+            Self::InvalidProfile => {
+                "Refresh the profile inventory and select a member agent/project, or configure unambiguous profile defaults."
             }
             Self::Forbidden => "Request access from the owner administrator.",
             Self::ProjectConflict => {
@@ -83,7 +89,10 @@ impl RemoteError {
 
     pub fn wire(self) -> Error {
         let numeric = match self {
-            Self::InvalidParams | Self::UnknownAgent | Self::InvalidWorkspace => -32602,
+            Self::InvalidParams
+            | Self::UnknownAgent
+            | Self::InvalidWorkspace
+            | Self::InvalidProfile => -32602,
             _ => -32060,
         };
         Error::new(numeric, self.to_string())
@@ -101,6 +110,7 @@ impl RemoteError {
             Self::InvalidParams,
             Self::Unsupported,
             Self::UnknownAgent,
+            Self::InvalidProfile,
             Self::Forbidden,
             Self::InvalidWorkspace,
             Self::ProjectConflict,
@@ -152,7 +162,7 @@ pub fn offered_versions(params: &Value) -> Result<Option<Vec<u64>>, Error> {
 }
 
 pub fn advertisement(node: &str) -> Value {
-    json!({"version": 1, "node": node, "features": {"agents": {}, "selection": {}, "control": {}, "workspaces": {}}})
+    json!({"version": 1, "node": node, "features": {"agents": {}, "selection": {}, "control": {}, "workspaces": {}, "profiles": {}}})
 }
 
 /// Retain raw values and redact Debug: malformed selectors must not become a default launch.
@@ -196,6 +206,30 @@ macro_rules! raw_request {
 raw_request!(Initialize, "initialize", Value);
 raw_request!(NewSession, "session/new", v2::NewSessionResponse);
 raw_request!(ListAgents, "_hive/agents/list", AgentsPage);
+raw_request!(ListProfiles, "_hive/profiles/list", ProfilesPage);
+
+#[derive(Clone, Debug, Deserialize, Serialize, agent_client_protocol::JsonRpcResponse)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfilesPage {
+    pub profiles: Vec<ExecutionProfile>,
+    pub default_profile: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// Safe setup inventory: policy kinds and references, never local paths or credentials.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionProfile {
+    pub id: String,
+    pub name: String,
+    pub agents: Vec<String>,
+    pub projects: Vec<String>,
+    pub default_agent: Option<String>,
+    pub default_project: Option<String>,
+    pub is_default: bool,
+    pub workspaces: std::collections::BTreeMap<String, Value>,
+}
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -261,6 +295,7 @@ pub struct Peer {
     selection: bool,
     agents: bool,
     workspaces: bool,
+    profiles: bool,
 }
 
 impl Peer {
@@ -280,12 +315,15 @@ impl Peer {
         let (node, selection, agents) = Self::validate(&response)?;
         let workspaces =
             response["capabilities"]["_meta"]["hive"]["features"]["workspaces"].is_object();
+        let profiles =
+            response["capabilities"]["_meta"]["hive"]["features"]["profiles"].is_object();
         Ok(Self {
             connection,
             node,
             selection,
             agents,
             workspaces,
+            profiles,
         })
     }
 
@@ -306,7 +344,14 @@ impl Peer {
         let features = hive["features"]
             .as_object()
             .ok_or_else(|| RemoteError::InvalidParams.wire())?;
-        for key in ["agents", "selection", "control", "location", "workspaces"] {
+        for key in [
+            "agents",
+            "selection",
+            "control",
+            "location",
+            "workspaces",
+            "profiles",
+        ] {
             if features.get(key).is_some_and(|value| {
                 !value.is_null() && value.as_object().is_none_or(|object| !object.is_empty())
             }) {
@@ -316,6 +361,7 @@ impl Peer {
         let enabled = |key| features.get(key).is_some_and(Value::is_object);
         if (enabled("selection") && (!enabled("agents") || !enabled("control")))
             || (enabled("workspaces") && !enabled("selection"))
+            || (enabled("profiles") && !enabled("selection"))
             || (enabled("location") && !enabled("control"))
             || (["selection", "location", "control"]
                 .iter()
@@ -356,6 +402,15 @@ impl Peer {
             .meta
             .as_ref()
             .and_then(|meta| meta.get("hive"))
+            .is_some_and(|hive| hive.get("profile").is_some())
+            && !self.profiles
+        {
+            return Err(RemoteError::Unsupported.wire());
+        }
+        if request
+            .meta
+            .as_ref()
+            .and_then(|meta| meta.get("hive"))
             .is_some_and(|hive| hive.get("workspace").is_some())
             && !self.workspaces
         {
@@ -369,6 +424,57 @@ impl Peer {
         hive.as_object_mut()
             .ok_or_else(|| RemoteError::InvalidParams.wire())?
             .insert("agent".into(), agent.into());
+        self.connection
+            .prepare_request(request)
+            .block_task()
+            .await
+            .map_err(|error| RemoteError::sanitized(error, RemoteError::LaunchUncertain))
+    }
+
+    pub async fn list_profiles(&self, params: ListParams) -> Result<ProfilesPage, Error> {
+        if !self.profiles {
+            return Err(RemoteError::Unsupported.wire());
+        }
+        params.validate()?;
+        self.connection
+            .prepare_request(ListProfiles(
+                serde_json::to_value(params).map_err(|_| RemoteError::InvalidParams.wire())?,
+            ))
+            .block_task()
+            .await
+            .map_err(|error| RemoteError::sanitized(error, RemoteError::Unsupported))
+    }
+
+    /// Profile-only creation lets the owner resolve defaults atomically with admission.
+    pub async fn start_profile(
+        &self,
+        profile: &str,
+        agent: Option<&str>,
+        mut request: v2::NewSessionRequest,
+    ) -> Result<v2::NewSessionResponse, Error> {
+        if !self.profiles {
+            return Err(RemoteError::Unsupported.wire());
+        }
+        if profile.is_empty() || agent.is_some_and(str::is_empty) {
+            return Err(RemoteError::InvalidParams.wire());
+        }
+        let hive = request
+            .meta
+            .get_or_insert_default()
+            .entry("hive")
+            .or_insert_with(|| json!({}));
+        let hive = hive
+            .as_object_mut()
+            .ok_or_else(|| RemoteError::InvalidParams.wire())?;
+        hive.insert("profile".into(), profile.into());
+        // Do not retain an accidental agent selector from a reused request.
+        hive.remove("agent");
+        if let Some(agent) = agent {
+            return self.start(agent, request).await;
+        }
+        if hive.contains_key("workspace") && !self.workspaces {
+            return Err(RemoteError::Unsupported.wire());
+        }
         self.connection
             .prepare_request(request)
             .block_task()
@@ -418,6 +524,7 @@ mod tests {
                 .contains("PRIVATE_SENTINEL")
         );
         for kind in [
+            RemoteError::InvalidProfile,
             RemoteError::ProjectConflict,
             RemoteError::ProvisioningFailed,
             RemoteError::ProvisioningUncertain,
@@ -444,6 +551,7 @@ mod tests {
             ),
             ("/capabilities/_meta/hive/features/agents", json!(true)),
             ("/capabilities/_meta/hive/features/workspaces", json!(true)),
+            ("/capabilities/_meta/hive/features/profiles", json!(true)),
             ("/capabilities/_meta/hive/features/selection", Value::Null),
             ("/capabilities/_meta/hive/features/control", Value::Null),
             ("/capabilities/_meta/hive/features/agents", Value::Null),

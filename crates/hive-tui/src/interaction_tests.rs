@@ -182,6 +182,18 @@ async fn connected(body: impl AsyncFnOnce(V2ConnectionTo<Agent>) -> Result<(), E
             agent_client_protocol::on_receive_notification!(),
         )
         .on_receive_request(
+            async |request: v2::NewSessionRequest,
+                   responder: agent_client_protocol::Responder<v2::NewSessionResponse>,
+                   _: V2ConnectionTo<Client>| {
+                // Creation picker tests must delegate agent defaults rather than invent an override.
+                if let Some(hive) = request.meta.as_ref().and_then(|meta| meta.get("hive")) {
+                    assert_eq!(hive, &json!({"profile":"personal"}));
+                }
+                responder.respond(v2::NewSessionResponse::new(v2::SessionId::new("created")))
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
             async |_: v2::ResumeSessionRequest, responder: agent_client_protocol::Responder<v2::ResumeSessionResponse>, _: V2ConnectionTo<Client>| {
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 responder.respond(v2::ResumeSessionResponse::new().meta(v2::Meta::from_iter([("hive".into(), json!({
@@ -267,6 +279,54 @@ async fn press(
     code: KeyCode,
 ) {
     key(cx, app, pending, code, KeyModifiers::NONE).await;
+}
+
+#[tokio::test]
+async fn cycling_profiles_delegates_agent_defaults_and_returns_to_implicit_selection() {
+    connected(async |cx| {
+        for default_agent in [json!("b"), Value::Null] {
+            let inventory = json!({"agents":[{"id":"a"},{"id":"b"},{"id":"outside"}], "profiles":[{"id":"personal","name":"Personal","agents":["a","b"],"projects":[],"defaultAgent":default_agent,"defaultProject":null,"isDefault":false,"workspaces":{}}]});
+            let mut app = App { page: Page::Profiles, connected: true, ..App::default() };
+            update_profiles(&mut app, &inventory);
+            assert_eq!(app.profiles[app.profile_selected], "a");
+            press(&cx, &mut app, &mut None, KeyCode::Char('p')).await;
+            assert_eq!(app.execution_profile.as_deref(), Some("personal"));
+            assert_eq!(app.profiles[app.profile_selected], "");
+            press(&cx, &mut app, &mut None, KeyCode::Enter).await;
+            let result = operation_completion(&mut app.session_operation).await.unwrap();
+            assert!(matches!(result.outcome, SessionOutcome::Create(Ok(_))));
+            app.session_operation = None;
+            app.page = Page::Profiles;
+            press(&cx, &mut app, &mut None, KeyCode::Char('p')).await;
+            assert!(app.execution_profile.is_none());
+            assert!(app.profiles.iter().any(|id| id == "outside"));
+            update_profiles(&mut app, &inventory);
+            assert!(app.execution_profile.is_none());
+            // The CLI uses the same transition before applying any explicit --agent override.
+            select_execution_profile(&mut app, Some("personal".into()));
+            assert_eq!(app.profiles[app.profile_selected], "");
+        }
+        Ok(())
+    }).await;
+}
+
+#[tokio::test]
+async fn implicit_daemon_profiles_follow_reload_and_create_without_an_empty_selector() {
+    connected(async |cx| {
+        let profile = |id, agent| json!({"id":id,"name":id,"agents":[agent],"projects":[],"defaultAgent":null,"defaultProject":null,"isDefault":false,"workspaces":{}});
+        let mut inventory = json!({"agents":[{"id":"a"},{"id":"b"}], "defaultProfile":"first", "profiles":[profile("first","a"),profile("second","b")]});
+        let mut app = App { page: Page::Profiles, connected: true, ..App::default() };
+        update_profiles(&mut app, &inventory);
+        assert_eq!(app.profiles, ["", "a"]);
+        inventory["defaultProfile"] = json!("second");
+        update_profiles(&mut app, &inventory);
+        assert!(app.execution_profile.is_none());
+        assert_eq!(app.profiles, ["", "b"]);
+        press(&cx, &mut app, &mut None, KeyCode::Enter).await;
+        let result = operation_completion(&mut app.session_operation).await.unwrap();
+        assert!(matches!(result.outcome, SessionOutcome::Create(Ok(_))));
+        Ok(())
+    }).await;
 }
 
 async fn text(

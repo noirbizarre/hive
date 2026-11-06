@@ -9,6 +9,9 @@ use hive_core::{identity::ProjectId, project::ProjectDefinition};
 use hive_protocol::AgentVersion;
 use serde::{Deserialize, Serialize};
 
+mod execution;
+pub use execution::{ExecutionProfile, WorkspaceDeclaration};
+
 /// Portable policy templates deliberately contain no runtime repository identity.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "policy", rename_all = "snake_case", deny_unknown_fields)]
@@ -74,6 +77,9 @@ impl WorkspaceTemplate {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    pub default_profile: Option<String>,
+    #[serde(default)]
+    pub profiles: BTreeMap<String, ExecutionProfile>,
     #[serde(default)]
     pub mcp_servers: BTreeMap<String, crate::mcp::configuration::ConfiguredServer>,
     #[serde(default)]
@@ -90,6 +96,9 @@ pub struct Config {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RootDocument {
+    default_profile: Option<String>,
+    #[serde(default)]
+    profiles: BTreeMap<String, ExecutionProfile>,
     #[serde(default)]
     mcp_servers: BTreeMap<String, crate::mcp::configuration::ConfiguredServer>,
     #[serde(default)]
@@ -109,6 +118,8 @@ struct RootDocument {
 struct FragmentDocument {
     #[serde(default)]
     mcp_servers: BTreeMap<String, crate::mcp::configuration::ConfiguredServer>,
+    #[serde(default)]
+    profiles: BTreeMap<String, ExecutionProfile>,
     #[serde(default)]
     workspaces: BTreeMap<String, WorkspaceTemplate>,
     worktrunk: Option<hive_core::workspace::integration::WorktrunkConfig>,
@@ -259,6 +270,22 @@ pub enum ConfigError {
     Mcp(String),
     #[error("{0}")]
     #[diagnostic(
+        code(hive::config::execution_profile),
+        help(
+            "correct the named profile's members, defaults and workspace settings; references must name configured entities"
+        )
+    )]
+    ExecutionProfile(String),
+    #[error("{0}")]
+    #[diagnostic(
+        code(hive::config::profile_conflict),
+        help(
+            "remove or align the conflicting field declarations; named profile memberships merge but scalar values must agree"
+        )
+    )]
+    ProfileConflict(String),
+    #[error("{0}")]
+    #[diagnostic(
         code(hive::config::workspace),
         help(
             "declare unique workspace policies under [workspaces] and reference them from agents with a project"
@@ -307,7 +334,7 @@ pub enum ConfigError {
     #[diagnostic(
         code(hive::config::duplicate_agent),
         help(
-            "rename or remove one agent definition; profiles cannot override or extend each other"
+            "rename or remove one agent definition; agent definitions cannot override or extend each other"
         )
     )]
     DuplicateAgent(String),
@@ -567,6 +594,12 @@ impl Config {
                 });
             }
         }
+        // Named-profile failures must not suppress connectivity probes of reusable agents.
+        problems.extend(
+            self.execution_problems()
+                .into_iter()
+                .map(|error| Problem { agent: None, error }),
+        );
         if let Some(default) = &self.default_agent
             && !self.agents.contains_key(default)
         {
@@ -698,7 +731,7 @@ fn parse_document<T: serde::de::DeserializeOwned>(
         });
         // Parser messages can quote credentials, so report only the source and position.
         ConfigError::Syntax(format!(
-            "invalid Hive config {}{}; check TOML syntax and allowed fields (include/default_agent are root-only)",
+            "invalid Hive config {}{}; check TOML syntax and allowed fields (include/default_agent/default_profile are root-only)",
             path.display(),
             line.map_or(String::new(), |line| format!(" near line {line}"))
         ))
@@ -762,12 +795,21 @@ fn include_paths(root: &Path, entry: &str, index: usize) -> Result<Vec<PathBuf>,
 fn compose(root: &Path, document: RootDocument) -> Result<Config, ConfigError> {
     let mut config = Config {
         mcp_servers: document.mcp_servers,
+        default_profile: document.default_profile,
+        profiles: BTreeMap::new(),
         workspaces: document.workspaces,
         worktrunk: document.worktrunk,
         projects: document.projects,
         default_agent: document.default_agent,
         agents: document.agents,
     };
+    let mut profile_origins = BTreeMap::new();
+    execution::merge(
+        &mut config.profiles,
+        document.profiles,
+        root,
+        &mut profile_origins,
+    )?;
     let identity = std::fs::canonicalize(root).map_err(|error| unreadable(root, error))?;
     let mut files = BTreeMap::from([(identity, root.to_path_buf())]);
     let mut origins: BTreeMap<_, _> = config
@@ -799,6 +841,12 @@ fn compose(root: &Path, document: RootDocument) -> Result<Config, ConfigError> {
                     return Err(ConfigError::Mcp("duplicate MCP definition across configuration files; give each server a unique ID".into()));
                 }
             }
+            execution::merge(
+                &mut config.profiles,
+                fragment.profiles,
+                &path,
+                &mut profile_origins,
+            )?;
             for (id, policy) in fragment.workspaces {
                 if config.workspaces.insert(id, policy).is_some() {
                     return Err(ConfigError::Workspace(

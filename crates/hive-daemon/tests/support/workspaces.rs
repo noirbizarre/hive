@@ -398,6 +398,103 @@ async fn remote_project_transfer_provisions_only_on_the_selected_owner_and_disti
 }
 
 #[tokio::test]
+async fn named_profiles_provision_inline_and_referenced_policies_across_transports_and_adapters() {
+    use hive_protocol::remote::{ListParams, Peer};
+    for version in [AgentVersion::V1, AgentVersion::V2] {
+        let fixture = Fixture::new(version, false);
+        // Agent defaults cannot hide a broken execution-profile policy implementation.
+        let agents = std::fs::read_to_string(fixture.path("agents.toml"))
+            .unwrap()
+            .replace("project = 'demo'\nworkspace = 'task'\n", "");
+        std::fs::write(fixture.path("agents.toml"), agents).unwrap();
+        std::fs::write(fixture.path("profiles.toml"), "[profiles.inline]\nagents = ['coder']\nprojects = ['demo']\n[profiles.inline.workspaces.demo]\npolicy = 'worktree'\n[profiles.reference]\nagents = ['coder']\nprojects = ['demo']\n[profiles.reference.workspaces.demo]\ntemplate = 'task'\n").unwrap();
+        std::fs::write(
+            fixture.path("settings.toml"),
+            "[profiles.inline.workspaces.demo]\nbase_ref = 'main'\n",
+        )
+        .unwrap();
+        std::fs::write(fixture.path("hive.toml"), "include = ['settings.toml','profiles.toml','agents.toml','projects.toml','policies.toml']\n").unwrap();
+        let (address, mut host) = fixture.start().await;
+        for transport in ["ws", "http"] {
+            Client
+                .v2()
+                .connect_with(
+                    HttpClient::new(format!("{transport}://{address}")).unwrap(),
+                    async |cx| {
+                        let peer = Peer::initialize(
+                            cx.clone(),
+                            v2::InitializeRequest::new(
+                                ProtocolVersion::V2,
+                                v2::Implementation::new("named-profile-test", "1"),
+                            ),
+                        )
+                        .await?;
+                        let page = peer
+                            .list_profiles(ListParams {
+                                limit: Some(1),
+                                cursor: None,
+                            })
+                            .await?;
+                        assert_eq!(page.profiles[0].id, "inline");
+                        let page = peer
+                            .list_profiles(ListParams {
+                                limit: Some(1),
+                                cursor: page.next_cursor,
+                            })
+                            .await?;
+                        assert_eq!(page.profiles[0].id, "reference");
+                        assert!(page.next_cursor.is_none());
+                        for profile in ["inline", "reference"] {
+                            let opened = peer
+                                .start_profile(
+                                    profile,
+                                    None,
+                                    v2::NewSessionRequest::new(fixture.path("placeholder")),
+                                )
+                                .await?;
+                            let context = &opened.meta.as_ref().unwrap()["hive"]["workspace"];
+                            assert_eq!(context["project"], "demo");
+                            let cwd = PathBuf::from(context["effectiveCwd"].as_str().unwrap());
+                            assert!(cwd.join(".git").is_file());
+                            fixture.assert_downstream_cwd(&cwd);
+                            cx.send_request(
+                                v2::CloseSessionRequest::new(opened.session_id).meta(opened.meta),
+                            )
+                            .block_task()
+                            .await?;
+                        }
+                        let before = inventory(address).await["workspaces"]
+                            .as_array()
+                            .unwrap()
+                            .len();
+                        let error = peer
+                            .start_profile(
+                                "inline",
+                                Some("outside"),
+                                v2::NewSessionRequest::new(fixture.path("placeholder")),
+                            )
+                            .await
+                            .unwrap_err();
+                        assert_eq!(error.data.unwrap()["code"], "hive::remote::invalid_profile");
+                        assert_eq!(
+                            inventory(address).await["workspaces"]
+                                .as_array()
+                                .unwrap()
+                                .len(),
+                            before
+                        );
+                        Ok(())
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        host.kill().await.unwrap();
+        host.wait().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn workspace_worktrees_reach_both_acp_adapters_from_composed_config_in_either_order() {
     for version in [AgentVersion::V1, AgentVersion::V2] {
         for reverse in [false, true] {

@@ -47,6 +47,11 @@ Session conversation/control methods live exclusively on `/acp`.
 Provider discovery omits commands, endpoints, arguments, environment, and headers.
 It describes configuration rather than successful availability probes.
 
+`GET /v1/providers` retains `agents` and `defaultAgent` and adds `profiles` and
+nullable `defaultProfile` for named execution setups. Profile summaries use the
+same safe fields as [`_hive/profiles/list`](acp-extensions.md#named-execution-profiles-_hiveprofileslist).
+An absent profile inventory on an older daemon means legacy agent selection.
+
 The [Hive ACP extensions](acp-extensions.md#current-implementation) expose negotiated
 profile discovery and selection/startup for remote peers. Persistent owners serve
 `_hive/agents/list` from the same configured broker inventory, adding safe launch

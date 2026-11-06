@@ -71,6 +71,7 @@ impl crate::Broker {
         Ok(Service::new(self.store.clone().ok_or(Error::Storage)?))
     }
 
+    #[cfg(test)]
     pub(crate) async fn launch_workspace(
         &self,
         request: &mut hive_protocol::v2::NewSessionRequest,
@@ -80,9 +81,35 @@ impl crate::Broker {
         managed: BTreeMap<ProjectId, ProjectDefinition>,
         session: String,
     ) -> Result<Option<hive_protocol::workspace::Context>, Error> {
+        self.launch_execution_workspace(request, launch, profile, None, config, managed, session)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn launch_execution_workspace(
+        &self,
+        request: &mut hive_protocol::v2::NewSessionRequest,
+        launch: Option<hive_protocol::workspace::Launch>,
+        profile: &crate::config::Profile,
+        execution: Option<&crate::config::ExecutionProfile>,
+        config: Arc<crate::config::Config>,
+        managed: BTreeMap<ProjectId, ProjectDefinition>,
+        session: String,
+    ) -> Result<Option<hive_protocol::workspace::Context>, Error> {
         use hive_protocol::workspace::Launch;
+        // Explicit existing/attach/new requests bypass automatic policy selection entirely.
+        let automatic = if launch.is_none() {
+            match execution {
+                Some(execution) => execution
+                    .automatic_workspace(profile.project.clone(), profile.workspace.is_some())
+                    .map_err(|error| Error::Profile(error.to_string()))?,
+                None => profile.workspace.is_some(),
+            }
+        } else {
+            false
+        };
         let launch = launch.or_else(|| {
-            profile.workspace.as_ref().map(|_| Launch::New {
+            automatic.then_some(Launch::New {
                 project: None,
                 definition: None,
                 policy: None,
@@ -120,9 +147,10 @@ impl crate::Broker {
                     return Err(Error::Request);
                 }
                 service
-                    .attach(
+                    .attach_scoped(
                         WorkspaceId::try_from(id).map_err(|_| Error::Request)?,
                         session,
+                        execution.map(|profile| profile.projects.clone()),
                     )
                     .await?
             }
@@ -137,20 +165,40 @@ impl crate::Broker {
                 if definition.is_some() && project.is_none() {
                     return Err(Error::Request);
                 }
-                let project = project
+                let explicit_project = project
                     .map(ProjectId::try_from)
                     .transpose()
-                    .map_err(|_| Error::Request)?
-                    .or_else(|| profile.project.clone())
-                    .ok_or(Error::Request)?;
-                let policy = policy
-                    .or_else(|| profile.workspace.clone())
-                    .ok_or(Error::Request)?;
-                let policy = config
-                    .workspaces
-                    .get(&policy)
-                    .cloned()
-                    .ok_or(Error::Request)?;
+                    .map_err(|_| Error::Request)?;
+                let project = match execution {
+                    Some(execution) => execution
+                        .project(explicit_project, profile.project.clone())
+                        .map_err(|error| Error::Profile(error.to_string()))?,
+                    None => explicit_project.or_else(|| profile.project.clone()),
+                }
+                .ok_or_else(|| match execution {
+                    Some(_) => Error::Profile(
+                        "project selection is ambiguous; set default_project or pass workspace.project".into(),
+                    ),
+                    None => Error::Request,
+                })?;
+                let policy = if let Some(policy) = policy {
+                    config
+                        .workspaces
+                        .get(&policy)
+                        .cloned()
+                        .ok_or(Error::Request)?
+                } else if let Some(declaration) =
+                    execution.and_then(|execution| execution.workspaces.get(&project))
+                {
+                    declaration.resolve(&config).map_err(Error::Profile)?
+                } else {
+                    profile
+                        .workspace
+                        .as_ref()
+                        .and_then(|id| config.workspaces.get(id))
+                        .cloned()
+                        .ok_or(Error::Request)?
+                };
                 let transferred = definition;
                 let definition = config
                     .projects
@@ -218,6 +266,8 @@ impl crate::Broker {
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("{0}")]
+    Profile(String),
     #[error(
         "project definition conflicts with the execution node; select another ID or explicitly update the owner definition"
     )]
@@ -287,6 +337,7 @@ impl Error {
     pub(crate) fn remote(&self) -> hive_protocol::remote::RemoteError {
         use hive_protocol::remote::RemoteError;
         match self {
+            Self::Profile(_) => RemoteError::InvalidProfile,
             Self::ProjectConflict => RemoteError::ProjectConflict,
             Self::Selector | Self::Request | Self::Unknown | Self::JjRevision => {
                 RemoteError::InvalidWorkspace
@@ -297,6 +348,7 @@ impl Error {
     }
     pub fn code(&self) -> &'static str {
         match self {
+            Self::Profile(_) => "hive::workspace::profile",
             Self::ProjectConflict => "hive::workspace::project_conflict",
             Self::JjUnavailable => "hive::jj::unavailable",
             Self::Jj(_) => "hive::jj::execution",
@@ -320,6 +372,9 @@ impl Error {
 
     pub fn json(&self) -> serde_json::Value {
         let help = match self {
+            Self::Profile(_) => {
+                "select a member project or configure unambiguous profile defaults; query GET /v1/providers"
+            }
             Self::ProjectConflict => {
                 "select another project ID or explicitly update the definition on the owning node"
             }
@@ -613,7 +668,24 @@ impl Service {
             .await
     }
     pub async fn attach(&self, id: WorkspaceId, session: String) -> Result<Entry, Error> {
+        self.attach_scoped(id, session, None).await
+    }
+    async fn attach_scoped(
+        &self,
+        id: WorkspaceId,
+        session: String,
+        projects: Option<std::collections::BTreeSet<ProjectId>>,
+    ) -> Result<Entry, Error> {
         self.run(move |rt| {
+            // Check membership before inspect/reservation can touch resource state.
+            if let Some(projects) = &projects {
+                let entry = rt.state.workspaces.get(id.as_str()).ok_or(Error::Unknown)?;
+                if !projects.contains(&entry.workspace.intent().project) {
+                    return Err(Error::Profile(
+                        "attached workspace project is outside the selected profile".into(),
+                    ));
+                }
+            }
             if !matches!(rt.inspect(&id)?, Inspection::Present { .. }) {
                 return Err(Error::Conflict);
             }

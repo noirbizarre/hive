@@ -47,6 +47,9 @@ pub struct App {
     pub page: Page,
     pub sessions: Vec<SessionSummary>,
     pub profiles: Vec<String>,
+    pub execution_profile: Option<String>,
+    pub execution_profiles: Vec<hive_protocol::remote::ExecutionProfile>,
+    pub providers: serde_json::Value,
     // Catalog refreshes reconcile only the session cursor, never another picker's selection.
     pub selected: usize,
     pub profile_selected: usize,
@@ -668,7 +671,7 @@ impl App {
                 Paragraph::new(vec![
                     Line::styled("No agents configured", theme.text()),
                     Line::styled(
-                        "Add an [agents.<id>] profile to the daemon configuration, then run hive daemon reload.",
+                        "Add an [agents.<id>] definition to the daemon configuration, then run hive daemon reload.",
                         theme.muted(),
                     ),
                 ])
@@ -678,12 +681,26 @@ impl App {
             );
             return;
         }
-        let list = List::new(
-            self.profiles
-                .iter()
-                .map(|profile| ListItem::new(Line::styled(profile.as_str(), theme.text()))),
+        let list = List::new(self.profiles.iter().map(|profile| {
+            ListItem::new(Line::styled(
+                if profile.is_empty() {
+                    "Profile default (resolved by daemon)"
+                } else {
+                    profile.as_str()
+                },
+                theme.text(),
+            ))
+        }))
+        .block(
+            Block::default()
+                .title(format!(
+                    "Execution profile: {} · p to cycle",
+                    self.execution_profile
+                        .as_deref()
+                        .unwrap_or("daemon default")
+                ))
+                .padding(Padding::horizontal(3)),
         )
-        .block(Block::default().padding(Padding::horizontal(3)))
         .highlight_symbol("▸ ")
         .highlight_style(theme.selected());
         self.profile_list.select(
@@ -873,7 +890,7 @@ impl App {
                 "↑↓ select  Enter pilot  o observe  Tab chat  a all  Ctrl-N new  Esc quit"
             }
             Page::Profiles if self.profiles.is_empty() => "Tab sessions  Esc quit",
-            Page::Profiles => "↑↓ select  Enter create  Tab sessions  Esc quit",
+            Page::Profiles => "↑↓ agent  p profile  Enter create  Tab sessions  Esc quit",
             Page::Chat if self.dialog.is_some() => "Enter confirm  Esc decline",
             Page::Chat if history => {
                 "History · PgUp/PgDn or wheel scroll · End live · Ctrl-↑↓ tool · Ctrl-O details"

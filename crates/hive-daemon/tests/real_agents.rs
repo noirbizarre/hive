@@ -273,6 +273,8 @@ async fn run_probe(installation: Installation, configuration: bool) -> Result<()
     let broker = hive_daemon::Broker::persistent(
         Config {
             mcp_servers: Default::default(),
+            default_profile: None,
+            profiles: Default::default(),
             workspaces: Default::default(),
             worktrunk: None,
             projects: Default::default(),

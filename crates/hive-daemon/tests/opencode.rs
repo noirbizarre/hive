@@ -56,6 +56,8 @@ fn config(url: &str) -> Config {
 fn config_with(profile: Profile) -> Config {
     Config {
         mcp_servers: Default::default(),
+        default_profile: None,
+        profiles: Default::default(),
         workspaces: Default::default(),
         worktrunk: None,
         projects: Default::default(),

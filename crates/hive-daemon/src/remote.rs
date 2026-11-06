@@ -53,6 +53,7 @@ pub(super) struct Connection {
     pub initialized: bool,
     pub mode: Mode,
     snapshot: Option<Snapshot>,
+    profile_snapshot: Option<Snapshot>,
 }
 
 struct Snapshot {
@@ -63,6 +64,80 @@ struct Snapshot {
 }
 
 impl Connection {
+    pub fn list_profiles(
+        &mut self,
+        broker: &Broker,
+        raw: serde_json::Value,
+    ) -> Result<hive_protocol::remote::ProfilesPage, Error> {
+        if !self.initialized || self.mode != Mode::Negotiated {
+            return Err(RemoteError::Unsupported.wire());
+        }
+        if ["cursor", "limit"]
+            .iter()
+            .any(|key| raw.get(key).is_some_and(serde_json::Value::is_null))
+        {
+            return Err(RemoteError::InvalidParams.wire());
+        }
+        let params: ListParams =
+            serde_json::from_value(raw).map_err(|_| RemoteError::InvalidParams.wire())?;
+        let limit = params.validate()?;
+        if self
+            .profile_snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.expires <= tokio::time::Instant::now())
+        {
+            self.profile_snapshot = None;
+        }
+        if let Some(cursor) = &params.cursor {
+            if self
+                .profile_snapshot
+                .as_ref()
+                .is_none_or(|snapshot| snapshot.cursor != *cursor)
+            {
+                return Err(RemoteError::InvalidParams.wire());
+            }
+        } else {
+            self.profile_snapshot = Some(Snapshot {
+                config: broker
+                    .registry
+                    .lock()
+                    .map_err(|_| Error::internal_error())?
+                    .current
+                    .clone(),
+                cursor: String::new(),
+                position: 0,
+                expires: tokio::time::Instant::now() + CURSOR_LIFETIME,
+            });
+        }
+        let snapshot = self
+            .profile_snapshot
+            .as_mut()
+            .expect("fresh or validated snapshot");
+        let default_profile = snapshot.config.default_profile.clone();
+        let profiles = snapshot
+            .config
+            .public_execution_profiles()
+            .into_iter()
+            .skip(snapshot.position)
+            .take(limit)
+            .collect::<Vec<_>>();
+        snapshot.position += profiles.len();
+        let next_cursor = if snapshot.position < snapshot.config.profiles.len() {
+            snapshot.cursor = uuid::Uuid::new_v4().to_string();
+            Some(snapshot.cursor.clone())
+        } else {
+            None
+        };
+        if next_cursor.is_none() {
+            self.profile_snapshot = None;
+        }
+        Ok(hive_protocol::remote::ProfilesPage {
+            profiles,
+            default_profile,
+            next_cursor,
+        })
+    }
+
     pub fn list(&mut self, broker: &Broker, raw: serde_json::Value) -> Result<AgentsPage, Error> {
         if !self.initialized || self.mode != Mode::Negotiated {
             return Err(RemoteError::Unsupported.wire());
@@ -194,11 +269,16 @@ pub(super) fn launch(
                 .ok_or_else(|| RemoteError::InvalidParams.wire())?;
             if hive
                 .keys()
-                .any(|key| !["agent", "workspace", "adopt"].contains(&key.as_str()))
+                .any(|key| !["agent", "profile", "workspace", "adopt"].contains(&key.as_str()))
                 || hive
                     .get("agent")
                     .is_some_and(|id| id.as_str().is_none_or(str::is_empty))
-                || (!hive.contains_key("agent") && !hive.contains_key("workspace"))
+                || hive
+                    .get("profile")
+                    .is_some_and(|id| id.as_str().is_none_or(str::is_empty))
+                || (!hive.contains_key("agent")
+                    && !hive.contains_key("workspace")
+                    && !hive.contains_key("profile"))
             {
                 return Err(RemoteError::InvalidParams.wire());
             }
@@ -274,6 +354,92 @@ mod tests {
         connection.snapshot.as_mut().unwrap().expires = tokio::time::Instant::now();
         assert!(connection.list(&broker, json!({"cursor":current})).is_err());
         assert_eq!(connection.list(&broker, json!({})).unwrap().agents.len(), 2);
+    }
+
+    #[test]
+    fn profile_pages_hold_one_snapshot_and_reject_foreign_expired_and_agent_cursors() {
+        let config: Config = toml::from_str("[agents.a]\ncommand = 'unused'\n[agents.b]\ncommand = 'unused'\n[profiles.first]\nagents = ['a']\n[profiles.second]\nagents = ['b']").unwrap();
+        let broker = Broker::new(config);
+        let mut connection = Connection {
+            initialized: true,
+            mode: Mode::Negotiated,
+            ..Default::default()
+        };
+        let cursor = connection
+            .list_profiles(&broker, json!({"limit":1}))
+            .unwrap()
+            .next_cursor
+            .unwrap();
+        let mut other = Connection {
+            initialized: true,
+            mode: Mode::Negotiated,
+            ..Default::default()
+        };
+        assert!(
+            other
+                .list_profiles(&broker, json!({"cursor":cursor}))
+                .is_err()
+        );
+        let agent_cursor = connection
+            .list(&broker, json!({"limit":1}))
+            .unwrap()
+            .next_cursor
+            .unwrap();
+        assert!(
+            connection
+                .list_profiles(&broker, json!({"cursor":agent_cursor}))
+                .is_err()
+        );
+        broker.registry.lock().unwrap().current = Arc::new(Config::default());
+        let next = connection
+            .list_profiles(&broker, json!({"cursor":cursor}))
+            .unwrap();
+        assert_eq!(next.profiles[0].id, "second");
+        assert!(
+            connection
+                .list_profiles(&broker, json!({}))
+                .unwrap()
+                .profiles
+                .is_empty()
+        );
+        let config: Config = toml::from_str("[profiles.a]\n[profiles.b]").unwrap();
+        broker.registry.lock().unwrap().current = Arc::new(config);
+        let cursor = connection
+            .list_profiles(&broker, json!({"limit":1}))
+            .unwrap()
+            .next_cursor
+            .unwrap();
+        connection.profile_snapshot.as_mut().unwrap().expires = tokio::time::Instant::now();
+        assert!(
+            connection
+                .list_profiles(&broker, json!({"cursor":cursor}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn malformed_profile_selectors_cannot_fall_back_to_default_admission() {
+        let connection = Connection {
+            initialized: true,
+            mode: Mode::Negotiated,
+            ..Default::default()
+        };
+        for profile in [json!(null), json!(""), json!(false), json!({})] {
+            assert!(
+                launch(
+                    json!({"cwd":"/", "mcpServers":[], "_meta":{"hive":{"profile":profile}}}),
+                    &connection
+                )
+                .is_err()
+            );
+        }
+        assert!(
+            launch(
+                json!({"cwd":"/", "mcpServers":[], "_meta":{"hive":{"profile":"personal"}}}),
+                &connection
+            )
+            .is_ok()
+        );
     }
 
     #[test]

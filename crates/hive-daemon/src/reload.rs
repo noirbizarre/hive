@@ -307,6 +307,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn profile_only_reload_publishes_complete_setups_and_rejects_conflicts_atomically() {
+        let fixture = Fixture::new();
+        let source = fixture
+            .config("include = ['profile.toml','settings.toml']\n[agents.a]\ncommand = 'unused'\n");
+        let profile = fixture.0.join("profile.toml");
+        let settings = fixture.0.join("settings.toml");
+        std::fs::write(
+            &profile,
+            "[profiles.personal]\nagents = ['a']\nname = 'Original'",
+        )
+        .unwrap();
+        std::fs::write(&settings, "[profiles.personal]\ndefault_agent = 'a'").unwrap();
+        let broker = Broker::new(source.load().unwrap()).with_config_source(source);
+        let before = broker.config();
+        std::fs::write(&settings, "[profiles.personal]\nname = 'Conflict'").unwrap();
+        assert!(matches!(
+            broker.reload_config().await,
+            Err(ReloadError::Config(ConfigError::ProfileConflict(_)))
+        ));
+        assert!(Arc::ptr_eq(&before, &broker.config()));
+        assert_eq!(*broker.catalog.borrow(), 0);
+        std::fs::write(&profile, "[profiles.personal]\nagents = ['a']").unwrap();
+        assert_eq!(broker.reload_config().await.unwrap(), 1);
+        assert_eq!(
+            broker.config().profiles["personal"].name.as_deref(),
+            Some("Conflict")
+        );
+        assert_eq!(
+            before.profiles["personal"].name.as_deref(),
+            Some("Original")
+        );
+    }
+
+    #[tokio::test]
     async fn fragment_changes_are_rediscovered_and_failed_composition_preserves_the_catalog() {
         let fixture = Fixture::new();
         let fragments = fixture.0.join("conf.d");
@@ -350,6 +384,8 @@ mod tests {
         for invalid in [
             "token = 'secret-must-not-leak'\n[",
             "default_agent = 'missing'",
+            "[profiles.p]\nagents = ['missing']",
+            "default_profile = 'missing'",
         ] {
             fixture.config(invalid);
             let error = broker.reload_config().await.unwrap_err();

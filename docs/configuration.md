@@ -1,8 +1,9 @@
 # Configuration
 
 Hive loads a root TOML file and any fragments it explicitly includes when the
-daemon starts. Profiles describe how to reach agents. They do not start agents
-until a session needs them.
+daemon starts. Agent definitions describe how to reach agents. Named execution
+profiles group agents, projects and workspace settings into working setups.
+Neither starts agents until a session needs them.
 
 ## MCP server declarations
 
@@ -164,10 +165,11 @@ default_agent = "claude"
 command = "claude-agent-acp"
 ```
 
-Each fragment can contain `[agents.<id>]`, `[mcp_servers.<id>]`, `[projects.<id>]`, `[workspaces.<id>]`
+Each fragment can contain `[profiles.<id>]`, `[agents.<id>]`, `[mcp_servers.<id>]`,
+`[projects.<id>]`, `[workspaces.<id>]`
 and global `[worktrunk]` tables with the
-same fields as the root. `include` and `default_agent` are root-only settings. A default can select a
-profile declared in a fragment. The root can also declare profiles directly.
+same fields as the root. `include`, `default_agent` and `default_profile` are
+root-only settings. Defaults can reference declarations in any fragment.
 
 Include entries are file paths or shell-style globs (`*`, `?`, character classes,
 and `**` for recursive matching). Relative paths resolve beside the selected root
@@ -181,8 +183,9 @@ or empty `conf.d`. An explicitly named missing file, invalid pattern, unreadable
 file, or directory selected as a fragment is an error. Glob traversal errors
 reported by the filesystem matcher also fail loading.
 
-Agent IDs must be unique across all files: profiles cannot override or extend
-one another. Repeated files, overlapping includes, symlink aliases, and including
+Agent IDs must be unique across all files: agent definitions cannot override or
+extend one another. Named execution profiles compose using the rules below.
+Repeated files, overlapping includes, symlink aliases, and including
 the root itself are rejected. There is no automatic `conf.d` discovery; without
 `include`, only the root is loaded.
 
@@ -223,7 +226,9 @@ and tracing settings require restart.
 | Setting | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `include` | Array of strings | `[]` | Root-only paths or globs for configuration fragments |
-| `default_agent` | String | Unset | Profile ID for session creation without a selector |
+| `default_agent` | String | Unset | Agent ID for session creation without an explicit agent |
+| `default_profile` | String | Unset | Root-only named execution profile for new sessions |
+| `profiles` | Table keyed by stable IDs | Empty | Named execution setups, composed across fragments |
 | `agents` | Table of profiles | Empty | Available downstream agents |
 | `mcp_servers` | Table keyed by server IDs | Empty | Managed stdio or directly forwarded HTTP definitions |
 | `projects` | Table keyed by project IDs | Empty | Portable configured definitions |
@@ -231,11 +236,100 @@ and tracing settings require restart.
 | `worktrunk` | Global integration table | Auto-detect | Optional WorkTrunk lifecycle selection |
 
 `HIVE_DEFAULT_AGENT` overrides `default_agent`. The selected ID must exist.
-A daemon can start without a default, but clients must then select a profile.
+A daemon can start without a default, but clients must then select an agent or
+an execution profile with an unambiguous agent choice.
 
 Profile IDs contain only ASCII letters, digits, `-`, or `_`, and cannot be empty.
 The ID in `[agents.opencode]` is `opencode`. Its optional `name` is only a display
 label and is not a selector.
+
+## Named execution profiles
+
+Agent definitions under `[agents]` remain compatible with existing configurations.
+Without a selected execution profile, existing agent selection and workspace
+behavior apply. A named profile references those agents and configured projects:
+
+```toml
+# config.toml
+default_profile = "personal"
+include = ["conf.d/*.toml"]
+```
+
+```toml
+# conf.d/personal.toml
+[profiles.personal]
+name = "Personal"
+agents = ["bee"]
+projects = ["hive", "bee"]
+default_agent = "bee"
+default_project = "hive"
+```
+
+```toml
+# conf.d/workspace-settings.toml
+[profiles.personal.workspaces.hive]
+policy = "worktree"
+base_ref = "main"
+
+[profiles.personal.workspaces.bee]
+template = "task"
+```
+
+Declare `agents.bee`, both projects, and `workspaces.task` elsewhere in the composed
+configuration. Profile references resolve after all fragments have been composed.
+They reference configured projects, not mutable managed-project database entries.
+
+`name`, `default_agent`, and `default_project` are optional. `agents` must contain
+at least one configured agent. `projects` can be empty for cwd-only setups.
+Defaults must belong to their respective member lists. A `workspaces` key must
+belong to `projects`. Each workspace entry uses either a `template` reference to
+a top-level workspace template or an inline `policy` with that policy's supported
+settings. Mixing the forms, or supplying inline overrides beside `template`, is
+an error. Policies must be compatible with the referenced project's SCM.
+
+### Composition rules
+
+| Profile field | Merge behavior across root and fragments |
+| --- | --- |
+| `agents`, `projects` | Sorted set union; duplicates and empty contributions have no effect |
+| `name`, `default_agent`, `default_project` | Missing contributes nothing; equal values agree; unequal values conflict |
+| `workspaces` | Merge by project ID, then by explicitly supplied field using the same scalar rule |
+
+An inline workspace's `policy` and its settings may be supplied by different
+fragments. Defaults apply only after composition. Conflicts report the profile,
+field path and both source files, without printing their values. Existing duplicate
+rules for agents, projects and top-level workspace templates still apply.
+
+Profile IDs use nonempty ASCII letters, digits, `-` or `_`. Profile and agent IDs
+are separate namespaces and may coincide. Moving or renaming a fragment never
+changes a profile's ID. Files are organizational, not profile owners.
+
+### Selection and overrides
+
+Select a profile with `hive tui --profile personal`, the web **Execution profile**
+selector, or `_meta.hive.profile` on `session/new`. Omission uses `default_profile`,
+if configured. Selection is per request, not a daemon-wide active setup.
+
+| Choice | Precedence within a selected execution profile |
+| --- | --- |
+| Agent | Explicit agent → profile `default_agent` → global `default_agent` if a member → sole member |
+| Project for workspace creation | Explicit project → profile `default_project` → agent's project if a member → sole member |
+| Workspace policy | Explicit named policy → profile's per-project policy/template → agent's workspace template |
+| Base/revision/branch | Explicit request selectors override policy defaults using the normal workspace rules |
+
+Explicit agents/projects outside membership fail. Legacy defaults outside
+membership are skipped. Ambiguous choices report how to select explicitly or set
+a default; list order never chooses an agent or project. A project is required
+only when creating a workspace. Membership alone does not change cwd or provision
+a checkout. An applicable workspace policy triggers automatic provisioning.
+
+An explicit existing directory bypasses managed provisioning. Attaching a local
+workspace requires its project to belong to the selected profile. Membership is
+working-setup availability, not a filesystem isolation boundary. Native adoption
+checks agent membership but does not provision a workspace. Resume/recovery keeps
+the recorded concrete agent and workspace, even after profile edits or removal.
+WorkTrunk settings remain global. Persisted agent-profile IDs retain their existing
+meaning; no migration is required.
 
 ## Logical projects
 

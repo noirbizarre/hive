@@ -204,6 +204,8 @@ fn encode(text: &str) -> String {
 fn config(server: &Server) -> Config {
     Config {
         mcp_servers: Default::default(),
+        default_profile: None,
+        profiles: Default::default(),
         workspaces: Default::default(),
         worktrunk: None,
         projects: Default::default(),

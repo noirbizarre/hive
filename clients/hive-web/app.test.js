@@ -9,6 +9,18 @@ const session = { sessionId: 'hive-tui', cwd: '/workspace', agent: 'pi', title: 
 const modelOptions = currentValue => [{ configId: 'model', name: 'Model', category: 'model', type: 'select', currentValue,
   options: [{ groupId: 'provider', name: 'Provider', options: [{ value: 'fast', name: 'Fast' }, { value: 'careful', name: 'Careful' }] }] }];
 
+test('explicit and implicit browser creation transmit named profile selection without inventing an agent', async () => {
+  for (const implicit of [false, true]) {
+    const sockets = transport();
+    const client = connect('ws://localhost/acp');
+    if (implicit) await client.prompt('hello', '', 'personal');
+    else await client.create('', 'personal');
+    const creation = sockets[0].sent.find(message => message.method === 'session/new');
+    assert.deepEqual(creation.params._meta.hive, { profile: 'personal' });
+    client.close();
+  }
+});
+
 test('provisioned workspace cwd is retained when relinquishing a newly created session', async () => {
   const sockets = transport((socket, message, result) => {
     if (message.method === 'session/new') return { ...result, _meta: { hive: { ...result._meta.hive,

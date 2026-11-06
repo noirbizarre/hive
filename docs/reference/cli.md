@@ -7,7 +7,7 @@ Use `hive <command> --help` for the installed executable's exact help.
 
 | Command | Purpose | Options |
 | --- | --- | --- |
-| `hive` / `hive tui` | Terminal client | `--address`, `--transport`, `--agent`, `--session` |
+| `hive` / `hive tui` | Terminal client | `--address`, `--transport`, `--profile`, `--agent`, `--session` |
 | `hive daemon` | Foreground daemon | `--listen`, `--config`, `--allow-remote`, `--auth-token-env`, `--allowed-origin` |
 | `hive daemon status` | Print daemon status response | `--url` |
 | `hive daemon reload` | Reload the original config for new sessions | `--url` |
@@ -29,7 +29,8 @@ prompt submission, native adoption, or session deletion subcommands.
 | --- | --- | --- |
 | `--address` | `127.0.0.1:8765` | Daemon host and port, without URL scheme |
 | `--transport` | `ws` | `ws`, `http` (HTTP/SSE), `wss`, or `https` |
-| `--agent` | Unset | Preselect a profile in the creation picker |
+| `--profile` | Daemon `default_profile` | Named execution setup for creation; conflicts with `--session` |
+| `--agent` | Unset | Preselect an agent in the creation picker; must belong to the selected profile |
 | `--session` | Unset | Attach to a known Hive session ID |
 | `--cwd` | Unset | Explicit existing directory, bypassing a profile workspace policy |
 | `--project` | Profile default | Project override for workspace creation |

@@ -615,7 +615,7 @@ export function connect(url, onChange = () => {}, onDisconnect = () => true) {
       }
       return takingControl;
     },
-    async create(agent = '') {
+    async create(agent = '', profile = '') {
       await ready();
       if (creating || configuring) throw new Error('Wait for session configuration to finish');
       if (selected) throw new Error('A session is already selected');
@@ -629,7 +629,7 @@ export function connect(url, onChange = () => {}, onDisconnect = () => true) {
         let created;
         try {
           created = await request('session/new', { cwd: '/', mcpServers: [],
-            ...(agent ? { _meta: { hive: { agent } } } : {}) });
+            ...(agent || profile ? { _meta: { hive: { ...(agent ? { agent } : {}), ...(profile ? { profile } : {}) } } } : {}) });
         } catch (error) {
           if (connected) { creationUncertain = false; store?.removeItem('hive.creating'); }
           throw error;
@@ -677,10 +677,10 @@ export function connect(url, onChange = () => {}, onDisconnect = () => true) {
       }
       finally { configuring = false; publish(); }
     },
-    async prompt(text, agent = '') {
+    async prompt(text, agent = '', profile = '') {
       await ready();
       if (!text?.trim()) throw new Error('Enter a prompt');
-      if (!selected) await client.create(agent);
+      if (!selected) await client.create(agent, profile);
       if (configuring || creating) throw new Error('Wait for session configuration to finish');
       if (desired && desired.sessionId !== selected.sessionId) throw new Error('Wait for the selected session to open');
       if (owner?.role !== 'pilot') throw new Error('Start typing to take control first');

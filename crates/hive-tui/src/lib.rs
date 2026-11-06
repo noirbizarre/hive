@@ -70,6 +70,9 @@ pub struct Options {
     pub transport: String,
     #[arg(long)]
     pub agent: Option<String>,
+    /// Named execution profile for new sessions.
+    #[arg(long, conflicts_with = "session")]
+    pub profile: Option<String>,
     #[arg(long)]
     pub session: Option<String>,
 }
@@ -639,10 +642,21 @@ fn start_creation(cx: &V2ConnectionTo<Agent>, app: &mut App, profile: String) {
     }
     let previous = previous_pilot(app, None);
     let mut meta = v2::Meta::new();
-    meta.insert("hive".into(), serde_json::json!({"agent":profile}));
+    let mut hive = serde_json::json!({});
+    if !profile.is_empty() {
+        hive["agent"] = profile.into();
+    }
+    if let Some(profile) = &app.execution_profile {
+        hive["profile"] = profile.clone().into();
+    }
+    meta.insert("hive".into(), hive);
     if let Some(launch) = &app.workspace_launch {
         meta.get_mut("hive").expect("Hive metadata exists")["workspace"] =
             serde_json::to_value(launch).expect("launch serializes");
+    }
+    // Omission delegates to daemon defaults; an empty Hive selector is deliberately invalid.
+    if meta["hive"] == serde_json::json!({}) {
+        meta.remove("hive");
     }
     let request = v2::NewSessionRequest::new(app.cwd.clone()).meta(meta);
     let (sent, result) = oneshot::channel();
@@ -895,6 +909,24 @@ fn apply_catalog(app: &mut App, catalog: Catalog) {
 }
 
 fn update_profiles(app: &mut App, providers: &serde_json::Value) {
+    app.providers = providers.clone();
+    app.execution_profiles =
+        serde_json::from_value(providers["profiles"].clone()).unwrap_or_default();
+    if app.execution_profile.as_ref().is_some_and(|id| {
+        !app.execution_profiles
+            .iter()
+            .any(|profile| &profile.id == id)
+    }) {
+        app.execution_profile = None;
+    }
+    let execution = app.execution_profiles.iter().find(|profile| {
+        Some(profile.id.as_str())
+            == app
+                .execution_profile
+                .as_deref()
+                .or_else(|| providers["defaultProfile"].as_str())
+    });
+    let selected_agent = app.profiles.get(app.profile_selected).cloned();
     // `selected` also indexes the session list on other pages; only remap it for profiles.
     let selected = (app.page == Page::Profiles)
         .then(|| app.profiles.get(app.selected).cloned())
@@ -904,16 +936,38 @@ fn update_profiles(app: &mut App, providers: &serde_json::Value) {
         .map(|agents| {
             agents
                 .iter()
+                .filter(|agent| {
+                    execution.is_none_or(|profile| {
+                        agent["id"]
+                            .as_str()
+                            .is_some_and(|id| profile.agents.iter().any(|member| member == id))
+                    })
+                })
                 .filter_map(|agent| agent["id"].as_str().map(str::to_owned))
                 .collect()
         })
         .unwrap_or_default();
+    if execution.is_some() {
+        app.profiles.insert(0, String::new());
+    }
+    app.profile_selected = selected_agent
+        .as_ref()
+        .and_then(|id| app.profiles.iter().position(|agent| agent == id))
+        .unwrap_or(0);
     if app.page == Page::Profiles {
         app.selected = selected
             .as_ref()
             .and_then(|id| app.profiles.iter().position(|profile| profile == id))
             .unwrap_or(0);
     }
+}
+
+fn select_execution_profile(app: &mut App, profile: Option<String>) {
+    app.execution_profile = profile;
+    // A profile change is new intent, not an inventory refresh preserving an agent override.
+    app.profiles.clear();
+    app.profile_selected = 0;
+    update_profiles(app, &app.providers.clone());
 }
 
 fn resume_failure(error: &agent_client_protocol::Error) -> String {
@@ -1505,6 +1559,23 @@ async fn handle_key(
                 .saturating_sub(1),
             )
         }
+        (KeyCode::Char('p'), _) if app.page == Page::Profiles => {
+            // Include implicit daemon selection so profiles never hide ungrouped agents forever.
+            let next = app
+                .execution_profile
+                .as_ref()
+                .and_then(|id| {
+                    app.execution_profiles
+                        .iter()
+                        .position(|profile| &profile.id == id)
+                })
+                .map_or(0, |index| index + 1);
+            let profile = app
+                .execution_profiles
+                .get(next)
+                .map(|profile| profile.id.clone());
+            select_execution_profile(app, profile);
+        }
         (KeyCode::Char('a'), _) if app.page == Page::Sessions => {
             app.all = !app.all;
             app.refresh_requested = true;
@@ -2090,11 +2161,24 @@ async fn run_with_clipboard(
         .json()
         .await?;
     update_profiles(&mut app, &providers);
+    if let Some(profile) = &options.profile {
+        if !app
+            .execution_profiles
+            .iter()
+            .any(|entry| &entry.id == profile)
+        {
+            return Err(
+                format!("unknown execution profile '{profile}'; query GET /v1/providers").into(),
+            );
+        }
+        select_execution_profile(&mut app, Some(profile.clone()));
+        app.page = Page::Profiles;
+    }
     if let Some(agent) = &options.agent {
         if options.session.is_none() {
             app.page = Page::Profiles;
         }
-        app.profile_selected = app.profiles.iter().position(|id| id == agent).unwrap_or(0);
+        app.profile_selected = app.profiles.iter().position(|id| id == agent).ok_or_else(|| format!("agent '{agent}' is unavailable in the selected profile; query GET /v1/providers"))?;
     }
     let mut guard = TerminalGuard::enter()?;
     let mut terminal =
@@ -2136,7 +2220,7 @@ async fn run_with_clipboard(
                  connected_once = true;
                  app.connected = true;
                  if let Err(error) = refresh(&http, &operational, &mut app).await { app.status = error; }
-                if app.page == Page::Profiles && app.active.is_none() {
+                 if !reconnecting && app.page == Page::Profiles && app.active.is_none() {
                     app.profile_selected = options.agent.as_ref().and_then(|agent| app.profiles.iter().position(|id| id == agent)).unwrap_or(0);
                 }
                 let initial = app.active.clone().or_else(|| options.session.clone());
@@ -2714,6 +2798,24 @@ mod tests {
         let result = done.recv_timeout(Duration::from_millis(500));
         worker.join().unwrap();
         result.expect("an idle keyboard reader must observe receiver closure");
+    }
+
+    #[test]
+    fn named_profile_refresh_filters_agents_and_preserves_selection_independently() {
+        let inventory = serde_json::json!({"agents":[{"id":"a"},{"id":"b"}], "defaultProfile":"personal", "profiles":[{"id":"personal","name":"Personal","agents":["b"],"projects":[],"defaultAgent":null,"defaultProject":null,"isDefault":true,"workspaces":{}}]});
+        let mut app = App {
+            page: Page::Profiles,
+            ..App::default()
+        };
+        update_profiles(&mut app, &inventory);
+        assert!(app.execution_profile.is_none());
+        assert_eq!(app.profiles, ["", "b"]);
+        app.profile_selected = 1;
+        update_profiles(&mut app, &inventory);
+        assert_eq!(app.profiles[app.profile_selected], "b");
+        update_profiles(&mut app, &serde_json::json!({"agents":[{"id":"a"}]}));
+        assert!(app.execution_profile.is_none());
+        assert_eq!(app.profiles, ["a"]);
     }
 
     #[test]

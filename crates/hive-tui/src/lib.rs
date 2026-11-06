@@ -3,9 +3,12 @@
 mod activity;
 pub mod capabilities;
 mod clipboard;
+mod draft;
 mod editor;
 mod external_editor;
 pub mod images;
+mod input;
+mod osc5522;
 mod picker;
 mod state;
 mod theme;
@@ -214,6 +217,8 @@ impl FormDraft {
 
 struct TerminalGuard {
     active: bool,
+    // Retry cleanup only for a mode we actually used; disabled/unavailable transports emit none.
+    rich_mode_used: bool,
     images: images::KittyRenderer,
 }
 impl Interaction {
@@ -275,6 +280,7 @@ impl TerminalGuard {
     fn enter() -> std::io::Result<Self> {
         let mut guard = Self {
             active: false,
+            rich_mode_used: false,
             images: images::KittyRenderer::default(),
         };
         guard.resume()?;
@@ -297,6 +303,11 @@ impl TerminalGuard {
                 std::io::stdout(),
                 DisableMouseCapture,
                 DisableBracketedPaste,
+                crossterm::style::Print(if self.rich_mode_used {
+                    "\x1b[?5522l"
+                } else {
+                    ""
+                }),
                 LeaveAlternateScreen
             );
             return Err(error);
@@ -329,7 +340,10 @@ impl TerminalGuard {
     ) -> std::io::Result<()> {
         self.images.invalidate();
         self.images.begin(terminal.backend_mut())?;
-        terminal.clear()
+        // Fullscreen resize resets the back buffer without Crossterm's cursor-position reader.
+        // A cursor query here could buffer keystrokes outside our single input owner.
+        let size = terminal.size()?;
+        terminal.resize(ratatui::layout::Rect::new(0, 0, size.width, size.height))
     }
 
     fn suspend(&mut self) -> std::io::Result<()> {
@@ -344,6 +358,11 @@ impl TerminalGuard {
             std::io::stdout(),
             DisableMouseCapture,
             DisableBracketedPaste,
+            crossterm::style::Print(if self.rich_mode_used {
+                "\x1b[?5522l"
+            } else {
+                ""
+            }),
             crossterm::cursor::Show,
             LeaveAlternateScreen
         );
@@ -360,6 +379,11 @@ impl Drop for TerminalGuard {
             std::io::stdout(),
             DisableMouseCapture,
             DisableBracketedPaste,
+            crossterm::style::Print(if self.rich_mode_used {
+                "\x1b[?5522l"
+            } else {
+                ""
+            }),
             crossterm::cursor::Show,
             LeaveAlternateScreen
         );
@@ -914,6 +938,8 @@ fn show_interaction(app: &mut App, interaction: &Interaction) {
     app.editor.cancel_drag();
     if app.suspended_draft.is_none() {
         app.suspended_draft = Some(std::mem::take(&mut app.input));
+        app.suspended_images = std::mem::take(&mut app.attachments);
+        app.draft_revision = app.draft_revision.wrapping_add(1);
     }
     if let Some(view) = app.transcript() {
         view.clear_selection();
@@ -988,19 +1014,37 @@ fn apply_prompt_ack(app: &mut App, (id, key, result): PromptAck) {
             let rejected = diagnostic
                 .is_some_and(|data| data["code"] == "hive::prompt::not_dispatched")
                 || error.code == Error::request_cancelled().code;
-            if rejected && let Some((_, text)) = app.pending.remove(&id) {
-                app.drafts.insert(id.clone(), text);
+            if rejected && let Some((_, draft)) = app.pending.remove(&id) {
+                app.rejected.insert(id.clone(), draft);
             }
             if app.active.as_deref() != Some(&id) {
                 return;
             }
             if rejected {
-                if app.input.is_empty() && app.dialog.is_none() && app.suspended_draft.is_none() {
-                    app.input = app.drafts.remove(&id).unwrap_or_default();
+                if app.input.is_empty()
+                    && app.attachments.is_empty()
+                    && app.dialog.is_none()
+                    && app.suspended_draft.is_none()
+                    && let Some(draft) = app.rejected.remove(&id)
+                {
+                    app.input = draft.text;
+                    app.attachments = draft.images;
                     app.editor = editor::PromptEditor::default();
                 }
                 app.status =
                     "Prompt was not dispatched; edit the draft and submit new intent".into();
+                if app.rejected.contains_key(&id) {
+                    app.status.push_str(
+                        "; newer draft kept — clear it and use Alt-R to restore rejected content",
+                    );
+                }
+                if let Some(data) = diagnostic {
+                    for field in ["message", "help"] {
+                        if let Some(message) = data[field].as_str() {
+                            app.status.push_str(&format!("; {message}"));
+                        }
+                    }
+                }
             } else {
                 app.status = diagnostic.map_or_else(|| "Prompt acknowledgement uncertain; observe the session, then use Ctrl-L to retrieve its receipt".into(), |data| format!("{} — {}", data["message"].as_str().unwrap_or("Prompt uncertain"), data["help"].as_str().unwrap_or("Inspect agent state")));
             }
@@ -1032,8 +1076,7 @@ fn send_prompt(cx: &V2ConnectionTo<Agent>, app: &App, acks: mpsc::UnboundedSende
     tokio::spawn(async move {
         let result = cx
             .send_request(
-                v2::PromptRequest::new(v2::SessionId::new(id.clone()), vec![content.into()])
-                    .meta(meta),
+                v2::PromptRequest::new(v2::SessionId::new(id.clone()), content.blocks()).meta(meta),
             )
             .block_task()
             .await;
@@ -1054,6 +1097,28 @@ async fn handle_key(
         return false;
     }
     restore_draft(app);
+    app.draft_revision = app.draft_revision.wrapping_add(1);
+    if app.page == Page::Chat
+        && app.dialog.is_none()
+        && app.picker.is_none()
+        && key.modifiers == KeyModifiers::ALT
+    {
+        if key.code == KeyCode::Backspace {
+            app.attachments.pop();
+            app.status = "Last image attachment removed".into();
+            return false;
+        }
+        if key.code == KeyCode::Char('r')
+            && app.input.is_empty()
+            && app.attachments.is_empty()
+            && let Some(draft) = app.active.as_ref().and_then(|id| app.rejected.remove(id))
+        {
+            app.input = draft.text;
+            app.attachments = draft.images;
+            app.status = "Rejected prompt restored; Enter submits new intent".into();
+            return false;
+        }
+    }
     if interaction.is_some() && matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
         app.dialog_scroll = if key.code == KeyCode::PageUp {
             app.dialog_scroll.saturating_sub(4)
@@ -1077,6 +1142,9 @@ async fn handle_key(
             *interaction = None;
             app.dialog = None;
             app.input.clear();
+            if app.suspended_draft.is_none() {
+                app.attachments.clear();
+            }
         }
         return false;
     }
@@ -1453,7 +1521,7 @@ async fn handle_key(
                 }
             }
             Page::Chat => {
-                if !app.input.trim().is_empty()
+                if (!app.input.trim().is_empty() || !app.attachments.is_empty())
                     && app.pilot()
                     && !app
                         .owner
@@ -1466,9 +1534,35 @@ async fn handle_key(
                         .as_ref()
                         .is_some_and(|id| !app.pending.contains_key(id))
                 {
-                    let content = std::mem::take(&mut app.input);
+                    if !app.attachments.is_empty()
+                        && app
+                            .owner
+                            .as_ref()
+                            .is_some_and(|owner| owner["hive"]["promptImages"] == false)
+                    {
+                        app.status = "This agent adapter does not accept images; choose an image-capable ACPv2 agent or remove attachments".into();
+                        return false;
+                    }
                     let key = uuid::Uuid::new_v4().to_string();
                     let id = app.active.clone().unwrap_or_default();
+                    let content = draft::PromptDraft {
+                        text: app.input.clone(),
+                        images: app.attachments.clone(),
+                    };
+                    let mut meta = app.owner.clone().unwrap_or_default();
+                    if let Some(hive) = meta.get_mut("hive") {
+                        hive["key"] = key.clone().into();
+                    }
+                    let request =
+                        v2::PromptRequest::new(v2::SessionId::new(id.clone()), content.blocks())
+                            .meta(meta);
+                    if let Err(error) = draft::check_request(&request) {
+                        app.status = error.to_string();
+                        return false;
+                    }
+                    app.input.clear();
+                    app.attachments.clear();
+                    app.draft_revision = app.draft_revision.wrapping_add(1);
                     // Only sequenced daemon messages enter history; the admission echo would duplicate this draft.
                     app.submitting.insert(id.clone());
                     app.pending.insert(id, (key, content));
@@ -1499,6 +1593,8 @@ fn restore_draft(app: &mut App) {
         && let Some(draft) = app.suspended_draft.take()
     {
         app.input = draft;
+        app.attachments = std::mem::take(&mut app.suspended_images);
+        app.draft_revision = app.draft_revision.wrapping_add(1);
     }
 }
 
@@ -1516,16 +1612,19 @@ fn paste(app: &mut App, interaction: &Option<Interaction>, value: &str) {
             .is_some_and(|(_, schema)| FormDraft::choices(schema).is_empty())
         {
             app.input.push_str(&value.replace('\n', " "));
+            app.draft_revision = app.draft_revision.wrapping_add(1);
         }
     } else if interaction.is_none() && app.dialog.is_none() {
         if let Some(picker) = app.picker.as_mut() {
             picker.query.push_str(&value.replace('\n', " "));
+            app.draft_revision = app.draft_revision.wrapping_add(1);
             let choices = app.config_choices();
             if let Some(picker) = app.picker.as_mut() {
                 picker.refresh(choices);
             }
         } else if app.page == Page::Chat {
             app.editor.insert(&mut app.input, &value);
+            app.draft_revision = app.draft_revision.wrapping_add(1);
             app.transcript_focused = false;
         }
     }
@@ -1538,26 +1637,38 @@ fn clipboard_request(
     clipboard: &clipboard::Clipboard,
     output: &mut impl std::io::Write,
 ) {
+    if let Some(request) = make_clipboard_request(app, interaction, command)
+        && let Some(completion) = clipboard.dispatch(request, &app.terminal_capabilities, output)
+    {
+        clipboard::complete(app, completion);
+    }
+}
+
+fn make_clipboard_request(
+    app: &mut App,
+    interaction: &Option<Interaction>,
+    command: char,
+) -> Option<clipboard::Request> {
     let target = if let Some(Interaction::Elicitation(request, _, draft)) = interaction {
         if command != 'v'
             || !FormDraft::fields(request)
                 .get(draft.field)
                 .is_some_and(|(_, schema)| FormDraft::choices(schema).is_empty())
         {
-            return;
+            return None;
         }
         clipboard::Target::Question(app.dialog.clone().unwrap_or_default())
     } else if interaction.is_some() || app.dialog.is_some() {
-        return;
+        return None;
     } else if let Some(picker) = &app.picker {
         if command != 'v' {
-            return;
+            return None;
         }
         clipboard::Target::Picker(picker.query.clone())
     } else if app.page == Page::Chat {
         clipboard::Target::Chat
     } else {
-        return;
+        return None;
     };
     if matches!(target, clipboard::Target::Chat) {
         app.editor.prepare(&app.input, app.editor.area);
@@ -1567,25 +1678,32 @@ fn clipboard_request(
     } else {
         app.editor.selected()
     };
+    let selected_image = if app.transcript_focused {
+        app.transcript().and_then(|view| view.selected_image())
+    } else {
+        None
+    };
     let operation = match (command, selected) {
-        ('v', _) => clipboard::Operation::Paste,
+        ('v', _) if matches!(target, clipboard::Target::Chat) => clipboard::Operation::Paste,
+        ('v', _) => clipboard::Operation::PasteText,
+        ('c', _) if selected_image.is_some() => {
+            clipboard::Operation::CopyImage(selected_image.expect("checked selected image"))
+        }
         ('c', Some(text)) => clipboard::Operation::Copy(text),
         ('x', Some(text)) if !app.transcript_focused => clipboard::Operation::Cut(text),
         _ => {
             app.status = "Select text before copying or cutting".into();
-            return;
+            return None;
         }
     };
-    let request = clipboard::Request {
+    Some(clipboard::Request {
         operation,
         session: app.active.clone(),
         original: app.input.clone(),
         editor: app.editor.clone(),
         target,
-    };
-    if let Some(completion) = clipboard.dispatch(request, &app.terminal_capabilities, output) {
-        clipboard::complete(app, completion);
-    }
+        revision: app.draft_revision,
+    })
 }
 
 fn apply_configuration(cx: &V2ConnectionTo<Agent>, app: &mut App) {
@@ -1829,6 +1947,7 @@ async fn interaction_client<R>(
         .await
 }
 
+#[cfg(any(test, not(unix)))]
 fn read_keys(keys: mpsc::UnboundedSender<Event>, mut next: impl FnMut() -> Option<Event>) {
     // Tokio waits for blocking workers on shutdown even when no more terminal input arrives.
     while !keys.is_closed() {
@@ -1847,16 +1966,24 @@ enum ReaderControl {
 
 fn terminal_reader(
     keys: mpsc::UnboundedSender<Event>,
+    replies: mpsc::Sender<input::Reply>,
     controls: std::sync::mpsc::Receiver<ReaderControl>,
 ) {
-    controlled_reader(keys, controls, || {
-        event::poll(Duration::from_millis(20))
-            .unwrap_or(false)
-            .then(|| event::read().ok())
-            .flatten()
-    });
+    #[cfg(unix)]
+    input::reader(keys, replies, controls);
+    #[cfg(not(unix))]
+    {
+        let _ = replies;
+        controlled_reader(keys, controls, || {
+            event::poll(Duration::from_millis(20))
+                .unwrap_or(false)
+                .then(|| event::read().ok())
+                .flatten()
+        });
+    }
 }
 
+#[cfg(any(test, not(unix)))]
 fn controlled_reader(
     keys: mpsc::UnboundedSender<Event>,
     controls: std::sync::mpsc::Receiver<ReaderControl>,
@@ -1968,8 +2095,20 @@ async fn run_with_clipboard(
     let mut terminal =
         ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(std::io::stdout()))?;
     let (keys_tx, mut keys) = mpsc::unbounded_channel();
+    let (replies_tx, mut replies) = mpsc::channel(32);
     let (reader_control, controls) = std::sync::mpsc::channel();
-    let reader = tokio::task::spawn_blocking(move || terminal_reader(keys_tx, controls));
+    let reader =
+        tokio::task::spawn_blocking(move || terminal_reader(keys_tx, replies_tx, controls));
+    let rich_paste = cfg!(unix)
+        && app.terminal_capabilities.osc5522_read.source
+            != capabilities::CapabilitySource::UnavailableTransport
+        && !(app.terminal_capabilities.osc5522_read.source
+            == capabilities::CapabilitySource::Override
+            && !app.terminal_capabilities.osc5522_read.is_usable());
+    if rich_paste {
+        std::io::Write::write_all(terminal.backend_mut(), b"\x1b[?5522$p")?;
+        std::io::Write::flush(terminal.backend_mut())?;
+    }
     let mut editing = None;
     let mut editor_prefix: Option<std::time::Instant> = None;
     let mut quit = false;
@@ -2072,16 +2211,49 @@ async fn run_with_clipboard(
                               editing = None;
                               guard.resume().map_err(Error::into_internal_error)?;
                                guard.clear(&mut terminal).map_err(Error::into_internal_error)?;
-                              while keys.try_recv().is_ok() {}
-                              let _ = reader_control.send(ReaderControl::Resume);
+                               while keys.try_recv().is_ok() {}
+                               while replies.try_recv().is_ok() {}
+                               let _ = reader_control.send(ReaderControl::Resume);
+                               if rich_paste { std::io::Write::write_all(terminal.backend_mut(), b"\x1b[?5522$p").and_then(|()| std::io::Write::flush(terminal.backend_mut())).map_err(Error::into_internal_error)?; }
                               match result { Ok(edited) => external_editor::apply(&mut app, edited), Err(error) => app.status = error }
                           }
-                          Some(completion) = clipboard.completions.recv(), if editing.is_none() => clipboard::complete(&mut app, completion),
+                          Some(completion) = clipboard.completions.recv(), if editing.is_none() => {
+                              if let Some(completion) = clipboard.finish(completion, terminal.backend_mut()) { clipboard::complete(&mut app, completion); }
+                          },
+                          Some(reply) = replies.recv(), if editing.is_none() => {
+                              match reply {
+                                  input::Reply::PasteMode(status) if rich_paste && matches!(status, 1..=3) => {
+                                      use std::io::Write;
+                                      // Mark before writing so partial output failures still attempt restoration.
+                                      guard.rich_mode_used = true;
+                                      terminal.backend_mut().write_all(b"\x1b[?5522h").and_then(|()| terminal.backend_mut().flush()).map_err(Error::into_internal_error)?;
+                                      clipboard.protocol.borrow_mut().native_paste = true;
+                                      // Negotiation proves support, but does not grant arbitrary read consent.
+                                      let cap = &mut app.terminal_capabilities.osc5522_write;
+                                      cap.detected = capabilities::Support::Supported;
+                                      if cap.source == capabilities::CapabilitySource::Automatic { cap.effective = capabilities::Support::Supported; }
+                                      app.terminal_capabilities.osc5522_read.detected = capabilities::Support::Supported;
+                                  }
+                                  input::Reply::Clipboard(bytes) => {
+                                      let outcome = clipboard.protocol.borrow_mut().receive(&bytes, || make_clipboard_request(&mut app, &interaction, 'v'), terminal.backend_mut());
+                                      match outcome {
+                                          Some(osc5522::Outcome::Complete(completion)) => clipboard::complete(&mut app, completion),
+                                          Some(osc5522::Outcome::Image(request, mime, bytes)) => {
+                                              if let Some(completion) = clipboard.prepare_image(request, mime, bytes) { clipboard::complete(&mut app, completion); }
+                                          }
+                                          None => {}
+                                      }
+                                  }
+                                  input::Reply::Error(message) => { clipboard.protocol.borrow_mut().abort(); app.status = message; }
+                                  _ => {}
+                              }
+                          },
                           Some(result) = catalog_rx.recv() => {
                               refreshing = false;
                               match result { Ok(catalog) => apply_catalog(&mut app, catalog), Err(error) => app.status = format!("Session list unavailable: {error}") }
                           }
                            _ = interaction_tick.tick() => {
+                               if editing.is_none() && let Some(completion) = clipboard.protocol.borrow_mut().tick(terminal.backend_mut()) { clipboard::complete(&mut app, completion); }
                                let phase = (animation_clock.elapsed().as_millis() / 100) as usize;
                                let animated = editing.is_none() && app.animation_visible && phase != app.animation_phase;
                                app.animation_phase = phase;
@@ -2143,12 +2315,15 @@ async fn run_with_clipboard(
                              // Dropping an overflow request safely cancels it at the daemon boundary.
                         }
                            Some(acknowledgement) = ack_rx.recv() => apply_prompt_ack(&mut app, acknowledgement),
-                          Some(event) = keys.recv() => {
-                             let key = match event {
+                           Some(event) = keys.recv() => {
+                              let key = match event {
                                  Event::Key(key) => key,
-                                  Event::Mouse(mouse) => {
-                                      if matches!(mouse.kind, MouseEventKind::Down(_)) { editor_prefix = None; }
-                                      handle_mouse(&mut app, mouse); dirty = true; continue;
+                                   Event::Mouse(mouse) => {
+                                       if matches!(mouse.kind, MouseEventKind::Down(_)) { editor_prefix = None; }
+                                       let before = (app.editor.caret, app.editor.selection());
+                                       handle_mouse(&mut app, mouse);
+                                       if before != (app.editor.caret, app.editor.selection()) { app.draft_revision = app.draft_revision.wrapping_add(1); }
+                                       dirty = true; continue;
                                   }
                                   Event::Paste(value) => { editor_prefix = None; paste(&mut app, &interaction, &value); dirty = true; continue; }
                                   Event::FocusLost => {
@@ -2165,7 +2340,7 @@ async fn run_with_clipboard(
                                   _ => { dirty = true; continue; },
                               };
                               dirty = true;
-                              if key.kind == KeyEventKind::Release { continue; }
+                               if key.kind == KeyEventKind::Release { continue; }
                                if let Some(command) = clipboard::command(key) {
                                    editor_prefix = None;
                                    // The UI owns terminal output; workers must never interleave escapes with a redraw or editor.
@@ -2180,8 +2355,11 @@ async fn run_with_clipboard(
                                               app.editor.cancel_drag();
                                               if let Some(view) = app.transcript() { view.clear_selection(); }
                                               let (sent, paused) = oneshot::channel();
-                                              if reader_control.send(ReaderControl::Pause(sent)).is_ok() && paused.await.is_ok() {
-                                                  while keys.try_recv().is_ok() {}
+                                               if reader_control.send(ReaderControl::Pause(sent)).is_ok() && paused.await.is_ok() {
+                                                   app.draft_revision = app.draft_revision.wrapping_add(1);
+                                                   clipboard.protocol.borrow_mut().cancel();
+                                                   while keys.try_recv().is_ok() {}
+                                                   while replies.try_recv().is_ok() {}
                                                   if let Err(error) = guard.suspend() {
                                                       let _ = guard.resume();
                                                       let _ = reader_control.send(ReaderControl::Resume);
@@ -2309,7 +2487,9 @@ mod tests {
             .unwrap();
         let (sender, mut keys) = mpsc::unbounded_channel();
         let (control, controls) = std::sync::mpsc::channel();
-        let reader = tokio::task::spawn_blocking(move || terminal_reader(sender, controls));
+        let (replies, _received) = mpsc::channel(32);
+        let reader =
+            tokio::task::spawn_blocking(move || terminal_reader(sender, replies, controls));
         let (sent, paused) = oneshot::channel();
         control.send(ReaderControl::Pause(sent)).unwrap();
         paused.await.unwrap();

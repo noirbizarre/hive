@@ -176,7 +176,13 @@ async fn main() -> agent_client_protocol::Result<()> {
                         v2::Implementation::new("hive-mock-agent", "0.1.0"),
                     )
                     .capabilities(
-                        v2::AgentCapabilities::new().session(v2::SessionCapabilities::new()),
+                        v2::AgentCapabilities::new().session({
+                            let mut session = v2::SessionCapabilities::new();
+                            if std::env::var_os("HIVE_MOCK_IMAGES").is_some() {
+                                session = session.prompt(v2::PromptCapabilities::new().image(v2::PromptImageCapabilities::new()));
+                            }
+                            session
+                        }),
                     ),
                 )
             },

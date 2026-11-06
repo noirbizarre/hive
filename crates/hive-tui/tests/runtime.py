@@ -18,6 +18,7 @@ import tempfile
 import termios
 import time
 import urllib.request
+import zlib
 from terminal_screen import Screen
 
 
@@ -38,6 +39,7 @@ def main():
         mode.write_text("success")
         create = sys.argv[2] == "create"
         osc52 = sys.argv[2] == "osc52"
+        rich = sys.argv[2] == "rich"
         editor.write_text(
             "from pathlib import Path\nimport sys, time\n"
             "root = Path(__file__).parent\n"
@@ -60,6 +62,9 @@ def main():
             # The child injects a failing clipboard backend rather than touching the native clipboard.
             env["XDG_RUNTIME_DIR"] = str(directory)
             env.pop("HIVE_RUNTIME_OSC52", None)
+            env.pop("HIVE_RUNTIME_RICH", None)
+            if rich:
+                env["HIVE_RUNTIME_RICH"] = "1"
             if osc52:
                 env["HIVE_RUNTIME_OSC52"] = "1"
             if create:
@@ -76,12 +81,38 @@ def main():
         screen = Screen()
         address = None
         cursor_queries = 0
+        mode_queries = 0
+        packet_offset = 0
+        clipboard_reads = []
+        clipboard_writes = []
+        deny_read = False
+
+        def png_chunk(kind, data):
+            return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+
+        png = (b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0))
+               + png_chunk(b"IDAT", zlib.compress(b"\x00\x01\x02\x03\xff")) + png_chunk(b"IEND", b""))
+
+        def clipboard_packet(metadata, data=b""):
+            return b"\x1b]5522;" + metadata.encode() + b";" + base64.b64encode(data) + b"\x1b\\"
+
+        def read_reply(identifier, mime, data):
+            # All-motion reporting must not invalidate an unchanged asynchronous paste target.
+            os.write(master, b"\x1b[<35;80;12M")
+            prefix = "type=read" + (f":id={identifier}" if identifier else "")
+            packets = clipboard_packet(prefix + ":status=OK")
+            for offset in range(0, len(data), 32):
+                packets += clipboard_packet(prefix + ":status=DATA:mime=" + base64.b64encode(mime.encode()).decode(), data[offset:offset + 32])
+            packets += clipboard_packet(prefix + ":status=DONE")
+            # Deliberately split framing and Base64 across writes, including ST boundaries.
+            for offset in range(0, len(packets), 7):
+                os.write(master, packets[offset:offset + 7])
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         # Start threads only in the parent, after fork; macOS forbids inherited runtime locks.
         http = ThreadPoolExecutor(max_workers=1)
 
         def pump():
-            nonlocal address, cursor_queries
+            nonlocal address, cursor_queries, mode_queries, packet_offset
             if not select.select([master], [], [], .02)[0]:
                 return
             try:
@@ -92,6 +123,27 @@ def main():
                 raise
             output.extend(chunk)
             screen.feed(chunk)
+            if rich:
+                while output.count(b"\x1b[?5522$p") > mode_queries:
+                    os.write(master, b"\x1b[?5522;2$y")
+                    mode_queries += 1
+                for packet in re.finditer(rb"\x1b\]5522;([^;]*);([^\x1b]*)\x1b\\", output[packet_offset:]):
+                    metadata = dict(field.split("=", 1) for field in packet[1].decode().split(":"))
+                    if metadata["type"] == "read":
+                        mime = base64.b64decode(packet[2]).decode()
+                        clipboard_reads.append((metadata, mime))
+                        if deny_read:
+                            os.write(master, clipboard_packet(f"type=read:id={metadata['id']}:status=EPERM"))
+                        else:
+                            read_reply(metadata["id"], mime, b"image/png text/plain" if mime == "." else png)
+                    elif metadata["type"] == "wdata":
+                        clipboard_writes.append((metadata, base64.b64decode(packet[2])))
+                        if "mime" not in metadata:
+                            os.write(master, clipboard_packet(f"type=write:id={metadata['id']}:status=DONE"))
+                # Retain an incomplete final packet for the next read.
+                complete = list(re.finditer(rb"\x1b\]5522;[^\x1b]*\x1b\\", output[packet_offset:]))
+                if complete:
+                    packet_offset += complete[-1].end()
             while output.count(b"\x1b[6n") > cursor_queries:
                 os.write(master, b"\x1b[3;3R")
                 cursor_queries += 1
@@ -135,6 +187,58 @@ def main():
                 wait(lambda: state()["creations"] == 1 and b"\x1b[?25h" in output)
             else:
                 wait(lambda: state()["resumes"] == 1 and b"\x1b[?25h" in output)
+            if rich:
+                wait(lambda: b"\x1b[?5522h" in output)
+                # Terminal-native offer authorizes exactly the follow-up representation read.
+                token = base64.b64encode(b"paste-token").decode()
+                send(clipboard_packet(f"type=read:status=OK:pw={token}"))
+                send(clipboard_packet("type=read:status=DATA:mime=Lg==", b"text/plain image/png"))
+                send(clipboard_packet("type=read:status=DONE"))
+                wait(lambda: screen.contains("Image attached"))
+                assert clipboard_reads[-1][0]["pw"] == token
+                assert not state()["prompts"]
+                send(b"describe\x18\x05")
+                wait(ready.exists)
+                assert ready.read_text() == "describe"
+                assert b"\x1b[?5522l" in output
+                release.touch()
+                wait(lambda: output.count(b"\x1b[?5522h") >= 2 and screen.contains("Editor changes loaded"))
+                send(b"\r")
+                wait(lambda: len(state()["prompts"]) == 1)
+                assert state()["prompts"][0] == [{"type": "text", "text": "from editor\nsecond"},
+                                               {"type": "image", "mimeType": "image/png", "data": base64.b64encode(png).decode()}]
+                # Explicit paste lists formats, then sends an image-only prompt.
+                send(b"\x1bv")
+                wait(lambda: len(clipboard_reads) == 3 and screen.contains("Image attached"))
+                send(b"\r")
+                wait(lambda: len(state()["prompts"]) == 2)
+                assert len(state()["prompts"][1]) == 1 and state()["prompts"][1][0]["type"] == "image"
+                action("image")
+                wait(lambda: screen.contains("[image 1:"))
+                rows = sorted({row for row, _ in screen.cells})
+                image_row = max(row for row in rows if "[image 1:" in "".join(screen.cells.get((row, col), " ") for col in range(100)))
+                send(f"\x1b[<0;5;{image_row + 1}M\x1b[<0;5;{image_row + 1}m\x1bc".encode())
+                wait(lambda: clipboard_writes and "mime" not in clipboard_writes[-1][0])
+                wait(lambda: screen.contains("Selection copied"))
+                assert b"".join(data for _, data in clipboard_writes).startswith(b"\x89PNG")
+                deny_read = True
+                send(b"\x1bv")
+                wait(lambda: screen.contains("permission denied"))
+                assert len(state()["prompts"]) == 2
+                send(b"\x11")
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    pump()
+                    exited, status = os.waitpid(pid, os.WNOHANG)
+                    if exited:
+                        pid = None
+                        assert os.waitstatus_to_exitcode(status) == 0
+                        break
+                else:
+                    raise AssertionError("rich clipboard fixture did not stop")
+                assert b"\x1b[?5522l" in output
+                assert settings(master) == original
+                return
             if osc52:
                 selection = "copy 界 👩‍💻\nsecond"
                 sequence = b"\x1b]52;c;" + base64.b64encode(selection.encode()) + b"\x1b\\"

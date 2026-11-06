@@ -31,6 +31,7 @@ pub struct Transcript {
     width: u16,
     epoch: u64,
     selection: Option<((usize, usize), (usize, usize))>,
+    image_selection: Option<(usize, usize, Arc<EncodedImage>)>,
     dragging: bool,
     pressed_tool: Option<usize>,
     dragged: bool,
@@ -139,21 +140,26 @@ fn entry_layout(
                 let height = usize::from(mode.1)
                     .saturating_sub(caption_height)
                     .min(usize::from(ImageBounds::INLINE.rows)) as u16;
-                if mode.0 && height > 0 && image.dimensions().is_ok() && !image.failed() {
-                    images.push(InlineImage {
-                        caption_row,
-                        row: rows.len(),
-                        height,
-                        image: image.clone(),
-                        ordinal,
-                    });
-                    // Pixel reservations have no logical characters and add nothing to copied text.
-                    rows.extend((0..height).map(|_| crate::editor::Row {
-                        start: plain.len(),
-                        end: plain.len(),
-                        ..Default::default()
-                    }));
-                }
+                let height =
+                    if mode.0 && height > 0 && image.dimensions().is_ok() && !image.failed() {
+                        height
+                    } else {
+                        0
+                    };
+                // Semantic hit targets exist even when graphics are unavailable or decoding failed.
+                images.push(InlineImage {
+                    caption_row,
+                    row: rows.len(),
+                    height,
+                    image: image.clone(),
+                    ordinal,
+                });
+                // Pixel reservations have no logical characters and add nothing to copied text.
+                rows.extend((0..height).map(|_| crate::editor::Row {
+                    start: plain.len(),
+                    end: plain.len(),
+                    ..Default::default()
+                }));
             }
         }
     }
@@ -163,6 +169,7 @@ fn entry_layout(
 impl Transcript {
     pub fn clear_selection(&mut self) {
         self.selection = None;
+        self.image_selection = None;
         self.dragging = false;
         self.pressed_tool = None;
         self.edge = None;
@@ -192,6 +199,12 @@ impl Transcript {
             text.push_str(entry.plain.get(from..to)?);
         }
         Some(text)
+    }
+
+    pub fn selected_image(&self) -> Option<Arc<EncodedImage>> {
+        self.image_selection
+            .as_ref()
+            .map(|(_, _, image)| image.clone())
     }
 
     fn hit(&self, row: usize, column: usize) -> Option<(usize, usize)> {
@@ -328,6 +341,16 @@ impl Transcript {
             MouseEventKind::ScrollDown => self.scroll(3),
             MouseEventKind::Down(MouseButton::Left) if inside => {
                 let row = self.top.unwrap_or(self.max_top) + (event.row - self.area.y) as usize;
+                self.image_selection = self.starts.iter().enumerate().find_map(|(index, start)| {
+                    self.cache[index]
+                        .images
+                        .iter()
+                        .find(|image| {
+                            row >= start + image.caption_row
+                                && row < start + image.row + usize::from(image.height)
+                        })
+                        .map(|image| (index, image.ordinal, image.image.clone()))
+                });
                 self.top = Some(self.top.unwrap_or(self.max_top));
                 self.selection = self
                     .hit(row, usize::from(event.column.saturating_sub(self.area.x)))
@@ -342,6 +365,7 @@ impl Transcript {
                     .map(|&(index, _)| index);
             }
             MouseEventKind::Drag(MouseButton::Left) if self.dragging => {
+                self.image_selection = None;
                 self.dragged = true;
                 // The controller ticks edge scrolling, so event frequency cannot accelerate it.
                 self.edge = if event.row < self.area.y {
@@ -479,6 +503,20 @@ impl Transcript {
                 }
             }
             self.cache.truncate(conversation.lines.len());
+            if self
+                .image_selection
+                .as_ref()
+                .is_some_and(|(index, ordinal, image)| {
+                    self.cache.get(*index).is_none_or(|entry| {
+                        !entry.images.iter().any(|candidate| {
+                            candidate.ordinal == *ordinal && Arc::ptr_eq(&candidate.image, image)
+                        })
+                    })
+                })
+            {
+                self.image_selection = None;
+                self.selection_invalidated = true;
+            }
             if first_changed < self.starts.len() {
                 self.starts.truncate(first_changed);
             }
@@ -555,6 +593,20 @@ impl Transcript {
                     .map(|row| row.line(range.clone()))
                     .collect::<Vec<_>>(),
             );
+            if let Some((selected, ordinal, _)) = &self.image_selection
+                && *selected == index
+                && let Some(image) = cached.images.iter().find(|image| image.ordinal == *ordinal)
+            {
+                for row in image.caption_row..image.row {
+                    if let Some(line) = text
+                        .lines
+                        .get_mut((start + row).saturating_sub(visible_start))
+                        && start + row >= visible_start
+                    {
+                        line.style = Theme.selected();
+                    }
+                }
+            }
             if self.selected == Some(index)
                 && visible_start == start
                 && let Some(header) = text.lines.first_mut()
@@ -584,6 +636,9 @@ impl Transcript {
             }
             frame.render_widget(Paragraph::new(text).style(Theme.text()), target);
             for image in &cached.images {
+                if image.height == 0 {
+                    continue;
+                }
                 let image_start = start + image.row;
                 let image_end = image_start + usize::from(image.height);
                 if start + image.caption_row >= top && image_end <= bottom {
@@ -960,6 +1015,37 @@ mod tests {
         conversation
     }
 
+    #[test]
+    fn clicking_an_image_selects_its_data_even_without_graphics_and_dragging_remains_text() {
+        let mut conversation = image_conversation();
+        let mut view = Transcript::default();
+        let mut terminal = Terminal::new(TestBackend::new(100, 60)).unwrap();
+        draw(&mut view, &conversation, &mut terminal);
+        let row = view.cache[0].images[0].caption_row as u16;
+        let event = |kind, row| MouseEvent {
+            kind,
+            row,
+            column: 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        view.mouse(event(MouseEventKind::Down(MouseButton::Left), row));
+        view.mouse(event(MouseEventKind::Up(MouseButton::Left), row));
+        assert!(view.selected_image().is_some());
+        assert!(view.selected_text().is_none());
+        view.mouse(event(MouseEventKind::Down(MouseButton::Left), row));
+        view.mouse(event(MouseEventKind::Drag(MouseButton::Left), row + 2));
+        view.mouse(event(MouseEventKind::Up(MouseButton::Left), row + 2));
+        assert!(view.selected_image().is_none());
+        assert!(view.selected_text().is_some());
+        view.mouse(event(MouseEventKind::Down(MouseButton::Left), row));
+        update(
+            &mut conversation,
+            json!({"sessionUpdate":"agent_message","messageId":"images","content":[{"type":"text","text":"replacement"}]}),
+        );
+        draw(&mut view, &conversation, &mut terminal);
+        assert!(view.selected_image().is_none());
+    }
+
     fn draw_images(
         view: &mut Transcript,
         conversation: &Conversation,
@@ -1119,7 +1205,7 @@ mod tests {
         assert!(view.cache[0].dirty);
         let images = draw_images(&mut view, &conversation, &mut terminal, Support::Supported);
         assert!(images.areas().is_empty());
-        assert!(view.cache[0].images.is_empty());
+        assert!(view.cache[0].images.iter().all(|image| image.height == 0));
         assert!(!view.cache[0].dirty);
         assert!(
             view.cache[0]

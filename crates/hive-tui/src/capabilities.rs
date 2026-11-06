@@ -163,7 +163,15 @@ impl TerminalEnvironment {
 impl TerminalCapabilities {
     /// Capture local evidence once at startup; consumers share the resulting snapshot.
     pub fn detect(options: &TerminalOptions) -> Self {
-        Self::resolve(&TerminalEnvironment::capture(), options)
+        let mut capabilities = Self::resolve(&TerminalEnvironment::capture(), options);
+        if !cfg!(unix) {
+            // The console-event backend cannot consume OSC acknowledgements or rich-paste offers.
+            capabilities.osc5522_write =
+                Capability::resolve(Support::Unknown, options.osc5522_write, false);
+            capabilities.osc5522_read =
+                Capability::resolve(Support::Unknown, options.osc5522_read, false);
+        }
+        capabilities
     }
 
     fn resolve(environment: &TerminalEnvironment, options: &TerminalOptions) -> Self {

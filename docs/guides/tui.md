@@ -36,12 +36,15 @@ so the same sessions are available in the Web UI and other ACP clients.
 | `Ctrl-A` | Select the entire prompt |
 | Backspace / Delete | Delete the selection or previous/next character |
 | `Alt-C` / `Alt-V` / `Alt-X` | Copy selection / paste / cut prompt selection |
+| `Alt-Backspace` | Remove the last image attachment |
+| `Alt-R` in an empty composer | Restore rejected prompt content retained behind a newer draft |
 | `Ctrl-X`, then `Ctrl-E` | Open the prompt in an external editor |
 | Page Up / Page Down | Scroll conversation history |
 | Home / End | Jump to the oldest message / resume following live output |
 | Mouse wheel over conversation | Scroll history |
 | Click a tool summary | Expand/collapse formatted tool details |
 | Drag over conversation text | Select text for copying |
+| Click an image or its caption | Select the image for copying with `Alt-C` |
 | `Ctrl-Up` / `Ctrl-Down` | Select the previous/next tool call |
 | `Ctrl-O` | Expand/collapse the selected tool (latest visible tool by default) |
 | `Ctrl-C` | Cancel foreground work |
@@ -90,8 +93,9 @@ Copy and cut prefer the terminal's clipboard through OSC 52 when write support
 is detected or explicitly enabled. Over SSH this reaches the clipboard of the
 machine running your terminal. When write support is unknown or disabled, Hive
 uses the native clipboard of the machine running Hive, which may be remote.
-`Alt-V` always reads that native clipboard; terminal-native paste remains
-available through bracketed paste, independently of clipboard read permissions.
+`Alt-V` reads the terminal clipboard through OSC 5522 when rich reads are explicitly
+enabled; otherwise it reads the native clipboard. Terminal-native text paste remains
+available through bracketed paste.
 
 OSC 52 copies are limited to 64 KiB of UTF-8 text before Base64 encoding (up to
 87,384 encoded payload bytes). Larger selections are rejected without truncation;
@@ -100,6 +104,53 @@ may impose a smaller limit or silently deny a write: a successful copy status
 means Hive sent the sequence, not that the terminal accepted it. Output failures
 and unavailable native clipboards are reported without deleting a cut selection.
 Failed OSC writes do not silently switch to a different machine's clipboard.
+
+### Paste and copy images
+
+On Unix, Hive negotiates private mode 5522 with the terminal. Supporting terminals
+send a rich clipboard offer when you trigger their normal paste action. Hive requests
+PNG, JPEG, or WebP in that preference order, falling back to plain text. The terminal
+may include a one-time permission token for this user-triggered read. Disable these
+offers with `--terminal-osc5522-read off`. Unsupported terminals keep bracketed paste.
+
+To read the terminal clipboard explicitly with `Alt-V` or `Ctrl-Shift-V`, opt in:
+
+```sh
+hive tui --terminal-osc5522-read on
+```
+
+An image becomes an unsent attachment, with its format and dimensions shown in the
+composer heading. Enter sends text plus attachments, or an image alone. `Alt-Backspace`
+removes the last attachment. Attachments survive session switching, agent questions,
+and external editing; the external editor changes only text. Images cannot be pasted
+into question fields or configuration searches. Clipboard HTML, SVG, file paths,
+and URLs are not imported as images or fetched automatically.
+
+Image input requires an ACPv2 agent advertising image-prompt support. The v1 and
+OpenCode server adapters currently accept text only. Unsupported sessions retain
+the draft and explain how to proceed. A rejected prompt never overwrites newer
+unsent work: clear the composer and use `Alt-R` to restore the retained rejection.
+Receipt lookup retains the original image data and intent key.
+
+Click an agent image or its fallback caption, then use `Alt-C` to copy its image
+data. Dragged text selections still copy captions as text. Rich copies prefer
+OSC 5522 when negotiated or enabled, and claim success only after acknowledgement;
+otherwise Hive uses the native image clipboard. A denied terminal request is
+reported without silently accessing another clipboard. On non-Unix platforms,
+native image clipboard operations remain available, but OSC 5522 is unavailable.
+
+Rich input is bounded to four images and 8 MiB of compressed image data per draft,
+16,384 pixels per dimension, and 40 million pixels per image. Images are fully
+decoded for validation before attachment. The complete serialized outgoing prompt
+is limited to 15 MiB, including Base64 and JSON escaping. Malformed transfers,
+unsupported data, permission denial, and transfer timeouts leave drafts unchanged.
+If a terminal sends an unterminated control reply, Hive discards its remaining bytes
+and asks you to press Escape once to restore keyboard input before retrying.
+
+OSC 5522 image reads enforce bounds before decoding. The native clipboard backend
+decodes images before returning them to Hive, so its initial allocation is outside
+Hive's decoder limits; Hive validates the returned dimensions and encoded size
+before attaching the image.
 
 ## Use an external editor
 
@@ -190,8 +241,9 @@ the TUI. See [CLI reference](../reference/cli.md).
 
 ### Terminal capabilities
 
-The Sessions heading shows a compact **Terminal caps** diagnostic, resolved once
-when the local TUI starts and shared by TUI components. `graphics` means Kitty
+The Sessions heading shows a compact **Terminal caps** diagnostic, initialized
+when the local TUI starts and shared by TUI components. Rich clipboard negotiation
+can subsequently establish write support. `graphics` means Kitty
 graphics, `OSC52` is the text clipboard protocol, `OSC5522` is the rich clipboard
 protocol, and `OSC7501` is program status reporting. Clipboard entries distinguish
 `w` (write) and `r` (read).
@@ -205,19 +257,21 @@ protocol, and `OSC7501` is program status reporting. Clipboard entries distingui
 
 The line clips in compact layouts. It reports permission to attempt an operation,
 not guaranteed terminal acceptance. ACP message images use the PNG Kitty backend.
-OSC 52 writes use the shared clipboard service. Terminal clipboard reads, rich
-clipboard operations, and program status reporting remain follow-up work.
+OSC 52 writes and OSC 5522 image operations use the shared clipboard service.
+Programmatic OSC 52 reads and program status reporting remain follow-up work.
 Existing text rendering, native clipboard operations, and terminal-native paste
 remain usable without any positive capability decision.
 
-Automatic detection is deliberately conservative and sends no terminal queries:
+Environment-based detection is deliberately conservative. On Unix, Hive also queries
+private mode 5522 to negotiate user-triggered rich paste (unless rich reads are off):
 
 | Evidence | Automatic decision |
 | --- | --- |
 | Direct `TERM=xterm-kitty` | Kitty graphics and OSC 52 writes supported |
 | `TMUX`, `STY`, or `ZELLIJ` present (even empty), or `TERM` starting with `screen`/`tmux` | All optional protocol support unknown |
 | Missing, empty, generic, or unrecognized terminal identity | All optional protocol support unknown |
-| OSC 5522 or OSC 7501 on any terminal | Unknown without an override |
+| Supporting response to the mode 5522 query | Native rich paste and OSC 5522 writes supported |
+| OSC 7501 on any terminal | Unknown without an override |
 | Clipboard reads on any terminal | Unknown without explicit read opt-in |
 
 Environment variables are hints, not negotiation: SSH may omit them or forward
@@ -226,11 +280,10 @@ settings vary. Kitty-specific incidental variables do not establish support for
 newer protocols. Overrides assert support but neither implement multiplexer
 passthrough nor guarantee that the terminal will accept an operation.
 
-Clipboard write support never grants read permission. Explicit read `on` expresses
-consent for that operation, but this version's input backend cannot receive OSC 52
-replies, so Hive never sends clipboard read queries, even with `on`. Native paste
-is still used; if it fails, use terminal-native paste. The diagnostic reports
-capability policy, not the presence of a read implementation. See
+Clipboard write support never grants arbitrary read permission. Rich read `on`
+opts into explicit OSC 5522 reads. Negotiated native paste handles user-triggered
+offers without enabling background reads. OSC 52 reads remain unimplemented even
+with `on`; use OSC 5522 reads or terminal-native paste instead. See
 [capability overrides](../reference/cli.md#terminal-capability-overrides) for all
 CLI options and environment variables. For example:
 

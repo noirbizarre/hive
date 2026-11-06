@@ -3,6 +3,92 @@
 use super::*;
 use serde_json::{Value, json};
 
+fn attachment() -> std::sync::Arc<draft::Attachment> {
+    draft::Attachment::from_native(arboard::ImageData {
+        width: 1,
+        height: 1,
+        bytes: vec![0; 4].into(),
+    })
+    .unwrap()
+}
+
+#[test]
+fn image_drafts_survive_session_switches_questions_and_rejected_receipts_without_overwriting_new_work()
+ {
+    let mut app = App::default();
+    app.select_session("one".into());
+    app.input = "describe this".into();
+    app.attachments.push(attachment());
+    app.select_session("two".into());
+    assert!(app.attachments.is_empty());
+    app.select_session("one".into());
+    assert_eq!(app.attachments.len(), 1);
+    let (sender, _) = oneshot::channel();
+    let question = Interaction::Permission(
+        v2::RequestPermissionRequest::new("one", "allow?", Vec::new()),
+        sender,
+    );
+    show_interaction(&mut app, &question);
+    assert!(app.attachments.is_empty());
+    app.dialog = None;
+    restore_draft(&mut app);
+    assert_eq!(app.input, "describe this");
+    assert_eq!(app.attachments.len(), 1);
+    app.pending.insert(
+        "one".into(),
+        (
+            "key".into(),
+            draft::PromptDraft {
+                text: "rejected".into(),
+                images: vec![attachment()],
+            },
+        ),
+    );
+    apply_prompt_ack(
+        &mut app,
+        (
+            "one".into(),
+            "key".into(),
+            Err(hive_protocol::recovery::RecoveryError::NotDispatched.wire(false)),
+        ),
+    );
+    assert_eq!(app.input, "describe this");
+    assert_eq!(app.attachments.len(), 1);
+    assert_eq!(app.rejected["one"].images.len(), 1);
+}
+
+#[tokio::test]
+async fn image_only_prompts_are_admitted_and_unsupported_sessions_keep_their_attachments() {
+    connected(async |cx| {
+        let mut app = App {
+            connected: true,
+            ..Default::default()
+        };
+        app.select_session("hive-test".into());
+        app.conversations
+            .entry("hive-test".into())
+            .or_default()
+            .generation = 1;
+        app.owner = Some(v2::Meta::from_iter([(
+            "hive".into(),
+            json!({"role":"pilot", "generation":1, "token":"test", "promptImages":false}),
+        )]));
+        app.attachments.push(attachment());
+        press(&cx, &mut app, &mut None, KeyCode::Enter).await;
+        assert!(app.pending.is_empty());
+        assert_eq!(app.attachments.len(), 1);
+        app.owner.as_mut().unwrap().get_mut("hive").unwrap()["promptImages"] = true.into();
+        press(&cx, &mut app, &mut None, KeyCode::Enter).await;
+        assert!(app.attachments.is_empty());
+        let pending = &app.pending["hive-test"];
+        let original = serde_json::to_value(pending.1.blocks()).unwrap();
+        assert_eq!(original[0]["type"], "image");
+        assert_eq!(original, serde_json::to_value(pending.1.blocks()).unwrap());
+        Ok(())
+    })
+    .await;
+}
+
 #[test]
 fn recovery_acknowledgement_retires_pending_intent_without_stopping_work_or_skipping_history() {
     let mut app = App {

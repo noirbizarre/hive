@@ -93,6 +93,129 @@ fn controlled(meta: &Option<v2::Meta>, key: &str) -> v2::Meta {
     value
 }
 
+#[tokio::test]
+async fn image_capabilities_gate_new_intent_and_image_bytes_participate_in_receipt_identity() {
+    for supported in [false, true] {
+        let mut config = config_with_agent(
+            "mock",
+            env!("CARGO_BIN_EXE_hive-test-agent"),
+            AgentVersion::V2,
+        );
+        if supported {
+            config
+                .agents
+                .get_mut("mock")
+                .unwrap()
+                .env
+                .insert("HIVE_MOCK_IMAGES".into(), "1".into());
+        }
+        let (address, server) = start_gateway(config).await;
+        for scheme in ["ws", "http"] {
+            let (updates, mut received) = mpsc::unbounded_channel();
+            timeout(
+                Duration::from_secs(15),
+                Client
+                    .v2()
+                    .on_receive_notification(
+                        async move |update: v2::UpdateSessionNotification,
+                                    _: V2ConnectionTo<Agent>| {
+                            let _ = updates.send(update);
+                            Ok(())
+                        },
+                        agent_client_protocol::on_receive_notification!(),
+                    )
+                    .connect_with(
+                        HttpClient::new(format!("{scheme}://{address}")).unwrap(),
+                        async move |cx| {
+                            cx.send_request(v2::InitializeRequest::new(
+                                ProtocolVersion::V2,
+                                v2::Implementation::new("image-test", "1"),
+                            ))
+                            .block_task()
+                            .await?;
+                            let opened = cx
+                                .send_request(v2::NewSessionRequest::new(
+                                    std::env::current_dir().unwrap(),
+                                ))
+                                .block_task()
+                                .await?;
+                            assert_eq!(
+                                opened.meta.as_ref().unwrap()["hive"]["promptImages"],
+                                supported
+                            );
+                            let image = v2::ContentBlock::Image(v2::ImageContent::new(
+                                "aW1hZ2U=",
+                                "image/png",
+                            ));
+                            let request = v2::PromptRequest::new(
+                                opened.session_id.clone(),
+                                vec![image.clone()],
+                            )
+                            .meta(controlled(&opened.meta, "image-intent"));
+                            let result = cx.send_request(request.clone()).block_task().await;
+                            if supported {
+                                let ack = result?;
+                                loop {
+                                    let update = received.recv().await.unwrap();
+                                    if let v2::SessionUpdate::UserMessage(message) = update.update {
+                                        assert_eq!(
+                                            serde_json::to_value(message.content).unwrap(),
+                                            serde_json::to_value(vec![image]).unwrap()
+                                        );
+                                        break;
+                                    }
+                                }
+                                assert_eq!(
+                                    cx.send_request(request).block_task().await?.message_id,
+                                    ack.message_id
+                                );
+                                let changed = v2::PromptRequest::new(
+                                    opened.session_id.clone(),
+                                    vec![v2::ContentBlock::Image(v2::ImageContent::new(
+                                        "ZGlmZmVyZW50",
+                                        "image/png",
+                                    ))],
+                                )
+                                .meta(controlled(&opened.meta, "image-intent"));
+                                let error =
+                                    cx.send_request(changed).block_task().await.unwrap_err();
+                                assert_eq!(
+                                    error.data.unwrap()["hive"]["code"],
+                                    "hive::prompt::key_conflict"
+                                );
+                            } else {
+                                assert_eq!(
+                                    result.unwrap_err().data.unwrap()["hive"]["code"],
+                                    "hive::prompt::not_dispatched"
+                                );
+                                // Reusing this key for text proves rejection reserved neither foreground nor intent.
+                                cx.send_request(
+                                    v2::PromptRequest::new(
+                                        opened.session_id.clone(),
+                                        vec!["text still works".into()],
+                                    )
+                                    .meta(controlled(&opened.meta, "image-intent")),
+                                )
+                                .block_task()
+                                .await?;
+                            }
+                            cx.send_request(
+                                v2::CloseSessionRequest::new(opened.session_id).meta(opened.meta),
+                            )
+                            .block_task()
+                            .await?;
+                            Ok(())
+                        },
+                    ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        }
+        server.abort();
+    }
+}
+
 async fn summaries(address: SocketAddr) -> serde_json::Value {
     reqwest::get(format!("http://{address}/v1/sessions"))
         .await

@@ -63,6 +63,10 @@ pub struct App {
     pub transcripts: HashMap<String, Transcript>,
     pub owner: Option<v2::Meta>,
     pub input: String,
+    pub attachments: Vec<std::sync::Arc<crate::draft::Attachment>>,
+    pub draft_images: HashMap<String, Vec<std::sync::Arc<crate::draft::Attachment>>>,
+    pub suspended_images: Vec<std::sync::Arc<crate::draft::Attachment>>,
+    pub draft_revision: u64,
     pub editor: crate::editor::PromptEditor,
     pub draft_editors: HashMap<String, crate::editor::PromptEditor>,
     pub transcript_focused: bool,
@@ -74,7 +78,9 @@ pub struct App {
     pub animation_visible: bool,
     pub submitting: std::collections::HashSet<String>,
     pub stopping: Option<String>,
-    pub pending: HashMap<String, (String, String)>,
+    pub pending: HashMap<String, (String, crate::draft::PromptDraft)>,
+    // A rejected intent must not overwrite newer unsent work in the same session.
+    pub rejected: HashMap<String, crate::draft::PromptDraft>,
     pub drafts: HashMap<String, String>,
     pub dialog: Option<String>,
     pub dialog_scroll: u16,
@@ -213,8 +219,19 @@ impl App {
     }
 
     pub fn select_session(&mut self, id: String) {
+        self.draft_revision = self.draft_revision.wrapping_add(1);
+        if self.active.as_ref() != Some(&id)
+            && let Some(draft) = self.suspended_draft.take()
+        {
+            // Save the chat draft under its original session, never a departing question's answer.
+            self.input = draft;
+            self.attachments = std::mem::take(&mut self.suspended_images);
+            self.dialog = None;
+        }
         self.picker = None;
         if let Some(previous) = self.active.take() {
+            self.draft_images
+                .insert(previous.clone(), std::mem::take(&mut self.attachments));
             self.editor.cancel_drag();
             self.editor.sync(&self.input);
             self.draft_editors
@@ -223,6 +240,14 @@ impl App {
                 .insert(previous, std::mem::take(&mut self.input));
         }
         self.input = self.drafts.remove(&id).unwrap_or_default();
+        self.attachments = self.draft_images.remove(&id).unwrap_or_default();
+        if self.input.is_empty()
+            && self.attachments.is_empty()
+            && let Some(draft) = self.rejected.remove(&id)
+        {
+            self.input = draft.text;
+            self.attachments = draft.images;
+        }
         self.editor = self.draft_editors.remove(&id).unwrap_or_default();
         self.transcript_focused = false;
         self.recent.retain(|recent| recent != &id);
@@ -735,9 +760,23 @@ impl App {
             return;
         }
         if self.page == Page::Chat {
+            let attachment_title = if self.attachments.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " · {} · Alt-Backspace remove",
+                    self.attachments
+                        .iter()
+                        .map(|image| format!("{} {}×{}", image.mime, image.width, image.height))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
             let block = Block::default()
                 .title(Line::styled(
-                    " Message · Alt-Enter newline · Ctrl-X Ctrl-E editor",
+                    format!(
+                        " Message{attachment_title} · Alt-Enter newline · Ctrl-X Ctrl-E editor"
+                    ),
                     theme.muted(),
                 ))
                 .borders(Borders::LEFT)

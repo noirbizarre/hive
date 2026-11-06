@@ -28,5 +28,11 @@ tempfile = { workspace = true }
 shell-words = { workspace = true }
 thiserror = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+terminput = { workspace = true }
+terminput-crossterm = { workspace = true }
+rustix = { workspace = true }
+signal-hook = { workspace = true }
+
 [dev-dependencies]
 axum = { workspace = true }

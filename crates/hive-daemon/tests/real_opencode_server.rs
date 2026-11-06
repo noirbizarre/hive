@@ -203,6 +203,7 @@ fn encode(text: &str) -> String {
 
 fn config(server: &Server) -> Config {
     Config {
+        mcp_servers: Default::default(),
         workspaces: Default::default(),
         worktrunk: None,
         projects: Default::default(),
@@ -210,6 +211,7 @@ fn config(server: &Server) -> Config {
         agents: BTreeMap::from([(
             "oc".into(),
             Profile {
+                mcp_servers: vec![],
                 workspace: None,
                 project: None,
                 name: None,

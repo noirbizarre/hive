@@ -32,6 +32,7 @@ fn cwd() -> String {
 
 fn opencode_profile(url: &str, password_env: Option<&str>) -> Profile {
     Profile {
+        mcp_servers: vec![],
         workspace: None,
         project: None,
         name: None,
@@ -54,6 +55,7 @@ fn config(url: &str) -> Config {
 
 fn config_with(profile: Profile) -> Config {
     Config {
+        mcp_servers: Default::default(),
         workspaces: Default::default(),
         worktrunk: None,
         projects: Default::default(),

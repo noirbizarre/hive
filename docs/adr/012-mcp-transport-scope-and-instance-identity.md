@@ -3,8 +3,8 @@
 ## Status
 
 Accepted. Defines the executable identity contract for [#93][issue] and shared
-stdio runtime for #94, part of the [managed MCP lifecycle epic][epic]. Scope
-discovery and agent routing follow in #95 and #96 respectively.
+stdio runtime for #94, scoped admission for #95 and aggregated agent routing for
+issue #96, part of the [managed MCP lifecycle epic][epic].
 
 ## Context
 
@@ -18,12 +18,12 @@ The existing implementation already handles inline ACP declarations:
 
 | Area | Current evidence and behavior |
 | --- | --- |
-| Daemon configuration | `crates/hive-daemon/src/config.rs`: `Config`, root/fragment documents and `Profile` configure agents and workspace policies, not MCP servers. Unknown fields are rejected. |
+| Daemon configuration | `crates/hive-daemon/src/config.rs`: root/fragment `mcp_servers` definitions and profile selectors resolve through `mcp/configuration.rs`. Unknown fields are rejected. |
 | Native ACPv2 creation | `Broker::create` and `run_agent` in `crates/hive-daemon/src/lib.rs` retain and forward the client's MCP declarations. |
 | Recovery | `Record::mcp_servers` in `src/persistence.rs` defaults to empty for legacy records. `Broker::recover` restores saved declarations for the downstream session. The test `recovery_keeps_workspace_roots_and_mcp_connections_alongside_the_original_identity` covers persistence. |
 | Live resume | `Broker::resume` attaches to an existing session; incoming MCP declarations are not applied as reconfiguration. |
 | Other adapters | `run_v1_agent` and `src/opencode/worker.rs::run_opencode_agent` reject nonempty MCP declarations. Bundled clients do not compose declarations. |
-| Capabilities | Hive does not advertise an MCP execution guarantee; per-transport downstream capability validation is incomplete. `unstable_mcp_over_acp` is disabled. |
+| Capabilities | Configured managed selections require downstream `session.mcp.acp`; configured HTTP requires `.http`. `unstable_mcp_over_acp` is enabled for the native aggregate, not an upstream general-purpose bridge. |
 | Existing identity code | `src/reload.rs::identity` binds OpenCode agent profiles. It is not an MCP reuse key: a password environment-variable name does not identify its current credential value. |
 
 Paths abbreviated as `src/` above are relative to `crates/hive-daemon/`.
@@ -51,9 +51,10 @@ credentials. The new contract does not change that existing persistence behavior
 ### Separate transport, ownership, scope and lifecycle
 
 `hive_daemon::mcp::ServerDefinition` is a checked standalone library schema.
-It is **not yet accepted in daemon configuration files** and does not register
-or activate servers. Trusted Rust callers can admit resolved identities to the
-runtime below; configuration selectors remain future work.
+Daemon TOML uses a separate compact configuration schema that converts into this
+contract: stdio implies managed/on-demand, HTTP implies forwarded/delegated.
+Definitions are inert until selected by a profile. Trusted Rust callers can also
+admit resolved identities directly to the runtime below.
 
 | Dimension | Values and meaning |
 | --- | --- |
@@ -169,6 +170,41 @@ Forwarded HTTP identity describes declaration compatibility only. It does not
 authorize pooling the agent's connection or remote MCP session, whose complete
 initialization and security state Hive may not know.
 
+### Configured aggregate routing
+
+Profiles select operator-owned TOML definitions. One native MCP-over-ACP service
+aggregates managed stdio backends; HTTP declarations remain direct agent connections.
+The aggregate presents MCP `2026-07-28` over initialized `2025-11-25` backends,
+projecting only tools, resources and prompts. Lists are fresh on request; push
+refresh, subscriptions, tasks and client callbacks are not advertised.
+
+Configuration defaults to private admission. Explicit shared policy supplies
+principal, partition, policy generation and a complete external-credential
+generation map. This is an operator assertion, not authenticated client metadata;
+the operator must update generations when external credentials or policy change.
+Existing structural input equality and scope remain mandatory.
+
+Tool/prompt aliases map deterministically to one original backend/name. Resource
+URIs/templates carry an exact, reversible backend prefix; standard resource content
+is rewritten, arbitrary application JSON is not. Bounded opaque cursors belong to
+one attachment, method and backend generation. Aggregation metadata never joins
+the shared process identity. See [configuration](../configuration.md#mcp-server-declarations)
+for syntax and limits.
+
+Before downstream new/resume publication, a private pending target authorizes
+admission and invocation against the exact startup control. Backends must initialize
+successfully before setup proceeds. Promotion establishes ordinary live-session
+authority; failed new-session setup revokes pending routes and releases
+settlement-aware bindings. Failed recovery withdraws its pending authority and
+cancels its calls while retaining the durable session's pinned definitions and leases.
+SDK session builders establish route readiness during setup/replay. Ordered resume
+callbacks still end historical ingestion before subsequent live notifications.
+
+Live sessions pin their definitions. Persistence stores original configured selector
+IDs separately from inline declarations, never generated ACP IDs or effective
+security snapshots. Restart re-resolves saved IDs against current configuration;
+missing definitions fail recovery. Legacy records do not adopt new profile selectors.
+
 ### Scoped Broker admission
 
 `Broker::bind_scoped_mcp(session, StdioAdmission)` resolves managed stdio scope
@@ -238,7 +274,8 @@ One process and one initialization handshake serve equal identities. Startup is
 single-flight. The runtime launches the exact resolved executable, arguments,
 cwd and complete environment, without inheriting new daemon environment values.
 The pinned ACP SDK's standalone MCP roles and JSON-RPC engine provide request IDs
-and concurrent response correlation. This is not MCP-over-ACP or an agent route.
+and concurrent response correlation. The agent-facing aggregate uses a separate
+native MCP-over-ACP service over these existing session-authorized operations.
 
 The initial runtime profile supports protocol `2025-11-25`, object client info
 with name/version, and client capabilities `{}` or `{"roots": {}}`. Initialization

@@ -75,6 +75,8 @@ impl WorkspaceTemplate {
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
+    pub mcp_servers: BTreeMap<String, crate::mcp::configuration::ConfiguredServer>,
+    #[serde(default)]
     pub workspaces: BTreeMap<String, WorkspaceTemplate>,
     pub worktrunk: Option<hive_core::workspace::integration::WorktrunkConfig>,
     #[serde(default)]
@@ -88,6 +90,8 @@ pub struct Config {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RootDocument {
+    #[serde(default)]
+    mcp_servers: BTreeMap<String, crate::mcp::configuration::ConfiguredServer>,
     #[serde(default)]
     workspaces: BTreeMap<String, WorkspaceTemplate>,
     worktrunk: Option<hive_core::workspace::integration::WorktrunkConfig>,
@@ -103,6 +107,8 @@ struct RootDocument {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FragmentDocument {
+    #[serde(default)]
+    mcp_servers: BTreeMap<String, crate::mcp::configuration::ConfiguredServer>,
     #[serde(default)]
     workspaces: BTreeMap<String, WorkspaceTemplate>,
     worktrunk: Option<hive_core::workspace::integration::WorktrunkConfig>,
@@ -174,6 +180,8 @@ impl ProfileKind {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {
+    #[serde(default)]
+    pub mcp_servers: Vec<String>,
     pub workspace: Option<String>,
     pub project: Option<ProjectId>,
     pub name: Option<String>,
@@ -243,6 +251,12 @@ fn is_loopback_host(host: &str) -> bool {
 /// pasted into bug reports and these messages are printed by `hive doctor`.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error, miette::Diagnostic)]
 pub enum ConfigError {
+    #[error("{0}")]
+    #[diagnostic(
+        code(hive::config::mcp),
+        help("check [mcp_servers] definitions and agent mcp_servers selectors")
+    )]
+    Mcp(String),
     #[error("{0}")]
     #[diagnostic(
         code(hive::config::workspace),
@@ -537,6 +551,22 @@ impl Config {
     /// Every problem, in the order `validate` would meet them.
     pub fn problems(&self) -> Vec<Problem> {
         let mut problems = Vec::new();
+        for (id, server) in &self.mcp_servers {
+            let valid_id = !id.is_empty()
+                && id.len() <= 128
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+            if !valid_id || id == "hive-managed-mcp" {
+                problems.push(Problem { agent: None, error: ConfigError::Mcp("MCP IDs must use 1-128 letters, digits, '-' or '_' and cannot be hive-managed-mcp".into()) });
+            }
+            if let Err(message) = server.validate() {
+                problems.push(Problem {
+                    agent: None,
+                    error: ConfigError::Mcp(message.into()),
+                });
+            }
+        }
         if let Some(default) = &self.default_agent
             && !self.agents.contains_key(default)
         {
@@ -549,6 +579,32 @@ impl Config {
         }
         for (id, profile) in &self.agents {
             let mut found = Vec::new();
+            let mut selected = std::collections::BTreeSet::new();
+            for selector in &profile.mcp_servers {
+                if !selected.insert(selector) || !self.mcp_servers.contains_key(selector) {
+                    found.push(ConfigError::Mcp(
+                        "MCP selectors must be unique and reference declared servers".into(),
+                    ));
+                }
+            }
+            if profile.mcp_servers.len() > 32
+                || (!profile.mcp_servers.is_empty()
+                    && (profile.kind != ProfileKind::Acp || profile.versions != [AgentVersion::V2]))
+            {
+                found.push(ConfigError::Mcp(
+                    "configured MCP requires an ACPv2-only profile and at most 32 selectors".into(),
+                ));
+            }
+            if profile
+                .mcp_servers
+                .iter()
+                .any(|id| self.mcp_servers.get(id).is_some_and(|s| s.managed()))
+                && !crate::worktrunk::local_profile(profile)
+            {
+                found.push(ConfigError::Mcp(
+                    "managed MCP requires a node-local agent profile".into(),
+                ));
+            }
             if let Some(policy) = &profile.workspace
                 && (!self.workspaces.contains_key(policy) || profile.project.is_none())
             {
@@ -705,6 +761,7 @@ fn include_paths(root: &Path, entry: &str, index: usize) -> Result<Vec<PathBuf>,
 
 fn compose(root: &Path, document: RootDocument) -> Result<Config, ConfigError> {
     let mut config = Config {
+        mcp_servers: document.mcp_servers,
         workspaces: document.workspaces,
         worktrunk: document.worktrunk,
         projects: document.projects,
@@ -737,6 +794,11 @@ fn compose(root: &Path, document: RootDocument) -> Result<Config, ConfigError> {
             }
             let text = std::fs::read_to_string(&path).map_err(|error| unreadable(&path, error))?;
             let fragment: FragmentDocument = parse_document(&path, &text)?;
+            for (id, server) in fragment.mcp_servers {
+                if config.mcp_servers.insert(id, server).is_some() {
+                    return Err(ConfigError::Mcp("duplicate MCP definition across configuration files; give each server a unique ID".into()));
+                }
+            }
             for (id, policy) in fragment.workspaces {
                 if config.workspaces.insert(id, policy).is_some() {
                     return Err(ConfigError::Workspace(
@@ -812,6 +874,68 @@ pub fn default_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mcp_definitions_compose_before_selection_and_duplicates_never_override() {
+        let declaration =
+            "[mcp_servers.docs]\ntransport = 'http'\nurl = 'https://example.test/mcp'\n";
+        let config = read_fragments(
+            "include = ['agent.toml','mcp.toml']",
+            &[
+                (
+                    "agent.toml",
+                    "[agents.coder]\ncommand = 'agent'\nmcp_servers = ['docs']\n",
+                ),
+                ("mcp.toml", declaration),
+            ],
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.agents["coder"].mcp_servers, ["docs"]);
+        assert!(matches!(
+            read_fragments(
+                &format!("include = ['mcp.toml']\n{declaration}"),
+                &[("mcp.toml", declaration)]
+            ),
+            Err(super::ConfigError::Mcp(_))
+        ));
+        for selectors in ["['missing']", "['docs','docs']"] {
+            let config: super::Config = toml::from_str(&format!(
+                "{declaration}\n[agents.coder]\ncommand = 'agent'\nmcp_servers = {selectors}\n"
+            ))
+            .unwrap();
+            assert!(
+                config
+                    .problems()
+                    .iter()
+                    .any(|p| matches!(p.error, super::ConfigError::Mcp(_)))
+            );
+        }
+    }
+
+    #[test]
+    fn shared_configuration_requires_explicit_complete_operator_evidence() {
+        let base = format!(
+            "[mcp_servers.files]\ntransport = 'stdio'\ncommand = '{}'\nscope = 'machine'\ncwd = '{}'\n",
+            std::env::current_exe().unwrap().display(),
+            std::env::current_dir().unwrap().display()
+        );
+        for policy in [
+            "mode = 'shared'",
+            "mode = 'shared'\nprincipal = 'owner'\npartition = 'team'\npolicy_generation = '1'",
+        ] {
+            assert!(
+                toml::from_str::<super::Config>(&format!(
+                    "{base}[mcp_servers.files.sharing]\n{policy}\n"
+                ))
+                .is_err()
+            );
+        }
+        let complete = "mode = 'shared'\nprincipal = 'owner'\npartition = 'team'\npolicy_generation = '1'\nexternal_generations = {}";
+        let config: super::Config =
+            toml::from_str(&format!("{base}[mcp_servers.files.sharing]\n{complete}\n")).unwrap();
+        config.validate().unwrap();
+        assert!(!format!("{config:?}").contains("owner"));
+    }
     #[test]
     fn workspace_policies_and_global_worktrunk_settings_compose_before_profile_references() {
         let directory = tempfile::tempdir().unwrap();

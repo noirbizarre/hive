@@ -14,6 +14,10 @@ path = "../hive-mock-agent/src/main.rs"
 name = "hive-test-mcp"
 path = "tests/fixtures/mcp_server.rs"
 
+[[bin]]
+name = "hive-test-mcp-agent"
+path = "tests/fixtures/mcp_agent.rs"
+
 [dependencies]
 command-group = { workspace = true }
 agent-client-protocol = { workspace = true }

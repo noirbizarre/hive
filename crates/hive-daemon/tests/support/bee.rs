@@ -70,6 +70,7 @@ where
     .unwrap();
     let broker = hive_daemon::Broker::persistent(
         Config {
+            mcp_servers: Default::default(),
             workspaces: Default::default(),
             worktrunk: None,
             projects: Default::default(),

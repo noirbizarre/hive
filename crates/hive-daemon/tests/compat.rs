@@ -11,6 +11,7 @@ use miette::Diagnostic;
 
 fn profile(command: &str, args: &[&str], version: AgentVersion) -> Profile {
     Profile {
+        mcp_servers: vec![],
         workspace: None,
         project: None,
         name: None,

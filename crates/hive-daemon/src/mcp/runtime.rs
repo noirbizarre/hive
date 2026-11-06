@@ -25,6 +25,26 @@ mod tests;
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error, Diagnostic)]
 pub enum RuntimeError {
     #[error(
+        "unsupported MCP method; use the facade's supported discovery, tool, resource or prompt operations"
+    )]
+    #[diagnostic(code(hive::mcp::method))]
+    Method,
+    #[error(
+        "configured MCP selection is missing or duplicated; restore the saved server definitions and use unique profile selectors before retrying"
+    )]
+    #[diagnostic(code(hive::mcp::selection))]
+    Selection,
+    #[error(
+        "MCP declaration names collide; rename configured or inline servers and reserve hive-managed-mcp for Hive's aggregate"
+    )]
+    #[diagnostic(code(hive::mcp::declarations))]
+    Declarations,
+    #[error(
+        "MCP backend returned an invalid or oversized result; check server compatibility before retrying"
+    )]
+    #[diagnostic(code(hive::mcp::response))]
+    Response,
+    #[error(
         "unsupported MCP runtime inputs; use local managed stdio, protocol 2025-11-25 and supported client capabilities"
     )]
     #[diagnostic(code(hive::mcp::runtime_inputs))]
@@ -110,9 +130,23 @@ impl Default for RuntimePolicy {
 }
 
 /// Requests cannot bypass initialization or create stateful subscriptions without an owner.
-pub struct McpRequest(UntypedMessage);
+pub struct McpRequest(UntypedMessage, Option<String>);
 
 impl McpRequest {
+    // Internal readiness follows the same operation/close fences without sending a fake wire method.
+    pub(crate) fn describe() -> Self {
+        Self(
+            UntypedMessage {
+                method: "$hive/describe".into(),
+                params: serde_json::json!({}),
+            },
+            None,
+        )
+    }
+    pub(crate) fn in_generation(mut self, generation: String) -> Self {
+        self.1 = Some(generation);
+        self
+    }
     pub fn new(method: &str, params: Value) -> Result<Self, RuntimeError> {
         if !matches!(
             method,
@@ -130,10 +164,13 @@ impl McpRequest {
         {
             return Err(RuntimeError::Request);
         }
-        Ok(Self(UntypedMessage {
-            method: method.into(),
-            params,
-        }))
+        Ok(Self(
+            UntypedMessage {
+                method: method.into(),
+                params,
+            },
+            None,
+        ))
     }
 }
 
@@ -141,13 +178,14 @@ impl McpRequest {
 pub(crate) struct Ready {
     pub connection: ConnectionTo<Server>,
     pub capabilities: Value,
+    pub metadata: Value,
     pub since: Instant,
 }
 
 #[derive(Clone)]
 pub(crate) enum Status {
     Starting,
-    Ready(Ready),
+    Ready(Arc<Ready>),
     Failed(RuntimeError),
     Stopped,
 }
@@ -635,7 +673,14 @@ impl Lease {
                 Err(error) => Err(error),
                 Ok((ready, mut generation)) => {
                     let capability = request.0.method.split('/').next().unwrap_or("");
-                    if capability != "ping"
+                    if request.1.as_ref().is_some_and(|expected| {
+                        ready.metadata["generation"].as_str() != Some(expected)
+                    }) {
+                        // A continuation must not cross a restart between describe and publication.
+                        Err(RuntimeError::Request)
+                    } else if request.0.method == "$hive/describe" {
+                        Ok(ready.metadata.clone())
+                    } else if capability != "ping"
                         && !ready
                             .capabilities
                             .get(capability)

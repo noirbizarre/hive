@@ -6,16 +6,105 @@ until a session needs them.
 
 ## MCP server declarations
 
-Hive currently accepts MCP connection declarations through native ACPv2 session
-setup, forwarding and persisting them for the agent. HTTP forwarding passes an
-existing endpoint to the agent; it does not start a server. ACPv1 and OpenCode
-adapters reject nonempty declarations, and bundled clients do not compose them.
+Define MCP servers in the root or included fragments, then select them on an
+ACPv2-only agent profile. Definitions are inert until a session selects them.
 
-The [MCP contract](adr/012-mcp-transport-scope-and-instance-identity.md) defines
-transport, ownership, lifecycle and `machine` / `project` / `workspace` sharing
-scopes as a standalone library schema. It is not an active daemon configuration
-registry: adding MCP tables to the root or fragment TOML still fails unknown-field
-validation. Existing agent profiles and inline ACP declarations need no migration.
+```toml
+[mcp_servers.files]
+transport = "stdio"
+command = "/absolute/path/to/files-mcp"
+args = ["--read-only"]
+env = { EXAMPLE_MODE = "readonly" }
+scope = "workspace"
+idle_timeout_seconds = 60
+
+[mcp_servers.docs]
+transport = "http"
+url = "https://example.test/mcp"
+headers = {}
+
+[agents.coder]
+command = "example-acp-agent"
+mcp_servers = ["files", "docs"]
+```
+
+Hive manages stdio servers and exposes them through **one aggregated native
+MCP-over-ACP service** named `hive-managed-mcp`. The agent must advertise
+`session.mcp.acp`; HTTP selections require `session.mcp.http`. Managed servers
+require a node-local agent. ACPv1 and OpenCode REST adapters do not support these
+selectors. An unavailable managed server fails startup before downstream session
+setup is sent. HTTP URL/headers go directly to the agent, which handles HTTP
+availability; Hive does not start an HTTP process or proxy its connection.
+
+Managed commands must be absolute paths. `scope` is `machine`, `project` or
+`workspace`. Workspace scope requires a verified registered workspace and defaults
+cwd to its concrete root; machine/project scope requires an explicit absolute
+`cwd`. Environment is the daemon's complete environment plus definition overrides,
+independent of the agent profile's environment. There is no shell interpolation,
+PATH search or automatic credential discovery. Backend initialization uses MCP
+`2025-11-25`, Hive client identity and empty client capabilities/options/roots.
+
+IDs use 1–128 ASCII letters, digits, `-` or `_`; `hive-managed-mcp` is reserved.
+Definitions and profile selectors must be unique. A profile can select at most
+32 servers. Inline native ACPv2 declarations retain their existing forwarding
+and persistence behavior; configured declarations cannot collide with their names.
+Bundled clients need no MCP composer to use profile selections.
+
+### Explicit process sharing
+
+Private session instances are the default. Scope alone never authorizes sharing.
+To opt in, the daemon operator supplies a complete trusted sharing assertion:
+
+```toml
+[mcp_servers.files.sharing]
+mode = "shared"
+principal = "local-operator"
+partition = "trusted-team"
+policy_generation = "policy-3"
+external_generations = { credential_file = "rotation-12" }
+```
+
+All fields are required. An explicit empty `external_generations = {}` asserts
+that no external credential source remains unaccounted for. Hive cannot verify
+this assertion: advance external generations when credential files/helpers rotate
+and policy generation when access policy changes. These are opaque revision IDs,
+not secrets or secret hashes. Agent/client metadata cannot grant sharing authority.
+The [MCP identity contract](adr/012-mcp-transport-scope-and-instance-identity.md)
+also compares scope, node, executable, arguments, complete environment, cwd and
+initialization inputs. Equal operator policy does not override those differences.
+
+### Aggregated discovery and invocation
+
+The agent-facing facade implements native MCP `2026-07-28` discovery, ping,
+tools list/call, resources list/template-list/read and prompts list/get over the
+legacy stdio backends. Discovery is fresh on request, with zero TTL and private
+cache scope. Tasks, multi-round continuations, subscriptions, sampling, elicitation,
+completion, logging configuration and push list-change notifications are unsupported.
+
+Tools/prompts receive stable bounded `hive_t_…` / `hive_p_…` aliases mapped to
+the exact original names, with display titles identifying backend and original title/name.
+Discover names before invoking them. Resource identifiers
+use `hive-mcp://v1-b<hex-definition-id>/<original-uri>`; preserve the entire URI
+byte-for-byte. Templates keep their original expressions behind that literal prefix.
+Hive also rewrites standard resource links/embedded resources in tool and prompt
+content. Arbitrary tool arguments, structured JSON, schemas and text URLs remain
+backend-native; Hive does not guess which application strings are resource IDs.
+
+Pagination visits one backend page at a time in definition-ID order. Cursors are
+opaque, attachment-local, method-specific and expire after 60 seconds. Restarted
+backend generations invalidate continuations; rediscover without a cursor. Bounded
+maps, cursors and frame sizes can return controlled capacity errors rather than
+silently returning incomplete catalogs. Backend failures are sanitized; published
+calls are never replayed automatically. Cancellation does not imply that a tool
+had no side effects, and cleanup waits for actual backend settlement.
+
+Live sessions pin selected definitions across reload. Saved sessions retain their
+original selector IDs; daemon restart resolves those IDs against current definitions
+and re-admits them. Missing definitions fail recovery. Legacy saved sessions do not
+gain newly added profile selectors. Generated ACP IDs, effective environments and
+sharing snapshots are not persisted.
+
+### Trusted embedding APIs
 
 Trusted Rust embedders can use `Broker::bind_scoped_mcp` with a `StdioAdmission`
 to resolve scope from registered session resources. Workspace scope defaults to
@@ -27,8 +116,7 @@ not search PATH or infer credential completeness.
 `Broker::mcp_execution_node`, low-level `Broker::bind_mcp` with fully resolved
 identities, and `Broker::release_mcp` are also available. The Broker owns the
 shared stdio runtime and durable session leases; client disconnects do not release
-them. This library API does not yet select managed servers from configuration or
-make their tools available through agent connections. See the
+them. Configuration-driven routing uses the same ownership fences. See the
 [runtime contract](adr/012-mcp-transport-scope-and-instance-identity.md#shared-stdio-runtime)
 for initialization, cancellation, restart and cleanup behavior.
 
@@ -76,7 +164,7 @@ default_agent = "claude"
 command = "claude-agent-acp"
 ```
 
-Each fragment can contain `[agents.<id>]`, `[projects.<id>]`, `[workspaces.<id>]`
+Each fragment can contain `[agents.<id>]`, `[mcp_servers.<id>]`, `[projects.<id>]`, `[workspaces.<id>]`
 and global `[worktrunk]` tables with the
 same fields as the root. `include` and `default_agent` are root-only settings. A default can select a
 profile declared in a fragment. The root can also declare profiles directly.
@@ -137,6 +225,7 @@ and tracing settings require restart.
 | `include` | Array of strings | `[]` | Root-only paths or globs for configuration fragments |
 | `default_agent` | String | Unset | Profile ID for session creation without a selector |
 | `agents` | Table of profiles | Empty | Available downstream agents |
+| `mcp_servers` | Table keyed by server IDs | Empty | Managed stdio or directly forwarded HTTP definitions |
 | `projects` | Table keyed by project IDs | Empty | Portable configured definitions |
 | `workspaces` | Table keyed by policy names | Empty | Workspace policy templates |
 | `worktrunk` | Global integration table | Auto-detect | Optional WorkTrunk lifecycle selection |
@@ -403,6 +492,7 @@ security sandboxes.
 | `name` | String | Profile ID for display | All profiles |
 | `project` | Project ID | Unset | Optional configured project reference, validated after composition |
 | `workspace` | Policy name | Unset | Provision this policy before startup; requires `project` |
+| `mcp_servers` | Array of server IDs | `[]` | Configured managed stdio/forwarded HTTP selections; ACPv2-only |
 | `kind` | `"acp"` or `"opencode-server"` | `"acp"` | All profiles |
 | `command` | String | Unset | ACP stdio executable |
 | `args` | Array of strings | `[]` | ACP stdio arguments |

@@ -207,6 +207,8 @@ struct Control {
     // Unlike pilot generation, this invalidates decisions permanently instead of reoffering them.
     interaction_epoch: u64,
     pending_interactions: usize,
+    // Separate bounded setup phases keep backend initialization inside its own watchdog budget.
+    startup_phase: u64,
     urls: HashMap<String, interactions::UrlRoute>,
     // Request publication and notification dispatch can race; records remain worker-local and bounded.
     early_completions: HashMap<String, (tokio::time::Instant, v2::CompleteElicitationNotification)>,
@@ -366,6 +368,7 @@ impl Control {
             client_capabilities: HashMap::new(),
             interaction_epoch: 0,
             pending_interactions: 0,
+            startup_phase: 0,
             urls: HashMap::new(),
             early_completions: HashMap::new(),
             token: uuid::Uuid::new_v4().to_string(),
@@ -438,6 +441,7 @@ impl Control {
             client_capabilities: HashMap::new(),
             interaction_epoch: 0,
             pending_interactions: 0,
+            startup_phase: 0,
             urls: HashMap::new(),
             early_completions: HashMap::new(),
             token: uuid::Uuid::new_v4().to_string(),
@@ -945,7 +949,8 @@ impl Broker {
                 }
             }
         }
-        let Some(provider) = self.config().agents.get(&record.profile).cloned() else {
+        let recovery_config = self.config();
+        let Some(mut provider) = recovery_config.agents.get(&record.profile).cloned() else {
             record.outcome = Outcome::Unavailable;
             record.reason =
                 Some("agent profile is missing; restore its configuration and restart Hive".into());
@@ -972,6 +977,29 @@ impl Broker {
             return;
         }
         let kind = provider.kind;
+        provider.mcp_servers = record.configured_mcp_servers.clone().unwrap_or_default();
+        let pinned_mcp = self
+            .mcp_sessions
+            .configured
+            .lock()
+            .ok()
+            .and_then(|bindings| {
+                bindings
+                    .get(&record.id)
+                    .map(|pinned| pinned.selection.clone())
+            });
+        let selected_mcp = match pinned_mcp
+            .map(Ok)
+            .unwrap_or_else(|| mcp::routing::select(&recovery_config, &provider.mcp_servers))
+        {
+            Ok(selected) => selected,
+            Err(error) => {
+                record.outcome = Outcome::Unavailable;
+                record.reason = Some(mcp::routing::diagnostic(error));
+                self.update_offline(record);
+                return;
+            }
+        };
         let version = if record.version == "v1" {
             AgentVersion::V1
         } else {
@@ -1001,6 +1029,24 @@ impl Broker {
         let (active_tx, active_rx) = oneshot::channel();
         let hive_id = v2::SessionId::new(record.id.clone());
         let cwd = v2::AbsolutePath::from(PathBuf::from(&record.cwd));
+        let mut mcp_pending = match self.begin_mcp_startup(
+            record.id.clone(),
+            mcp::PendingTarget {
+                control: control.clone(),
+                cwd: cwd.clone(),
+            },
+            mcp::StartupOwnership::Recovery,
+        ) {
+            Ok(guard) => guard,
+            // Another recovery, an already-live worker or shutdown owns this identity.
+            Err(_) => return,
+        };
+        self.mcp_sessions
+            .configured
+            .lock()
+            .expect("MCP configured bindings lock poisoned")
+            .entry(record.id.clone())
+            .or_insert_with(|| mcp::routing::Bindings::new(selected_mcp.clone()));
         let request = v2::NewSessionRequest::new(cwd.clone())
             .additional_directories(record.additional_directories.clone())
             .mcp_servers(record.mcp_servers.clone());
@@ -1009,6 +1055,7 @@ impl Broker {
         let broker = self.clone();
         let worker_id = id.to_owned();
         let worker_saved = saved.clone();
+        let mcp_broker = self.clone();
         let attach_api = record.api.as_deref().and_then(opencode::api::Flavor::parse);
         let attach_origin = if record.origin == "adopted" {
             "adopted"
@@ -1050,7 +1097,11 @@ impl Broker {
                     rx,
                     (ready_tx, active_rx),
                     worker_control.clone(),
-                    Some(downstream_id),
+                    AgentSetup {
+                        recovering: Some(downstream_id),
+                        broker: mcp_broker,
+                        selected_mcp,
+                    },
                 )
                 .await;
             }
@@ -1085,7 +1136,7 @@ impl Broker {
             }
         });
         let mut guard = AbortOnDrop(Some(worker.abort_handle()));
-        let result = tokio::time::timeout(std::time::Duration::from_secs(12), ready_rx).await;
+        let result = interactions::startup(&control, ready_rx).await;
         match result {
             Ok(Ok(Ok((_, returned_id)))) if returned_id == record.downstream_id => {
                 // Live updates may already have changed usage/cursors after the ordered resume
@@ -1107,6 +1158,11 @@ impl Broker {
                     commands: tx,
                     control,
                 };
+                let registry = self.registry.lock().expect("configuration lock poisoned");
+                if registry.stopping {
+                    worker.abort();
+                    return;
+                }
                 if let Ok(mut sessions) = self.sessions.lock() {
                     sessions.insert(id.to_owned(), entry);
                     self.offline
@@ -1115,6 +1171,7 @@ impl Broker {
                         .remove(id);
                     self.catalog.send_modify(|revision| *revision += 1);
                 }
+                drop(registry);
                 if active_tx.send(()).is_err() {
                     worker.abort();
                     if let Ok(mut sessions) = self.sessions.lock() {
@@ -1128,6 +1185,7 @@ impl Broker {
                     return;
                 }
                 guard.0 = None;
+                mcp_pending.promoted = true;
                 return;
             }
             Ok(Ok(Err(error))) => {
@@ -2023,6 +2081,8 @@ impl Broker {
             )
         };
         let kind = provider.kind;
+        let selected_mcp = mcp::routing::select(&launch_config, &provider.mcp_servers)
+            .map_err(|error| startup_error(mcp::routing::diagnostic(error)))?;
         if negotiated
             && (adopt.is_some() || (workspace_launch.is_none() && provider.workspace.is_none()))
             && !request.cwd.0.is_dir()
@@ -2134,6 +2194,24 @@ impl Broker {
             state.worktrunk_local = worktrunk::local_profile(&provider);
         }
         let cwd = request.cwd.clone();
+        let mut mcp_pending = self
+            .begin_mcp_startup(
+                hive_id.to_string(),
+                mcp::PendingTarget {
+                    control: control.clone(),
+                    cwd: cwd.clone(),
+                },
+                mcp::StartupOwnership::New,
+            )
+            .map_err(|error| startup_error(mcp::routing::diagnostic(error)))?;
+        self.mcp_sessions
+            .configured
+            .lock()
+            .map_err(|_| Error::internal_error())?
+            .insert(
+                hive_id.to_string(),
+                mcp::routing::Bindings::new(selected_mcp.clone()),
+            );
         let startup_evidence = control
             .lock()
             .map_err(|_| Error::internal_error())?
@@ -2154,6 +2232,7 @@ impl Broker {
                 cwd: cwd.0.display().to_string(),
                 additional_directories: request.additional_directories.clone(),
                 mcp_servers: request.mcp_servers.clone(),
+                configured_mcp_servers: Some(provider.mcp_servers.clone()),
                 profile: chosen.clone(),
                 version: if provider.preferred_version() == AgentVersion::V1 {
                     "v1"
@@ -2207,6 +2286,7 @@ impl Broker {
         }
         let worker_registry = self.registry.clone();
         let worker_mcp = self.mcp_sessions.clone();
+        let mcp_broker = self.clone();
         // Each session owns its subprocess: no guessed transport support or duplicate probing.
         let task = tokio::spawn(async move {
             if kind == ProfileKind::OpencodeServer {
@@ -2242,7 +2322,11 @@ impl Broker {
                     rx,
                     (ready_tx, active_rx),
                     control,
-                    None,
+                    AgentSetup {
+                        recovering: None,
+                        broker: mcp_broker,
+                        selected_mcp,
+                    },
                 )
                 .await;
             }
@@ -2376,6 +2460,12 @@ impl Broker {
                 {
                     // Match snapshot's sessions-then-offline order, so no reader can see
                     // a gap while a durable pending creation becomes a live session.
+                    let registry = self.registry.lock().map_err(|_| Error::internal_error())?;
+                    if registry.stopping {
+                        return Err(startup_error(mcp::routing::diagnostic(
+                            mcp::runtime::RuntimeError::Stopping,
+                        )));
+                    }
                     let mut sessions = self.sessions.lock().map_err(|_| Error::internal_error())?;
                     self.offline
                         .lock()
@@ -2386,6 +2476,7 @@ impl Broker {
                 }
                 reservation.retained = true;
                 let _ = active_tx.send(());
+                mcp_pending.promoted = true;
                 startup_guard.0 = None;
                 pending_startup.armed = false;
                 startup_evidence
@@ -2419,11 +2510,12 @@ impl Broker {
     }
 }
 
-/// Startup failures arrive as text. Diagnostics from the OpenCode adapter lead with their
-/// `hive::opencode::<kind>` code; surface that as a field so clients need not parse prose.
+/// Adapter/MCP startup diagnostics lead with their public code so clients need not parse prose.
 fn startup_error(message: String) -> Error {
     match message.split_once(": ") {
-        Some((code, rest)) if code.starts_with("hive::opencode::") => {
+        Some((code, rest))
+            if code.starts_with("hive::opencode::") || code.starts_with("hive::mcp::") =>
+        {
             Error::internal_error().data(serde_json::json!({ "code": code, "message": rest }))
         }
         _ => Error::internal_error().data(message),
@@ -2447,18 +2539,38 @@ async fn restore_history(
     // Install the barrier before publication: block_task alone lets post-response live
     // notifications overtake the task that ends historical ingestion.
     request.on_receiving_result(async move |result| {
-        let result = result.and_then(|discovery| {
-            let mut state = control.lock().map_err(|_| Error::internal_error())?;
-            let options = state.legacy_config.discover(discovery)?;
-            state.selected_model = selected_model(&options);
-            state.config_options = options.clone();
-            state.finish_history();
-            Ok(options)
-        });
+        let result = finish_restoration(&control, result);
         let _ = tx.send(result);
         Ok(())
     })?;
     rx.await.map_err(|_| Error::internal_error())?
+}
+
+async fn restore_sent_history(
+    request: agent_client_protocol::SentRequest<session_config::Discovery>,
+    control: Arc<Mutex<Control>>,
+) -> agent_client_protocol::Result<Vec<v2::SessionConfigOption>> {
+    let (tx, rx) = oneshot::channel();
+    // Keep the same ordered response barrier for SDK session builders as prepared requests.
+    request.on_receiving_result(async move |result| {
+        let result = finish_restoration(&control, result);
+        let _ = tx.send(result);
+        Ok(())
+    })?;
+    rx.await.map_err(|_| Error::internal_error())?
+}
+
+fn finish_restoration(
+    control: &Mutex<Control>,
+    result: agent_client_protocol::Result<session_config::Discovery>,
+) -> agent_client_protocol::Result<Vec<v2::SessionConfigOption>> {
+    let discovery = result?;
+    let mut state = control.lock().map_err(|_| Error::internal_error())?;
+    let options = state.legacy_config.discover(discovery)?;
+    state.selected_model = selected_model(&options);
+    state.config_options = options.clone();
+    state.finish_history();
+    Ok(options)
 }
 
 fn forward_v1(
@@ -2985,16 +3097,32 @@ async fn pilot_elicitation(
     interactions::elicitation(control, request).await
 }
 
+struct AgentSetup {
+    recovering: Option<String>,
+    broker: Broker,
+    selected_mcp: std::collections::BTreeMap<String, mcp::configuration::ConfiguredServer>,
+}
+
 async fn run_agent(
     provider: Profile,
-    request: v2::NewSessionRequest,
+    mut request: v2::NewSessionRequest,
     hive_id: v2::SessionId,
     mut rx: mpsc::UnboundedReceiver<Command>,
     startup: WorkerStartup,
     control: Arc<Mutex<Control>>,
-    recovering: Option<String>,
+    setup: AgentSetup,
 ) {
+    let AgentSetup {
+        recovering,
+        broker: mcp_broker,
+        selected_mcp,
+    } = setup;
     let (ready, active) = startup;
+    if selected_mcp.values().any(|server| server.managed()) && !worktrunk::local_profile(&provider)
+    {
+        let _ = ready.send(Err("hive::mcp::locality: managed MCP requires a node-local agent; restore the original local profile before recovery".into()));
+        return;
+    }
     let agent = match transport(&provider) {
         Ok(agent) => agent,
         Err(error) => {
@@ -3133,6 +3261,14 @@ async fn run_agent(
                 .await;
             match initialized {
                 Ok(agent_client_protocol::InitializeOutcome::Initialized(response)) if response.protocol_version == ProtocolVersion::V2 && response.capabilities.session.is_some() => {
+                    let capabilities = response.capabilities.session.as_ref().and_then(|s| s.mcp.as_ref());
+                    let managed = selected_mcp.values().any(|s| s.managed());
+                    let configured_http = selected_mcp.values().any(|s| !s.managed());
+                    if (managed && capabilities.is_none_or(|c| c.acp.is_none()))
+                        || (configured_http && capabilities.is_none_or(|c| c.http.is_none())) {
+                        let _ = ready.send(Err("hive::mcp::transport: agent does not advertise the selected MCP transport; enable native MCP-over-ACP for managed servers or HTTP support for forwarded servers".into()));
+                        return Ok(());
+                    }
                     tracing::info!(protocol = "v2", session = true, "agent capabilities negotiated");
                     if let Ok(mut state) = control.lock() {
                         state.history_status.restoration = Restoration::Supported;
@@ -3155,6 +3291,16 @@ async fn run_agent(
                     return Ok(());
                 }
             }
+            if let Err(error) = mcp::routing::forward_http(&selected_mcp, &mut request.mcp_servers) {
+                let _ = ready.send(Err(mcp::routing::diagnostic(error)));
+                return Ok(());
+            }
+            if let Ok(mut state) = control.lock() { state.startup_phase += 1; }
+            let aggregate = match mcp::routing::Aggregate::prepare(&mcp_broker, &hive_id, selected_mcp).await {
+                Ok(aggregate) => aggregate,
+                Err(error) => { let _ = ready.send(Err(error)); return Ok(()); }
+            };
+            if let Ok(mut state) = control.lock() { state.startup_phase += 1; }
             let restoring = recovering.is_some();
             let (opened, downstream_id) = if let Some(id) = recovering {
                 if let Ok(mut state) = control.lock() {
@@ -3167,12 +3313,19 @@ async fn run_agent(
                 // Route updates sent during session/resume, before its response is available.
                 if let Ok(mut route) = downstream.lock() { *route = Some(id.clone()); }
                 tracing::info!(protocol = "v2", method = "session/resume", replay = "start", "restoring agent history");
-                let prepared = cx.prepare_request(v2::ResumeSessionRequest::new(id.clone(), request.cwd)
+                let resume = v2::ResumeSessionRequest::new(id.clone(), request.cwd)
                     .additional_directories(request.additional_directories)
                     .mcp_servers(request.mcp_servers)
-                    .replay_from(v2::ReplayFrom::Start(v2::ReplayFromStart::new())))
-                    .map(|response| Ok(session_config::Discovery { options: Some(response.config_options), modes: None }));
-                match restore_history(prepared, control.clone()).await {
+                    .replay_from(v2::ReplayFrom::Start(v2::ReplayFromStart::new()));
+                let restored = if let Some(aggregate) = aggregate {
+                    let sent = cx.resume_session_from(resume)
+                        .with_mcp_server(agent_client_protocol::mcp_server::McpServer::new_service(mcp::routing::NAME, aggregate, agent_client_protocol::NullRun))?
+                        .start_session().map(|opened| Ok(session_config::Discovery { options: Some(opened.into_parts().1.config_options), modes: None }));
+                    restore_sent_history(sent, control.clone()).await
+                } else {
+                    restore_history(cx.prepare_request(resume).map(|response| Ok(session_config::Discovery { options: Some(response.config_options), modes: None })), control.clone()).await
+                };
+                match restored {
                     Ok(options) => (v2::NewSessionResponse::new(hive_id.clone()).config_options(options), id),
                     Err(error) => {
                         let failure = transcript::RestoreError::downstream("v2", "session/resume", &error);
@@ -3182,12 +3335,22 @@ async fn run_agent(
                     }
                 }
             } else {
-                let prepared = cx.prepare_request(request);
                 let parent = control.lock().map_err(|_| Error::internal_error())?.startup_parent.take();
-                let prepared = if let Some(parent) = &parent { prepared.forward_cancellation_from(parent.cancellation.clone()) } else { prepared };
-                let _mapping = interactions::ParentMapping::new(&control, prepared.id().clone(), parent);
                 remote::publishing(&control)?;
-                match prepared.block_task().await {
+                let result = if let Some(aggregate) = aggregate {
+                    let sent = cx.build_session_from(request)
+                        .with_mcp_server(agent_client_protocol::mcp_server::McpServer::new_service(mcp::routing::NAME, aggregate, agent_client_protocol::NullRun))?
+                        .start_session();
+                    let sent = if let Some(parent) = &parent { sent.forward_cancellation_from(parent.cancellation.clone()) } else { sent };
+                    let _mapping = interactions::ParentMapping::new(&control, sent.id().clone(), parent);
+                    sent.block_task().await.map(|opened| opened.into_parts().1)
+                } else {
+                    let prepared = cx.prepare_request(request);
+                    let prepared = if let Some(parent) = &parent { prepared.forward_cancellation_from(parent.cancellation.clone()) } else { prepared };
+                    let _mapping = interactions::ParentMapping::new(&control, prepared.id().clone(), parent);
+                    prepared.block_task().await
+                };
+                match result {
                     Ok(response) => { let id = response.session_id.clone(); remote::created(&control, id.to_string())?; (response, id) }
                     Err(error) => {
                         tracing::warn!(code = ?error.code, "agent session/new failed");
@@ -4752,6 +4915,7 @@ mod control_tests {
         let (catalog, _) = watch::channel(0);
         Control {
             workspace_session: None,
+            startup_phase: 0,
             worktrunk_terminal: None,
             worktrunk_restore: false,
             worktrunk_local: false,

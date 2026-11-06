@@ -14,6 +14,8 @@ use tokio::{
 
 #[path = "support/interactions.rs"]
 mod interactions;
+#[path = "support/mock_agent.rs"]
+mod mock_agent;
 #[path = "support/recovery.rs"]
 mod recovery;
 #[path = "support/remote_discovery.rs"]
@@ -2342,7 +2344,7 @@ fn config_with_agent(id: &str, command: &str, version: AgentVersion) -> Config {
             name: None,
             command: Some(words.next().unwrap().to_string()),
             args: words.map(str::to_string).collect(),
-            env: BTreeMap::new(),
+            env: mock_agent::env(),
             endpoint: None,
             headers: BTreeMap::new(),
             versions: vec![version],
@@ -2703,12 +2705,6 @@ async fn restore_conversation(version: AgentVersion, mode: &str) -> std::path::P
         .insert("HIVE_MOCK_STATE".into(), agent_state.display().to_string());
     profile.env.insert("HIVE_MOCK_RESTORE".into(), mode.into());
     profile.env.insert("HIVE_MOCK_ACK_META".into(), "1".into());
-    if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
-        profile.env.insert(
-            "LLVM_PROFILE_FILE".into(),
-            if cfg!(windows) { "NUL" } else { "/dev/null" }.into(),
-        );
-    }
     let broker = hive_daemon::Broker::persistent(config.clone(), database.clone()).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -3113,14 +3109,6 @@ async fn a_restart_reattaches_the_original_downstream_session_without_creating_a
         .unwrap()
         .env
         .insert("HIVE_MOCK_STATE".into(), agent_state.display().to_string());
-    if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
-        // Abruptly stopped test agents cannot safely flush coverage profiles;
-        // only the parent test's profile should be collected by llvm-cov.
-        config.agents.get_mut("mock").unwrap().env.insert(
-            "LLVM_PROFILE_FILE".into(),
-            if cfg!(windows) { "NUL" } else { "/dev/null" }.into(),
-        );
-    }
     let broker = hive_daemon::Broker::persistent(config.clone(), database.clone()).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
@@ -3862,13 +3850,6 @@ async fn restore_plans(forget: bool) {
         profile
             .env
             .insert("HIVE_MOCK_FORGET_PLANS".into(), "1".into());
-    }
-    if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
-        // Test agents are killed on shutdown, so only the parent can flush a coverage profile.
-        profile.env.insert(
-            "LLVM_PROFILE_FILE".into(),
-            if cfg!(windows) { "NUL" } else { "/dev/null" }.into(),
-        );
     }
     let broker = hive_daemon::Broker::persistent(config.clone(), database.clone()).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

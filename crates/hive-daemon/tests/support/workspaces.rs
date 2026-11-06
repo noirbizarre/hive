@@ -73,15 +73,7 @@ impl Fixture {
             AgentVersion::V1 => ("v1", "['v1']"),
             AgentVersion::V2 => ("v2", "[]"),
         };
-        // Agents stopped by the broker cannot flush reliable coverage profiles, including in-process hosts.
-        let coverage = if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
-            format!(
-                "LLVM_PROFILE_FILE = {:?}\n",
-                if cfg!(windows) { "NUL" } else { "/dev/null" }
-            )
-        } else {
-            String::new()
-        };
+        let coverage = format!("LLVM_PROFILE_FILE = {:?}\n", mock_agent::PROFILE_FILE);
         std::fs::write(
             base.join("agents.toml"),
             format!(

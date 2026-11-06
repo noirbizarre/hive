@@ -1,5 +1,8 @@
 //! Opt-in compatibility probes: never launch a paid agent during routine CI.
 
+#[path = "support/mock_agent.rs"]
+mod mock_agent;
+
 use std::{collections::BTreeMap, net::SocketAddr, path::PathBuf, process::Stdio, time::Duration};
 
 use agent_client_protocol::{
@@ -250,6 +253,11 @@ async fn run(installation: Installation) -> Result<(), String> {
 }
 
 async fn run_probe(installation: Installation, configuration: bool) -> Result<(), String> {
+    let env = if installation.command == env!("CARGO_BIN_EXE_hive-test-agent") {
+        mock_agent::env()
+    } else {
+        BTreeMap::new()
+    };
     let profile = Profile {
         mcp_servers: vec![],
         workspace: None,
@@ -257,7 +265,7 @@ async fn run_probe(installation: Installation, configuration: bool) -> Result<()
         name: None,
         command: Some(installation.command),
         args: installation.args,
-        env: BTreeMap::new(),
+        env,
         endpoint: None,
         headers: BTreeMap::new(),
         versions: vec![installation.wire],

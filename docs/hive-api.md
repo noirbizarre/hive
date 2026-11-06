@@ -56,7 +56,9 @@ The [Hive ACP extensions](acp-extensions.md#current-implementation) expose negot
 profile discovery and selection/startup for remote peers. Persistent owners serve
 `_hive/agents/list` from the same configured broker inventory, adding safe launch
 requirements and snapshot pagination. Both surfaces share the deployment's
-administrative principal. Qualified session location/routing remains #80.
+administrative principal. Qualified session location and cross-Hive control use
+ACP; the operational catalog remains local to this Hive. See
+[peer routing](acp-extensions.md#configured-peers-and-explicit-selection).
 
 ## Configuration reload
 

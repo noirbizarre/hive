@@ -7,6 +7,58 @@ use hive_protocol::remote::{
 
 const CURSOR_LIFETIME: std::time::Duration = std::time::Duration::from_secs(300);
 
+pub(super) fn negotiated(connection: &Mutex<Connection>) -> Result<(), Error> {
+    let state = connection.lock().map_err(|_| Error::internal_error())?;
+    if !state.initialized || state.mode != Mode::Negotiated {
+        return Err(RemoteError::Unsupported.wire());
+    }
+    Ok(())
+}
+
+pub(super) fn available(
+    broker: &Broker,
+    id: &v2::SessionId,
+    connection: &Mutex<Connection>,
+) -> Result<(), Error> {
+    if connection.lock().map_err(|_| Error::internal_error())?.mode != Mode::Negotiated {
+        return Ok(());
+    }
+    if broker
+        .sessions
+        .lock()
+        .map_err(|_| Error::internal_error())?
+        .contains_key(&id.to_string())
+    {
+        return Ok(());
+    }
+    if broker
+        .offline
+        .lock()
+        .map_err(|_| Error::internal_error())?
+        .contains_key(&id.to_string())
+    {
+        Err(RemoteError::AgentUnavailable.wire())
+    } else {
+        Err(RemoteError::SessionNotFound.wire())
+    }
+}
+
+pub(super) fn peer_selector(
+    raw: &mut serde_json::Value,
+    connection: &Mutex<Connection>,
+) -> Result<Option<hive_core::identity::NodeId>, Error> {
+    let Some(peer) = raw.get_mut("peer") else {
+        return Ok(None);
+    };
+    negotiated(connection)?;
+    let owner =
+        serde_json::from_value(peer.take()).map_err(|_| RemoteError::InvalidParams.wire())?;
+    raw.as_object_mut()
+        .ok_or_else(|| RemoteError::InvalidParams.wire())?
+        .remove("peer");
+    Ok(Some(owner))
+}
+
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(super) enum Phase {
     #[default]
@@ -52,11 +104,11 @@ pub(super) enum Mode {
 pub(super) struct Connection {
     pub initialized: bool,
     pub mode: Mode,
-    snapshot: Option<Snapshot>,
-    profile_snapshot: Option<Snapshot>,
+    pub(super) snapshot: Option<Snapshot>,
+    pub(super) profile_snapshot: Option<Snapshot>,
 }
 
-struct Snapshot {
+pub(super) struct Snapshot {
     config: Arc<Config>,
     cursor: String,
     position: usize,
@@ -250,6 +302,27 @@ pub(super) fn launch(
     raw: serde_json::Value,
     connection: &Connection,
 ) -> Result<(v2::NewSessionRequest, bool), Error> {
+    launch_at(raw, connection, true)
+}
+
+pub(super) fn launch_remote(raw: serde_json::Value) -> Result<v2::NewSessionRequest, Error> {
+    launch_at(
+        raw,
+        &Connection {
+            initialized: true,
+            mode: Mode::Negotiated,
+            ..Default::default()
+        },
+        false,
+    )
+    .map(|(request, _)| request)
+}
+
+fn launch_at(
+    raw: serde_json::Value,
+    connection: &Connection,
+    local: bool,
+) -> Result<(v2::NewSessionRequest, bool), Error> {
     let hive = hive_protocol::remote::hive_metadata(&raw)?;
     if connection.mode == Mode::Unsupported && hive.is_some() {
         return Err(RemoteError::Unsupported.wire());
@@ -310,7 +383,11 @@ pub(super) fn launch(
         if !request.additional_directories.is_empty() || !request.mcp_servers.is_empty() {
             return Err(RemoteError::Unsupported.wire());
         }
-        if !request.cwd.0.is_absolute() {
+        if !(if local {
+            request.cwd.0.is_absolute()
+        } else {
+            hive_protocol::remote::owner_path_is_absolute(&request.cwd.0)
+        }) {
             return Err(RemoteError::InvalidWorkspace.wire());
         }
     }
@@ -321,6 +398,18 @@ pub(super) fn launch(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn remote_launch_validation_leaves_foreign_filesystem_roots_to_the_owner() {
+        for cwd in ["/srv/owner", "C:\\work\\owner", "\\\\server\\share\\owner"] {
+            let request =
+                launch_remote(json!({"cwd":cwd,"_meta":{"hive":{"agent":"coder"}}})).unwrap();
+            assert_eq!(request.cwd.0.to_str(), Some(cwd));
+        }
+        assert!(
+            launch_remote(json!({"cwd":"relative","_meta":{"hive":{"agent":"coder"}}})).is_err()
+        );
+    }
 
     #[test]
     fn cursor_expiry_replacement_and_connection_isolation_never_restart_a_listing() {

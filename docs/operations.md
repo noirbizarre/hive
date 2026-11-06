@@ -89,7 +89,8 @@ agent-registry reload does not change them. Pilot fencing remains independent of
 listener authentication. See [transport guarantees](transports.md#sdk-audit-and-limits)
 for live reattachment and current SDK limitations. [Remote discovery and selection](acp-extensions.md#current-implementation)
 require Hive extension negotiation and a persistent owner. Routed session location
-remains #80; connectivity alone does not negotiate either feature.
+also requires [configured peers](configuration.md#remote-hive-peers) pinned to
+owner NodeIds; connectivity alone does not negotiate these features.
 
 ## Health and diagnosis
 

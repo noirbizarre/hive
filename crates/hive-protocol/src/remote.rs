@@ -10,6 +10,14 @@ use crate::{AgentVersion, v2};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RemoteError {
+    #[error("The authoritative owner has no retained session with this ID")]
+    SessionNotFound,
+    #[error("No verified connection to the configured session owner is available")]
+    OwnerUnavailable,
+    #[error("The session route is no longer valid")]
+    StaleRoute,
+    #[error("The session is retained but its agent is unavailable")]
+    AgentUnavailable,
     #[error("Hive extension parameters are malformed or the inventory cursor has expired")]
     InvalidParams,
     #[error("The requested Hive feature was not negotiated or is unsupported")]
@@ -37,6 +45,10 @@ pub enum RemoteError {
 impl RemoteError {
     pub fn code(self) -> &'static str {
         match self {
+            Self::SessionNotFound => "hive::remote::session_not_found",
+            Self::OwnerUnavailable => "hive::remote::owner_unavailable",
+            Self::StaleRoute => "hive::remote::stale_route",
+            Self::AgentUnavailable => "hive::remote::agent_unavailable",
             Self::InvalidParams => "hive::remote::invalid_params",
             Self::Unsupported => "hive::remote::unsupported",
             Self::UnknownAgent => "hive::remote::unknown_agent",
@@ -53,6 +65,18 @@ impl RemoteError {
 
     pub fn help(self) -> &'static str {
         match self {
+            Self::SessionNotFound => {
+                "Refresh the authoritative owner catalog and check the retained session reference."
+            }
+            Self::OwnerUnavailable => {
+                "Restore the configured owner connection, then resolve the retained reference again."
+            }
+            Self::StaleRoute => {
+                "Resolve the qualified session reference again; verify the configured owner identity."
+            }
+            Self::AgentUnavailable => {
+                "Inspect agent availability and recovery on the owning Hive, then explicitly resume the original session."
+            }
             Self::InvalidParams => {
                 "Correct the Hive parameters, or restart discovery without a cursor."
             }
@@ -107,6 +131,10 @@ impl RemoteError {
             .and_then(|data| data.get("code"))
             .and_then(Value::as_str);
         [
+            Self::SessionNotFound,
+            Self::OwnerUnavailable,
+            Self::StaleRoute,
+            Self::AgentUnavailable,
             Self::InvalidParams,
             Self::Unsupported,
             Self::UnknownAgent,
@@ -162,7 +190,56 @@ pub fn offered_versions(params: &Value) -> Result<Option<Vec<u64>>, Error> {
 }
 
 pub fn advertisement(node: &str) -> Value {
-    json!({"version": 1, "node": node, "features": {"agents": {}, "selection": {}, "control": {}, "workspaces": {}, "profiles": {}}})
+    json!({"version": 1, "node": node, "features": {"agents": {}, "selection": {}, "control": {}, "location": {}, "peers": {}, "workspaces": {}, "profiles": {}}})
+}
+
+/// Native agent IDs and endpoint URLs are deliberately absent from global identity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionReference {
+    pub owner: hive_core::identity::NodeId,
+    pub id: String,
+}
+
+impl SessionReference {
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.id.is_empty() {
+            return Err(RemoteError::InvalidParams.wire());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveParams {
+    pub session: SessionReference,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, agent_client_protocol::JsonRpcResponse)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionLocation {
+    pub session: SessionReference,
+    pub session_id: String,
+    pub cwd: v2::AbsolutePath,
+}
+
+/// Intermediate Hives validate wire syntax, not the path rules of their own operating system.
+pub fn owner_path_is_absolute(path: &std::path::Path) -> bool {
+    let Some(path) = path.to_str() else {
+        return false;
+    };
+    let bytes = path.as_bytes();
+    path.starts_with('/')
+        || (bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'/' | b'\\'))
+        || path.strip_prefix("\\\\").is_some_and(|unc| {
+            let mut components = unc.split(['\\', '/']);
+            components.next().is_some_and(|server| !server.is_empty())
+                && components.next().is_some_and(|share| !share.is_empty())
+        })
 }
 
 /// Retain raw values and redact Debug: malformed selectors must not become a default launch.
@@ -207,6 +284,8 @@ raw_request!(Initialize, "initialize", Value);
 raw_request!(NewSession, "session/new", v2::NewSessionResponse);
 raw_request!(ListAgents, "_hive/agents/list", AgentsPage);
 raw_request!(ListProfiles, "_hive/profiles/list", ProfilesPage);
+raw_request!(ResolveSession, "_hive/sessions/resolve", SessionLocation);
+raw_request!(ListPeers, "_hive/peers/list", Value);
 
 #[derive(Clone, Debug, Deserialize, Serialize, agent_client_protocol::JsonRpcResponse)]
 #[serde(rename_all = "camelCase")]
@@ -296,9 +375,128 @@ pub struct Peer {
     agents: bool,
     workspaces: bool,
     profiles: bool,
+    location: bool,
+    peers: bool,
 }
 
 impl Peer {
+    pub fn connection(&self) -> &V2ConnectionTo<Agent> {
+        &self.connection
+    }
+
+    pub async fn resolve(&self, session: SessionReference) -> Result<SessionLocation, Error> {
+        if !self.location {
+            return Err(RemoteError::Unsupported.wire());
+        }
+        session.validate()?;
+        let location = self
+            .connection
+            .prepare_request(ResolveSession(json!({"session": session})))
+            .block_task()
+            .await
+            .map_err(|error| RemoteError::sanitized(error, RemoteError::OwnerUnavailable))?;
+        if location.session != session
+            || location.session_id.is_empty()
+            || !owner_path_is_absolute(&location.cwd.0)
+        {
+            return Err(RemoteError::StaleRoute.wire());
+        }
+        Ok(location)
+    }
+
+    pub fn can_route(&self) -> bool {
+        self.location && self.selection
+    }
+
+    pub async fn list_peers(&self) -> Result<Value, Error> {
+        if !self.peers {
+            return Err(RemoteError::Unsupported.wire());
+        }
+        self.connection
+            .prepare_request(ListPeers(json!({})))
+            .block_task()
+            .await
+            .map_err(|error| RemoteError::sanitized(error, RemoteError::OwnerUnavailable))
+    }
+
+    pub async fn list_at(
+        &self,
+        owner: &hive_core::identity::NodeId,
+        params: ListParams,
+    ) -> Result<AgentsPage, Error> {
+        if !self.peers {
+            return Err(RemoteError::Unsupported.wire());
+        }
+        params.validate()?;
+        let mut raw =
+            serde_json::to_value(params).map_err(|_| RemoteError::InvalidParams.wire())?;
+        raw["peer"] = owner.as_str().into();
+        self.connection
+            .prepare_request(ListAgents(raw))
+            .block_task()
+            .await
+            .map_err(|error| RemoteError::sanitized(error, RemoteError::OwnerUnavailable))
+    }
+
+    pub async fn list_profiles_at(
+        &self,
+        owner: &hive_core::identity::NodeId,
+        params: ListParams,
+    ) -> Result<ProfilesPage, Error> {
+        if !self.peers {
+            return Err(RemoteError::Unsupported.wire());
+        }
+        params.validate()?;
+        let mut raw =
+            serde_json::to_value(params).map_err(|_| RemoteError::InvalidParams.wire())?;
+        raw["peer"] = owner.as_str().into();
+        self.connection
+            .prepare_request(ListProfiles(raw))
+            .block_task()
+            .await
+            .map_err(|error| RemoteError::sanitized(error, RemoteError::OwnerUnavailable))
+    }
+
+    pub async fn start_at(
+        &self,
+        owner: &hive_core::identity::NodeId,
+        agent: &str,
+        mut request: v2::NewSessionRequest,
+    ) -> Result<v2::NewSessionResponse, Error> {
+        self.select_peer(owner, &mut request)?;
+        self.start(agent, request).await
+    }
+
+    pub async fn start_profile_at(
+        &self,
+        owner: &hive_core::identity::NodeId,
+        profile: &str,
+        agent: Option<&str>,
+        mut request: v2::NewSessionRequest,
+    ) -> Result<v2::NewSessionResponse, Error> {
+        self.select_peer(owner, &mut request)?;
+        self.start_profile(profile, agent, request).await
+    }
+
+    fn select_peer(
+        &self,
+        owner: &hive_core::identity::NodeId,
+        request: &mut v2::NewSessionRequest,
+    ) -> Result<(), Error> {
+        if !self.peers {
+            return Err(RemoteError::Unsupported.wire());
+        }
+        let hive = request
+            .meta
+            .get_or_insert_default()
+            .entry("hive")
+            .or_insert_with(|| json!({}));
+        hive.as_object_mut()
+            .ok_or_else(|| RemoteError::InvalidParams.wire())?
+            .insert("peer".into(), owner.as_str().into());
+        Ok(())
+    }
+
     pub async fn initialize(
         connection: V2ConnectionTo<Agent>,
         mut request: v2::InitializeRequest,
@@ -317,6 +515,9 @@ impl Peer {
             response["capabilities"]["_meta"]["hive"]["features"]["workspaces"].is_object();
         let profiles =
             response["capabilities"]["_meta"]["hive"]["features"]["profiles"].is_object();
+        let location =
+            response["capabilities"]["_meta"]["hive"]["features"]["location"].is_object();
+        let peers = response["capabilities"]["_meta"]["hive"]["features"]["peers"].is_object();
         Ok(Self {
             connection,
             node,
@@ -324,6 +525,8 @@ impl Peer {
             agents,
             workspaces,
             profiles,
+            location,
+            peers,
         })
     }
 
@@ -349,6 +552,7 @@ impl Peer {
             "selection",
             "control",
             "location",
+            "peers",
             "workspaces",
             "profiles",
         ] {
@@ -363,6 +567,7 @@ impl Peer {
             || (enabled("workspaces") && !enabled("selection"))
             || (enabled("profiles") && !enabled("selection"))
             || (enabled("location") && !enabled("control"))
+            || (enabled("peers") && (!enabled("location") || !enabled("selection")))
             || (["selection", "location", "control"]
                 .iter()
                 .any(|key| enabled(key))
@@ -387,11 +592,11 @@ impl Peer {
             .map_err(|error| RemoteError::sanitized(error, RemoteError::Unsupported))
     }
 
-    pub async fn start(
+    pub fn prepare_start(
         &self,
         agent: &str,
         mut request: v2::NewSessionRequest,
-    ) -> Result<v2::NewSessionResponse, Error> {
+    ) -> Result<agent_client_protocol::PreparedRequest<v2::NewSessionResponse>, Error> {
         if !self.selection {
             return Err(RemoteError::Unsupported.wire());
         }
@@ -424,8 +629,15 @@ impl Peer {
         hive.as_object_mut()
             .ok_or_else(|| RemoteError::InvalidParams.wire())?
             .insert("agent".into(), agent.into());
-        self.connection
-            .prepare_request(request)
+        Ok(self.connection.prepare_request(request))
+    }
+
+    pub async fn start(
+        &self,
+        agent: &str,
+        request: v2::NewSessionRequest,
+    ) -> Result<v2::NewSessionResponse, Error> {
+        self.prepare_start(agent, request)?
             .block_task()
             .await
             .map_err(|error| RemoteError::sanitized(error, RemoteError::LaunchUncertain))
@@ -446,12 +658,12 @@ impl Peer {
     }
 
     /// Profile-only creation lets the owner resolve defaults atomically with admission.
-    pub async fn start_profile(
+    pub fn prepare_start_profile(
         &self,
         profile: &str,
         agent: Option<&str>,
         mut request: v2::NewSessionRequest,
-    ) -> Result<v2::NewSessionResponse, Error> {
+    ) -> Result<agent_client_protocol::PreparedRequest<v2::NewSessionResponse>, Error> {
         if !self.profiles {
             return Err(RemoteError::Unsupported.wire());
         }
@@ -470,13 +682,21 @@ impl Peer {
         // Do not retain an accidental agent selector from a reused request.
         hive.remove("agent");
         if let Some(agent) = agent {
-            return self.start(agent, request).await;
+            return self.prepare_start(agent, request);
         }
         if hive.contains_key("workspace") && !self.workspaces {
             return Err(RemoteError::Unsupported.wire());
         }
-        self.connection
-            .prepare_request(request)
+        Ok(self.connection.prepare_request(request))
+    }
+
+    pub async fn start_profile(
+        &self,
+        profile: &str,
+        agent: Option<&str>,
+        request: v2::NewSessionRequest,
+    ) -> Result<v2::NewSessionResponse, Error> {
+        self.prepare_start_profile(profile, agent, request)?
             .block_task()
             .await
             .map_err(|error| RemoteError::sanitized(error, RemoteError::LaunchUncertain))
@@ -486,6 +706,31 @@ impl Peer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owner_paths_accept_posix_windows_and_unc_roots_independently_of_the_gateway_os() {
+        for path in [
+            "/srv/project",
+            "C:\\work\\project",
+            "D:/work/project",
+            "\\\\server\\share\\project",
+        ] {
+            assert!(owner_path_is_absolute(std::path::Path::new(path)), "{path}");
+        }
+        for path in [
+            "",
+            "relative/project",
+            "C:relative",
+            "\\relative",
+            "\\\\server",
+            "\\\\server\\",
+        ] {
+            assert!(
+                !owner_path_is_absolute(std::path::Path::new(path)),
+                "{path}"
+            );
+        }
+    }
 
     #[test]
     fn malformed_metadata_and_versions_cannot_become_an_absent_offer() {

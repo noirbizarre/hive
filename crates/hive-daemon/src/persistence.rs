@@ -100,6 +100,10 @@ fn default_origin() -> String {
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error(
+        "cannot read or write remote session routing metadata; check database permissions and stored aliases, restore a valid backup if necessary, then resolve the original qualified references"
+    )]
+    Routing,
+    #[error(
         "cannot access workspace registry; check database permissions and stored resource records"
     )]
     Resource,

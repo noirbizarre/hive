@@ -60,10 +60,14 @@ async fn nested_session_location_payloads_remain_connection_scoped_without_an_at
     let initialized = raw_exchange(&mut channel, serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":2,"info":{"name":"scope-test","version":"1"},"capabilities":{}}})).await;
     assert_eq!(initialized["result"]["protocolVersion"], 2);
     let response = raw_exchange(&mut channel, serde_json::json!({"jsonrpc":"2.0","id":2,"method":"_hive/sessions/resolve","params":{"session":{"owner":"node-11111111-1111-4111-8111-111111111111","id":"hive-example"}}})).await;
-    // Resolution is deliberately unimplemented; receiving its error on the connection stream
-    // proves the nested session reference did not require a session SSE subscription.
+    // A legacy client cannot resolve, but its error still uses the connection stream:
+    // looking up a nested reference must not require an existing SSE attachment.
     assert_eq!(response["id"], 2);
-    assert_eq!(response["error"]["code"], -32601);
+    assert_eq!(response["error"]["code"], -32060);
+    assert_eq!(
+        response["error"]["data"]["code"],
+        "hive::remote::unsupported"
+    );
     assert!(
         summaries(address).await["sessions"]
             .as_array()

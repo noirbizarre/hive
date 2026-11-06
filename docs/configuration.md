@@ -5,6 +5,47 @@ daemon starts. Agent definitions describe how to reach agents. Named execution
 profiles group agents, projects and workspace settings into working setups.
 Neither starts agents until a session needs them.
 
+## Remote Hive peers
+
+Register remote execution owners in the root file or included fragments:
+
+```toml
+[peers.workstation]
+owner = "node-11111111-1111-4111-8111-111111111111"
+endpoint = "https://workstation.example/acp"
+name = "Workstation"
+auth_token_env = "HIVE_WORKSTATION_TOKEN"
+```
+
+`owner` is the remote Hive's persistent advertised NodeId. Obtain it from that
+owner's initialization response. `workstation` is only a local configuration
+alias: clients use the NodeId on the wire. Duplicate aliases and owners are
+rejected. Endpoints are exact HTTP(S) URLs without userinfo or fragments;
+redirects are disabled. `name` and `auth_token_env` are optional. Token values
+are read from the named variable when connecting and never appear in discovery.
+
+Registration is inert and does not probe or launch agents. Clients enumerate
+registrations with `_hive/peers/list`, discover owner-scoped agents/profiles with
+`_hive/agents/list` or `_hive/profiles/list` and a `peer` parameter, then select
+`_meta.hive.peer` plus `agent` or `profile` in ordinary `session/new`. Inventories
+remain dynamic; no local alias per remote agent is needed. See the
+[peer extension contract](acp-extensions.md#configured-peers-and-explicit-selection).
+
+Reload publishes registrations atomically without network access. Existing
+verified links retain their registration snapshot; new links use the current
+endpoint and credentials and verify the advertised NodeId again. Removing a
+registration prevents new connections without closing its remote sessions.
+Changing an alias never changes session identity. There is no automatic peer
+discovery or recursive routing through unconfigured owners.
+
+Remote cwd, project, workspace and MCP inputs are evaluated by the owner. The
+initiating Hive does not provision workspaces or validate remote paths against
+its own filesystem. Intermediate hops accept absolute POSIX, Windows drive and
+UNC wire paths; only the execution owner validates their local meaning and existence.
+Retain the qualified `{owner, id}` session reference from
+creation/listing, resolve it after reconnect, and explicitly resume. Cached
+gateway aliases do not confer control or authority to restore the remote agent.
+
 ## MCP server declarations
 
 Define MCP servers in the root or included fragments, then select them on an

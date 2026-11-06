@@ -306,7 +306,7 @@ async fn negotiation_rejects_malformed_offers_and_never_advertises_an_ephemeral_
             let selected = &retried["result"]["capabilities"]["_meta"]["hive"];
             if persistent {
                 assert_eq!(selected["version"], 1);
-                assert!(selected["features"]["location"].is_null());
+                assert!(selected["features"]["location"].is_object());
                 if let Some(node) = &identity {
                     assert_eq!(&selected["node"], node);
                 }

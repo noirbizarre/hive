@@ -55,7 +55,8 @@ by this decision record. Remote transport validation, authenticated/authorized
 deployment and safe non-loopback binding remain follow-up implementation work.
 The retrospective local trust boundary above described production at that time.
 Subsequent implementation in #79 supplies negotiated profile discovery/selection
-for persistent owners; qualified session location remains #80.
+for persistent owners; #80 adds qualified session location and routing through
+statically registered, identity-verified peers over the same ACP boundary.
 
 ## Shared private-network listener — 2026-11-05
 

@@ -10,7 +10,9 @@ use hive_protocol::AgentVersion;
 use serde::{Deserialize, Serialize};
 
 mod execution;
+mod peers;
 pub use execution::{ExecutionProfile, WorkspaceDeclaration};
+pub use peers::PeerRegistration;
 
 /// Portable policy templates deliberately contain no runtime repository identity.
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
@@ -77,6 +79,8 @@ impl WorkspaceTemplate {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    #[serde(default)]
+    pub peers: BTreeMap<String, PeerRegistration>,
     pub default_profile: Option<String>,
     #[serde(default)]
     pub profiles: BTreeMap<String, ExecutionProfile>,
@@ -96,6 +100,8 @@ pub struct Config {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RootDocument {
+    #[serde(default)]
+    peers: BTreeMap<String, PeerRegistration>,
     default_profile: Option<String>,
     #[serde(default)]
     profiles: BTreeMap<String, ExecutionProfile>,
@@ -116,6 +122,8 @@ struct RootDocument {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FragmentDocument {
+    #[serde(default)]
+    peers: BTreeMap<String, PeerRegistration>,
     #[serde(default)]
     mcp_servers: BTreeMap<String, crate::mcp::configuration::ConfiguredServer>,
     #[serde(default)]
@@ -262,6 +270,14 @@ fn is_loopback_host(host: &str) -> bool {
 /// pasted into bug reports and these messages are printed by `hive doctor`.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error, miette::Diagnostic)]
 pub enum ConfigError {
+    #[error("{0}")]
+    #[diagnostic(
+        code(hive::config::peer),
+        help(
+            "Configure unique peer aliases and owner NodeIds with HTTP(S) endpoints and optional auth_token_env names."
+        )
+    )]
+    Peer(String),
     #[error("{0}")]
     #[diagnostic(
         code(hive::config::mcp),
@@ -578,6 +594,11 @@ impl Config {
     /// Every problem, in the order `validate` would meet them.
     pub fn problems(&self) -> Vec<Problem> {
         let mut problems = Vec::new();
+        problems.extend(
+            peers::problems(&self.peers)
+                .into_iter()
+                .map(|error| Problem { agent: None, error }),
+        );
         for (id, server) in &self.mcp_servers {
             let valid_id = !id.is_empty()
                 && id.len() <= 128
@@ -794,6 +815,7 @@ fn include_paths(root: &Path, entry: &str, index: usize) -> Result<Vec<PathBuf>,
 
 fn compose(root: &Path, document: RootDocument) -> Result<Config, ConfigError> {
     let mut config = Config {
+        peers: document.peers,
         mcp_servers: document.mcp_servers,
         default_profile: document.default_profile,
         profiles: BTreeMap::new(),
@@ -836,6 +858,13 @@ fn compose(root: &Path, document: RootDocument) -> Result<Config, ConfigError> {
             }
             let text = std::fs::read_to_string(&path).map_err(|error| unreadable(&path, error))?;
             let fragment: FragmentDocument = parse_document(&path, &text)?;
+            for (alias, peer) in fragment.peers {
+                if config.peers.insert(alias, peer).is_some() {
+                    return Err(ConfigError::Peer(
+                        "duplicate peer alias across configuration files".into(),
+                    ));
+                }
+            }
             for (id, server) in fragment.mcp_servers {
                 if config.mcp_servers.insert(id, server).is_some() {
                     return Err(ConfigError::Mcp("duplicate MCP definition across configuration files; give each server a unique ID".into()));
@@ -922,6 +951,40 @@ pub fn default_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn peers_compose_without_network_access_and_duplicate_aliases_or_owners_are_rejected() {
+        let declaration = "[peers.desktop]\nowner = 'node-11111111-1111-4111-8111-111111111111'\nendpoint = 'http://127.0.0.1:9/acp'\nauth_token_env = 'HIVE_TEST_UNSET_PEER_TOKEN'\n";
+        let config =
+            read_fragments("include = ['peer.toml']\n", &[("peer.toml", declaration)]).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.peers.len(), 1);
+        assert!(matches!(
+            read_fragments(
+                &format!("include = ['peer.toml']\n{declaration}"),
+                &[("peer.toml", declaration)]
+            ),
+            Err(super::ConfigError::Peer(_))
+        ));
+        let duplicate = declaration.replace("peers.desktop", "peers.another");
+        let config: super::Config = toml::from_str(&format!("{declaration}{duplicate}")).unwrap();
+        assert!(
+            config
+                .problems()
+                .iter()
+                .any(|problem| matches!(problem.error, super::ConfigError::Peer(_)))
+        );
+        for invalid in [
+            declaration.replace(
+                "http://127.0.0.1:9/acp",
+                "http://private:secret@example.test/acp",
+            ),
+            declaration.replace("HIVE_TEST_UNSET_PEER_TOKEN", "literal secret"),
+        ] {
+            let config: super::Config = toml::from_str(&invalid).unwrap();
+            assert!(config.validate().is_err());
+        }
+    }
+
     #[test]
     fn mcp_definitions_compose_before_selection_and_duplicates_never_override() {
         let declaration =

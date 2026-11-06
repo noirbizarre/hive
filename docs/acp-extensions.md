@@ -1,19 +1,19 @@
 # Hive ACP extensions: remote discovery and control
 
-**Contract version 1 — discovery and selection implemented.** This normative
+**Contract version 1 — discovery, selection and routing implemented.** This normative
 contract originates in [#77][issue]. Persistent owner Hives implement negotiation,
 agent discovery and selection/startup through [#79][discovery], over the remote
-Streamable HTTP transport validated in [#78][transport]. Qualified references,
-the resolver and cross-Hive routing remain specified for [#80][routing].
+Streamable HTTP transport validated in [#78][transport]. [#80][routing] implements
+qualified references, read-only resolution and routing through configured owners.
 See the [compatibility matrix][matrix] for existing selection/control metadata.
 
 MUST, MUST NOT, SHOULD and MAY express requirements on implementations claiming
-this contract. Location requirements remain future work as qualified below.
+this contract.
 
 ## Current implementation
 
-Persistent brokers advertise `agents`, `selection`, `control`, `workspaces` and
-`profiles` after a compatible
+Persistent brokers advertise `agents`, `selection`, `control`, `location`, `peers`,
+`workspaces` and `profiles` after a compatible
 offer. They reuse their stored execution-node ID across restart. In-memory embedded
 brokers omit the Hive advertisement. A missing/null offer retains legacy metadata
 behavior; an incompatible offer disables extension operations/selectors while
@@ -49,8 +49,11 @@ existing `Credentials::peer` connection, call `list(ListParams)`, then
 `start(agent_id, NewSessionRequest)`. It validates version/features, preserves
 standard session responses, and sanitizes remote errors. Ordinary session control
 uses the original ACP connection and returned attachment metadata. Reconnect
-requires initialization and explicit resume of the retained owner-local session;
-qualified session resolution remains #80. Built-in UI migration remains #81.
+requires initialization, `resolve(SessionReference)`, then explicit standard resume.
+For gateways, `list_peers`, `list_at`, `list_profiles_at`, `start_at` and
+`start_profile_at` use explicit owner NodeIds. Prepared creation APIs allow bridges
+to install parent-ID mappings before publishing requests. Built-in UI migration
+remains #81.
 
 ## Baseline and minimal extension surface
 
@@ -105,6 +108,7 @@ unsuccessful. An unknown offered version is not malformed.
 | `workspaces` | Workspace intent and portable project transfer are consumed by `session/new`; requires `selection` |
 | `profiles` | `_hive/profiles/list` and `_meta.hive.profile` selection are implemented; requires `selection` |
 | `location` | Qualified session metadata and `_hive/sessions/resolve` are implemented; requires `control` |
+| `peers` | Configured peer enumeration, peer-scoped inventories and explicit peer launch selection; requires `location` and `selection` |
 | `control` | Existing Hive controller, prompt-key and replay contracts linked below are implemented |
 
 Each recognized marker is `{}` when supported, omitted/null otherwise; other
@@ -173,6 +177,40 @@ The Rust `Peer` offers `list_profiles(ListParams)` and
 feature; unsupported owners never receive a silently downgraded launch. Existing
 `list` and `start` continue to operate on concrete agent IDs. A configured
 `default_profile` also applies when no profile selector is supplied.
+
+## Configured peers and explicit selection
+
+With `peers` negotiated, `_hive/peers/list` accepts `{}` and returns
+`{"peers":[{"owner":NodeId,"alias":"workstation","name":"Workstation"}]}`.
+`name` can be null. This enumerates statically configured registrations without
+probing. Responses omit endpoints, credential selectors and token values.
+
+The existing `_hive/agents/list` and `_hive/profiles/list` accept optional
+`peer: NodeId` alongside `cursor` and `limit`. Omission selects the receiving
+Hive's local inventory; a present value selects a verified configured owner.
+Agent/profile IDs remain opaque and owner-scoped. Cursors are scoped to the
+upstream connection, owner, inventory kind and live owner link. Replacing an
+owner link invalidates continuation rather than silently restarting discovery.
+
+Remote creation uses standard `session/new`, for example:
+
+```json
+{
+  "cwd": "/srv/project",
+  "_meta": {"hive": {
+    "peer": "node-11111111-1111-4111-8111-111111111111",
+    "agent": "coder"
+  }}
+}
+```
+
+`peer` MUST identify a configured owner NodeId, never a local alias or URL.
+An explicit `agent` or `profile` is required for remote creation; profile-plus-agent
+selection retains normal owner-side override rules. The gateway consumes `peer`
+and forwards existing selectors via `Peer`, without applying local defaults or
+filesystem/workspace admission. Unavailable peers never fall back to local agents.
+Every new owner connection verifies its advertised NodeId before use. Registration
+and reload behavior is documented in [configuration](configuration.md#remote-hive-peers).
 
 ## Agent discovery: `_hive/agents/list`
 
@@ -296,9 +334,8 @@ WorkTrunk hooks retain their normal lifecycle.
 Workspace context includes `owner`, `project`, `workspace`, and `effectiveCwd`.
 An attach selector may include `owner`; a foreign owner is rejected before local
 resource inspection. Successful managed launches and resumes also include
-`_meta.hive.session: {"owner": NodeId, "id": SessionId}`. These additive references
-do not advertise `location` or implement #80 routing: retain the selected peer for
-ordinary control and explicit resume. Old contexts without `owner` remain readable.
+`_meta.hive.session: {"owner": NodeId, "id": SessionId}`. Negotiated unmanaged
+sessions now carry the same reference. Old contexts without `owner` remain readable.
 
 Acquisition/backend failures return `provisioning_failed`, interrupted effects
 return `provisioning_uncertain`, and invalid owner project/policy inputs return
@@ -327,6 +364,24 @@ With `location` negotiated, each standard `session/list` entry and successful
 The standard `sessionId` is usable at the **responding gateway**. List entries
 retain standard cwd/filter/cursor semantics; no separate session-list RPC exists.
 This metadata does not upgrade Hive's currently partial pagination support.
+
+Negotiated `session/list` merges local sessions with directly configured owners'
+catalogs. Gateways request `_meta.hive.ownerOnly: true` on the standard list method
+to enumerate only that peer's owned sessions; it requires negotiation. This prevents
+cycles from recursively aggregating catalogs. No transitive owner discovery occurs.
+On an owner outage or registration removal, known cached entries carry
+`_meta.hive.cached: true` and `availability: "owner_unavailable"`; response metadata
+includes `partial: true` and `unavailableOwners: [NodeId, ...]`. Missing connectivity
+never proves absence. Successful authoritative listings supersede cached presence.
+Absence is reconciled only for complete listings within their cwd scope, without
+revoking newer positive observations. Confirmed close or authoritative not-found
+also retires cached presence. The alias remains retained for stable-reference
+diagnostics, including after gateway restart, but does not reappear as an outage entry.
+
+Gateway aliases and qualified references/cwd are durable routing metadata, stored
+separately from local recovery records. Controller tokens, replay journals and
+process ownership stay on the owner. Gateway restart requires fresh verification
+and explicit attachment; it never starts a replacement remote worker.
 
 For example, creation at the owner returns the following response (other existing
 attachment snapshots are omitted here for clarity):
@@ -453,7 +508,7 @@ prompt, transfer control or silently create a replacement.
 ## Errors, unknown extensions and evolution
 
 These errors apply to the negotiated contract; legacy handlers retain their
-existing payloads. Location errors remain specified for #80. Standard ACP errors retain their standard
+existing payloads. Standard ACP errors retain their standard
 meaning. An unrecognized method returns `-32601`; unrecognized notifications
 are ignored without a response. Version 1 defines no new notifications.
 
@@ -476,6 +531,7 @@ string. `error.message` describes the specific failure without private inputs.
 | `-32060` | `hive::remote::session_not_found` | Authorized authoritative lookup found no session; refresh owner catalog |
 | `-32060` | `hive::remote::owner_unavailable` | No verified configured owner connection; restore connectivity/configuration |
 | `-32060` | `hive::remote::stale_route` | Mapping no longer valid; resolve qualified reference again |
+| `-32060` | `hive::remote::agent_unavailable` | Session is retained but its agent is unavailable; inspect owner recovery and explicitly resume |
 
 A transport loss cannot deliver a JSON-RPC error; the caller reports equivalent
 local uncertainty. Servers MAY hide forbidden profile/session existence as not
@@ -528,8 +584,7 @@ not authentication and browser-origin checks are not login.
 
 Production Hive defaults to loopback and permits explicitly opted-in remote
 binding with optional shared-token authentication through [#78][transport].
-Discovery and selection additionally require extension negotiation; session routing
-remains #80. See
+Discovery, selection and session routing additionally require extension negotiation. See
 [transports](transports.md), [deployment](operations.md#private-network-access)
 and [ADR-006](adr/006-local-operational-http-and-acp-boundary.md).
 
@@ -555,8 +610,12 @@ the `remote::tests` modules, and
 in `crates/hive-daemon/tests/bee.rs`. It covers negotiation, safe inventory/pagination,
 reload, strict launch admission, v1/v2 selection, launch failure/uncertainty,
 owner-side cwd, standard control and explicit reattachment without duplicate creation.
-The resolver, general session location, gateway aliases and cross-Hive routing checks
-remain obligations for #80.
+`crates/hive-daemon/tests/support/remote_routing.rs` exercises two real brokers,
+owner HTTP transport, both upstream transports and both ACP adapters: retained
+identity and receipts across gateway restart, owner takeover fencing, translated
+elicitation parents, lost acknowledgements, unreachable/replaced owners and
+retained unavailable agents. Configuration and alias-collision tests live in
+the daemon's `config::tests` and `routing::tests` modules.
 
 [issue]: https://github.com/noirbizarre/hive/issues/77
 [discovery]: https://github.com/noirbizarre/hive/issues/79

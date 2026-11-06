@@ -272,6 +272,7 @@ async fn run_probe(installation: Installation, configuration: bool) -> Result<()
     let database = directory.path().join("hive/sessions.sqlite3");
     let broker = hive_daemon::Broker::persistent(
         Config {
+            peers: Default::default(),
             mcp_servers: Default::default(),
             default_profile: None,
             profiles: Default::default(),

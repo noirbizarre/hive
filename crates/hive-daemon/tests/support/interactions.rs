@@ -82,7 +82,7 @@ async fn fixture_inner(
                             }
                             "cancel" | "close-permission" => json!(peer.send_request(permission("cancel me")).block_task().await.unwrap()),
                             "request" | "unsupported" | "close-form" => {
-                                let scope = if mode == "request" || mode == "close-form" { v2::ElicitationRequestScope::new(responder.id().clone()).into() }
+                                let scope = if mode == "request" || mode == "close-form" { v2::ElicitationRequestScope::new(hive_protocol::interactions::v2_request_id(responder.id()).expect("v2 requests have non-null IDs")).into() }
                                     else { v2::ElicitationScope::from(v2::ElicitationSessionScope::new(request.session_id.clone())) };
                                 let schema = serde_json::from_value(json!({"type":"object","properties":{"approved":{"type":"boolean"}},"required":["approved"]})).unwrap();
                                 json!(peer.send_request(v2::CreateElicitationRequest::new(v2::ElicitationFormMode::new(scope, schema), "Approve?")).block_task().await.unwrap())
@@ -321,11 +321,21 @@ async fn concurrent_permissions_before_prompt_acknowledgement_keep_their_own_res
                         )),
                     ))?;
                     first_response.respond(v2::RequestPermissionResponse::new(
-                        v2::RequestPermissionOutcome::Cancelled,
+                        // Proxying a cancellation must preserve future extension data as well as its outcome.
+                        v2::CancelledPermissionOutcome::new()
+                            .meta(v2::Meta::from_iter([(
+                                "future".into(),
+                                json!({"preserved": [1, 2, 3]}),
+                            )]))
+                            .into(),
                     ))?;
                     pending.await?;
                     let results = reports.recv().await.unwrap();
                     assert_eq!(results[0]["outcome"]["outcome"], "cancelled");
+                    assert_eq!(
+                        results[0]["outcome"]["_meta"]["future"],
+                        json!({"preserved": [1, 2, 3]})
+                    );
                     assert_eq!(results[1]["outcome"]["outcome"], "selected");
                     Ok(())
                 },
@@ -403,7 +413,7 @@ async fn request_scoped_forms_reference_the_original_live_client_rpc() {
             let id = prepared.id().clone();
             let pending = prepared.block_task();
             let (request, responder) = rx.recv().await.unwrap();
-            assert!(matches!(request.scope(), v2::ElicitationScope::Request(scope) if scope.request_id == id));
+            assert!(matches!(request.scope(), v2::ElicitationScope::Request(scope) if hive_protocol::interactions::raw_request_id(&scope.request_id) == id));
             responder.respond(serde_json::from_value(json!({"action":"accept","content":{"approved":false}})).unwrap())?;
             pending.await?;
             assert_eq!(reports.recv().await.unwrap()["content"]["approved"], false);
@@ -615,7 +625,7 @@ async fn a_disconnected_pilots_permission_is_reoffered_and_its_late_answer_canno
                             _: V2ConnectionTo<Agent>| {
                     reoffered.send(()).unwrap();
                     responder.respond(v2::RequestPermissionResponse::new(
-                        v2::RequestPermissionOutcome::Cancelled,
+                        v2::CancelledPermissionOutcome::new().into(),
                     ))
                 },
                 agent_client_protocol::on_receive_request!(),

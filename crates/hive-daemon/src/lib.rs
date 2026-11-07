@@ -3239,10 +3239,10 @@ async fn run_agent(
                    responder: Responder<v2::RequestPermissionResponse>,
                    cx: V2ConnectionTo<Agent>| {
                     if downstream.lock().map_err(|_| Error::internal_error())?.as_ref() != Some(&request.session_id) {
-                        return responder.respond(v2::RequestPermissionResponse::new(v2::RequestPermissionOutcome::Cancelled));
+                        return responder.respond(v2::RequestPermissionResponse::new(v2::CancelledPermissionOutcome::new().into()));
                     }
                     if control.lock().map_err(|_| Error::internal_error())?.hydrating {
-                        return responder.respond(v2::RequestPermissionResponse::new(v2::RequestPermissionOutcome::Cancelled));
+                        return responder.respond(v2::RequestPermissionResponse::new(v2::CancelledPermissionOutcome::new().into()));
                     }
                     request.session_id = hive_id.clone();
                     let control = control.clone();
@@ -5040,7 +5040,7 @@ mod control_tests {
         .await;
         assert!(matches!(
             response.outcome,
-            v2::RequestPermissionOutcome::Cancelled
+            v2::RequestPermissionOutcome::Cancelled(_)
         ));
         assert_eq!(started.elapsed(), std::time::Duration::from_secs(120));
         assert_eq!(control.lock().unwrap().pending_interactions, 0);
@@ -5061,7 +5061,7 @@ mod control_tests {
         control.lock().unwrap().begin_close().unwrap();
         assert!(matches!(
             dialog.await.outcome,
-            v2::RequestPermissionOutcome::Cancelled
+            v2::RequestPermissionOutcome::Cancelled(_)
         ));
         assert!(
             interrupted.borrow().is_some(),
@@ -5101,7 +5101,7 @@ mod control_tests {
         let response = pending.await;
         assert!(matches!(
             response.outcome,
-            v2::RequestPermissionOutcome::Cancelled
+            v2::RequestPermissionOutcome::Cancelled(_)
         ));
         assert_eq!(control.lock().unwrap().pending_interactions, 0);
     }

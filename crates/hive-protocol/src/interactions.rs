@@ -1,7 +1,25 @@
 //! ACP decision validation shared by the broker and native presentation adapters.
 
 use crate::v2;
+use agent_client_protocol::schema::v1;
 use serde_json::Value;
+
+/// SDK responders use raw JSON-RPC IDs even when a typed v2 scope identifies the request.
+pub fn raw_request_id(id: &v2::RequestId) -> v1::RequestId {
+    match id {
+        v2::RequestId::Number(value) => v1::RequestId::Number(*value),
+        v2::RequestId::Str(value) => v1::RequestId::Str(value.clone()),
+    }
+}
+
+/// A null raw ID cannot identify a v2 parent; never invent an ID that could route to another RPC.
+pub fn v2_request_id(id: &v1::RequestId) -> Option<v2::RequestId> {
+    match id {
+        v1::RequestId::Number(value) => Some(v2::RequestId::Number(*value)),
+        v1::RequestId::Str(value) => Some(v2::RequestId::Str(value.clone())),
+        v1::RequestId::Null => None,
+    }
+}
 
 /// Never include submitted values in diagnostics: forms may contain credentials.
 #[derive(Debug, thiserror::Error)]
@@ -253,6 +271,32 @@ pub fn parse_field(field: &Value, text: &str) -> Result<v2::ElicitationContentVa
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn request_id_conversion_preserves_identity_and_rejects_null_parents() {
+        let number = v1::RequestId::Number(1);
+        let string = v1::RequestId::Str("1".into());
+        for raw in [&number, &string] {
+            let typed = v2_request_id(raw).unwrap();
+            assert_eq!(raw_request_id(&typed), *raw);
+            assert_eq!(
+                serde_json::to_value(&typed).unwrap(),
+                serde_json::to_value(raw).unwrap()
+            );
+        }
+        assert_ne!(v2_request_id(&number), v2_request_id(&string));
+        assert_eq!(v2_request_id(&v1::RequestId::Null), None);
+    }
+
+    #[test]
+    fn cancellation_without_metadata_keeps_the_existing_wire_shape() {
+        let response =
+            v2::RequestPermissionResponse::new(v2::CancelledPermissionOutcome::new().into());
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            json!({"outcome": {"outcome": "cancelled"}})
+        );
+    }
 
     #[test]
     fn invented_permission_options_are_rejected_and_future_outcomes_remain_opaque() {

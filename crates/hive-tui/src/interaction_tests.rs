@@ -990,7 +990,7 @@ async fn permission_keys_require_a_listed_choice_and_escape_never_approves() {
         press(&cx, &mut app, &mut pending, KeyCode::Esc).await;
         assert!(matches!(
             answer.await.unwrap().outcome,
-            v2::RequestPermissionOutcome::Cancelled
+            v2::RequestPermissionOutcome::Cancelled(_)
         ));
         Ok(())
     })

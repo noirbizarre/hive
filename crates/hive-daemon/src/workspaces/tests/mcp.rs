@@ -28,7 +28,9 @@ async fn workspace_tool_scope_is_derived_from_the_session_hold_and_rejects_forei
         .unwrap();
     assert_eq!(result.repository_backend.as_deref(), Some("git"));
     assert_eq!(result.provisioner, "git.worktree");
-    assert_eq!(result.tools, tools::catalog(true));
+    let mut expected = tools::catalog(true);
+    expected.extend(tools::lifecycle::catalog(true));
+    assert_eq!(result.tools, expected);
     assert!(matches!(
         fixture
             .service
@@ -76,9 +78,9 @@ async fn built_in_calls_retain_settlement_after_close_caller_drop_recovery_and_s
     // All cases fence native dispatch, so they can share one provisioned checkout.
     let fixture = Fixture::new();
     let entry = fixture.create(fixture.request()).await.unwrap();
-    for (action, mutation) in ["close", "drop", "recovery", "shutdown"]
+    for (action, operation) in ["close", "drop", "recovery", "shutdown"]
         .into_iter()
-        .flat_map(|action| [(action, false), (action, true)])
+        .flat_map(|action| ["read", "commit", "create"].map(|operation| (action, operation)))
     {
         let project = entry.workspace.intent().project.clone();
         let mut config = crate::Config::default();
@@ -86,7 +88,7 @@ async fn built_in_calls_retain_settlement_after_close_caller_drop_recovery_and_s
             .projects
             .insert(project.clone(), fixture.definition.clone());
         // Exercise the real workspace store without starting an unrelated marker publisher
-        // or reopening SQLite eight times. The cancellation registry must remain fresh per case.
+        // or reopening SQLite per case. The cancellation registry must remain fresh per case.
         let mut broker = crate::Broker::new(config).unwrap();
         broker.store = Some(fixture.service.store.clone());
         let session = hive_protocol::v2::SessionId::new("built-in-session");
@@ -127,13 +129,28 @@ async fn built_in_calls_retain_settlement_after_close_caller_drop_recovery_and_s
         }));
         let old = provider.clone();
         let call = tokio::spawn(async move {
-            let request = mutation.then(|| hive_core::workspace::backend::vcs::Request::Commit {
-                message: "must not dispatch".into(),
-                inclusion: hive_core::workspace::backend::vcs::Inclusion::TrackedWorkingCopy,
-                untracked: vec![],
-                ignored: vec![],
-                expected_state: None,
-            });
+            let request = if operation == "create" {
+                hive_protocol::workspace_tools::Request::Workspace(
+                    hive_protocol::workspace_tools::lifecycle::Request::Create {
+                        operation: OperationId::new(),
+                        base_ref: None,
+                        branch: None,
+                        revision: None,
+                    },
+                )
+            } else {
+                operation
+                    .eq("commit")
+                    .then(|| hive_core::workspace::backend::vcs::Request::Commit {
+                        message: "must not dispatch".into(),
+                        inclusion:
+                            hive_core::workspace::backend::vcs::Inclusion::TrackedWorkingCopy,
+                        untracked: vec![],
+                        ignored: vec![],
+                        expected_state: None,
+                    })
+                    .into()
+            };
             provider.execute(request, None).await
         });
         ready.await.unwrap();
@@ -185,13 +202,25 @@ async fn built_in_calls_retain_settlement_after_close_caller_drop_recovery_and_s
             .await
             .unwrap();
         let _ = call.await;
-        if mutation {
+        if operation == "commit" {
             let root = Path::new(entry.workspace.location().unwrap().root.as_str());
             assert_eq!(
                 git(root, &["log", "-1", "--format=%s"], "test")
                     .unwrap()
                     .trim(),
                 "initial"
+            );
+        }
+        if operation == "create" {
+            assert!(
+                fixture
+                    .service
+                    .list()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|workspace| workspace.workspace.id() == entry.workspace.id()
+                        || workspace.workspace.state() == WorkspaceState::Failed)
             );
         }
         assert!(old.capabilities(None).await.is_err());

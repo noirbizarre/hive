@@ -114,10 +114,21 @@ impl Provider {
 
     pub(crate) async fn execute(
         &self,
-        request: Option<hive_core::workspace::backend::vcs::Request>,
+        request: impl Into<hive_protocol::workspace_tools::Request>,
         cancellation: Option<&McpOperationCancellation>,
     ) -> Result<serde_json::Value, RuntimeError> {
-        let mutation = request.as_ref().is_some_and(|r| r.mutates());
+        let request = request.into();
+        let mutation = request.mutates();
+        let uncertain = if matches!(
+            request,
+            hive_protocol::workspace_tools::Request::Workspace(_)
+        ) {
+            ToolError::Lifecycle {
+                code: "hive::workspace::uncertain_operation",
+            }
+        } else {
+            ToolError::Vcs(hive_core::workspace::backend::vcs::Error::Uncertain)
+        };
         if cancellation.is_some_and(McpOperationCancellation::is_cancelled) {
             return Err(ToolError::Cancelled.into());
         }
@@ -188,7 +199,7 @@ impl Provider {
             Some(result) => result
                 .map_err(|_| {
                     if mutation {
-                        ToolError::Vcs(hive_core::workspace::backend::vcs::Error::Uncertain)
+                        uncertain
                     } else {
                         ToolError::Backend
                     }
@@ -199,11 +210,7 @@ impl Provider {
                 let settled = response.await;
                 // A completed mutation must not masquerade as a cancelled read that is safe to retry.
                 if mutation {
-                    settled
-                        .map_err(|_| {
-                            ToolError::Vcs(hive_core::workspace::backend::vcs::Error::Uncertain)
-                        })?
-                        .map_err(Into::into)
+                    settled.map_err(|_| uncertain)?.map_err(Into::into)
                 } else {
                     Err(ToolError::Cancelled.into())
                 }

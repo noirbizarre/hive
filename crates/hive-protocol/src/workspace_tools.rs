@@ -12,6 +12,30 @@ pub const VCS_TOOLS: [&str; 4] = [
     "hive.vcs.log",
 ];
 pub use hive_core::workspace::backend::vcs;
+pub mod lifecycle;
+
+#[derive(Clone, Debug)]
+pub enum Request {
+    Capabilities,
+    Vcs(vcs::Request),
+    Workspace(lifecycle::Request),
+}
+
+impl Request {
+    pub fn mutates(&self) -> bool {
+        match self {
+            Self::Capabilities => false,
+            Self::Vcs(request) => request.mutates(),
+            Self::Workspace(request) => request.mutates(),
+        }
+    }
+}
+
+impl From<Option<vcs::Request>> for Request {
+    fn from(request: Option<vcs::Request>) -> Self {
+        request.map_or(Self::Capabilities, Self::Vcs)
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -87,6 +111,9 @@ pub fn request(name: &str, arguments: Option<&Value>) -> Result<vcs::Request, To
 }
 
 pub fn tool_descriptor(name: &str) -> Value {
+    if lifecycle::NAMES.contains(&name) {
+        return lifecycle::descriptor(name);
+    }
     if name == CAPABILITIES {
         return descriptor();
     }
@@ -201,6 +228,12 @@ pub enum ToolError {
     Backend,
     #[error(transparent)]
     Vcs(#[from] vcs::Error),
+    #[error(
+        "Workspace lifecycle request failed ({code}); inspect the operation and workspace before retrying"
+    )]
+    Lifecycle { code: &'static str },
+    #[error("Workspace removal refused: {0:?}")]
+    Cleanup(hive_core::workspace::CleanupRefusal),
 }
 
 impl ToolError {
@@ -213,6 +246,8 @@ impl ToolError {
             Self::Session => "hive::workspace_tools::session",
             Self::Cancelled => "hive::workspace_tools::cancelled",
             Self::Backend => "hive::workspace_tools::backend",
+            Self::Lifecycle { code } => code,
+            Self::Cleanup(_) => "hive::workspace::unsafe_cleanup",
             Self::Vcs(error) => match error {
                 vcs::Error::Unsupported => "hive::vcs::unsupported",
                 vcs::Error::Arguments => "hive::vcs::arguments",
@@ -229,7 +264,7 @@ impl ToolError {
     pub fn help(self) -> &'static str {
         match self {
             Self::Arguments => {
-                "Use the tool's advertised input schema; resource selectors are not accepted"
+                "Use the tool's advertised input schema and only its documented resource selectors"
             }
             Self::Unsupported => "Discover tools again and use an advertised Hive tool name",
             Self::Scope => {
@@ -244,6 +279,12 @@ impl ToolError {
             }
             Self::Backend => {
                 "Inspect workspace diagnostics on the owning Hive node, repair the resource store or backend, then retry"
+            }
+            Self::Lifecycle { .. } => {
+                "Inspect the original operation ID and workspace on its owning node; preserve changes, release active holds, and resolve uncertain evidence before retrying the same intent"
+            }
+            Self::Cleanup(_) => {
+                "Preserve the workspace; inspect its cleanliness, ownership and session holds and resolve the reported condition before retrying safe removal"
             }
             Self::Vcs(vcs::Error::Uncertain) => {
                 "Inspect status and native history on the owning node before retrying; staging or snapshotting may already have occurred"
@@ -271,7 +312,50 @@ impl ToolError {
     }
 
     pub fn data(self) -> Value {
-        json!({"code":self.code(),"message":self.to_string(),"help":self.help()})
+        let mut data = json!({"code":self.code(),"message":self.to_string(),"help":self.help()});
+        if let Self::Lifecycle { code } = self {
+            // Controlled descriptions keep actionable domain failures without exporting native output.
+            let (message, help) = match code {
+                "hive::workspace::retry_conflict" => (
+                    "The operation ID already records different immutable intent",
+                    "Replay the original request with its original ID; reconcile before allocating another ID",
+                ),
+                "hive::workspace::uncertain_operation" => (
+                    "The workspace operation may have partial or complete effects",
+                    "Inspect this operation and reconcile on its owning node before retrying the same ID",
+                ),
+                "hive::workspace::unknown" => (
+                    "The operation is not recorded in this committed snapshot",
+                    "Retain the original operation ID and inspect again; absence is not permission to replay with a new ID",
+                ),
+                "hive::workspace::request" => (
+                    "The requested base revision or branch is incompatible with the inherited workspace policy",
+                    "Use base_ref/branch for Git, revision for JJ, and a backend-resolvable base",
+                ),
+                "hive::workspace::identity_conflict" => (
+                    "Workspace resource evidence conflicts with its durable identity",
+                    "Preserve the resource and reconcile its registered identity on the owning node",
+                ),
+                "hive::workspace::worktrunk" => (
+                    "The pinned WorkTrunk provisioner could not complete the operation",
+                    "Inspect the original operation, node-local wt compatibility and hook approvals before retrying",
+                ),
+                "hive::jj::revision" => (
+                    "The requested JJ revision did not resolve to one commit",
+                    "Inspect native history and supply a single conflict-free revision or change ID",
+                ),
+                _ => (
+                    "The owning workspace service could not complete the lifecycle request",
+                    self.help(),
+                ),
+            };
+            data["message"] = json!(message);
+            data["help"] = json!(help);
+        }
+        if let Self::Cleanup(reason) = self {
+            data["reason"] = json!(reason);
+        }
+        data
     }
 }
 

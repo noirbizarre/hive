@@ -335,8 +335,50 @@ async fn remote_workspace_capabilities(scm: &str, provisioner: &str) {
                 assert_eq!(actual["project"], "demo");
                 assert_eq!(actual["repositoryBackend"], scm);
                 assert_eq!(actual["provisioner"], provisioner);
-                assert_eq!(report["lists"]["tools"].as_array().unwrap().len(), 5);
-                assert_eq!(actual["tools"].as_array().unwrap().len(), 5);
+                assert_eq!(report["lists"]["tools"].as_array().unwrap().len(), 11);
+                assert_eq!(actual["tools"].as_array().unwrap().len(), 11);
+                assert_eq!(report["currentRemove"]["isError"], true);
+                let refusal: Value = serde_json::from_str(
+                    report["currentRemove"]["content"][0]["text"]
+                        .as_str()
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(refusal["code"], "hive::workspace::unsafe_cleanup");
+                assert!(
+                    refusal["operation"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("operation-")
+                );
+                assert!(matches!(
+                    refusal["reason"].as_str(),
+                    Some("in_use" | "unknown_use")
+                ));
+                for key in [
+                    "workspaceCurrent",
+                    "workspaceInfo",
+                    "siblingCreate",
+                    "siblingReplay",
+                    "siblingInfo",
+                    "siblingRemove",
+                    "siblingOperation",
+                ] {
+                    assert_eq!(report[key]["isError"], false, "{key}: {}", report[key]);
+                    assert_eq!(report[key]["structuredContent"]["owner"], actual["owner"]);
+                    assert_eq!(
+                        report[key]["structuredContent"]["project"],
+                        actual["project"]
+                    );
+                }
+                assert_eq!(
+                    report["siblingCreate"]["structuredContent"]["workspace"],
+                    report["siblingReplay"]["structuredContent"]["workspace"]
+                );
+                assert_eq!(
+                    report["siblingOperation"]["structuredContent"]["state"],
+                    "removed"
+                );
                 assert_vcs_report(&report, &peer.node, scm);
                 assert_native_vcs_record(
                     Path::new(context["effectiveCwd"].as_str().unwrap()),

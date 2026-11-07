@@ -71,7 +71,13 @@ one text item with the same JSON for clients that consume textual results:
     {"name": "hive.vcs.status", "schemaVersion": 1, "effect": "read_only"},
     {"name": "hive.vcs.diff", "schemaVersion": 1, "effect": "read_only"},
     {"name": "hive.vcs.commit", "schemaVersion": 1, "effect": "mutation"},
-    {"name": "hive.vcs.log", "schemaVersion": 1, "effect": "read_only"}
+    {"name": "hive.vcs.log", "schemaVersion": 1, "effect": "read_only"},
+    {"name": "hive.workspace.current", "schemaVersion": 1, "effect": "read_only"},
+    {"name": "hive.workspace.info", "schemaVersion": 1, "effect": "read_only"},
+    {"name": "hive.workspace.list", "schemaVersion": 1, "effect": "read_only"},
+    {"name": "hive.workspace.create", "schemaVersion": 1, "effect": "mutation"},
+    {"name": "hive.workspace.remove", "schemaVersion": 1, "effect": "mutation"},
+    {"name": "hive.workspace.operation", "schemaVersion": 1, "effect": "read_only"}
   ]
 }
 ```
@@ -92,16 +98,103 @@ additional authority.
 
 | Workspace implementation | `repositoryBackend` | `provisioner` | Callable built-ins |
 | --- | --- | --- | --- |
-| Native Git worktree | `git` | `git.worktree` | Capabilities and all four `hive.vcs.*` tools |
-| Independent Git clone | `git` | `git.clone` | Capabilities and all four `hive.vcs.*` tools |
-| Git with WorkTrunk | `git` | `worktrunk` | Capabilities and all four `hive.vcs.*` tools |
-| Native Jujutsu | `jj` | `jj.workspace` | Capabilities and all four `hive.vcs.*` tools |
-| Registered external directory | null | `external.directory` | `hive.workspace.capabilities` |
+| Native Git worktree | `git` | `git.worktree` | Capabilities, four VCS tools and six lifecycle tools |
+| Independent Git clone | `git` | `git.clone` | Capabilities, four VCS tools and six lifecycle tools |
+| Git with WorkTrunk | `git` | `worktrunk` | Capabilities, four VCS tools and six lifecycle tools |
+| Native Jujutsu | `jj` | `jj.workspace` | Capabilities, four VCS tools and six lifecycle tools |
+| Registered external directory | null | `external.directory` | Capabilities and lifecycle tools except create; removal still refuses external targets |
 
 Provisioner lifecycle flags are not VCS-tool support. In particular, WorkTrunk
 remains a Git workspace provisioner: VCS operations dispatch directly to its pinned
-Git backend. Workspace current/info and list/create/remove belong to
-[#143](https://github.com/noirbizarre/hive/issues/143).
+Git backend. Lifecycle creation inherits the pinned compatible provisioner instead
+of selecting a new implementation from current configuration.
+
+## Workspace lifecycle tools
+
+The session's durable project attachment authorizes same-project workspaces on
+the owning node. Explicit IDs select resources within that context; they never
+grant cross-project or cross-node access. Inputs cannot contain arbitrary paths,
+repository sources, policy names, backend IDs, shell commands, or discard flags.
+
+| Tool | Input fields | Semantics |
+| --- | --- | --- |
+| `hive.workspace.current` | None (`{}`) | Inspect the attached workspace and fresh resource evidence. |
+| `hive.workspace.info` | Optional `workspace` | Defaults to current; inspect an explicitly identified authorized sibling. |
+| `hive.workspace.list` | Optional `limit`, `cursor` | Project-local workspace metadata sorted by workspace ID, default 20, maximum 100. Pass `nextCursor` as `cursor`; null ends pagination. |
+| `hive.workspace.create` | Required `operation`; optional `base_ref`, `branch`, `revision` | Create an unattached managed sibling using inherited policy and provisioner. Git accepts `base_ref`/`branch`; JJ accepts `revision`. |
+| `hive.workspace.remove` | Required `workspace`, `operation` | Preserve-only removal, subject to fresh existing cleanup checks. |
+| `hive.workspace.operation` | Required `operation` | Inspect a committed durable operation snapshot without replaying effects. |
+
+All inputs are strict objects. Omitted arguments mean `{}`; unknown fields and
+explicit null values are rejected. Workspace and operation IDs use their canonical
+`workspace-<UUID>` and `operation-<UUID>` forms. Base/branch/revision strings are
+bounded to 4,096 UTF-8 bytes and validated using their native domain types.
+
+### Sibling creation and safe removal
+
+Creation inherits the current managed workspace's durable repository handle,
+managed/ephemeral policy, retention, base intent and pinned compatible provisioner.
+It does not inherit a concrete checkout path, native workspace identity, prepared
+checkpoint or Git branch. An omitted Git branch generates a fresh task branch.
+JJ retains its native revision semantics; Git branch intent is rejected for JJ.
+Changing project defaults, repository sources or WorkTrunk configuration does not
+replace these pinned choices. Bases resolve from the reusable owner-side repository;
+creation does not copy the parent's uncommitted working files.
+
+The new workspace does not replace the caller's session attachment. Absolute expiry
+deadlines remain absolute; idle retention uses the new workspace's own lifecycle
+baseline. Existing lifecycle and retention policies remain authoritative.
+
+Removal always preserves changes and existing history-preservation behavior. Dirty
+tracked files, untracked **and ignored** content, active or unknown use, external
+ownership, unverified identity and uncertain evidence prevent deletion. The current
+workspace remains protected by its session hold. A clean VCS status alone is not
+cleanup authorization. Agent tools cannot authorize destructive discard or replay
+an administrative discard operation. Ending a session never removes its workspace.
+
+### Durable identity and operation inspection
+
+Allocate an operation ID before each new mutation and retain it even if the response
+is lost. Calls normally await completion and return that reference. Execution errors
+also include the supplied `operation`. Repeating the same ID with changed intent
+conflicts; an identical retry uses the original frozen request and checkpoints,
+including cleanup's original target snapshot. Inspect first after interruption;
+uncertain external effects and hooks require existing owner-side reconciliation.
+
+```json
+{
+  "name": "hive.workspace.create",
+  "arguments": {
+    "operation": "operation-22222222-2222-4222-8222-222222222222",
+    "base_ref": "main"
+  }
+}
+```
+
+Inspect that key with `hive.workspace.operation` and
+`{"operation":"operation-22222222-2222-4222-8222-222222222222"}`. Inspection reads
+committed state without waiting for the long-running resource lock or invoking a
+backend. It never migrates records, resumes work or certifies deletion safety.
+`persistedSnapshot: true` identifies this response: `state`, `failure` and `retry`
+describe the associated workspace's **latest persisted lifecycle**, not a separate
+live worker status or an immutable historical result for the queried operation.
+`kind` and `effectsStarted` belong to the queried operation. Provisioning/cleaning
+does not prove that a worker is alive, and an effects marker does not prove success.
+A missing key means not recorded in that snapshot, not permission to allocate a
+replacement key and repeat effects.
+
+Workspace metadata contains `schemaVersion`, `owner`, `project`, `workspace`,
+`state`, `ownership`, nullable `operation`, `failure`, `retry`, `repositoryBackend`
+and `provisioner`. Current/info add `inspection.presence` and, for present/partial
+resources, `inspection.safety` (`ownership_verified`, `cleanliness`, `usage`). List
+returns `workspaces` and nullable `nextCursor`. Operation inspection adds `kind`,
+`effectsStarted` and `persistedSnapshot`. Raw requests, prepared backend payloads,
+holder session IDs, repository sources and internal paths are not returned.
+
+Authority is checked after resource admission and before later mutation phases,
+including deletion after preservation. Once a native effect has been dispatched,
+Hive retains its checkpoint/result settlement across cancellation, close and caller
+drop; these cannot turn a completed mutation into a safely retryable cancelled read.
 
 ## VCS tools
 
@@ -224,14 +317,19 @@ that state is the last preflight observation, not a claimed post-commit snapshot
 
 The provider captures the exact owner-side session control and workspace context.
 It accepts calls during pending new/resume setup and after promotion to a live
-session. Every operation rechecks shutdown, closing/ended status, control identity,
-registered project, durable workspace hold, owner, pinned backend selection and
-workspace evidence under the existing resource admission gate. It rejects a stale
-provider after close, failed startup, worker exit or replacement during recovery.
+session. Every operation rechecks shutdown, closing/ended status, control identity
+and registered project. Resource operations additionally validate the durable
+workspace hold, owner, pinned backend selection and fresh workspace evidence under
+the existing resource admission gate. `hive.workspace.operation` instead validates
+the durable attachment and project/node scope against one committed snapshot; it
+does not take that gate or inspect filesystem/backend evidence. The provider rejects
+stale authority after close, failed startup, worker exit or replacement during recovery.
 
-The capability, status, diff and log tools are read-only. An admitted agent may
-inspect and record its own workspace's changes without a pilot approval interaction.
-It cannot select another session/project/workspace or execute arbitrary commands.
+Capability discovery, VCS status/diff/log and workspace current/info/list/operation
+are read-only. An admitted agent may inspect and record its own workspace's changes
+without a pilot approval interaction.
+VCS tools cannot select another session/project/workspace or execute arbitrary
+commands. Lifecycle tools allow explicit same-project sibling selectors only.
 MCP annotations describe effects; they are not permission to mutate resources or
 discard data. Commit requires explicit inclusion, fresh session authority and the
 existing workspace safety contracts.
@@ -252,13 +350,13 @@ workspace automatically.
 Invalid arguments and unsupported tool names produce MCP JSON-RPC error `-32602`
 with controlled `data.code`, `data.message` and `data.help`. A scoped tool execution
 failure returns `isError: true` with a text item containing the same structured
-diagnostic; it has no successful `structuredContent`. Discovery-time scope or
+diagnostic in text and `structuredContent`, not a successful tool result. Discovery-time scope or
 authority failures use JSON-RPC `-32000` with diagnostic data. Transport cancellation
 may instead surface through ACP's cancellation response.
 
 | Stable diagnostic code | Meaning and action |
 | --- | --- |
-| `hive::workspace_tools::arguments` | Follow the advertised tool schema; resource selectors are not accepted. |
+| `hive::workspace_tools::arguments` | Follow the advertised tool schema and only its documented selectors. |
 | `hive::workspace_tools::unsupported` | Discover again and use an advertised tool name. |
 | `hive::workspace_tools::scope` | Inspect and repair the owning session's registered workspace and backend. |
 | `hive::workspace_tools::owner` | Reconnect to the Hive node owning the session/workspace. |
@@ -273,6 +371,13 @@ may instead surface through ACP's cancellation response.
 | `hive::vcs::backend` | Repair native SCM configuration/evidence on the owning node. |
 | `hive::vcs::cancelled` | Authority ended before mutation; use an active session. |
 | `hive::vcs::uncertain` | Inspect status and history before retrying; partial or complete effects are possible. |
+| `hive::workspace::unsafe_cleanup` | Inspect structured `reason` (dirty, in use, unknown use/cleanliness, external/unverified ownership); preserve the resource and resolve the condition. |
+| `hive::workspace::retry_conflict` | Restore the original operation ID and intent; never change a recorded cleanup's discard mode. |
+| `hive::workspace::uncertain_operation` | Inspect the original operation and reconcile owner-side effects before retrying. |
+| `hive::workspace::unknown` | The operation is not recorded in this committed snapshot; retain its original ID. |
+
+Other lifecycle failures retain the existing domain diagnostic code, such as
+`hive::workspace::request`, `hive::workspace::worktrunk` or `hive::jj::revision`.
 
 Existing MCP facade limits still apply, including bounded concurrent operations
 (`hive::mcp::busy`), response sizes and cursor validation. Errors do not expose
@@ -310,8 +415,11 @@ and backend-specific workflows.
 - `src/workspaces/tests/vcs.rs`: Git/JJ native state and identities, partial staging,
   explicit additions, ignored files, layered read-only JJ inspection, conflicts,
   hooks, mutation fences, bounded output and Git dispatch for WorkTrunk selection.
+- `src/workspaces/tests/lifecycle_tools.rs`: inherited siblings and durable retries,
+  project/owner authorization, preserve-only cleanup and session holds, committed
+  snapshots while the resource gate is held, and revocation before checkout dispatch.
 - Backend-specific gateway tests in `tests/support/workspaces.rs`:
-  direct peer-to-owner Git/JJ/optional WorkTrunk capabilities and VCS operations
+  direct peer-to-owner Git/JJ/optional WorkTrunk capabilities, lifecycle and VCS operations
   during startup and restart, with independent native history checks. This
   exercises the selected owner's provider, rather than
   routing through an initiating Hive gateway.

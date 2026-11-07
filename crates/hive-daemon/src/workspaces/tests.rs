@@ -9,6 +9,9 @@ mod backend_tests;
 #[path = "tests/mcp.rs"]
 mod mcp_tests;
 
+#[path = "tests/lifecycle_tools.rs"]
+mod lifecycle_tools;
+
 #[path = "tests/jj.rs"]
 mod jj_tests;
 

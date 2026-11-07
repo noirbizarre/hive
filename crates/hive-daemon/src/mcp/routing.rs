@@ -475,16 +475,26 @@ impl Aggregate {
             .ok_or(ToolError::Arguments)?;
         let request = if name == tools::CAPABILITIES {
             tools::validate_arguments(params.get("arguments"))?;
-            None
+            tools::Request::Capabilities
+        } else if tools::lifecycle::NAMES.contains(&name) {
+            tools::Request::Workspace(tools::lifecycle::request(name, params.get("arguments"))?)
         } else {
-            Some(tools::request(name, params.get("arguments"))?)
+            tools::Request::Vcs(tools::request(name, params.get("arguments"))?)
+        };
+        let operation = match &request {
+            tools::Request::Workspace(request) => request.operation().cloned(),
+            _ => None,
         };
         let result = match provider.execute(request, Some(cancellation)).await {
             Ok(value) => {
                 json!({"structuredContent":value,"content":[{"type":"text","text":value.to_string()}],"isError":false})
             }
             Err(RuntimeError::WorkspaceTool(error)) => {
-                json!({"isError":true,"content":[{"type":"text","text":error.data().to_string()}]})
+                let mut diagnostic = error.data();
+                if let Some(operation) = operation {
+                    diagnostic["operation"] = json!(operation);
+                }
+                json!({"isError":true,"structuredContent":diagnostic,"content":[{"type":"text","text":diagnostic.to_string()}]})
             }
             Err(error) => return Err(error),
         };

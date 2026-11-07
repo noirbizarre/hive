@@ -1,6 +1,7 @@
 //! File protection is independent of session attachment and survives lost process evidence.
 
 use super::*;
+mod lifecycle;
 use crate::mcp::{
     AdmissionError, InstanceIdentity, ResolvedTransport, Scope, ScopeContext, SessionMcpLease,
     runtime,
@@ -52,10 +53,19 @@ impl Service {
         session: String,
         context: hive_protocol::workspace::Context,
         cwd: PathBuf,
-        request: Option<hive_core::workspace::backend::vcs::Request>,
+        request: impl Into<hive_protocol::workspace_tools::Request>,
         authorize: impl Fn() -> Result<(), hive_protocol::workspace_tools::ToolError> + Send + 'static,
     ) -> Result<serde_json::Value, hive_protocol::workspace_tools::ToolError> {
         use hive_protocol::workspace_tools::{self as tools, ToolError};
+        let request = request.into();
+        let lifecycle = matches!(request, tools::Request::Workspace(_));
+        if let tools::Request::Workspace(tools::lifecycle::Request::Operation { operation }) =
+            &request
+        {
+            return self
+                .tool_operation_snapshot(session, context, operation.clone(), authorize)
+                .await;
+        }
         let mutation_admitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let admitted = mutation_admitted.clone();
         self.run(move |rt| {
@@ -72,6 +82,15 @@ impl Service {
                 }
                 rt.mcp_scope(&session, Some(&context), &cwd, true)
                     .map_err(|_| ToolError::Scope)?;
+                if let tools::Request::Workspace(request) = request {
+                    let fence = || {
+                        authorize()?;
+                        // Lost delivery after a lifecycle phase starts requires operation inspection.
+                        admitted.store(true, std::sync::atomic::Ordering::Release);
+                        Ok(())
+                    };
+                    return rt.workspace_tool(&session, request, &fence);
+                }
                 let id = rt.state.uses.get(&session).ok_or(ToolError::Scope)?;
                 let entry = rt
                     .state
@@ -85,7 +104,7 @@ impl Service {
                     .map(|repository| rt.manager.repository(repository))
                     .transpose()
                     .map_err(|_| ToolError::Backend)?;
-                if let Some(request) = request {
+                if let tools::Request::Vcs(request) = request {
                     let repository = selection
                         .repository
                         .as_ref()
@@ -132,7 +151,14 @@ impl Service {
                         .as_ref()
                         .map(|repository| repository.backend.0.clone()),
                     provisioner: selection.provisioner.0.clone(),
-                    tools: tools::catalog(backend.is_some_and(|backend| backend.supports_vcs())),
+                    tools: {
+                        let mut catalog =
+                            tools::catalog(backend.is_some_and(|backend| backend.supports_vcs()));
+                        catalog.extend(tools::lifecycle::catalog(backends::supports_siblings(
+                            entry,
+                        )));
+                        catalog
+                    },
                 })
                 .map_err(|_| ToolError::Backend)
             })())
@@ -140,7 +166,13 @@ impl Service {
         .await
         .map_err(|_| {
             if mutation_admitted.load(std::sync::atomic::Ordering::Acquire) {
-                ToolError::Vcs(hive_core::workspace::backend::vcs::Error::Uncertain)
+                if lifecycle {
+                    ToolError::Lifecycle {
+                        code: "hive::workspace::uncertain_operation",
+                    }
+                } else {
+                    ToolError::Vcs(hive_core::workspace::backend::vcs::Error::Uncertain)
+                }
             } else {
                 ToolError::Backend
             }

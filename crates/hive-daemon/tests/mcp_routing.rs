@@ -138,9 +138,22 @@ async fn built_in_workspace_tools_work_alone_and_beside_paginated_user_tools_dur
             assert_eq!(capabilities["repositoryBackend"], Value::Null);
             assert_eq!(capabilities["provisioner"], "external.directory");
             assert_eq!(capabilities["schemaVersion"], 1);
+            assert_eq!(capabilities["tools"], {
+                let mut catalog = hive_protocol::workspace_tools::tools();
+                catalog.extend(hive_protocol::workspace_tools::lifecycle::catalog(false));
+                json!(catalog)
+            });
             assert_eq!(
-                capabilities["tools"],
-                json!([{"name":"hive.workspace.capabilities","schemaVersion":1,"effect":"read_only"}])
+                report["workspaceCurrent"]["structuredContent"]["workspace"],
+                context["workspace"]
+            );
+            assert_eq!(report["workspaceInfo"], report["workspaceCurrent"]);
+            assert_eq!(
+                report["workspaceList"]["structuredContent"]["workspaces"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1
             );
             assert_eq!(report["workspaceDirect"], report["workspace"]);
             assert_eq!(report["workspace"]["resultType"], "complete");
@@ -159,10 +172,10 @@ async fn built_in_workspace_tools_work_alone_and_beside_paginated_user_tools_dur
                 "hive::workspace_tools::unsupported"
             );
             let tools = report["lists"]["tools"].as_array().unwrap();
-            assert_eq!(tools.len(), if managed { 7 } else { 1 });
+            assert_eq!(tools.len(), if managed { 12 } else { 6 });
             assert_eq!(tools[0]["name"], "hive.workspace.capabilities");
             assert!(
-                tools[1..]
+                tools[6..]
                     .iter()
                     .all(|tool| tool["name"].as_str().unwrap().starts_with("hive_t_"))
             );

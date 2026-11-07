@@ -227,6 +227,13 @@ retaining the workspace.
 node and must not be inspected as an initiating-Hub path. Legacy stored contexts
 may omit `owner`.
 
+Registered native ACPv2 sessions with MCP-over-ACP support also receive
+[agent-facing workspace tools](workspace-tools.md#workspace-lifecycle-tools).
+These expose project-scoped inspection, sibling creation with inherited pinned
+provisioners, preserve-only removal and durable operation snapshots through the
+existing owner-side workspace service. Agents supply no filesystem paths or
+backend commands; their session attachment supplies authority.
+
 ## Project registry
 
 `POST /v1/projects` accepts an optional `id` and project metadata:

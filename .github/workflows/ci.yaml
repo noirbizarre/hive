@@ -113,11 +113,6 @@ jobs:
         with:
           name: webui-dist
           path: clients/hive-web/dist/
-      # Setup precedes caches so their post-save hooks run before the drive is dismounted.
-      - name: Tune Windows runner
-        uses: ./.github/actions/setup-windows
-        if: runner.os == 'Windows'
-
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
@@ -132,6 +127,12 @@ jobs:
       - uses: jdx/mise-action@v5
         with:
           cache: true
+
+      # Bootstrap tools first: mise installs on C: with a same-volume temporary rename.
+      # Storage still precedes the Cargo cache so its post hook runs before drive teardown.
+      - name: Tune Windows runner
+        uses: ./.github/actions/setup-windows
+        if: runner.os == 'Windows'
 
       - uses: jdx/mr-boxington-action@v1
         with:

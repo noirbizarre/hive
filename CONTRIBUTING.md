@@ -258,8 +258,9 @@ git tpl merge          # take it
 `tpl:update` is safe to run at any time: it only advances the rendered ref.
 Nothing reaches your branch until the merge.
 
-git-tpl is declared in `mise.toml` and installed by `mise install`. Its release
-archives avoid compiling the tool separately in every CI job.
+`mise install` provides git-tpl through the declared `cargo:` tool. With
+cargo-binstall available, mise downloads its release archive rather than
+compiling the libgit2 dependency from source.
 
 Files carrying template-owned content — `mise.toml`, `prek.toml`, `Cargo.toml` —
 end with a `# --- project-specific ---` marker. Add below it; Git's 3-way merge

@@ -1,5 +1,8 @@
 //! Real subprocess evidence complements the pure identity contract tests.
 
+#[path = "support/mock_agent.rs"]
+mod mock_agent;
+
 use hive_core::{
     identity::NodeId,
     workspace::{NodePath, PathSyntax},
@@ -259,7 +262,7 @@ async fn scoped_admission_shares_canonical_worktrees_and_isolates_other_worktree
     let config = serde_json::from_value(json!({
         "default_agent":"mock", "projects":{"demo":{"name":"Demo"},"other":{"name":"Other"}},
         "workspaces":{"first":{"policy":"existing","directory":first},"second":{"policy":"existing","directory":second},"other":{"policy":"existing","directory":other}},
-        "agents":{"mock":{"command":env!("CARGO_BIN_EXE_hive-test-agent"),"versions":["v2"]}}
+        "agents":{"mock":{"command":env!("CARGO_BIN_EXE_hive-test-agent"),"versions":["v2"],"env":mock_agent::env()}}
     })).unwrap();
     let broker =
         hive_daemon::Broker::persistent(config, base.join("state/catalog.sqlite3")).unwrap();
@@ -943,7 +946,7 @@ async fn broker_sessions_share_durable_bindings_across_disconnect_and_close() {
     use agent_client_protocol_http::HttpClient;
 
     let mut fixture = Fixture::new();
-    let config = serde_json::from_value(json!({"default_agent": "mock", "agents": {"mock": {"command": env!("CARGO_BIN_EXE_hive-test-agent"), "versions": ["v2"]}}})).unwrap();
+    let config = serde_json::from_value(json!({"default_agent": "mock", "agents": {"mock": {"command": env!("CARGO_BIN_EXE_hive-test-agent"), "versions": ["v2"], "env": mock_agent::env()}}})).unwrap();
     let broker = hive_daemon::Broker::new(config).unwrap();
     fixture.node = broker.mcp_execution_node().await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1381,7 +1384,7 @@ async fn worker_exit_retains_only_recoverable_session_ownership_and_allows_offli
     use agent_client_protocol_http::HttpClient;
     for persistent in [false, true] {
         let mut fixture = Fixture::new();
-        let config = serde_json::from_value(json!({"default_agent": "mock", "agents": {"mock": {"command": env!("CARGO_BIN_EXE_hive-test-agent"), "versions": ["v2"]}}})).unwrap();
+        let config = serde_json::from_value(json!({"default_agent": "mock", "agents": {"mock": {"command": env!("CARGO_BIN_EXE_hive-test-agent"), "versions": ["v2"], "env": mock_agent::env()}}})).unwrap();
         let broker = if persistent {
             hive_daemon::Broker::persistent(
                 config,
@@ -1546,7 +1549,7 @@ async fn released_binding_cleanup(close_session: bool) {
     use agent_client_protocol_http::HttpClient;
     let mut fixture = Fixture::new();
     let cwd = fixture.directory.path().to_path_buf();
-    let config = serde_json::from_value(json!({"default_agent":"mock", "projects":{"demo":{"name":"Demo"}}, "workspaces":{"task":{"policy":"existing", "directory":cwd}}, "agents":{"mock":{"command":env!("CARGO_BIN_EXE_hive-test-agent"), "versions":["v2"], "project":"demo", "workspace":"task"}}})).unwrap();
+    let config = serde_json::from_value(json!({"default_agent":"mock", "projects":{"demo":{"name":"Demo"}}, "workspaces":{"task":{"policy":"existing", "directory":cwd}}, "agents":{"mock":{"command":env!("CARGO_BIN_EXE_hive-test-agent"), "versions":["v2"], "project":"demo", "workspace":"task", "env":mock_agent::env()}}})).unwrap();
     let broker =
         hive_daemon::Broker::persistent(config, cwd.join("state/catalog.sqlite3")).unwrap();
     fixture.node = broker.mcp_execution_node().await.unwrap();

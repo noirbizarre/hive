@@ -1,5 +1,8 @@
 //! `probe_initialize` against the deterministic mock agent: no real agent, no model costs.
 
+#[path = "support/mock_agent.rs"]
+mod mock_agent;
+
 use std::collections::BTreeMap;
 
 use hive_daemon::{
@@ -17,7 +20,7 @@ fn profile(command: &str, args: &[&str], version: AgentVersion) -> Profile {
         name: None,
         command: Some(command.into()),
         args: args.iter().map(ToString::to_string).collect(),
-        env: BTreeMap::new(),
+        env: mock_agent::env(),
         endpoint: None,
         headers: BTreeMap::new(),
         versions: vec![version],

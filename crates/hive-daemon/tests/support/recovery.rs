@@ -16,13 +16,6 @@ fn recovery_config(base: &Path) -> Config {
         "HIVE_MOCK_STATE".into(),
         base.join("agent.json").display().to_string(),
     );
-    if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
-        // Killed children cannot flush valid coverage profiles.
-        env.insert(
-            "LLVM_PROFILE_FILE".into(),
-            if cfg!(windows) { "NUL" } else { "/dev/null" }.into(),
-        );
-    }
     config
 }
 

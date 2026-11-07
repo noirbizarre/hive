@@ -2,12 +2,21 @@
 
 #[path = "support/fake_opencode.rs"]
 mod fake_opencode;
+#[path = "support/mock_agent.rs"]
+mod mock_agent;
 
 use std::path::{Path, PathBuf};
 
 use hive_daemon::doctor::{Options, Report, Status, run};
 
 const MOCK: &str = env!("CARGO_BIN_EXE_hive-test-agent");
+
+fn mock_command() -> String {
+    format!(
+        "command = '{MOCK}'\nenv.LLVM_PROFILE_FILE = {:?}\n",
+        mock_agent::env()["LLVM_PROFILE_FILE"]
+    )
+}
 
 /// A throwaway directory holding the config and standing in for the XDG directories.
 struct Sandbox(PathBuf);
@@ -40,17 +49,14 @@ fn profile<'a>(report: &'a Report, id: &str) -> &'a hive_daemon::doctor::Profile
 
 #[tokio::test]
 async fn included_agents_are_probed_and_composed_semantic_errors_are_collected() {
+    let mock = mock_command();
     let sandbox = Sandbox::new();
     let fragment = sandbox.0.join("agents.toml");
-    std::fs::write(&fragment, format!("[agents.good]\ncommand = '{MOCK}'\n")).unwrap();
+    std::fs::write(&fragment, format!("[agents.good]\n{mock}")).unwrap();
     let report = run(sandbox.options("include = ['agents.toml']\ndefault_agent = 'good'")).await;
     assert!(!report.failed(), "{report:#?}");
     assert_eq!(profile(&report, "good").status, Status::Pass);
-    std::fs::write(
-        &fragment,
-        format!("[agents.good]\ncommand = '{MOCK}'\n[agents.empty]\n"),
-    )
-    .unwrap();
+    std::fs::write(&fragment, format!("[agents.good]\n{mock}[agents.empty]\n")).unwrap();
     let report = run(sandbox.options("include = ['agents.toml']\ndefault_agent = 'missing'")).await;
     assert_eq!(
         codes(&report.config.findings),
@@ -62,8 +68,9 @@ async fn included_agents_are_probed_and_composed_semantic_errors_are_collected()
 
 #[tokio::test]
 async fn healthy_v1_and_v2_agents_are_reported_with_their_capabilities() {
+    let mock = mock_command();
     let report = run(Sandbox::new().options(&format!(
-        "[agents.modern]\ncommand = '{MOCK}'\n[agents.legacy]\ncommand = '{MOCK}'\nargs = ['v1']\nversions = ['v1']\n"
+        "[agents.modern]\n{mock}[agents.legacy]\n{mock}args = ['v1']\nversions = ['v1']\n"
     )))
     .await;
     assert!(!report.failed(), "{report:#?}");
@@ -75,8 +82,9 @@ async fn healthy_v1_and_v2_agents_are_reported_with_their_capabilities() {
 
 #[tokio::test]
 async fn a_profile_declaring_the_wrong_protocol_fails_with_its_compat_code_and_help() {
+    let mock = mock_command();
     let report = run(Sandbox::new().options(&format!(
-        "[agents.wrong]\ncommand = '{MOCK}'\nargs = ['v1']\nversions = ['v2']\n"
+        "[agents.wrong]\n{mock}args = ['v1']\nversions = ['v2']\n"
     )))
     .await;
     assert!(report.failed());
@@ -112,8 +120,9 @@ async fn a_missing_binary_is_reported_as_binary_missing() {
 
 #[tokio::test]
 async fn one_broken_profile_fails_the_run_without_hiding_the_healthy_one() {
+    let mock = mock_command();
     let report = run(Sandbox::new().options(&format!(
-        "[agents.good]\ncommand = '{MOCK}'\n[agents.gone]\ncommand = 'hive-definitely-not-installed'\n"
+        "[agents.good]\n{mock}[agents.gone]\ncommand = 'hive-definitely-not-installed'\n"
     )))
     .await;
     assert!(report.failed());
@@ -123,8 +132,9 @@ async fn one_broken_profile_fails_the_run_without_hiding_the_healthy_one() {
 
 #[tokio::test]
 async fn an_invalid_config_reports_every_problem_and_probes_nothing() {
+    let mock = mock_command();
     let report = run(Sandbox::new().options(&format!(
-        "default_agent = 'missing'\n[agents.good]\ncommand = '{MOCK}'\n[agents.empty]\n"
+        "default_agent = 'missing'\n[agents.good]\n{mock}[agents.empty]\n"
     )))
     .await;
     assert!(report.failed());
@@ -146,8 +156,9 @@ async fn an_unparsable_config_fails_without_quoting_its_content() {
 
 #[tokio::test]
 async fn an_unknown_agent_filter_is_a_failure() {
+    let mock = mock_command();
     let sandbox = Sandbox::new();
-    let mut options = sandbox.options(&format!("[agents.good]\ncommand = '{MOCK}'\n"));
+    let mut options = sandbox.options(&format!("[agents.good]\n{mock}"));
     options.agents = vec!["nope".into()];
     let report = run(options).await;
     assert!(report.failed());
@@ -216,6 +227,7 @@ async fn a_non_loopback_listen_address_fails() {
 
 #[tokio::test]
 async fn an_unreachable_endpoint_profile_fails_without_leaking_its_url_or_headers() {
+    let mock = mock_command();
     // Reserve a port, then free it so nothing answers there.
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -224,7 +236,7 @@ async fn an_unreachable_endpoint_profile_fails_without_leaking_its_url_or_header
         .port();
     let report = run(Sandbox::new().options(&format!(
         "[agents.remote]\nendpoint = 'http://127.0.0.1:{port}/secret-path'\nheaders = {{ 'X-Secret' = 'secret-token' }}\n\
-         [agents.local]\ncommand = '{MOCK}'\nenv = {{ SENTINEL = 'secret-env' }}\n"
+         [agents.local]\n{mock}env.SENTINEL = 'secret-env'\n"
     )))
     .await;
     assert!(report.failed());

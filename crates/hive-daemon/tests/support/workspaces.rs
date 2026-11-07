@@ -303,7 +303,8 @@ async fn remote_workspace_capabilities(scm: &str, provisioner: &str) {
     let (address, mut host) = fixture.start().await;
     let retained = std::sync::Mutex::new(None);
     timeout(
-        Duration::from_secs(30),
+        // This is a total test ceiling, not the agent-silence watchdog: setup runs native tools.
+        Duration::from_secs(120),
         Client.v2().connect_with(
             Credentials::default()
                 .peer(&format!("http://{address}/acp"))
@@ -403,7 +404,7 @@ async fn remote_workspace_capabilities(scm: &str, provisioner: &str) {
     let (id, context) = retained.into_inner().unwrap().unwrap();
     let (address, mut host) = fixture.start().await;
     timeout(
-        Duration::from_secs(30),
+        Duration::from_secs(120),
         Client.v2().connect_with(
             Credentials::default()
                 .peer(&format!("http://{address}/acp"))

@@ -195,6 +195,9 @@ Authority is checked after resource admission and before later mutation phases,
 including deletion after preservation. Once a native effect has been dispatched,
 Hive retains its checkpoint/result settlement across cancellation, close and caller
 drop; these cannot turn a completed mutation into a safely retryable cancelled read.
+Built-in work admitted during new/resume also counts as startup progress until its
+resource job settles. After settlement, an otherwise silent agent remains subject
+to the normal startup watchdog.
 
 ## VCS tools
 

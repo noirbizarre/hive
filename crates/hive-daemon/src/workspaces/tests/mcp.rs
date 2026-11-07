@@ -154,6 +154,7 @@ async fn built_in_calls_retain_settlement_after_close_caller_drop_recovery_and_s
             provider.execute(request, None).await
         });
         ready.await.unwrap();
+        assert_eq!(control.lock().unwrap().pending_builtin_operations, 1);
         match action {
             "close" => control.lock().unwrap().closing = true,
             "drop" => call.abort(),
@@ -185,6 +186,7 @@ async fn built_in_calls_retain_settlement_after_close_caller_drop_recovery_and_s
             );
         }
         let sessions = broker.mcp_sessions.clone();
+        assert_eq!(control.lock().unwrap().pending_builtin_operations, 1);
         let mut waiter = Box::pin(async move {
             match evidence {
                 Some(pending) => crate::mcp::settled(pending).await,
@@ -202,6 +204,7 @@ async fn built_in_calls_retain_settlement_after_close_caller_drop_recovery_and_s
             .await
             .unwrap();
         let _ = call.await;
+        assert_eq!(control.lock().unwrap().pending_builtin_operations, 0);
         if operation == "commit" {
             let root = Path::new(entry.workspace.location().unwrap().root.as_str());
             assert_eq!(

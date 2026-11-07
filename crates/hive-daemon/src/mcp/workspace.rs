@@ -18,6 +18,28 @@ impl Drop for CancelOnDrop {
     }
 }
 
+struct BuiltinActivity(Arc<Mutex<crate::Control>>);
+
+impl BuiltinActivity {
+    fn start(control: Arc<Mutex<crate::Control>>) -> Result<Self, RuntimeError> {
+        {
+            let mut state = control.lock().map_err(|_| RuntimeError::Binding)?;
+            state.pending_builtin_operations += 1;
+            state.builtin_activity_revision = state.builtin_activity_revision.wrapping_add(1);
+        }
+        Ok(Self(control))
+    }
+}
+
+impl Drop for BuiltinActivity {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.0.lock() {
+            state.pending_builtin_operations -= 1;
+            state.builtin_activity_revision = state.builtin_activity_revision.wrapping_add(1);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct Provider {
     broker: crate::Broker,
@@ -137,6 +159,11 @@ impl Provider {
                 .mcp_sessions
                 .track_operation(&self.session.to_string(), &self.active)
         })?;
+        // The authority callback already holds Control; register liveness only after it returns.
+        let activity = BuiltinActivity::start(self.control.clone()).inspect_err(|_| {
+            // No resource job was dispatched, so a failed liveness registration is settled.
+            done.send_replace(true);
+        })?;
         let this = self.clone();
         let (reply, response) = tokio::sync::oneshot::channel();
         let admission_cancelled = cancelled.clone();
@@ -185,6 +212,8 @@ impl Provider {
                     Err(_) => Err(ToolError::Backend),
                 }
             };
+            // The coordinator, not the caller future, owns liveness through actual settlement.
+            drop(activity);
             done.send_replace(true);
             let _ = reply.send(result);
         });

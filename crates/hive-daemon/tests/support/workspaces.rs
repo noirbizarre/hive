@@ -134,7 +134,9 @@ impl Fixture {
             .spawn()
             .unwrap();
         let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
-        let address = timeout(Duration::from_secs(15), async {
+        // Reconciliation can resume an agent that runs native lifecycle tools before readiness.
+        // Keep this total fixture ceiling distinct from the agent-silence watchdog.
+        let address = timeout(Duration::from_secs(120), async {
             while let Some(line) = lines.next_line().await.unwrap() {
                 if let Some(address) = line.strip_prefix("HIVE_WORKSPACE_READY ") {
                     return address.parse().unwrap();

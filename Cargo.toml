@@ -110,7 +110,7 @@ arboard = { version = "3.6", default-features = false, features = ["wayland-data
 tempfile = "3"
 shell-words = "1"
 # Pin the pure input parser to the workspace MSRV; newer releases raise it independently.
-terminput = "=0.5.4"
-terminput-crossterm = "=0.4.0"
+terminput = "=0.5.13"
+terminput-crossterm = "=0.4.9"
 rustix = { version = "1", features = ["event", "stdio"] }
 signal-hook = "0.4"

@@ -14,6 +14,10 @@ Mise's postinstall hook installs both `pre-commit` and `commit-msg` hooks.
 Prek installs Commitizen and its Emotional plugin in an isolated Python environment
 for commit-message validation.
 
+Windows CI places build outputs and temporary files on a ReFS Dev Drive.
+The shared setup action exports `TMP`, `TEMP` and `TMPDIR` for all subsequent
+steps and child processes, with temporary storage outside the cached target directory.
+
 ### Mr Boxington build caching
 
 [Mr Boxington](https://mr-boxington.jdx.dev/setup) is enabled through mise's
@@ -50,9 +54,10 @@ Environment-selected wrappers still take precedence and prevent mbx caching.
 CI uses `jdx/mr-boxington-action` instead of sccache and rust-cache. Its default
 GitHub `target` payload includes Cargo outputs and registry/git downloads, so
 an additional rust-cache action is unnecessary. Successful main pushes populate
-the cache; same-repository pull requests also save in their own PR scope.
-Fork pull requests only restore. Cross-build jobs retain their container-produced
-target outputs through that payload; native builds also use compiler caching.
+the cache; all pull requests only restore to avoid expensive archive creation
+and PR-scoped entries competing for the cache budget. PR-only cross-build jobs
+can restore compatible baselines but do not populate caches of their own.
+Native builds also use compiler caching.
 Publication jobs use `backend: local` without shared compiler-output restores
 or saves. No separate remote cache service or local-to-CI connection is configured.
 
@@ -209,7 +214,12 @@ no CI results. That means the repository needs:
 - a `release` environment holding the variable `APP_CLIENT_ID` and the secret
   `APP_PRIVATE_KEY`.
 - the corresponding GitHub App installed on `noirbizarre/hive` with
-  Contents and Pull requests read/write permissions.
+  Contents, Actions, Pull requests and Issues read/write permissions.
+
+Preparation runs `gh ship sign` to re-create the release commit with GitHub's signature.
+
+Also configure:
+
 - squash-merge settings of `squash_merge_commit_title: PR_TITLE` and
   `squash_merge_commit_message: BLANK`, so the squash commit subject is the
   Conventional Commit title from `.github/ship.yml`.

@@ -52,11 +52,17 @@ Environment-selected wrappers still take precedence and prevent mbx caching.
 CI uses `jdx/mr-boxington-action` instead of sccache and rust-cache. Its default
 GitHub `target` payload includes Cargo outputs and registry/git downloads, so
 an additional rust-cache action is unnecessary. Successful main pushes populate
-the cache; same-repository pull requests also save in their own PR scope.
-Fork pull requests only restore. Cross-build jobs retain their container-produced
+the cache; same-repository pull requests also save in their own PR scope, except
+Windows test jobs, which only restore because archiving their cache is expensive.
+Successful main pushes populate the Windows baseline. Fork pull requests only
+restore. Cross-build jobs retain their container-produced
 target outputs through that payload; native builds also use compiler caching.
 Publication jobs use `backend: local` without shared compiler-output restores
 or saves. No separate remote cache service or local-to-CI connection is configured.
+
+Windows CI places build outputs and test temporary files on a ReFS Dev Drive.
+Test temporary storage is separate from the cached target directory; its
+environment overrides apply only to the coverage test step.
 
 Local compiler actions, eligible links, build scripts and C/C++ compilations
 are cached by default. Compilation scheduling, in-flight deduplication and

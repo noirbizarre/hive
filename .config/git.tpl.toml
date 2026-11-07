@@ -15,6 +15,7 @@ crate = "hive"
 description = "An ACPv2 gateway and session multiplexer for AI coding agents"
 docs = true
 docs_accent = "indigo"
+gh_ship_token_mode = "app"
 keywords = ""
 kind = "workspace"
 mbx = true

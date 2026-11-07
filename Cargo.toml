@@ -67,7 +67,7 @@ strip = true
 # favour of the project if `git tpl update` ever touches it.
 
 [workspace.dependencies]
-base64 = "0.22"
+base64 = "0.23"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
 command-group = { version = "5.0.1", features = ["with-tokio"] }
 # Shared versions for member crates to inherit via `dep = { workspace = true }`.

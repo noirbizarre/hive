@@ -7,6 +7,9 @@ use std::{future::Future, time::Duration};
 const LIMIT: usize = 128;
 const DEADLINE: Duration = Duration::from_secs(120);
 
+#[cfg(test)]
+mod tests;
+
 pub(super) async fn startup<T>(
     control: &Arc<Mutex<Control>>,
     ready: impl Future<Output = T>,

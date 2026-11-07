@@ -3,8 +3,10 @@
 //! The fake records every call, so the central guarantee (adopting never creates a second
 //! conversation) is asserted by counting `POST /session`, not by inference.
 
-#[path = "support/fake_opencode.rs"]
-mod fake_opencode;
+// Library-side protocol tests can acknowledge private worker completion without public test APIs.
+use crate::fake_opencode;
+
+use crate as hive_daemon;
 
 use std::{
     collections::BTreeMap,
@@ -128,6 +130,7 @@ async fn discover(address: SocketAddr, agent: &str, directory: Option<&str>) -> 
 /// What the test's "client" does when Hive, as pilot, forwards a permission or form.
 #[derive(Clone, Default)]
 struct Pilot {
+    changed: Arc<tokio::sync::watch::Sender<()>>,
     /// Option ID to select, or `None` to hold the request open.
     permission: Option<&'static str>,
     form: Option<BTreeMap<String, v2::ElicitationContentValue>>,
@@ -136,6 +139,16 @@ struct Pilot {
 }
 
 impl Pilot {
+    async fn until(&self, done: impl Fn() -> bool) {
+        let mut changed = self.changed.subscribe();
+        timeout(Duration::from_secs(15), async {
+            while !done() {
+                changed.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("the pilot never received the expected interaction");
+    }
     fn cancel(&self) {
         for responder in self.held.lock().unwrap().drain(..) {
             let _ = responder.respond(v2::RequestPermissionResponse::new(
@@ -193,6 +206,7 @@ async fn connect<T>(
                         )),
                         None => {
                             permissions.held.lock().unwrap().push(responder);
+                            permissions.changed.send_modify(|_| {});
                             Ok(())
                         }
                     }
@@ -208,6 +222,7 @@ async fn connect<T>(
                         .lock()
                         .unwrap()
                         .push(serde_json::to_value(&request).unwrap());
+                    forms.changed.send_modify(|_| {});
                     let mut accept = v2::ElicitationAcceptAction::new();
                     accept.content = forms.form.clone();
                     responder.respond(v2::CreateElicitationResponse::new(
@@ -1096,13 +1111,7 @@ async fn a_permission_request_is_relayed_to_the_pilot_and_answered_in_opencode()
     connect(address, pilot.clone(), async |cx, _| {
         cx.send_request(new_request()).block_task().await?;
         fake.ask_permission("ses_new1", "per_1");
-        timeout(Duration::from_secs(15), async {
-            while fake.permission_replies().is_empty() {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .expect("OpenCode never received the reply");
+        fake.until(|| !fake.permission_replies().is_empty()).await;
         Ok(())
     })
     .await;
@@ -1125,25 +1134,19 @@ async fn a_permission_request_is_relayed_to_the_pilot_and_answered_in_opencode()
 #[tokio::test]
 async fn a_permission_answered_natively_first_is_not_answered_again_by_hive() {
     let (fake, url) = fake_opencode::start(Options::default()).await;
-    let (_broker, address) = start(config(&url)).await;
+    let (broker, address) = start(config(&url)).await;
     let pilot = Pilot::default(); // holds requests open
 
     connect(address, pilot.clone(), async |cx, _| {
         cx.send_request(new_request()).block_task().await?;
         fake.ask_permission("ses_new1", "per_1");
-        timeout(Duration::from_secs(15), async {
-            while pilot.seen.lock().unwrap().is_empty() {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .expect("the pilot never saw the request");
+        pilot.until(|| !pilot.held.lock().unwrap().is_empty()).await;
 
         // The TUI user answers first; then the (slow) Hive pilot also answers.
         fake.answer_permission_natively("ses_new1", "per_1");
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        stream_barrier(&fake, &broker).await;
         pilot.release("once");
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        settled(&broker, "per_1").await;
         Ok(())
     })
     .await;
@@ -1174,13 +1177,7 @@ async fn a_question_is_relayed_as_a_form_and_the_answer_returns_to_opencode() {
             json!([{"header": "Mode", "question": "Pick one",
                 "options": [{"label": "fast"}, {"label": "safe"}]}]),
         );
-        timeout(Duration::from_secs(15), async {
-            while fake.question_replies().is_empty() {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await
-        .expect("OpenCode never received the answer");
+        fake.until(|| !fake.question_replies().is_empty()).await;
         Ok(())
     })
     .await;
@@ -1216,7 +1213,7 @@ async fn an_ordinary_tool_linked_question_remains_a_form_even_when_its_wording_m
     connect(address, pilot.clone(), async |cx, _| {
         cx.send_request(new_request()).block_task().await?;
         fake.ask_tool_question("ses_new1", "question_1", "question");
-        wait_until(|| !fake.question_replies().is_empty()).await;
+        fake.until(|| !fake.question_replies().is_empty()).await;
         let seen = pilot.seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0]["mode"], "form");
@@ -1238,25 +1235,50 @@ async fn an_ordinary_tool_linked_question_remains_a_form_even_when_its_wording_m
     .await;
 }
 
-async fn wait_until(done: impl Fn() -> bool) {
-    timeout(Duration::from_secs(15), async {
-        while !done() {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("the expected native interaction did not occur");
+fn probe(broker: &crate::Broker) -> super::TestProbe {
+    let sessions = broker.sessions.lock().unwrap();
+    assert_eq!(
+        sessions.len(),
+        1,
+        "select a session explicitly for multi-session tests"
+    );
+    sessions
+        .values()
+        .next()
+        .unwrap()
+        .control
+        .lock()
+        .unwrap()
+        .opencode_probe
+        .clone()
+        .unwrap()
+}
+
+async fn stream_barrier(fake: &fake_opencode::Fake, broker: &crate::Broker) {
+    let id = uuid::Uuid::new_v4().to_string();
+    fake.emit(json!({"type":"hive.test.barrier", "properties":{"id":id}}));
+    timeout(Duration::from_secs(15), probe(broker).barrier(&id))
+        .await
+        .unwrap();
+}
+
+async fn settled(broker: &crate::Broker, id: &str) {
+    let mut task = probe(broker).task(id);
+    timeout(Duration::from_secs(15), task.wait_for(|done| *done))
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 #[tokio::test]
 async fn leaving_plan_requires_an_explicit_once_only_approval_of_the_correlated_question() {
     let (fake, url) = fake_opencode::start(Options::default()).await;
-    let (_broker, address) = start(config(&url)).await;
+    let (broker, address) = start(config(&url)).await;
     let pilot = Pilot::default();
     connect(address, pilot.clone(), async |cx, _| {
         cx.send_request(new_request()).block_task().await?;
         let request = fake.ask_plan_exit("ses_new1", "plan_1");
-        wait_until(|| pilot.seen.lock().unwrap().len() == 1).await;
+        pilot.until(|| pilot.seen.lock().unwrap().len() == 1).await;
         let shown = pilot.seen.lock().unwrap()[0].clone();
         assert_eq!(shown["title"], "OpenCode: leave Plan mode?");
         assert!(
@@ -1273,13 +1295,20 @@ async fn leaving_plan_requires_an_explicit_once_only_approval_of_the_correlated_
         assert!(fake.question_replies().is_empty());
         // Overlapping SSE and polling must not manufacture another consent dialog.
         fake.emit(json!({"type": "question.asked", "properties": request}));
-        tokio::time::sleep(Duration::from_millis(2200)).await;
+        stream_barrier(&fake, &broker).await;
+        probe(&broker).poll().await;
+        // A duplicate task may not have reached the pilot yet, even after the worker's barrier.
+        assert_eq!(probe(&broker).starts("plan_1"), 1);
         assert_eq!(pilot.seen.lock().unwrap().len(), 1);
         pilot.release("approve");
-        wait_until(|| !fake.question_replies().is_empty()).await;
+        fake.until(|| !fake.question_replies().is_empty()).await;
+        settled(&broker, "plan_1").await;
+        // Remove the now-unlisted pending task so the replay exercises terminal identity fencing.
+        probe(&broker).poll().await;
         // Historical replay after native settlement cannot renew consent.
         fake.emit(json!({"type": "question.asked", "properties": request}));
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        stream_barrier(&fake, &broker).await;
+        assert_eq!(probe(&broker).starts("plan_1"), 1);
         assert_eq!(pilot.seen.lock().unwrap().len(), 1);
         Ok(())
     })
@@ -1306,7 +1335,7 @@ async fn staying_in_plan_rejects_the_native_question_instead_of_sending_an_empty
     connect(address, pilot, async |cx, _| {
         cx.send_request(new_request()).block_task().await?;
         fake.ask_plan_exit("ses_new1", "plan_1");
-        wait_until(|| !fake.question_replies().is_empty()).await;
+        fake.until(|| !fake.question_replies().is_empty()).await;
         Ok(())
     })
     .await;
@@ -1320,19 +1349,22 @@ async fn staying_in_plan_rejects_the_native_question_instead_of_sending_an_empty
 async fn cancellation_and_invalid_options_never_approve_or_reoffer_the_same_plan_exit() {
     for invalid in [false, true] {
         let (fake, url) = fake_opencode::start(Options::default()).await;
-        let (_broker, address) = start(config(&url)).await;
+        let (broker, address) = start(config(&url)).await;
         let pilot = Pilot::default();
         connect(address, pilot.clone(), async |cx, _| {
             cx.send_request(new_request()).block_task().await?;
             let request = fake.ask_plan_exit("ses_new1", "plan_1");
-            wait_until(|| !pilot.held.lock().unwrap().is_empty()).await;
+            pilot.until(|| !pilot.held.lock().unwrap().is_empty()).await;
             if invalid {
                 pilot.release("always");
             } else {
                 pilot.cancel();
             }
+            settled(&broker, "plan_1").await;
             fake.emit(json!({"type": "question.asked", "properties": request}));
-            tokio::time::sleep(Duration::from_millis(2300)).await;
+            stream_barrier(&fake, &broker).await;
+            probe(&broker).poll().await;
+            assert_eq!(probe(&broker).starts("plan_1"), 1);
             assert_eq!(pilot.seen.lock().unwrap().len(), 1);
             assert!(fake.question_replies().is_empty());
             Ok(())
@@ -1344,15 +1376,16 @@ async fn cancellation_and_invalid_options_never_approve_or_reoffer_the_same_plan
 #[tokio::test]
 async fn native_settlement_withdraws_a_plan_approval_before_a_late_pilot_answer() {
     let (fake, url) = fake_opencode::start(Options::default()).await;
-    let (_broker, address) = start(config(&url)).await;
+    let (broker, address) = start(config(&url)).await;
     let pilot = Pilot::default();
     connect(address, pilot.clone(), async |cx, _| {
         cx.send_request(new_request()).block_task().await?;
         fake.ask_plan_exit("ses_new1", "plan_1");
-        wait_until(|| !pilot.held.lock().unwrap().is_empty()).await;
+        pilot.until(|| !pilot.held.lock().unwrap().is_empty()).await;
         fake.answer_question_natively("ses_new1", "plan_1");
         pilot.release("approve");
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        stream_barrier(&fake, &broker).await;
+        settled(&broker, "plan_1").await;
         assert!(fake.question_replies().is_empty());
         Ok(())
     })
@@ -1374,7 +1407,7 @@ async fn attaching_with_a_pending_plan_exit_uses_its_exact_message_outside_the_h
     };
     connect(address, pilot, async |cx, _| {
         cx.send_request(adopt_request("ses_a")).block_task().await?;
-        wait_until(|| !fake.question_replies().is_empty()).await;
+        fake.until(|| !fake.question_replies().is_empty()).await;
         assert_eq!(fake.count("GET /session/ses_a/message/msg_plan_1"), 1);
         Ok(())
     })
@@ -1388,7 +1421,7 @@ async fn child_plan_exit_cannot_authorize_the_parent_or_its_own_unsupported_tran
     fake.add_session("parent", "Parent", &cwd());
     fake.add_session("child", "Child", &cwd());
     fake.make_child("child", "parent");
-    let (_broker, address) = start(config(&url)).await;
+    let (broker, address) = start(config(&url)).await;
     let pilot = Pilot {
         permission: Some("approve"),
         ..Pilot::default()
@@ -1398,11 +1431,12 @@ async fn child_plan_exit_cannot_authorize_the_parent_or_its_own_unsupported_tran
             .block_task()
             .await?;
         fake.ask_plan_exit("child", "plan_child");
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        stream_barrier(&fake, &broker).await;
+        assert_eq!(probe(&broker).starts("plan_child"), 0);
         assert!(pilot.seen.lock().unwrap().is_empty());
         assert!(fake.question_replies().is_empty());
         cx.send_request(adopt_request("child")).block_task().await?;
-        wait_until(|| !fake.question_replies().is_empty()).await;
+        fake.until(|| !fake.question_replies().is_empty()).await;
         assert!(pilot.seen.lock().unwrap().is_empty());
         assert_eq!(fake.question_replies()[0].1, "reject");
         Ok(())
@@ -1413,22 +1447,23 @@ async fn child_plan_exit_cannot_authorize_the_parent_or_its_own_unsupported_tran
 #[tokio::test]
 async fn reconnect_withdraws_old_consent_and_requires_a_new_plan_confirmation() {
     let (fake, url) = fake_opencode::start(Options::default()).await;
-    let (_broker, address) = start(config(&url)).await;
+    let (broker, address) = start(config(&url)).await;
     let pilot = Pilot::default();
     connect(address, pilot.clone(), async |cx, _| {
         cx.send_request(new_request()).block_task().await?;
         fake.ask_plan_exit("ses_new1", "plan_1");
-        wait_until(|| !pilot.held.lock().unwrap().is_empty()).await;
+        pilot.until(|| !pilot.held.lock().unwrap().is_empty()).await;
         let old = pilot.held.lock().unwrap().pop().unwrap();
+        let mut old_task = probe(&broker).task("plan_1");
         fake.kill_streams();
-        wait_until(|| pilot.seen.lock().unwrap().len() >= 2).await;
+        pilot.until(|| pilot.seen.lock().unwrap().len() >= 2).await;
         let _ = old.respond(v2::RequestPermissionResponse::new(
             v2::RequestPermissionOutcome::Selected(v2::SelectedPermissionOutcome::new("approve")),
         ));
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        old_task.wait_for(|done| *done).await.unwrap();
         assert!(fake.question_replies().is_empty());
         pilot.release("approve");
-        wait_until(|| !fake.question_replies().is_empty()).await;
+        fake.until(|| !fake.question_replies().is_empty()).await;
         Ok(())
     })
     .await;
@@ -1439,18 +1474,21 @@ async fn reconnect_withdraws_old_consent_and_requires_a_new_plan_confirmation() 
 async fn an_uncertain_native_answer_is_never_retried_without_fresh_confirmation() {
     let (fake, url) = fake_opencode::start(Options::default()).await;
     fake.fail_question_reply(true);
-    let (_broker, address) = start(config(&url)).await;
+    let (broker, address) = start(config(&url)).await;
     let pilot = Pilot::default();
     connect(address, pilot.clone(), async |cx, _| {
         cx.send_request(new_request()).block_task().await?;
         fake.ask_plan_exit("ses_new1", "plan_1");
-        wait_until(|| !pilot.held.lock().unwrap().is_empty()).await;
+        pilot.until(|| !pilot.held.lock().unwrap().is_empty()).await;
         pilot.release("approve");
-        wait_until(|| pilot.seen.lock().unwrap().len() >= 2).await;
+        settled(&broker, "plan_1").await;
+        probe(&broker).poll().await;
+        assert_eq!(probe(&broker).starts("plan_1"), 2);
+        pilot.until(|| pilot.seen.lock().unwrap().len() >= 2).await;
         assert_eq!(fake.question_replies().len(), 1);
         fake.fail_question_reply(false);
         pilot.release("stay");
-        wait_until(|| fake.question_replies().len() == 2).await;
+        fake.until(|| fake.question_replies().len() == 2).await;
         assert_eq!(fake.question_replies()[1].1, "reject");
         Ok(())
     })
@@ -1460,21 +1498,26 @@ async fn an_uncertain_native_answer_is_never_retried_without_fresh_confirmation(
 #[tokio::test]
 async fn cancellation_winning_after_the_pilot_answers_but_before_publication_prevents_approval() {
     let (fake, url) = fake_opencode::start(Options::default()).await;
-    let (_broker, address) = start(config(&url)).await;
+    let (broker, address) = start(config(&url)).await;
     let pilot = Pilot::default();
     connect(address, pilot.clone(), async |cx, _| {
         let opened = cx.send_request(new_request()).block_task().await?;
+        // Only the answering task may consume the held GET; a periodic repair must not steal it.
+        probe(&broker).suspend_polling().await;
         fake.ask_plan_exit("ses_new1", "plan_1");
-        wait_until(|| !pilot.held.lock().unwrap().is_empty()).await;
+        pilot.until(|| !pilot.held.lock().unwrap().is_empty()).await;
         fake.hold_next_question_read();
         pilot.release("approve");
-        wait_until(|| fake.question_read_held()).await;
+        fake.until(|| fake.question_read_held()).await;
         cx.send_notification(
             v2::CancelSessionNotification::new(opened.session_id).meta(opened.meta.unwrap()),
         )?;
-        wait_until(|| fake.exact("POST /session/ses_new1/abort") == 1).await;
+        fake.until(|| fake.exact("POST /session/ses_new1/abort") == 1)
+            .await;
         fake.release_question_read();
-        tokio::time::sleep(Duration::from_millis(2200)).await;
+        settled(&broker, "plan_1").await;
+        probe(&broker).poll().await;
+        assert_eq!(probe(&broker).starts("plan_1"), 1);
         assert!(fake.question_replies().is_empty());
         assert_eq!(pilot.seen.lock().unwrap().len(), 1);
         Ok(())
@@ -1485,17 +1528,18 @@ async fn cancellation_winning_after_the_pilot_answers_but_before_publication_pre
 #[tokio::test]
 async fn closing_with_an_unanswered_plan_exit_withdraws_the_confirmation() {
     let (fake, url) = fake_opencode::start(Options::default()).await;
-    let (_broker, address) = start(config(&url)).await;
+    let (broker, address) = start(config(&url)).await;
     let pilot = Pilot::default();
     connect(address, pilot.clone(), async |cx, _| {
         let opened = cx.send_request(new_request()).block_task().await?;
         fake.ask_plan_exit("ses_new1", "plan_1");
-        wait_until(|| !pilot.held.lock().unwrap().is_empty()).await;
+        pilot.until(|| !pilot.held.lock().unwrap().is_empty()).await;
+        let mut finished = probe(&broker).task("plan_1");
         cx.send_request(v2::CloseSessionRequest::new(opened.session_id).meta(opened.meta))
             .block_task()
             .await?;
         pilot.release("approve");
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        finished.wait_for(|done| *done).await.unwrap();
         assert!(fake.question_replies().is_empty());
         Ok(())
     })
@@ -1505,12 +1549,12 @@ async fn closing_with_an_unanswered_plan_exit_withdraws_the_confirmation() {
 #[tokio::test]
 async fn a_disconnected_pilot_cannot_approve_and_a_new_pilot_gets_the_pending_plan() {
     let (fake, url) = fake_opencode::start(Options::default()).await;
-    let (_broker, address) = start(config(&url)).await;
+    let (broker, address) = start(config(&url)).await;
     let old = Pilot::default();
     let id = connect(address, old.clone(), async |cx, _| {
         let opened = cx.send_request(new_request()).block_task().await?;
         fake.ask_plan_exit("ses_new1", "plan_1");
-        wait_until(|| !old.held.lock().unwrap().is_empty()).await;
+        old.until(|| !old.held.lock().unwrap().is_empty()).await;
         Ok(opened.session_id)
     })
     .await;
@@ -1522,13 +1566,17 @@ async fn a_disconnected_pilot_cannot_approve_and_a_new_pilot_gets_the_pending_pl
         ))
         .block_task()
         .await?;
-        wait_until(|| !new.held.lock().unwrap().is_empty()).await;
+        new.until(|| !new.held.lock().unwrap().is_empty()).await;
         old.release("approve");
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        assert!(fake.question_replies().is_empty());
         new.release("stay");
-        wait_until(|| !fake.question_replies().is_empty()).await;
-        assert_eq!(fake.question_replies()[0].1, "reject");
+        fake.until(|| !fake.question_replies().is_empty()).await;
+        // The task can repilot internally. Its eventual settlement proves that the obsolete
+        // answer never published, without waiting for cancellation on an already-disconnected wire.
+        settled(&broker, "plan_1").await;
+        assert_eq!(
+            fake.question_replies(),
+            [("plan_1".into(), "reject".into(), Value::Null)]
+        );
         Ok(())
     })
     .await;

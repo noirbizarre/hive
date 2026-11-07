@@ -251,161 +251,169 @@ fn assert_native_vcs_record(root: &Path, report: &Value, backend: &str) {
 }
 
 #[tokio::test]
-async fn remote_workspace_capability_calls_execute_on_the_owner_during_startup_and_recovery() {
+async fn remote_git_workspace_capability_calls_execute_on_the_owner_during_startup_and_recovery() {
+    remote_workspace_capabilities("git", "git.worktree").await;
+}
+
+#[tokio::test]
+async fn remote_jj_workspace_capability_calls_execute_on_the_owner_during_startup_and_recovery() {
+    remote_workspace_capabilities("jj", "jj.workspace").await;
+}
+
+#[tokio::test]
+async fn remote_worktrunk_capability_calls_execute_on_the_owner_during_startup_and_recovery() {
+    remote_workspace_capabilities("git", "worktrunk").await;
+}
+
+async fn remote_workspace_capabilities(scm: &str, provisioner: &str) {
     use hive_protocol::{remote::Peer, transport::Credentials};
-    for (scm, provisioner) in [
-        ("git", "git.worktree"),
-        ("jj", "jj.workspace"),
-        ("git", "worktrunk"),
-    ] {
-        if provisioner == "worktrunk"
-            && !Command::new("wt")
-                .args(["config", "state", "marker", "--help"])
-                .output()
-                .is_ok_and(|output| {
-                    output.status.success()
-                        && String::from_utf8_lossy(&output.stdout).contains("--branch")
-                })
-        {
-            eprintln!("skipping workspace capability WorkTrunk case: compatible wt unavailable");
-            continue;
-        }
-        let fixture = Fixture::new(AgentVersion::V2, false);
-        std::fs::write(fixture.path("agents.toml"), format!(
-             "[agents.coder]\ncommand = {:?}\n[agents.coder.env]\nHIVE_MCP_REPORT = {:?}\nHIVE_WORKSPACE_TOOLS = '1'\nHIVE_VCS_EXERCISE = '1'\n",
-            env!("CARGO_BIN_EXE_hive-test-mcp-agent"), fixture.path("report.json"))).unwrap();
-        if scm == "jj" {
-            std::fs::write(fixture.path("projects.toml"), "[projects.demo]\nname = 'Demo'\nscm = 'jj'\nrepository_source = 'https://example.test/project'\ndefault_revision = 'main@origin'\n").unwrap();
-            std::fs::write(fixture.path("jj.toml"), "[user]\nname = 'Hive Test'\nemail = 'hive@example.test'\n[signing]\nbehavior = 'drop'\n").unwrap();
-        }
-        std::fs::write(
-            fixture.path("policies.toml"),
-            format!(
-                "[workspaces.task]\npolicy = '{}'\n[worktrunk]\nenabled = {}\n",
-                if scm == "jj" { "jj" } else { "worktree" },
-                provisioner == "worktrunk"
-            ),
-        )
-        .unwrap();
-        let initiating = tempfile::tempdir().unwrap();
-        let placeholder = initiating.path().join("absent-placeholder");
-        let (address, mut host) = fixture.start().await;
-        let retained = std::sync::Mutex::new(None);
-        timeout(
-            Duration::from_secs(30),
-            Client.v2().connect_with(
-                Credentials::default()
-                    .peer(&format!("http://{address}/acp"))
-                    .unwrap(),
-                async |cx| {
-                    let peer = Peer::initialize(
-                        cx.clone(),
-                        v2::InitializeRequest::new(
-                            ProtocolVersion::V2,
-                            v2::Implementation::new("workspace-tool-peer", "1"),
-                        ),
-                    )
-                    .await?;
-                    let opened = peer
-                        .start(
-                            "coder",
-                            v2::NewSessionRequest::new(placeholder.clone()).meta(selector(
-                                json!({"kind":"new","project":"demo","policy":"task"}),
-                            )),
-                        )
-                        .await?;
-                    let report: Value = serde_json::from_slice(
-                        &std::fs::read(fixture.path("report.json")).unwrap(),
-                    )
-                    .unwrap();
-                    let actual = &report["workspaceDirect"]["structuredContent"];
-                    let context = &opened.meta.as_ref().unwrap()["hive"]["workspace"];
-                    assert_eq!(actual["owner"], peer.node);
-                    assert_eq!(actual["workspace"], context["workspace"]);
-                    assert_eq!(actual["project"], "demo");
-                    assert_eq!(actual["repositoryBackend"], scm);
-                    assert_eq!(actual["provisioner"], provisioner);
-                    assert_eq!(report["lists"]["tools"].as_array().unwrap().len(), 5);
-                    assert_eq!(actual["tools"].as_array().unwrap().len(), 5);
-                    assert_vcs_report(&report, &peer.node, scm);
-                    assert_native_vcs_record(
-                        Path::new(context["effectiveCwd"].as_str().unwrap()),
-                        &report,
-                        scm,
-                    );
-                    assert_eq!(
-                        inventory(address).await["workspaces"][0]["selection"]["provisioner"],
-                        actual["provisioner"]
-                    );
-                    assert!(!placeholder.exists());
-                    *retained.lock().unwrap() = Some((opened.session_id, context.clone()));
-                    Ok(())
-                },
-            ),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        host.kill().await.unwrap();
-        host.wait().await.unwrap();
-        let (id, context) = retained.into_inner().unwrap().unwrap();
-        let (address, mut host) = fixture.start().await;
-        timeout(
-            Duration::from_secs(30),
-            Client.v2().connect_with(
-                Credentials::default()
-                    .peer(&format!("http://{address}/acp"))
-                    .unwrap(),
-                async |cx| {
-                    Peer::initialize(
-                        cx.clone(),
-                        v2::InitializeRequest::new(
-                            ProtocolVersion::V2,
-                            v2::Implementation::new("workspace-tool-peer", "1"),
-                        ),
-                    )
-                    .await?;
-                    let opened = cx
-                        .send_request(v2::ResumeSessionRequest::new(
-                            id.clone(),
-                            PathBuf::from(context["effectiveCwd"].as_str().unwrap()),
-                        ))
-                        .block_task()
-                        .await?;
-                    let report: Value = serde_json::from_slice(
-                        &std::fs::read(fixture.path("report.json")).unwrap(),
-                    )
-                    .unwrap();
-                    assert_eq!(report["phase"], "resume");
-                    assert_vcs_report(&report, context["owner"].as_str().unwrap(), scm);
-                    assert_native_vcs_record(
-                        Path::new(context["effectiveCwd"].as_str().unwrap()),
-                        &report,
-                        scm,
-                    );
-                    assert_eq!(
-                        report["workspace"]["structuredContent"]["owner"],
-                        context["owner"]
-                    );
-                    assert_eq!(
-                        report["workspace"]["structuredContent"]["workspace"],
-                        context["workspace"]
-                    );
-                    cx.send_request(v2::CloseSessionRequest::new(id.clone()).meta(opened.meta))
-                        .block_task()
-                        .await?;
-                    Ok(())
-                },
-            ),
-        )
-        .await
-        .unwrap()
-        .unwrap();
-        assert!(!placeholder.exists());
-        assert!(!initiating.path().join("repositories").exists());
-        host.kill().await.unwrap();
-        host.wait().await.unwrap();
+    if provisioner == "worktrunk"
+        && !Command::new("wt")
+            .args(["config", "state", "marker", "--help"])
+            .output()
+            .is_ok_and(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("--branch")
+            })
+    {
+        eprintln!("skipping workspace capability WorkTrunk case: compatible wt unavailable");
+        return;
     }
+    let fixture = Fixture::new(AgentVersion::V2, false);
+    std::fs::write(fixture.path("agents.toml"), format!(
+              "[agents.coder]\ncommand = {:?}\n[agents.coder.env]\nHIVE_MCP_REPORT = {:?}\nHIVE_WORKSPACE_TOOLS = '1'\nHIVE_VCS_EXERCISE = '1'\nLLVM_PROFILE_FILE = {:?}\n",
+            env!("CARGO_BIN_EXE_hive-test-mcp-agent"), fixture.path("report.json"),
+            // The recovery scenario deliberately terminates processes before profile flushing.
+            if cfg!(windows) { "NUL" } else { "/dev/null" })).unwrap();
+    if scm == "jj" {
+        std::fs::write(fixture.path("projects.toml"), "[projects.demo]\nname = 'Demo'\nscm = 'jj'\nrepository_source = 'https://example.test/project'\ndefault_revision = 'main@origin'\n").unwrap();
+        std::fs::write(fixture.path("jj.toml"), "[user]\nname = 'Hive Test'\nemail = 'hive@example.test'\n[signing]\nbehavior = 'drop'\n").unwrap();
+    }
+    std::fs::write(
+        fixture.path("policies.toml"),
+        format!(
+            "[workspaces.task]\npolicy = '{}'\n[worktrunk]\nenabled = {}\n",
+            if scm == "jj" { "jj" } else { "worktree" },
+            provisioner == "worktrunk"
+        ),
+    )
+    .unwrap();
+    let initiating = tempfile::tempdir().unwrap();
+    let placeholder = initiating.path().join("absent-placeholder");
+    let (address, mut host) = fixture.start().await;
+    let retained = std::sync::Mutex::new(None);
+    timeout(
+        Duration::from_secs(30),
+        Client.v2().connect_with(
+            Credentials::default()
+                .peer(&format!("http://{address}/acp"))
+                .unwrap(),
+            async |cx| {
+                let peer = Peer::initialize(
+                    cx.clone(),
+                    v2::InitializeRequest::new(
+                        ProtocolVersion::V2,
+                        v2::Implementation::new("workspace-tool-peer", "1"),
+                    ),
+                )
+                .await?;
+                let opened = peer
+                    .start(
+                        "coder",
+                        v2::NewSessionRequest::new(placeholder.clone()).meta(selector(
+                            json!({"kind":"new","project":"demo","policy":"task"}),
+                        )),
+                    )
+                    .await?;
+                let report: Value =
+                    serde_json::from_slice(&std::fs::read(fixture.path("report.json")).unwrap())
+                        .unwrap();
+                let actual = &report["workspaceDirect"]["structuredContent"];
+                let context = &opened.meta.as_ref().unwrap()["hive"]["workspace"];
+                assert_eq!(actual["owner"], peer.node);
+                assert_eq!(actual["workspace"], context["workspace"]);
+                assert_eq!(actual["project"], "demo");
+                assert_eq!(actual["repositoryBackend"], scm);
+                assert_eq!(actual["provisioner"], provisioner);
+                assert_eq!(report["lists"]["tools"].as_array().unwrap().len(), 5);
+                assert_eq!(actual["tools"].as_array().unwrap().len(), 5);
+                assert_vcs_report(&report, &peer.node, scm);
+                assert_native_vcs_record(
+                    Path::new(context["effectiveCwd"].as_str().unwrap()),
+                    &report,
+                    scm,
+                );
+                assert_eq!(
+                    inventory(address).await["workspaces"][0]["selection"]["provisioner"],
+                    actual["provisioner"]
+                );
+                assert!(!placeholder.exists());
+                *retained.lock().unwrap() = Some((opened.session_id, context.clone()));
+                Ok(())
+            },
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    host.kill().await.unwrap();
+    host.wait().await.unwrap();
+    let (id, context) = retained.into_inner().unwrap().unwrap();
+    let (address, mut host) = fixture.start().await;
+    timeout(
+        Duration::from_secs(30),
+        Client.v2().connect_with(
+            Credentials::default()
+                .peer(&format!("http://{address}/acp"))
+                .unwrap(),
+            async |cx| {
+                Peer::initialize(
+                    cx.clone(),
+                    v2::InitializeRequest::new(
+                        ProtocolVersion::V2,
+                        v2::Implementation::new("workspace-tool-peer", "1"),
+                    ),
+                )
+                .await?;
+                let opened = cx
+                    .send_request(v2::ResumeSessionRequest::new(
+                        id.clone(),
+                        PathBuf::from(context["effectiveCwd"].as_str().unwrap()),
+                    ))
+                    .block_task()
+                    .await?;
+                let report: Value =
+                    serde_json::from_slice(&std::fs::read(fixture.path("report.json")).unwrap())
+                        .unwrap();
+                assert_eq!(report["phase"], "resume");
+                assert_vcs_report(&report, context["owner"].as_str().unwrap(), scm);
+                assert_native_vcs_record(
+                    Path::new(context["effectiveCwd"].as_str().unwrap()),
+                    &report,
+                    scm,
+                );
+                assert_eq!(
+                    report["workspace"]["structuredContent"]["owner"],
+                    context["owner"]
+                );
+                assert_eq!(
+                    report["workspace"]["structuredContent"]["workspace"],
+                    context["workspace"]
+                );
+                cx.send_request(v2::CloseSessionRequest::new(id.clone()).meta(opened.meta))
+                    .block_task()
+                    .await?;
+                Ok(())
+            },
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!placeholder.exists());
+    assert!(!initiating.path().join("repositories").exists());
+    host.kill().await.unwrap();
+    host.wait().await.unwrap();
 }
 
 async fn serve(broker: &hive_daemon::Broker) -> (SocketAddr, tokio::task::JoinHandle<()>) {

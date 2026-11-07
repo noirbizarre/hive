@@ -106,6 +106,9 @@ pub(crate) fn aggregate(values: impl IntoIterator<Item = (Status, u64)>) -> Stat
 pub(crate) struct Publisher {
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     stop: tokio::sync::Notify,
+    // Tests need completed decisions, not merely an observed filesystem write mid-publication.
+    #[cfg(test)]
+    pub(crate) processed: tokio::sync::watch::Sender<Option<u64>>,
 }
 
 impl Publisher {
@@ -141,7 +144,9 @@ impl Publisher {
             loop {
                 // Streaming events share the catalog signal; coalesce bursts before Git inspection.
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                changed.borrow_and_update();
+                let revision = *changed.borrow_and_update();
+                #[cfg(not(test))]
+                let _ = revision;
                 let (Some(sessions), Some(registry), Some(publisher)) =
                     (sessions.upgrade(), registry.upgrade(), publisher.upgrade())
                 else {
@@ -208,6 +213,8 @@ impl Publisher {
                 }
                 drop(sessions);
                 drop(registry);
+                #[cfg(test)]
+                publisher.processed.send_replace(Some(revision));
                 tokio::select! {
                     _ = publisher.stop.notified() => {
                         // Shutdown withdraws execution claims, never workspace cleanup protection.

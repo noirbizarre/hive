@@ -308,12 +308,31 @@ async fn the_broker_publisher_observes_interaction_only_waits_and_drains_on_shut
         .await
         .unwrap();
     }
-    wait_for(&fixture, "🤖 Hive").await;
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    let mut processed = broker.worktrunk.processed.subscribe();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        processed.wait_for(|revision| revision.is_some()),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        marker(&fixture)["marker"]
+            .as_str()
+            .unwrap()
+            .starts_with("🤖 Hive")
+    );
     let calls = fixture._directory.path().join("wt-calls");
     let before = std::fs::read_to_string(&calls).unwrap();
     broker.catalog.send_modify(|revision| *revision += 1);
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    let revision = *broker.catalog.borrow();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        processed.wait_for(|seen| seen.is_some_and(|seen| seen >= revision)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(std::fs::read_to_string(&calls).unwrap(), before);
     {
         // Reloaded definitions cannot change the locality of an already-running worker.

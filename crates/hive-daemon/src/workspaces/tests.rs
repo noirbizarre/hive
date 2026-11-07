@@ -19,8 +19,7 @@ mod vcs_tests;
 #[path = "tests/activity.rs"]
 mod activity_tests;
 
-#[path = "../../tests/support/fake_opencode.rs"]
-mod fake_opencode;
+use crate::fake_opencode;
 
 struct Fixture {
     _directory: tempfile::TempDir,
@@ -211,13 +210,7 @@ impl Fixture {
         TEST_GIT_CONFIG.with(|current| *current.borrow_mut() = Some(config.clone()));
         std::fs::create_dir(&seed).unwrap();
         git(&seed, &["init", "-b", "main"], "test").unwrap();
-        git(&seed, &["config", "user.name", "Hive Tests"], "test").unwrap();
-        git(
-            &seed,
-            &["config", "user.email", "hive@example.test"],
-            "test",
-        )
-        .unwrap();
+        // The isolated global config already supplies identity; avoid two processes per fixture.
         std::fs::write(seed.join("content"), "original\n").unwrap();
         git(&seed, &["add", "content"], "test").unwrap();
         git(&seed, &["commit", "-m", "initial"], "test").unwrap();

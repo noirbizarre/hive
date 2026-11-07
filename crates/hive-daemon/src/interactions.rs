@@ -16,16 +16,21 @@ pub(super) async fn startup<T>(
 ) -> Result<T, ()> {
     tokio::pin!(ready);
     let mut deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-    let mut phase = control.lock().map_err(|_| ())?.startup_phase;
+    let (mut phase, mut builtin_revision) = {
+        let state = control.lock().map_err(|_| ())?;
+        (state.startup_phase, state.builtin_activity_revision)
+    };
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     loop {
         tokio::select! {
             result = &mut ready => return Ok(result),
             _ = tick.tick() => {
-                // Human decisions have their own deadline; startup's watchdog measures agent silence.
+                // Tool jobs and human decisions have their own lifetime; neither is agent silence.
                 let state = control.lock().map_err(|_| ())?;
-                if state.pending_interactions > 0 || state.startup_phase != phase {
+                if state.pending_interactions > 0 || state.pending_builtin_operations > 0
+                    || state.builtin_activity_revision != builtin_revision || state.startup_phase != phase {
                     phase = state.startup_phase;
+                    builtin_revision = state.builtin_activity_revision;
                     // Readiness has its own 15-second runtime budget; leave time for its diagnostic.
                     deadline = tokio::time::Instant::now() + Duration::from_secs(if phase == 1 { 20 } else { 15 });
                 } else if tokio::time::Instant::now() >= deadline { return Err(()); }

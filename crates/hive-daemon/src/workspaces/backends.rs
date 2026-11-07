@@ -70,6 +70,42 @@ pub(super) fn intent(entry: &Entry) -> Result<BackendData, Error> {
     }
 }
 
+pub(super) fn supports_siblings(entry: &Entry) -> bool {
+    entry.workspace.intent().ownership() == Ownership::HiveManaged
+        && intent(entry).is_ok_and(|intent| {
+            matches!(intent.schema.as_str(), "hive.git.intent" | "hive.jj.intent")
+        })
+}
+
+pub(super) fn sibling_intent(
+    entry: &Entry,
+    base_ref: Option<GitRef>,
+    branch: Option<GitRef>,
+    revision: Option<hive_core::project::Revision>,
+) -> Result<BackendData, Error> {
+    let original = intent(entry)?;
+    if original.schema == "hive.jj.intent" {
+        if base_ref.is_some() || branch.is_some() {
+            return Err(Error::Request);
+        }
+        let inherited: hive_core::project::Revision = original.decode("hive.jj.intent")?;
+        data("hive.jj.intent", &revision.unwrap_or(inherited))
+    } else {
+        if revision.is_some() {
+            return Err(Error::Request);
+        }
+        let inherited = git_intent(entry)?;
+        // Reusing the parent's branch would alias its mutable native workspace identity.
+        data(
+            "hive.git.intent",
+            &GitIntent {
+                base_ref: base_ref.unwrap_or(inherited.base_ref),
+                branch,
+            },
+        )
+    }
+}
+
 pub(super) fn legacy_checkpoint(
     entry: &Entry,
     operation: &Operation,

@@ -856,28 +856,12 @@ impl hive_core::workspace::backend::WorkspaceBackend for Service {
                     .state
                     .operations
                     .get(request.operation.as_str())
+                    .cloned()
+                    .filter(Operation::is_create)
                     .ok_or(Error::RetryConflict)?;
-                let create: CreateRequest = serde_json::from_value(original.request.clone())
-                    .map_err(|_| Error::RetryConflict)?;
-                let source = entry
-                    .repository
-                    .as_ref()
-                    .and_then(|id| rt.state.repositories.get(id.as_str()))
-                    .map(|repo| repo.source.clone());
                 let already_ready = entry.workspace.state() == WorkspaceState::Ready;
-                let result = rt.create(
-                    create,
-                    ProjectDefinition {
-                        scm: hive_core::project::Scm::Git,
-                        default_revision: None,
-                        name: "Registered workspace".into(),
-                        repository_source: source,
-                        default_ref: None,
-                        preparation: vec![],
-                    },
-                    // Retry dispatch uses the persisted selection before configuration is consulted.
-                    WorktrunkConfig::default(),
-                )?;
+                // Replay persisted intent for administrative and agent-created workspaces alike.
+                let result = rt.resume_creation(&request.operation, original, &|| Ok(()))?;
                 Ok(hive_core::workspace::backend::ProvisionResult {
                     workspace: request.workspace,
                     operation: request.operation,
@@ -1231,89 +1215,83 @@ impl Runtime<'_> {
             if original.request != json {
                 return Err(Error::RetryConflict);
             }
-            let mut entry = self
-                .state
-                .workspaces
-                .get(original.workspace.as_str())
-                .cloned()
-                .ok_or(Error::Conflict)?;
-            if !original.effects_started && entry.workspace.state() == WorkspaceState::Provisioning
-            {
-                // No checkout mutation was dispatched; interrupted cache work can be retried
-                // under the same repository guard without creating another workspace identity.
-                entry
-                    .workspace
-                    .transition(WorkspaceEvent::ProvisionFailed {
-                        retry: RetryDisposition::InspectFirst,
-                        location: None,
-                    })?;
-                self.state
-                    .workspaces
-                    .insert(original.workspace.to_string(), entry.clone());
-                self.save()?;
-            }
-            if !original.effects_started && entry.workspace.state() == WorkspaceState::Failed {
-                entry
-                    .workspace
-                    .transition(WorkspaceEvent::ReconciledRetry)?;
-                entry.workspace.transition(WorkspaceEvent::Provision {
-                    operation: request.operation.clone(),
-                    backend: entry.workspace.backend().cloned().ok_or(Error::Conflict)?,
-                })?;
-                self.state
-                    .workspaces
-                    .insert(original.workspace.to_string(), entry.clone());
-                self.save()?;
-                match self.provision(&entry, &key) {
-                    Ok(location) => {
-                        entry.failure = None;
-                        entry
-                            .workspace
-                            .transition(WorkspaceEvent::Provisioned { location })?;
-                    }
-                    Err(error) => {
-                        entry.failure = Some(error.code().into());
-                        entry
-                            .workspace
-                            .transition(WorkspaceEvent::ProvisionFailed {
-                                retry: RetryDisposition::InspectFirst,
-                                location: None,
-                            })?;
-                        self.state
-                            .workspaces
-                            .insert(original.workspace.to_string(), entry);
-                        self.save()?;
-                        return Err(error);
-                    }
-                }
-                self.state
-                    .workspaces
-                    .insert(original.workspace.to_string(), entry.clone());
-                self.save()?;
-                return Ok(entry);
-            }
-            match self.inspect(&original.workspace)? {
-                Inspection::Present { .. } if entry.workspace.state() == WorkspaceState::Ready => {
-                    return Ok(entry);
-                }
-                Inspection::Present { .. }
-                    if original.effects_started && !self.uncertain_backend(&entry)? =>
-                {
-                    let mut entry = entry;
-                    entry.failure = None;
-                    let location = self.completed_creation(&entry)?.ok_or(Error::Uncertain)?;
-                    entry
-                        .workspace
-                        .transition(WorkspaceEvent::ReconciledReady { location })?;
-                    self.state
-                        .workspaces
-                        .insert(original.workspace.to_string(), entry.clone());
-                    self.save()?;
-                    return Ok(entry);
-                }
-                _ => return Err(Error::Uncertain),
-            }
+            return self.resume_creation(&request.operation, original, &|| Ok(()));
         }
+        self.register_creation(request, definition, worktrunk, json)
+    }
+
+    fn resume_creation(
+        &mut self,
+        operation: &OperationId,
+        original: Operation,
+        authorize: &dyn Fn() -> Result<(), Error>,
+    ) -> Result<Entry, Error> {
+        let key = operation.to_string();
+        let mut entry = self
+            .state
+            .workspaces
+            .get(original.workspace.as_str())
+            .cloned()
+            .ok_or(Error::Conflict)?;
+        if !original.effects_started && entry.workspace.state() == WorkspaceState::Provisioning {
+            // No checkout mutation was dispatched; interrupted cache work can be retried
+            // under the same repository guard without creating another workspace identity.
+            entry
+                .workspace
+                .transition(WorkspaceEvent::ProvisionFailed {
+                    retry: RetryDisposition::InspectFirst,
+                    location: None,
+                })?;
+            self.state
+                .workspaces
+                .insert(original.workspace.to_string(), entry.clone());
+            self.save()?;
+        }
+        if !original.effects_started && entry.workspace.state() == WorkspaceState::Failed {
+            entry
+                .workspace
+                .transition(WorkspaceEvent::ReconciledRetry)?;
+            entry.workspace.transition(WorkspaceEvent::Provision {
+                operation: operation.clone(),
+                backend: entry.workspace.backend().cloned().ok_or(Error::Conflict)?,
+            })?;
+            self.state
+                .workspaces
+                .insert(original.workspace.to_string(), entry.clone());
+            self.save()?;
+            return self.complete_creation(entry, &key, authorize);
+        }
+        match self.inspect(&original.workspace)? {
+            Inspection::Present { .. } if entry.workspace.state() == WorkspaceState::Ready => {
+                Ok(entry)
+            }
+            Inspection::Present { .. }
+                if original.effects_started && !self.uncertain_backend(&entry)? =>
+            {
+                let mut entry = entry;
+                entry.failure = None;
+                let location = self.completed_creation(&entry)?.ok_or(Error::Uncertain)?;
+                entry
+                    .workspace
+                    .transition(WorkspaceEvent::ReconciledReady { location })?;
+                self.state
+                    .workspaces
+                    .insert(original.workspace.to_string(), entry.clone());
+                self.save()?;
+                Ok(entry)
+            }
+            _ => Err(Error::Uncertain),
+        }
+    }
+
+    fn register_creation(
+        &mut self,
+        request: CreateRequest,
+        definition: ProjectDefinition,
+        worktrunk: WorktrunkConfig,
+        json: serde_json::Value,
+    ) -> Result<Entry, Error> {
+        let key = request.operation.to_string();
         // Reject inert invalid input before reserving an operation with no resource to reconcile.
         let jj = request.uses_jj();
         request.validate_definition(&definition)?;
@@ -1443,7 +1421,7 @@ impl Runtime<'_> {
             operation: request.operation,
             backend: BackendId(backend.into()),
         })?;
-        let mut entry = Entry {
+        let entry = Entry {
             workspace,
             repository: repository.clone(),
             failure: None,
@@ -1475,9 +1453,20 @@ impl Runtime<'_> {
             .selection = entry.selection.clone();
         self.state.workspaces.insert(id.to_string(), entry.clone());
         self.save()?;
-        let result = self.provision(&entry, &key);
+        self.complete_creation(entry, &key, &|| Ok(()))
+    }
+
+    fn complete_creation(
+        &mut self,
+        mut entry: Entry,
+        key: &str,
+        authorize: &dyn Fn() -> Result<(), Error>,
+    ) -> Result<Entry, Error> {
+        let id = entry.workspace.id().clone();
+        let result = self.provision_authorized(&entry, key, authorize);
         match result {
             Ok(location) => {
+                entry.failure = None;
                 #[cfg(test)]
                 recovery::crash_boundary("provisioned");
                 entry
@@ -1502,13 +1491,25 @@ impl Runtime<'_> {
         Ok(entry)
     }
 
+    #[cfg(test)]
     fn provision(&mut self, entry: &Entry, key: &str) -> Result<WorkspaceLocation, Error> {
+        self.provision_authorized(entry, key, &|| Ok(()))
+    }
+
+    fn provision_authorized(
+        &mut self,
+        entry: &Entry,
+        key: &str,
+        authorize: &dyn Fn() -> Result<(), Error>,
+    ) -> Result<WorkspaceLocation, Error> {
         let selection = self.selection(entry)?;
         let backend = entry.workspace.backend().ok_or(Error::Conflict)?.clone();
         let manager = self.manager;
         let intent = backends::intent(entry)?;
         manager.provisioner(&selection)?.validate_intent(&intent)?;
         if let Some(repository) = &selection.repository {
+            // Acquisition/fetch can mutate shared storage even before checkout dispatch.
+            authorize()?;
             let mut repo = self
                 .state
                 .repositories
@@ -1542,6 +1543,8 @@ impl Runtime<'_> {
             },
             &mut persistence::OperationCheckpoints { runtime: self, key },
         )?;
+        // Authority may have ended during fetch or native preparation.
+        authorize()?;
         let operation = self.state.operations.get_mut(key).ok_or(Error::Conflict)?;
         operation.prepared = Some(prepared.intent.clone());
         operation.path = prepared
@@ -1734,6 +1737,17 @@ impl Runtime<'_> {
         discard: bool,
         durable: Option<CleanupRequest>,
     ) -> Result<Entry, Error> {
+        self.remove_authorized(id, operation, discard, durable, &|| Ok(()))
+    }
+
+    fn remove_authorized(
+        &mut self,
+        id: WorkspaceId,
+        operation: OperationId,
+        discard: bool,
+        durable: Option<CleanupRequest>,
+        authorize: &dyn Fn() -> Result<(), Error>,
+    ) -> Result<Entry, Error> {
         let mut entry = self
             .state
             .workspaces
@@ -1791,6 +1805,7 @@ impl Runtime<'_> {
                     .prepared
                     .as_ref()
                     .ok_or(Error::Conflict)?;
+                authorize()?;
                 self.manager.provisioner(&selection)?.finish_removal(
                     selection.repository.as_ref(),
                     intent,
@@ -1827,6 +1842,7 @@ impl Runtime<'_> {
             &location.root,
             false,
         )?;
+        authorize()?;
         provisioner.prepare_cleanup(selection.repository.as_ref(), &removal_intent)?;
         entry.workspace.transition(WorkspaceEvent::Cleanup {
             operation: operation.clone(),
@@ -1849,6 +1865,7 @@ impl Runtime<'_> {
         self.save()?;
         let path = Path::new(location.root.as_str());
         let result = (|| {
+            authorize()?;
             if !discard {
                 let directory = self.path(self.store.state_directory())?;
                 let previous = self.cleanup_checkpoint(&operation)?;
@@ -1882,6 +1899,8 @@ impl Runtime<'_> {
                 &location.root,
                 false,
             )?;
+            // A preservation job may outlive session authority; do not then dispatch deletion.
+            authorize()?;
             provisioner.remove_checkpointed(
                 selection.repository.as_ref(),
                 &intent,

@@ -44,6 +44,15 @@ async fn exercise(
                         json!({"name":"hive.workspace.capabilities"}),
                     )
                     .await?;
+                    for (key, name) in [
+                        ("workspaceCurrent", "hive.workspace.current"),
+                        ("workspaceInfo", "hive.workspace.info"),
+                        ("workspaceList", "hive.workspace.list"),
+                    ] {
+                        report[key] =
+                            invoke(&cx, id, "tools/call", json!({"name":name,"arguments":{}}))
+                                .await?;
+                    }
                     for (key, params) in [
                         (
                             "workspaceArguments",
@@ -104,6 +113,12 @@ async fn exercise(
                         .await?;
                         continue;
                     }
+                    if tool["name"]
+                        .as_str()
+                        .is_some_and(|name| name.starts_with("hive.workspace."))
+                    {
+                        continue;
+                    }
                     if tool["title"]
                         .as_str()
                         .is_some_and(|title| title.ends_with(": hold"))
@@ -140,6 +155,26 @@ async fn exercise(
                     });
                 }
                 if std::env::var_os("HIVE_VCS_EXERCISE").is_some() {
+                    let current =
+                        report["workspaceCurrent"]["structuredContent"]["workspace"].clone();
+                    report["currentRemove"] = invoke(&cx, id, "tools/call", json!({"name":"hive.workspace.remove","arguments":{"workspace":current,"operation":format!("operation-{}",uuid::Uuid::new_v4())}})).await?;
+                    let operation = format!("operation-{}", uuid::Uuid::new_v4());
+                    let params =
+                        json!({"name":"hive.workspace.create","arguments":{"operation":operation}});
+                    report["siblingCreate"] = invoke(&cx, id, "tools/call", params.clone()).await?;
+                    report["siblingReplay"] = invoke(&cx, id, "tools/call", params).await?;
+                    let workspace =
+                        report["siblingCreate"]["structuredContent"]["workspace"].clone();
+                    report["siblingInfo"] = invoke(
+                        &cx,
+                        id,
+                        "tools/call",
+                        json!({"name":"hive.workspace.info","arguments":{"workspace":workspace}}),
+                    )
+                    .await?;
+                    let cleanup = format!("operation-{}", uuid::Uuid::new_v4());
+                    report["siblingRemove"] = invoke(&cx, id, "tools/call", json!({"name":"hive.workspace.remove","arguments":{"workspace":workspace,"operation":cleanup}})).await?;
+                    report["siblingOperation"] = invoke(&cx, id, "tools/call", json!({"name":"hive.workspace.operation","arguments":{"operation":cleanup}})).await?;
                     let root = cwd.as_ref().ok_or_else(Error::internal_error)?;
                     std::fs::write(root.join("committed.txt"), format!("VCS tool {phase}\n"))
                         .map_err(|_| Error::internal_error())?;

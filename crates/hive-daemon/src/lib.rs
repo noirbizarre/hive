@@ -218,6 +218,10 @@ struct Control {
     pending_interactions: usize,
     // Separate bounded setup phases keep backend initialization inside its own watchdog budget.
     startup_phase: u64,
+    // Owner-side tool work is progress even before the agent acknowledges new/resume.
+    pending_builtin_operations: usize,
+    // Completed calls between watchdog ticks must also refresh the silence budget.
+    builtin_activity_revision: u64,
     urls: HashMap<String, interactions::UrlRoute>,
     // Request publication and notification dispatch can race; records remain worker-local and bounded.
     early_completions: HashMap<String, (tokio::time::Instant, v2::CompleteElicitationNotification)>,
@@ -378,6 +382,8 @@ impl Control {
             interaction_epoch: 0,
             pending_interactions: 0,
             startup_phase: 0,
+            pending_builtin_operations: 0,
+            builtin_activity_revision: 0,
             urls: HashMap::new(),
             early_completions: HashMap::new(),
             token: uuid::Uuid::new_v4().to_string(),
@@ -453,6 +459,8 @@ impl Control {
             interaction_epoch: 0,
             pending_interactions: 0,
             startup_phase: 0,
+            pending_builtin_operations: 0,
+            builtin_activity_revision: 0,
             urls: HashMap::new(),
             early_completions: HashMap::new(),
             token: uuid::Uuid::new_v4().to_string(),
@@ -4984,6 +4992,42 @@ mod control_tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn startup_waits_for_builtin_work_but_times_out_after_it_settles_into_silence() {
+        let control = Arc::new(Mutex::new(detached()));
+        control.lock().unwrap().pending_builtin_operations = 1;
+        let ready = async {
+            tokio::time::sleep(std::time::Duration::from_secs(35)).await;
+            "ready"
+        };
+        assert_eq!(interactions::startup(&control, ready).await, Ok("ready"));
+        {
+            let mut state = control.lock().unwrap();
+            state.pending_builtin_operations = 0;
+            state.builtin_activity_revision += 1;
+        }
+        let started = tokio::time::Instant::now();
+        assert!(
+            interactions::startup(&control, std::future::pending::<()>())
+                .await
+                .is_err()
+        );
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(15));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn builtin_activity_completed_between_watchdog_ticks_refreshes_startup() {
+        let control = Arc::new(Mutex::new(detached()));
+        let ready = async {
+            // No pending call remains at the next 100-ms tick; only the revision proves progress.
+            tokio::time::sleep(std::time::Duration::from_millis(14_050)).await;
+            control.lock().unwrap().builtin_activity_revision += 2;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            "ready"
+        };
+        assert_eq!(interactions::startup(&control, ready).await, Ok("ready"));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn an_unanswered_permission_expires_without_retaining_a_pending_waiter() {
         let mut state = detached();
         state.pilot = None;
@@ -5068,6 +5112,8 @@ mod control_tests {
         Control {
             workspace_session: None,
             startup_phase: 0,
+            pending_builtin_operations: 0,
+            builtin_activity_revision: 0,
             worktrunk_terminal: None,
             worktrunk_restore: false,
             worktrunk_local: false,

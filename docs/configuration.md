@@ -99,7 +99,7 @@ setup is sent. HTTP URL/headers go directly to the agent, which handles HTTP
 availability; Hive does not start an HTTP process or proxy its connection.
 
 Registered-workspace sessions also expose the built-in
-[`hive.workspace.capabilities` and backend-supported VCS tools](workspace-tools.md)
+[`hive.workspace.capabilities`, lifecycle and backend-supported VCS tools](workspace-tools.md)
 through the same aggregate
 when a local native ACPv2 agent advertises `session.mcp.acp`. No server selector is
 required. This automatic provider is omitted for unsupported agents or unregistered

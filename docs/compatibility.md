@@ -183,7 +183,7 @@ explicit sharing policy and the supported legacy-backend protocol subset.
 
 Registered-workspace sessions with a local native ACPv2 agent advertising
 `session.mcp.acp` also receive the built-in
-[`hive.workspace.capabilities` and backend-supported VCS tools](workspace-tools.md).
+[`hive.workspace.capabilities`, lifecycle and backend-supported VCS tools](workspace-tools.md).
 They use the same aggregate
 without requiring configured servers. Session authority, owner-side remote
 execution, supported-only discovery, typed errors and tool schema versioning are

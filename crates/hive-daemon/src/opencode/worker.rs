@@ -54,6 +54,77 @@ enum Stream {
     Dropped,
     Reconnected,
     Lost,
+    #[cfg(test)]
+    Poll(oneshot::Sender<()>),
+    #[cfg(test)]
+    SuspendPolling(oneshot::Sender<()>),
+}
+
+/// Acknowledges work in the worker's ordering domain, rather than guessing how long HTTP takes.
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct TestProbe {
+    events: mpsc::UnboundedSender<Stream>,
+    barriers: Arc<tokio::sync::watch::Sender<HashSet<String>>>,
+    tasks: Arc<Mutex<HashMap<String, TestTask>>>,
+}
+
+#[cfg(test)]
+struct TestTask {
+    finished: tokio::sync::watch::Receiver<bool>,
+    starts: usize,
+}
+
+#[cfg(test)]
+impl TestProbe {
+    pub(crate) async fn suspend_polling(&self) {
+        let (tx, rx) = oneshot::channel();
+        self.events.send(Stream::SuspendPolling(tx)).unwrap();
+        rx.await.unwrap();
+    }
+
+    pub(crate) async fn poll(&self) {
+        let (tx, rx) = oneshot::channel();
+        self.events.send(Stream::Poll(tx)).unwrap();
+        rx.await.unwrap();
+    }
+
+    pub(crate) async fn barrier(&self, id: &str) {
+        self.barriers
+            .subscribe()
+            .wait_for(|seen| seen.contains(id))
+            .await
+            .unwrap();
+    }
+
+    pub(crate) fn task(&self, id: &str) -> tokio::sync::watch::Receiver<bool> {
+        self.tasks
+            .lock()
+            .unwrap()
+            .get(id)
+            .expect("interaction was registered before forwarding")
+            .finished
+            .clone()
+    }
+
+    pub(crate) fn starts(&self, id: &str) -> usize {
+        self.tasks
+            .lock()
+            .unwrap()
+            .get(id)
+            .map_or(0, |task| task.starts)
+    }
+}
+
+#[cfg(test)]
+struct TaskFinished(tokio::sync::watch::Sender<bool>);
+
+#[cfg(test)]
+impl Drop for TaskFinished {
+    fn drop(&mut self) {
+        // Aborted tasks must acknowledge destruction as well as normally completed answers.
+        self.0.send_replace(true);
+    }
 }
 
 struct Turn {
@@ -305,6 +376,17 @@ pub(crate) async fn run_opencode_agent(
         }
         state.finish_history();
     }
+    let (events_tx, mut events) = mpsc::unbounded_channel();
+    #[cfg(test)]
+    let probe = TestProbe {
+        events: events_tx.clone(),
+        barriers: Arc::new(tokio::sync::watch::Sender::new(HashSet::new())),
+        tasks: Arc::default(),
+    };
+    #[cfg(test)]
+    {
+        control.lock().unwrap().opencode_probe = Some(probe.clone());
+    }
     let _ = ready.send(Ok((
         v2::NewSessionResponse::new(hive_id.clone()),
         native.id.clone(),
@@ -313,7 +395,6 @@ pub(crate) async fn run_opencode_agent(
         return;
     }
 
-    let (events_tx, mut events) = mpsc::unbounded_channel();
     let _stream = AbortOnDrop(Some(
         tokio::spawn(run_events(native.clone(), first, cursor, events_tx)).abort_handle(),
     ));
@@ -341,6 +422,10 @@ pub(crate) async fn run_opencode_agent(
     worker.refresh_pending().await;
     let mut tick = tokio::time::interval(POLL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    #[cfg(test)]
+    let mut polling = true;
+    #[cfg(not(test))]
+    let polling = true;
     loop {
         tokio::select! {
             command = rx.recv() => match command {
@@ -351,6 +436,21 @@ pub(crate) async fn run_opencode_agent(
                 Some(Stream::Event(event)) => {
                     let mapped = worker.mapper.event(&event);
                     worker.events(mapped).await;
+                    #[cfg(test)]
+                    if event["type"] == "hive.test.barrier" {
+                        let id = event["properties"]["id"].as_str().unwrap().to_owned();
+                        probe.barriers.send_modify(|seen| { seen.insert(id); });
+                    }
+                }
+                #[cfg(test)]
+                Some(Stream::Poll(done)) => {
+                    worker.poll().await;
+                    let _ = done.send(());
+                }
+                #[cfg(test)]
+                Some(Stream::SuspendPolling(done)) => {
+                    polling = false;
+                    let _ = done.send(());
                 }
                 Some(Stream::Dropped) => {
                     worker.withdraw_approvals(false);
@@ -369,7 +469,7 @@ pub(crate) async fn run_opencode_agent(
                     break;
                 }
             },
-            _ = tick.tick() => worker.poll().await,
+            _ = tick.tick(), if polling => worker.poll().await,
         }
         // Finish the complete mapped event batch before releasing the upstream close response.
         if worker.settle_close() {
@@ -987,6 +1087,27 @@ impl Worker {
     /// Spawns and registers under one lock, so a task that finishes instantly cannot remove
     /// its entry before it exists and leave a stale one behind.
     fn track(&self, id: String, task: impl Future<Output = ()> + Send + 'static) {
+        #[cfg(test)]
+        let task = {
+            let (done, finished) = tokio::sync::watch::channel(false);
+            let probe = self
+                .control
+                .lock()
+                .unwrap()
+                .opencode_probe
+                .as_ref()
+                .unwrap()
+                .clone();
+            let mut tasks = probe.tasks.lock().unwrap();
+            let starts = tasks.get(&id).map_or(1, |task| task.starts + 1);
+            tasks.insert(id.clone(), TestTask { finished, starts });
+            // Construct outside the future so even an abort before its first poll is observable.
+            let finished = TaskFinished(done);
+            async move {
+                let _finished = finished;
+                task.await
+            }
+        };
         if let Ok(mut pending) = self.pending.lock() {
             let handle = tokio::spawn(task).abort_handle();
             pending.insert(id, AbortOnDrop(Some(handle)));

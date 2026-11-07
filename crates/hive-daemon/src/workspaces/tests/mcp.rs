@@ -73,26 +73,22 @@ async fn workspace_tool_scope_is_derived_from_the_session_hold_and_rejects_forei
 #[tokio::test]
 async fn built_in_calls_retain_settlement_after_close_caller_drop_recovery_and_shutdown() {
     use crate::mcp::{PendingTarget, StartupOwnership, workspace::Provider};
+    // All cases fence native dispatch, so they can share one provisioned checkout.
+    let fixture = Fixture::new();
+    let entry = fixture.create(fixture.request()).await.unwrap();
     for (action, mutation) in ["close", "drop", "recovery", "shutdown"]
         .into_iter()
         .flat_map(|action| [(action, false), (action, true)])
     {
-        let fixture = Fixture::new();
-        let entry = fixture.create(fixture.request()).await.unwrap();
         let project = entry.workspace.intent().project.clone();
         let mut config = crate::Config::default();
         config
             .projects
             .insert(project.clone(), fixture.definition.clone());
-        let broker = crate::Broker::persistent(
-            config,
-            fixture
-                .service
-                .store
-                .state_directory()
-                .join("catalog.sqlite3"),
-        )
-        .unwrap();
+        // Exercise the real workspace store without starting an unrelated marker publisher
+        // or reopening SQLite eight times. The cancellation registry must remain fresh per case.
+        let mut broker = crate::Broker::new(config).unwrap();
+        broker.store = Some(fixture.service.store.clone());
         let session = hive_protocol::v2::SessionId::new("built-in-session");
         fixture
             .service

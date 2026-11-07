@@ -39,6 +39,9 @@ mod activity;
 pub mod compat;
 pub mod config;
 pub mod doctor;
+#[cfg(test)]
+#[path = "../tests/support/fake_opencode.rs"]
+mod fake_opencode;
 pub mod http;
 mod interactions;
 pub mod mcp;
@@ -191,6 +194,8 @@ struct Entry {
 type NativeInterruption = watch::Sender<Option<tokio::time::Instant>>;
 
 struct Control {
+    #[cfg(test)]
+    opencode_probe: Option<opencode::TestProbe>,
     // Capability belongs to this live adapter, not the heterogeneous gateway as a whole.
     prompt_images: bool,
     // Cleanup protection is not proof of dispatch; classify startup from worker publication evidence.
@@ -397,6 +402,8 @@ impl Control {
             catalog,
             closing: false,
             native_interruption: None,
+            #[cfg(test)]
+            opencode_probe: None,
             prompts: HashMap::new(),
             activity,
             plans: plans::Plans::default(),
@@ -471,6 +478,8 @@ impl Control {
             catalog,
             closing: false,
             native_interruption: None,
+            #[cfg(test)]
+            opencode_probe: None,
             prompts: HashMap::new(),
             activity,
             plans: plans::Plans::default(),
@@ -5093,6 +5102,8 @@ mod control_tests {
             catalog,
             closing: false,
             native_interruption: None,
+            #[cfg(test)]
+            opencode_probe: None,
             prompts: HashMap::new(),
             activity: Activity::new(),
             plans: plans::Plans::default(),

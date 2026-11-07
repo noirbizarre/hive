@@ -9,8 +9,12 @@ pub(crate) mod api;
 pub(crate) mod error;
 mod http;
 mod map;
+#[cfg(test)]
+mod tests;
 mod version;
 mod worker;
+#[cfg(test)]
+pub(crate) use worker::TestProbe;
 
 use crate::config::Profile;
 use api::NativeSession;

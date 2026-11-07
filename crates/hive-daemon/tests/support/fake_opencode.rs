@@ -7,7 +7,6 @@
 use std::{
     collections::HashSet,
     sync::{Arc, Mutex},
-    time::Duration,
 };
 
 use axum::{
@@ -93,6 +92,7 @@ struct Data {
 
 struct Inner {
     state: Mutex<Data>,
+    changed: tokio::sync::watch::Sender<()>,
     v1_events: broadcast::Sender<String>,
     v2_events: broadcast::Sender<String>,
     question_read_release: tokio::sync::Notify,
@@ -101,10 +101,40 @@ struct Inner {
 #[derive(Clone)]
 pub struct Fake(Arc<Inner>);
 
+/// Notify on mutations, including held HTTP requests, without waking on reads.
+struct StateGuard<'a> {
+    state: std::sync::MutexGuard<'a, Data>,
+    changed: &'a tokio::sync::watch::Sender<()>,
+    dirty: bool,
+}
+
+impl std::ops::Deref for StateGuard<'_> {
+    type Target = Data;
+    fn deref(&self) -> &Data {
+        &self.state
+    }
+}
+
+impl std::ops::DerefMut for StateGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Data {
+        self.dirty = true;
+        &mut self.state
+    }
+}
+
+impl Drop for StateGuard<'_> {
+    fn drop(&mut self) {
+        if self.dirty {
+            self.changed.send_modify(|_| {});
+        }
+    }
+}
+
 pub async fn start(options: Options) -> (Fake, String) {
     let (v1_events, _) = broadcast::channel(1024);
     let (v2_events, _) = broadcast::channel(1024);
     let fake = Fake(Arc::new(Inner {
+        changed: tokio::sync::watch::Sender::new(()),
         state: Mutex::new(Data {
             options,
             sessions: Vec::new(),
@@ -170,8 +200,24 @@ pub async fn start(options: Options) -> (Fake, String) {
 // ---- test-facing controls -------------------------------------------------------------
 
 impl Fake {
-    fn state(&self) -> std::sync::MutexGuard<'_, Data> {
-        self.0.state.lock().unwrap()
+    fn state(&self) -> StateGuard<'_> {
+        StateGuard {
+            state: self.0.state.lock().unwrap(),
+            changed: &self.0.changed,
+            dirty: false,
+        }
+    }
+
+    pub async fn until(&self, done: impl Fn() -> bool) {
+        // Subscribe before checking so a racing mutation cannot become a lost wakeup.
+        let mut changed = self.0.changed.subscribe();
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            while !done() {
+                changed.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("the expected fake-server state did not occur");
     }
 
     pub fn calls(&self) -> Vec<String> {
@@ -388,10 +434,6 @@ impl Fake {
         self.state().sessions.iter().find(|s| s.id == id).cloned()
     }
 
-    async fn pause(&self) {
-        tokio::time::sleep(Duration::from_millis(15)).await;
-    }
-
     /// The v1 turn the real server performs for a prompt, in the order observed on 1.19.3.
     async fn run_v1_turn(&self, session: &str, text: &str) {
         let n = self.next();
@@ -412,7 +454,6 @@ impl Fake {
         self.state().busy.insert(session.into());
         self.emit(status_event(session, "busy"));
         if let Script::Reply(reply) = script {
-            self.pause().await;
             self.reply(session, n, &reply).await;
         }
     }
@@ -424,7 +465,6 @@ impl Fake {
         self.emit(json!({"type": "message.part.updated", "properties": {"part": {
             "id": part, "sessionID": session, "messageID": assistant, "type": "text", "text": ""}}}));
         for piece in reply.split_inclusive(' ') {
-            self.pause().await;
             self.emit(json!({"type": "message.part.delta", "properties": {
                 "sessionID": session, "messageID": assistant, "partID": part,
                 "field": "text", "delta": piece}}));
@@ -480,7 +520,6 @@ impl Fake {
             return;
         };
         for piece in reply.split_inclusive(' ') {
-            self.pause().await;
             self.v2_push(
                 "session.next.text.delta",
                 json!({"sessionID": session, "assistantMessageID": assistant,

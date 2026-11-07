@@ -357,9 +357,11 @@ with the run date before changing a cell of the
 [OpenCode server matrix](compatibility.md#capability-and-version-matrix).
 Failures name a fixed stage and never echo server replies. The deterministic
 equivalent, covering cancel, permissions, questions, reconnect, restart, version
-and credential handling, is `cargo test -p hive-daemon --test opencode`. It runs
+and credential handling, is `mise exec -- cargo test -p hive-daemon --lib opencode::tests`. It runs
 against `tests/support/fake_opencode.rs`, which records every call so tests can
-assert that Hive did **not** create a session.
+assert that Hive did **not** create a session. These protocol tests live alongside
+the adapter so they can acknowledge worker processing and answer settlement
+without fixed sleeps or public test-only controls.
 
 ## Template maintenance
 

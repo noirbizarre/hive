@@ -310,7 +310,7 @@ and backend-specific workflows.
 - `src/workspaces/tests/vcs.rs`: Git/JJ native state and identities, partial staging,
   explicit additions, ignored files, layered read-only JJ inspection, conflicts,
   hooks, mutation fences, bounded output and Git dispatch for WorkTrunk selection.
-- Gateway `remote_workspace_capability_calls_execute_on_the_owner_during_startup_and_recovery`:
+- Backend-specific gateway tests in `tests/support/workspaces.rs`:
   direct peer-to-owner Git/JJ/optional WorkTrunk capabilities and VCS operations
   during startup and restart, with independent native history checks. This
   exercises the selected owner's provider, rather than

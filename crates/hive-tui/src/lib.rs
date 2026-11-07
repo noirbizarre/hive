@@ -1641,7 +1641,7 @@ async fn handle_key(
                 let mut tx = Some(tx);
                 if key.code == KeyCode::Esc {
                     let _ = tx.take().unwrap().send(v2::RequestPermissionResponse::new(
-                        v2::RequestPermissionOutcome::Cancelled,
+                        v2::CancelledPermissionOutcome::new().into(),
                     ));
                     keep = false;
                 } else if key.code == KeyCode::Enter {
@@ -2440,7 +2440,7 @@ async fn interaction_client<R>(
                             .run_until_cancelled(async {
                                 Ok(rx.await.unwrap_or_else(|_| {
                                     v2::RequestPermissionResponse::new(
-                                        v2::RequestPermissionOutcome::Cancelled,
+                                        v2::CancelledPermissionOutcome::new().into(),
                                     )
                                 }))
                             })
@@ -3366,7 +3366,7 @@ mod tests {
                 cx.spawn(async move {
                     let permission = |title| v2::RequestPermissionRequest::new(request.session_id.clone(), title, vec![v2::PermissionOption::new("allow", "Allow once", v2::PermissionOptionKind::AllowOnce)]);
                     let (first, second) = tokio::join!(peer.send_request(permission("first")).block_task(), peer.send_request(permission("second")).block_task());
-                    assert!(matches!(first?.outcome, v2::RequestPermissionOutcome::Cancelled));
+                    assert!(matches!(first?.outcome, v2::RequestPermissionOutcome::Cancelled(_)));
                     assert!(matches!(second?.outcome, v2::RequestPermissionOutcome::Selected(_)));
                     let form: v2::CreateElicitationRequest = serde_json::from_value(serde_json::json!({"mode":"form","sessionId":"session","message":"Approve?","requestedSchema":{"properties":{"approved":{"type":"boolean"}},"required":["approved"]}})).unwrap();
                     let result = peer.send_request(form).block_task().await?;
@@ -3420,7 +3420,7 @@ mod tests {
                     .unwrap();
                 first_tx
                     .send(v2::RequestPermissionResponse::new(
-                        v2::RequestPermissionOutcome::Cancelled,
+                        v2::CancelledPermissionOutcome::new().into(),
                     ))
                     .unwrap();
                 let Interaction::Elicitation(request, tx, mut draft) =

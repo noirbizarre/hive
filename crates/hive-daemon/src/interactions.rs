@@ -1,7 +1,9 @@
 //! Human waits are independent of SDK dispatch and bounded by the session lifecycle.
 
 use super::*;
-use hive_protocol::interactions::{validate_elicitation, validate_permission};
+use hive_protocol::interactions::{
+    raw_request_id, v2_request_id, validate_elicitation, validate_permission,
+};
 use std::{future::Future, time::Duration};
 
 const LIMIT: usize = 128;
@@ -284,7 +286,7 @@ pub(super) async fn permission_receipt(
 ) -> (v2::RequestPermissionResponse, Option<DecisionReceipt>) {
     let cancelled = || {
         (
-            v2::RequestPermissionResponse::new(v2::RequestPermissionOutcome::Cancelled),
+            v2::RequestPermissionResponse::new(v2::CancelledPermissionOutcome::new().into()),
             None,
         )
     };
@@ -405,10 +407,12 @@ pub(super) async fn elicitation_at(
             .started = true;
     }
     if let v2::ElicitationScope::Request(scope) = request.scope() {
-        let parent = control
-            .lock()
-            .ok()
-            .and_then(|state| state.parents.get(&scope.request_id).cloned());
+        let parent = control.lock().ok().and_then(|state| {
+            state
+                .parents
+                .get(&raw_request_id(&scope.request_id))
+                .cloned()
+        });
         let Some(mut parent) = parent.filter(Parent::live) else {
             tracing::debug!(
                 code = "hive::interactions::unmapped_parent",
@@ -425,13 +429,17 @@ pub(super) async fn elicitation_at(
         if !supported {
             return cancelled();
         }
+        // Raw SDK IDs may be null, but a forwarded v2 scope must identify a real parent.
+        let Some(parent_id) = v2_request_id(&parent.id) else {
+            return cancelled();
+        };
         let mut forwarded = request.clone();
         match &mut forwarded.mode {
             v2::ElicitationMode::Form(form) => {
-                form.scope = v2::ElicitationRequestScope::new(parent.id.clone()).into()
+                form.scope = v2::ElicitationRequestScope::new(parent_id).into()
             }
             v2::ElicitationMode::Url(url) => {
-                url.scope = v2::ElicitationRequestScope::new(parent.id.clone()).into();
+                url.scope = v2::ElicitationRequestScope::new(parent_id).into();
                 let mut state = control.lock().expect("session state is not poisoned");
                 let Some(route) = state.urls.get_mut(&url.elicitation_id.to_string()) else {
                     return cancelled();

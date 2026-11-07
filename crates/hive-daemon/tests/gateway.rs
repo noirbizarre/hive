@@ -2631,7 +2631,7 @@ async fn post_recovery_updates_and_permissions_are_live(address: SocketAddr, id:
                         _: V2ConnectionTo<Agent>| {
                 tx.send(()).map_err(Error::into_internal_error)?;
                 responder.respond(v2::RequestPermissionResponse::new(
-                    v2::RequestPermissionOutcome::Cancelled,
+                    v2::CancelledPermissionOutcome::new().into(),
                 ))
             },
             agent_client_protocol::on_receive_request!(),

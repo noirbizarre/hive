@@ -604,7 +604,10 @@ async fn request_scoped_elicitation_translates_parent_ids_through_the_gateway_wi
                         let v2::ElicitationScope::Request(scope) = question.scope() else {
                             panic!("request scope was lost");
                         };
-                        assert_eq!(scope.request_id, expected);
+                        assert_eq!(
+                            hive_protocol::interactions::raw_request_id(&scope.request_id),
+                            expected
+                        );
                         responder.respond(v2::CreateElicitationResponse::new(
                             v2::ElicitationAction::Cancel,
                         ))?;

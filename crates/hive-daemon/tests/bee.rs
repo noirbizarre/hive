@@ -721,12 +721,14 @@ async fn permissions_correlate_tool_subjects_and_dialog_outcomes() {
                                         .iter()
                                         .any(|state| state["state"] == "requires_action")
                                 );
-                                let outcome =
-                                    choice.map_or(v2::RequestPermissionOutcome::Cancelled, |id| {
+                                let outcome = choice.map_or(
+                                    v2::CancelledPermissionOutcome::new().into(),
+                                    |id| {
                                         v2::RequestPermissionOutcome::Selected(
                                             v2::SelectedPermissionOutcome::new(id),
                                         )
-                                    });
+                                    },
+                                );
                                 responder.respond(v2::RequestPermissionResponse::new(outcome))?;
                                 break;
                             }

@@ -152,7 +152,7 @@ impl Pilot {
     fn cancel(&self) {
         for responder in self.held.lock().unwrap().drain(..) {
             let _ = responder.respond(v2::RequestPermissionResponse::new(
-                v2::RequestPermissionOutcome::Cancelled,
+                v2::CancelledPermissionOutcome::new().into(),
             ));
         }
     }
